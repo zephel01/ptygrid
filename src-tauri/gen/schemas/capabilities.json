@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability for the main window: core APIs (events, window) needed by the terminal pane.","local":true,"windows":["main"],"permissions":["core:default"]}}

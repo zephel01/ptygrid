@@ -1,0 +1,48 @@
+# mterm.yml — ptygrid project config (example)
+#
+# Copy this file to your project root as `mterm.yml`, then load it from the
+# app toolbar. Relative `cwd` values are resolved against the directory
+# containing mterm.yml; `${VAR}` in env values is expanded from the host
+# environment (missing variables become empty strings).
+#
+# agents:    interactive AI CLIs (get an `instructions` field in Phase 2)
+# processes: plain long-running commands (same fields, no instructions)
+# autorestart: never | on-failure | always   (default: never)
+
+project: my-app
+
+# queen: the built-in MCP server that lets agent CLIs inside panes read other
+# panes, send them messages, spawn config-defined agents, and toast the UI.
+# Every spawned session gets env QUEEN_URL=http://127.0.0.1:<port>/mcp.
+# Register in Claude Code with:
+#   claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+# Both fields are optional; the whole block can be omitted.
+queen:
+  enabled: true   # default true; false stops the server
+  port: 39237     # default 39237; if busy, +1 is tried up to 39246
+
+agents:
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    autostart: false
+    autorestart: never
+
+  - name: codex
+    cmd: "codex"
+    cwd: "."
+    autostart: false
+
+  - name: grok
+    cmd: "grok"
+    cwd: "."
+    autostart: false
+
+processes:
+  - name: web
+    cmd: "npm run dev"
+    cwd: "."
+    autostart: false
+    autorestart: on-failure

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "multi-terminal",
+  "version": "0.1.0",
+  "identifier": "com.zephel01.multiterminal",
+  "build": {
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "multi-terminal",
+        "width": 1100,
+        "height": 750
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all"
+  }
+}

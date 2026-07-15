@@ -1,0 +1,28 @@
+{
+  "name": "multi-terminal",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@xterm/xterm": "^5",
+    "@xterm/addon-fit": "^0.10",
+    "svelte-splitpanes": "^8.0.12"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@sveltejs/vite-plugin-svelte": "^5",
+    "svelte": "^5",
+    "svelte-check": "^4",
+    "tslib": "^2",
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}

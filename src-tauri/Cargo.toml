@@ -1,0 +1,36 @@
+# Keep this crate independent from the pty-core-check smoke-test crate.
+[workspace]
+
+[package]
+name = "multi-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-agent terminal app (Phase 0: single-pane PTY)"
+authors = ["zephel01"]
+
+[lib]
+name = "multi_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+portable-pty = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+notify = "8"
+rmcp = { version = "1.8", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+# Enables tauri::test::mock_app() (MockRuntime) for session state-machine tests.
+tauri = { version = "2", features = ["test"] }
