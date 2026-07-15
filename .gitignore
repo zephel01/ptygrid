@@ -1,6 +1,22 @@
+# dependencies / build artifacts
 node_modules/
 dist/
 src-tauri/target/
 src-tauri/pty-core-check/target/
+src-tauri/mcp-server-check/target/
+
+# local user config (may contain secrets/API keys) — commit mterm.example.yml instead
+mterm.yml
+
+# editor / OS / logs
 *.log
 .DS_Store
+.idea/
+.vscode/
+__pycache__/
+
+# local agent runtime state (session locks, scratch writes)
+.claude/
+
+# personal notes
+docs/note
