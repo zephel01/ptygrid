@@ -11,6 +11,7 @@ mod resource_monitor;
 mod session;
 mod teams_hooks;
 mod teams_host;
+mod token_store;
 mod transcript;
 mod trust;
 mod worktree;
@@ -42,11 +43,15 @@ pub fn run() {
     tauri::Builder::default()
         .manage(PtyManager::new())
         .manage(ConfigManager::new())
-        .manage(QueenStatus::new())
-        .manage(TeamsHooks::new())
         .manage(TeamsHostManager::new())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
+            // Load (or first-time generate) the persisted auth tokens before the
+            // Queen server binds, so both the /mcp token and the hook Bearer are
+            // fixed for the run and survive restarts (token_store owns the logic).
+            let tokens = token_store::load_or_create(&app_data).map_err(std::io::Error::other)?;
+            app.manage(QueenStatus::new(tokens.queen_token));
+            app.manage(TeamsHooks::new(tokens.hook_token));
             let queen_store =
                 queen_store::QueenStore::open(&app_data.join("queen").join("queen.sqlite3"))
                     .map_err(std::io::Error::other)?;
@@ -73,6 +78,7 @@ pub fn run() {
             commands::queen_status,
             commands::teammate_hooks_info,
             commands::register_teammate_hooks,
+            commands::regenerate_auth_tokens,
             commands::teams_host_status,
             commands::git_status,
             commands::git_diff,

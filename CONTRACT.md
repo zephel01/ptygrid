@@ -1261,3 +1261,80 @@ default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localh
 - `style-src 'unsafe-inline'`: Svelte / xterm.js / svelte-splitpanes のスタイル注入に必要。
 - `img-src 'self' data:`: `data:` 画像許可（ビルド後の CSS に `data:` フォントは無し）。
 - 多層防御目的（現状ライブな XSS シンクは未検出）。webview 実機確認は別途。
+
+---
+
+# Security 追加契約 (認証トークンの永続化)
+
+両エージェントはこの契約に**厳密に**従うこと。既存の `/mcp` 認証・`/hooks/v1/*` Bearer・
+`QUEEN_URL` 形式（`?token=`）・teams-backend は互換維持（本節は「トークンの出所」を
+非永続→永続へ替えるだけで、生成方式・検証ロジック・URL 形式は不変）。背景は
+[docs/inside/evaluation-2026-07-16.md](docs/inside/evaluation-2026-07-16.md) の
+「hook token 固定化」。
+
+## 動機
+
+Phase 2「Queen 認証」と Phase 4.0「token（非永続）」は、`/mcp` トークンと teammate hooks
+Bearer トークンを**起動ごとに再生成**し、ディスクに書かなかった。その結果、アプリを再起動
+（や再ビルド）するたびに `~/.claude/settings.json` の登録済み hook トークンと MCP の
+`QUEEN_URL` トークンがずれ、**再登録するまで observe ペインが出ず Queen も 401** になっていた。
+これを解消するため、両トークンを app-data に**永続化**し、起動ごとに変わらないようにする。
+
+## トークンストア
+
+- 両トークンを Tauri app-data 直下の `auth-tokens.json` に version 付き JSON で保存する
+  （`app-settings.json` / `trusted-folders.json` と同階層・同流儀）。
+
+  ```json
+  { "version": 1, "hookToken": "<64-hex>", "queenToken": "<64-hex>" }
+  ```
+
+- `app_settings` / `trust` と同じ on-disk 規律: version 付き JSON、未知の version は
+  開かず拒否、書き込みは atomic（temp + rename）。
+- **ファイル権限は Unix で `0600`**（所有者読み書きのみ）。秘密値のため、rename 前の
+  temp ファイルに設定してから公開する（一瞬でも world-readable にしない）。
+- 生成方式は従来どおり 256bit ランダム・lowercase hex・`getrandom`（OS CSPRNG）。生成関数と
+  定数時間比較（`teams_hooks::{generate_token, constant_time_eq}`）は不変で共有。
+
+## 起動時ロード / 生成
+
+- アプリ setup（Queen サーバ bind の**前**）で `token_store::load_or_create` を一度呼び、
+  ストアに保存済みトークンがあればロード、無ければ両トークンを生成して保存する。
+- ロードした値で `QueenStatus` / `TeamsHooks` を構築する。両トークンは起動時に一度だけ確定し、
+  以降 env 注入（`QUEEN_URL` / hook Bearer）・middleware 検証・snippet 生成が同じ値を使う。
+- 実行中トークンは共有ハンドル（`TokenHandle` = `Arc<Mutex<String>>`）で保持し、bind 済みの
+  `/mcp` middleware と `/hooks/v1/*` receiver はそのハンドルを**キャプチャ**する
+  （スナップショットしない）。これにより再生成が**再 bind なし**で反映される。
+
+## 再生成コマンド（ローテーション）
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `regenerate_auth_tokens` | `{ which?: "hook" \| "queen" \| "all" }` | `{ regenerated: string[] }` | 対象トークンを再生成 + ストア保存 + 実行中 state へ反映 |
+
+- `which` 省略/空/`"all"` は両方、`"hook"` / `"queen"` は片方。未知値はエラー。
+- 新トークンを生成してストアに保存し、`QueenStatus` / `TeamsHooks` の `TokenHandle` を更新する。
+  Queen は再 bind 不要（middleware が同ハンドルを見る）。hooks も同様。
+- 戻り値 `regenerated` は再生成したトークンのラベル（`"hook"` / `"queen"`）。
+- **再生成後は settings.json / MCP 登録がずれる**ため、frontend は再登録を促す通知を出す。
+
+## Frontend
+
+- Teammates パネルに「hook トークン再生成」「Queen トークン再生成」ボタンを追加
+  （`regenerate_auth_tokens`）。再生成後は `teammate_hooks_info` / `queen_status` を再取得し、
+  再登録を促すトースト（hook→settings.json 登録 / Queen→登録コマンドコピー）を出す。
+  Queen バッジは単体ボタン（クリックで登録コマンドコピー）で専用パネルを持たないため、
+  Queen トークンの再生成ボタンも Teammates パネルに集約する。
+- 既存の「settings.json へ登録」「Queen 登録 URL コピー」は永続トークンを使う（値がストア由来に
+  なるだけで、呼び出し側は不変）。
+- ツールチップ/注記の文言を「初回のみ登録が必要。トークンは保存され再起動後も有効
+  （再生成したときだけ再登録）」に更新する。
+
+## セキュリティのトレードオフ
+
+- 永続化により、**app-data を読める同一ユーザープロセス**がトークンを取得可能になる
+  （従来は子プロセスの environ 経由でのみ露出）。app-data は `0600` でユーザー専用のため、
+  対象脅威モデル（同一ユーザーローカル）では**実質同等**。漏洩時は `regenerate_auth_tokens` で
+  ローテーション可能。
+- DNS リバインディング / cross-origin / env に触れないプロセスへの防御（Phase 2「Queen 認証」の
+  Host/Origin allow-list・token 検証）は**不変**。bind は 127.0.0.1 のみ、検証は定数時間のまま。

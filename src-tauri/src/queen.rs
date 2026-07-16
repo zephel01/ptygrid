@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ConfigManager;
 use crate::queen_store::{InboxWait, InboxWaitOptions, QueenStore};
 use crate::session::{PtyManager, SessionState};
+use crate::token_store::TokenHandle;
 
 /// Contract default port; fallback +1 each up to DEFAULT_PORT+9 (39246).
 pub const DEFAULT_PORT: u16 = 39237;
@@ -58,27 +59,39 @@ struct QueenStatusInner {
 /// Managed Tauri state describing the Queen server.
 pub struct QueenStatus {
     inner: Mutex<QueenStatusInner>,
-    /// Non-persistent 256-bit token authorizing `/mcp` requests for this app
-    /// run. Minted once at launch and never written to disk, so a registered
-    /// MCP URL is only valid until the app restarts. Immutable, so it lives
-    /// outside the mutex.
-    token: String,
+    /// 256-bit token authorizing `/mcp` requests. Persisted in app-data
+    /// (`crate::token_store`) and loaded at startup, so a registered MCP URL
+    /// stays valid across restarts. Held in a shared [`TokenHandle`] so a
+    /// regeneration is seen by the already-bound `/mcp` middleware.
+    token: TokenHandle,
 }
 
 impl QueenStatus {
-    pub fn new() -> Self {
+    /// Construct with the persisted `/mcp` token loaded at startup.
+    pub fn new(token: String) -> Self {
         QueenStatus {
             inner: Mutex::new(QueenStatusInner {
                 desired_port: DEFAULT_PORT,
                 ..Default::default()
             }),
-            token: crate::teams_hooks::generate_token(),
+            token: TokenHandle::new(token),
         }
     }
 
     /// The `/mcp` auth token for this app run (distinct from the hook token).
-    pub fn token(&self) -> &str {
-        &self.token
+    pub fn token(&self) -> String {
+        self.token.get()
+    }
+
+    /// Shared handle captured by the `/mcp` auth middleware so a rotation takes
+    /// effect without rebinding the server.
+    pub fn token_handle(&self) -> TokenHandle {
+        self.token.clone()
+    }
+
+    /// Rotate to a freshly generated token (already persisted by the caller).
+    pub fn set_token(&self, token: String) {
+        self.token.set(token);
     }
 
     fn lock(&self) -> MutexGuard<'_, QueenStatusInner> {
@@ -108,7 +121,7 @@ impl QueenStatus {
                 .then(|| inner.port.map(url_for_port))
                 .flatten(),
             // The frontend appends this to build the token-carrying register URL.
-            token: self.token.clone(),
+            token: self.token.get(),
             error: inner.error.clone(),
         }
     }
@@ -155,7 +168,7 @@ pub fn current_env_url<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> 
     }
     // Sessions get the token-carrying URL so the agent CLI can connect without
     // any extra `--header` configuration.
-    Some(env_url_for_port(port, status.token()))
+    Some(env_url_for_port(port, &status.token()))
 }
 
 // ---------- lifecycle ----------
@@ -253,15 +266,17 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
         // the /mcp router; the hook receiver is merged afterwards so it keeps
         // its own Bearer auth untouched.
         let mcp_auth_state = McpAuthState {
-            token: app.state::<QueenStatus>().token().to_string(),
+            token: app.state::<QueenStatus>().token_handle(),
             port,
         };
         let mcp = axum::Router::new()
             .nest_service("/mcp", service)
             .layer(from_fn_with_state(mcp_auth_state, mcp_auth));
         // Phase 4.0: the teammate hook receiver shares this 127.0.0.1 server,
-        // co-located with /mcp. Its own module owns all the hook logic.
-        let hooks_token = app.state::<crate::teams_hooks::TeamsHooks>().token().to_string();
+        // co-located with /mcp. Its own module owns all the hook logic. Both
+        // token handles are shared (not snapshotted) so a regeneration is
+        // honored without rebinding this server.
+        let hooks_token = app.state::<crate::teams_hooks::TeamsHooks>().token_handle();
         let router = mcp.merge(crate::teams_hooks::router(app.clone(), hooks_token));
 
         status_update(&|inner| {
@@ -289,11 +304,12 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
 
 // ---------- /mcp auth layer (Finding S1) ----------
 
-/// State captured by the `/mcp` auth middleware: the per-run token and the
-/// bound port (for the Host allow-list). Cloned per request by axum.
+/// State captured by the `/mcp` auth middleware: the shared token handle and the
+/// bound port (for the Host allow-list). Cloned per request by axum; the
+/// [`TokenHandle`] shares its `Arc`, so a rotation is read live.
 #[derive(Clone)]
 struct McpAuthState {
-    token: String,
+    token: TokenHandle,
     port: u16,
 }
 
@@ -301,7 +317,7 @@ struct McpAuthState {
 /// request reaches the MCP service. 403 for a non-loopback Host/Origin (DNS
 /// rebinding), 401 for a missing/wrong token.
 async fn mcp_auth(State(state): State<McpAuthState>, req: Request, next: Next) -> Response {
-    match authorize_mcp(req.headers(), req.uri().query(), state.port, &state.token) {
+    match authorize_mcp(req.headers(), req.uri().query(), state.port, &state.token.get()) {
         Ok(()) => next.run(req).await,
         Err(code) => code.into_response(),
     }
@@ -1217,7 +1233,7 @@ mod tests {
             .route("/mcp", axum::routing::any(|| async { "ok" }))
             .layer(from_fn_with_state(
                 McpAuthState {
-                    token: token.to_string(),
+                    token: TokenHandle::new(token.to_string()),
                     port,
                 },
                 mcp_auth,

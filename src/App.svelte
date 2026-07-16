@@ -118,8 +118,8 @@
     else if (q.port) lines.push(`http://127.0.0.1:${q.port}/mcp`);
     if (q.error) lines.push(`エラー: ${q.error}`);
     if (!q.running) lines.push("停止中");
-    // アプリ再起動ごとにトークンが変わるため、登録は再起動のたびにやり直す。
-    lines.push("クリックで token 込み登録コマンドをコピー（再起動ごとに再登録が必要）");
+    // トークンは app-data に永続化され再起動後も有効。初回のみ登録が必要。
+    lines.push("クリックで token 込み登録コマンドをコピー（初回のみ登録。再起動後も有効。再生成時のみ再登録）");
     return lines.join("\n") || "Queen MCP サーバー";
   });
 
@@ -139,8 +139,8 @@
     const cmd = `claude mcp add -s user --transport http queen ${url}`;
     try {
       await navigator.clipboard.writeText(cmd);
-      // 認証トークンはアプリ再起動ごとに変わる（非永続）。再起動後は再登録が必要。
-      addNotice("登録コマンドをコピーしました（再起動ごとに再登録が必要）", cmd);
+      // 認証トークンは永続化され再起動後も有効。初回のみ登録すればよい。
+      addNotice("登録コマンドをコピーしました（初回のみ登録。再起動後も有効）", cmd);
     } catch (err) {
       ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
     }
@@ -158,6 +158,7 @@
   let toolbarEl = $state<HTMLDivElement | null>(null);
   let teammatesPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
   let registering = $state(false);
+  let regenerating = $state(false);
 
   // Phase 4.2: any host lead that fell back to observe (host unavailable).
   let hostFallbackActive = $derived.by(
@@ -236,6 +237,34 @@
       ui.errorBanner = `hooks の登録に失敗しました (register_teammate_hooks): ${err}`;
     } finally {
       registering = false;
+    }
+  }
+
+  // Rotate the persisted auth token(s) for leak recovery. The backend updates
+  // the live /mcp + hook auth layers in place (no server restart), but the
+  // already-registered settings.json / MCP URL now carry the old token, so we
+  // refresh both statuses and prompt the user to re-register.
+  async function regenerateTokens(which: "hook" | "queen"): Promise<void> {
+    if (!isTauri() || regenerating) return;
+    regenerating = true;
+    try {
+      const result = await invokeCmd<{ regenerated: string[] }>(
+        "regenerate_auth_tokens",
+        { which },
+      );
+      // Reflect the new token values in the snippet / register URL.
+      await refreshTeammateHooks();
+      await refreshQueenStatus();
+      const labels = result.regenerated
+        .map((r) => (r === "hook" ? "hook" : "Queen"))
+        .join(" / ");
+      addNotice(
+        `${labels} トークンを再生成しました。再登録が必要です（hook: settings.json へ登録 / Queen: 登録コマンドをコピー）。`,
+      );
+    } catch (err) {
+      ui.errorBanner = `トークンの再生成に失敗しました (regenerate_auth_tokens): ${err}`;
+    } finally {
+      regenerating = false;
     }
   }
 
@@ -1116,6 +1145,27 @@
                 title="~/.claude/settings.json へ登録"
               >
                 {registering ? "登録中…" : "settings.json へ登録 (user)"}
+              </button>
+            </div>
+            <p class="tm-note">
+              トークンは保存され、再起動後も有効です。初回のみ登録が必要（再生成したときだけ再登録）。
+            </p>
+            <div class="tm-actions">
+              <button
+                class="btn btn-small"
+                onclick={() => regenerateTokens("hook")}
+                disabled={regenerating}
+                title="hook トークンを再生成（漏洩時のローテーション用。再生成後は settings.json の再登録が必要）"
+              >
+                hook トークン再生成
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={() => regenerateTokens("queen")}
+                disabled={regenerating}
+                title="Queen /mcp トークンを再生成（漏洩時のローテーション用。再生成後は MCP の再登録が必要）"
+              >
+                Queen トークン再生成
               </button>
             </div>
             {#if finishedTeammatePaneIds.length > 0}

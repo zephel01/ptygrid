@@ -79,7 +79,7 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 - **ツールバー左**: 「+ Shell」ボタン(ペイン追加)、**作業フォルダ**の入力欄＋「読み込み」ボタン(例 `~/works/hoge`。先頭 `~` 可)、読み込み後は設定ファイルの由来バッジ(`設定: プロジェクト内 / 起動フォルダ / ~/.ptygrid / 既定`)と ptygrid.yml で定義したエージェントのチップ(クリックで起動)。読み込み成功時は開いているシェルのペインが作業フォルダへ自動 cd します
 - **ツールバー右**: Gitパネルのボタン、全ペインのCPU/メモリ合計、「● Queen :39237」バッジ、ペイン数
   - 🟢 緑 = 稼働中 / 🔴 赤 = 停止 / ⚪ 灰 = 無効(`queen.enabled: false`)
-  - クリックで Claude Code 用の登録コマンド(認証トークン込み)をクリップボードにコピー。トークンは再起動ごとに変わるため、再起動後は再登録が必要
+  - クリックで Claude Code 用の登録コマンド(認証トークン込み)をクリップボードにコピー。トークンは保存され再起動後も有効なので、登録は**初回のみ**でOK(トークンを再生成したときだけ再登録)
 
 ### 作業フォルダのサジェスト
 
@@ -308,9 +308,11 @@ Queen はアプリ内に常駐する MCP サーバーです(streamable HTTP、bi
 > Queen は 127.0.0.1 限定ですが、同一ホストの別プロセスや DNS リバインディングした Web ページ
 > からの不正アクセスを防ぐため、`/mcp` は**認証トークン + Host/Origin 検証**で保護されています。
 > 登録 URL には `?token=<トークン>` が付きます。
-> **このトークンはアプリを起動するたびに変わります(非永続)。アプリを再起動したら、各 CLI で
-> 登録をやり直してください。** 実際の URL は必ずツールバーの「● Queen」バッジをクリックして
-> コピーしてください(下記コマンドの `<token>` はプレースホルダです)。
+> **このトークンは app-data に保存され、アプリを再起動しても変わりません。登録は初回のみで
+> OK です。** トークンを再生成したときだけ再登録が必要です(Teammates パネルの
+> 「Queen トークン再生成」で、漏洩時のローテーションができます)。実際の URL は必ず
+> ツールバーの「● Queen」バッジをクリックしてコピーしてください(下記コマンドの `<token>` は
+> プレースホルダです)。
 
 ### Claude Code
 
@@ -324,7 +326,8 @@ claude mcp add -s user --transport http queen "http://127.0.0.1:39237/mcp?token=
 > Claude Code から Queen が見えません(実例あり)。プロジェクト単位で共有したい場合は
 > `-s project`(`.mcp.json` がリポジトリに作られる)も使えます。
 >
-> 再起動でトークンが変わったら `claude mcp remove queen` してから登録し直すか、上書き登録します。
+> トークンは再起動後も有効なので、通常は再登録不要です。トークンを再生成した場合だけ
+> `claude mcp remove queen` してから登録し直すか、上書き登録します。
 
 ### Codex CLI
 
@@ -382,10 +385,15 @@ teammates:
 - **settings.json へ登録 (user)**: `~/.claude/settings.json` へ hooks 定義を自動マージします
   (既存内容は保持、書込前に `settings.json.ptygrid-backup-<unix秒>` を作成、同一内容なら
   書き込みません)。
+- **hook トークン再生成 / Queen トークン再生成**: 漏洩時のローテーション用。対象トークンを
+  再生成し、実行中の認証層へ即時反映します(Queen サーバの再起動は不要)。再生成後は
+  settings.json / MCP の登録が古いトークンのままになるため、再登録が必要です(パネルが
+  通知します)。
 - **直近のイベント**: 受信した teammate-lifecycle を最新10件まで表示します。
 
-> ⚠️ token はアプリ起動ごとに再生成され、ディスクに保存されません。アプリを再起動したら
-> スニペットの再コピー、または settings.json への再登録が必要です。
+> ✅ token は app-data(`auth-tokens.json`、Unix では権限 0600)に保存され、アプリを再起動しても
+> 変わりません。登録は**初回のみ**でOKです。トークンを再生成したときだけ、スニペットの再コピー
+> または settings.json への再登録が必要です。
 
 ### observe: read-only transcript ペイン(Phase 4.1)
 
@@ -663,6 +671,7 @@ ptygridのruntime管理データはTauriのapp-data directoryへ保存し、proj
 | logical session state | `project-state/` | project、layout、pane順、定義名、worktree参照 |
 | linked worktree | `worktrees/` | opt-inで作成したworktreeとbranch |
 | Queen Pins / Notes / Inbox | `queen/queen.sqlite3` | canonical project directoryごとの共有データ |
+| 認証トークン | `auth-tokens.json` | Queen `/mcp` トークンと hook Bearer トークン(version付き、Unix権限0600)。再起動後も有効 |
 
 terminal出力、展開後の環境変数、`QUEEN_URL`、起動command本文はsession stateへ保存しません。
 Queenはlocalhost (`127.0.0.1`) のみにbindし、`spawn_agent`は読み込んだ`ptygrid.yml`の

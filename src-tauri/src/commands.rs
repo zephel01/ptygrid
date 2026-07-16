@@ -110,6 +110,19 @@ pub fn register_teammate_hooks(app: AppHandle, scope: String) -> Result<Register
     teams_hooks::register(&app, &scope)
 }
 
+/// Rotate the persisted auth token(s) and update the running auth layers so the
+/// new value takes effect without restarting the Queen server. `which` is
+/// `"hook"`, `"queen"`, or `"all"` (default `"all"`). Returns which tokens were
+/// regenerated. After this the registered settings.json / MCP URL are stale, so
+/// the frontend prompts for re-registration.
+#[tauri::command]
+pub fn regenerate_auth_tokens(
+    app: AppHandle,
+    which: Option<String>,
+) -> Result<crate::token_store::RegenerateResult, String> {
+    crate::token_store::regenerate(&app, which.as_deref())
+}
+
 /// Phase 4.2: report active host leads (mode, fallback state, live teammate
 /// session ids) for the Teammates panel.
 #[tauri::command]

@@ -31,33 +31,42 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use crate::config::ConfigManager;
 use crate::queen::QueenStatus;
 use crate::session::PtyManager;
+use crate::token_store::TokenHandle;
 
 /// Hard grid ceiling shared with the frontend (`MAX_PANES`). A transcript pane
 /// is never created past it.
 const GRID_MAX_PANES: usize = 9;
 
-/// Managed Tauri state: the bearer token authorizing hook POSTs. Regenerated
-/// on every app launch and never written to disk, so registered settings.json
-/// snippets are only valid for the current run.
+/// Managed Tauri state: the bearer token authorizing hook POSTs. Persisted in
+/// app-data (`crate::token_store`) and loaded at startup, so a registered
+/// settings.json snippet stays valid across restarts. Held in a shared
+/// [`TokenHandle`] so a regeneration is seen by the already-bound receiver.
 pub struct TeamsHooks {
-    token: String,
+    token: TokenHandle,
 }
 
 impl TeamsHooks {
-    pub fn new() -> Self {
+    /// Construct with the persisted token loaded at startup.
+    pub fn new(token: String) -> Self {
         TeamsHooks {
-            token: generate_token(),
+            token: TokenHandle::new(token),
         }
     }
 
-    pub fn token(&self) -> &str {
-        &self.token
+    /// The bearer token for this run (persisted value).
+    pub fn token(&self) -> String {
+        self.token.get()
     }
-}
 
-impl Default for TeamsHooks {
-    fn default() -> Self {
-        Self::new()
+    /// Shared handle captured by the `/hooks/v1/*` router so a rotation takes
+    /// effect without rebinding the server.
+    pub fn token_handle(&self) -> TokenHandle {
+        self.token.clone()
+    }
+
+    /// Rotate to a freshly generated token (already persisted by the caller).
+    pub fn set_token(&self, token: String) {
+        self.token.set(token);
     }
 }
 
@@ -176,7 +185,7 @@ struct LifecyclePayload {
 /// drive it with `tauri::test::MockRuntime`.
 struct HookContext<R: Runtime> {
     app: AppHandle<R>,
-    token: String,
+    token: TokenHandle,
 }
 
 // Manual Clone so we don't force a `R: Clone` bound (runtimes are not Clone,
@@ -191,8 +200,9 @@ impl<R: Runtime> Clone for HookContext<R> {
 }
 
 /// Build the `/hooks/v1/*` router. Merged into the Queen Axum app in
-/// `queen::run_server`; also bound standalone by the tests.
-pub fn router<R: Runtime>(app: AppHandle<R>, token: String) -> Router {
+/// `queen::run_server`; also bound standalone by the tests. The [`TokenHandle`]
+/// is read per request so a token rotation is honored without a rebind.
+pub fn router<R: Runtime>(app: AppHandle<R>, token: TokenHandle) -> Router {
     let ctx = HookContext { app, token };
     Router::new()
         .route("/hooks/v1/subagent-start", post(subagent_start::<R>))
@@ -252,7 +262,7 @@ fn process<R: Runtime>(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Response {
-    if !authorized(headers, &ctx.token) {
+    if !authorized(headers, &ctx.token.get()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !is_json_content_type(headers) {
@@ -679,7 +689,7 @@ pub struct TeammateHooksInfo {
     pub hook_notifications: bool,
     /// The Queen server port hooks share (bound port, else configured port).
     pub port: u16,
-    /// Non-persistent bearer token for this app run.
+    /// Persisted bearer token (stable across restarts until regenerated).
     pub token: String,
     /// Default scope ("user" | "project") from `teammates.hooks_scope`.
     pub hooks_scope: &'static str,
@@ -698,7 +708,7 @@ pub fn hooks_info<R: Runtime>(app: &AppHandle<R>) -> TeammateHooksInfo {
         .unwrap_or(crate::queen::DEFAULT_PORT);
     let token = app
         .try_state::<TeamsHooks>()
-        .map(|t| t.token().to_string())
+        .map(|t| t.token())
         .unwrap_or_default();
     TeammateHooksInfo {
         enabled: teammates.effective_enabled(),
@@ -746,7 +756,7 @@ pub fn register<R: Runtime>(app: &AppHandle<R>, scope: &str) -> Result<RegisterR
         .unwrap_or(crate::queen::DEFAULT_PORT);
     let token = app
         .try_state::<TeamsHooks>()
-        .map(|t| t.token().to_string())
+        .map(|t| t.token())
         .unwrap_or_default();
     let path = base_dir.join(".claude").join("settings.json");
     write_hook_settings(&path, port, &token)
@@ -1243,7 +1253,7 @@ mod tests {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = router(app, token.to_string());
+        let router = router(app, TokenHandle::new(token.to_string()));
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
