@@ -173,9 +173,12 @@ impl QueenStore {
                 return Err(format!("cannot initialize Queen database: {error}"));
             }
         } else if version == 1 {
+            // `IF NOT EXISTS` so a partially-migrated db (user_version still 1
+            // but the table/indexes already present) migrates idempotently
+            // instead of hard-failing `open` with "table already exists" (L12a).
             let migration_result = connection.execute_batch(
                 "BEGIN IMMEDIATE;
-                 CREATE TABLE inbox_messages (
+                 CREATE TABLE IF NOT EXISTS inbox_messages (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    project_dir TEXT NOT NULL,
                    sender TEXT NOT NULL,
@@ -189,9 +192,9 @@ impl QueenStore {
                    FOREIGN KEY (in_reply_to_id) REFERENCES inbox_messages(id),
                    FOREIGN KEY (root_message_id) REFERENCES inbox_messages(id)
                  );
-                 CREATE INDEX inbox_recipient_id
+                 CREATE INDEX IF NOT EXISTS inbox_recipient_id
                    ON inbox_messages(project_dir, recipient, id ASC);
-                 CREATE INDEX inbox_root_id
+                 CREATE INDEX IF NOT EXISTS inbox_root_id
                    ON inbox_messages(project_dir, root_message_id, id ASC);
                  PRAGMA user_version = 2;
                  COMMIT;",
@@ -1393,6 +1396,73 @@ mod tests {
 
         let store = QueenStore::open(&database).unwrap();
         assert_eq!(store.list_pins(&one).unwrap()[0].value, "kept");
+        assert!(store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "migrated".to_string(),
+                "ready".to_string(),
+            )
+            .is_ok());
+        let version: i64 = store
+            .lock()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_version_one_when_inbox_table_already_exists() {
+        // L12a: a partially-migrated db (user_version still 1 but the v2
+        // inbox table/indexes already present) must migrate idempotently
+        // instead of hard-failing `open` with "table already exists".
+        let (root, one, _) = projects();
+        let database = root.join("data/queen.sqlite3");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE pins (
+                   project_dir TEXT NOT NULL,
+                   pin_key TEXT NOT NULL,
+                   value TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY (project_dir, pin_key)
+                 );
+                 CREATE TABLE notes (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project_dir TEXT NOT NULL,
+                   title TEXT NOT NULL,
+                   body TEXT NOT NULL,
+                   tags_json TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE inbox_messages (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project_dir TEXT NOT NULL,
+                   sender TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   subject TEXT NOT NULL,
+                   body TEXT NOT NULL,
+                   in_reply_to_id INTEGER,
+                   root_message_id INTEGER,
+                   acknowledged_at_ms INTEGER,
+                   created_at_ms INTEGER NOT NULL,
+                   FOREIGN KEY (in_reply_to_id) REFERENCES inbox_messages(id),
+                   FOREIGN KEY (root_message_id) REFERENCES inbox_messages(id)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = QueenStore::open(&database).unwrap();
         assert!(store
             .send_inbox(
                 &one,

@@ -735,17 +735,25 @@ pub fn write_hook_settings(
 
     // Back up the existing file before overwriting it.
     if existed {
+        // Millisecond precision (M7): a second-granular stamp let two writes in
+        // the same second overwrite the first backup. Add a numeric suffix if
+        // even the millisecond stamp collides, so no prior backup is lost.
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis())
             .unwrap_or(0);
-        let backup = settings_path.with_file_name(format!(
-            "{}.ptygrid-backup-{unix}",
-            settings_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("settings.json")
-        ));
+        let base_name = settings_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.json");
+        let mut backup =
+            settings_path.with_file_name(format!("{base_name}.ptygrid-backup-{unix}"));
+        let mut seq = 1u32;
+        while backup.exists() {
+            backup = settings_path
+                .with_file_name(format!("{base_name}.ptygrid-backup-{unix}-{seq}"));
+            seq += 1;
+        }
         std::fs::copy(settings_path, &backup)
             .map_err(|e| format!("backup failed: {e}"))?;
     }

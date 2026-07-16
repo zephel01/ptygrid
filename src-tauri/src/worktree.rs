@@ -341,33 +341,66 @@ fn prepare_at(
     )
     .map_err(|e| format!("worktree creation failed: {e}"))?;
 
-    let worktree_root = worktree_root
-        .canonicalize()
-        .map_err(|e| format!("worktree was created but its path cannot be resolved: {e}"))?;
+    // The locked worktree and branch `ptygrid/<slug>/<suffix>` now exist on
+    // disk. Any failure below must roll them back (M4): a `--lock`ed worktree
+    // cannot be reclaimed by `git worktree prune`, so setup scripts that keep
+    // failing would otherwise leak worktrees and refs forever.
+    let finalize = || -> Result<PreparedWorktree, String> {
+        let canonical_root = worktree_root
+            .canonicalize()
+            .map_err(|e| format!("worktree was created but its path cannot be resolved: {e}"))?;
+        let cwd = canonical_root.join(relative_cwd);
+        if !cwd.is_dir() {
+            return Err(format!(
+                "worktree created and kept at {}, but cwd {} does not exist in it",
+                canonical_root.display(),
+                cwd.display()
+            ));
+        }
+        if let Some(setup) = options.setup.as_deref() {
+            run_setup(setup, &cwd, env, &canonical_root)?;
+        }
+        Ok(PreparedWorktree {
+            cwd,
+            info: WorktreeInfo {
+                name,
+                repo_root: repo_root.display().to_string(),
+                path: canonical_root.display().to_string(),
+                branch: branch.clone(),
+                base,
+                locked: true,
+            },
+        })
+    };
 
-    let cwd = worktree_root.join(relative_cwd);
-    if !cwd.is_dir() {
-        return Err(format!(
-            "worktree created and kept at {}, but cwd {} does not exist in it",
-            worktree_root.display(),
-            cwd.display()
-        ));
+    match finalize() {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(error) => {
+            cleanup_locked_worktree(&repo_root, &worktree_root, &branch);
+            Err(error)
+        }
     }
-    if let Some(setup) = options.setup.as_deref() {
-        run_setup(setup, &cwd, env, &worktree_root)?;
-    }
+}
 
-    Ok(Some(PreparedWorktree {
-        cwd,
-        info: WorktreeInfo {
-            name,
-            repo_root: repo_root.display().to_string(),
-            path: worktree_root.display().to_string(),
-            branch,
-            base,
-            locked: true,
-        },
-    }))
+/// Roll back a locked worktree (and the branch created for it) after a
+/// post-creation failure. The worktree is `--lock`ed, so it must be unlocked
+/// before `git worktree remove` and cannot be reclaimed by `prune`. Best
+/// effort: failures are logged, not surfaced, so the caller's original error
+/// is preserved (M4).
+fn cleanup_locked_worktree(repo_root: &Path, worktree_root: &Path, branch: &str) {
+    let path = worktree_root.to_string_lossy();
+    if let Err(e) = checked_git(repo_root, ["worktree", "unlock", path.as_ref()]) {
+        eprintln!("worktree cleanup: unlock {path} failed: {e}");
+    }
+    if let Err(e) = checked_git(repo_root, ["worktree", "remove", "--force", path.as_ref()]) {
+        eprintln!("worktree cleanup: remove {path} failed: {e}");
+        // The directory may be gone but the admin entry may linger; prune the
+        // now-unlocked entry as a fallback.
+        let _ = checked_git(repo_root, ["worktree", "prune"]);
+    }
+    if let Err(e) = checked_git(repo_root, ["branch", "-D", branch]) {
+        eprintln!("worktree cleanup: delete branch {branch} failed: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -464,6 +497,70 @@ agents:
         run(&["worktree", "unlock", &prepared.info.path]);
         run(&["worktree", "remove", "--force", &prepared.info.path]);
         run(&["branch", "-D", &prepared.info.branch]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_setup_rolls_back_worktree_and_branch() {
+        // M4: when the setup script fails, the locked worktree and its branch
+        // must be cleaned up (a locked worktree cannot be pruned), leaving no
+        // leaked worktree entry or ref behind.
+        let suffix = unique_suffix();
+        let root = std::env::temp_dir().join(format!("ptygrid-worktree-fail-{suffix}"));
+        let repo = root.join("repo");
+        let app_data = root.join("app-data");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "ptygrid test"]);
+        run(&["config", "user.email", "ptygrid@example.invalid"]);
+        std::fs::write(repo.join("tracked.txt"), "tracked\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+
+        let cfg = parse_config(
+            r#"
+agents:
+  - name: Broken Setup
+    cmd: codex
+    worktree:
+      enabled: true
+      base: HEAD
+      setup: "exit 3"
+"#,
+        )
+        .unwrap();
+        let error = match prepare_at(&app_data, &cfg.agents[0], &repo, &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("setup failure must propagate"),
+        };
+        assert!(error.contains("setup failed"), "got: {error}");
+
+        // No worktree entry and no ptygrid branch should survive the failure.
+        let listed = checked_git(&repo, ["worktree", "list", "--porcelain"]).unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            !listed.contains("broken-setup"),
+            "leaked worktree entry: {listed}"
+        );
+        let branches = checked_git(&repo, ["branch", "--list", "ptygrid/broken-setup/*"]).unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "leaked branch: {}",
+            String::from_utf8_lossy(&branches.stdout)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -388,7 +388,10 @@ pub fn commit(dir: &Path, message: String) -> Result<GitCommitInfo, String> {
     }
     let root = discover_root(dir)?;
     let mut child = base_command(&root, false)
-        .args(["commit", "--file=-", "--cleanup=strip"])
+        // `whitespace` (not `strip`) so leading `#` lines like "#42 fix" are
+        // preserved instead of being treated as comments and dropped, which
+        // desynced the commit body from the reported summary (M2).
+        .args(["commit", "--file=-", "--cleanup=whitespace"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -582,6 +585,45 @@ mod tests {
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].index_status, "?");
         assert_eq!(result.files[0].worktree_status, "?");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_preserves_leading_hash_lines() {
+        // M2: `#42 fix` must survive `--cleanup=whitespace` (with `strip` the
+        // whole line would be dropped as a comment, and the summary would
+        // disagree with the actual commit body / fail as "empty message").
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("ptygrid-git-hash-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "ptygrid test"]);
+        run(&["config", "user.email", "ptygrid@example.invalid"]);
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        stage(&dir, vec!["f.txt".to_string()]).unwrap();
+
+        let committed = commit(&dir, "#42 fix login".to_string()).unwrap();
+        assert_eq!(committed.summary, "#42 fix login");
+
+        // The committed subject must match the summary (line preserved).
+        let subject = trimmed_stdout(
+            checked_output(&dir, ["log", "-1", "--pretty=%s"]).unwrap(),
+        );
+        assert_eq!(subject, "#42 fix login");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

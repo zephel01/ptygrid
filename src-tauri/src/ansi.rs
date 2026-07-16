@@ -223,11 +223,13 @@ fn apply_csi(state: &mut ScreenState, private: bool, params: &[usize], final_byt
     let amount = csi_param(params, 0, 1);
     match final_byte {
         'A' => state.row = state.row.saturating_sub(amount),
-        'B' => state.row = (state.row + amount).min(state.rows() - 1),
-        'C' => state.col = (state.col + amount).min(state.cols() - 1),
+        // saturating_add so a huge CSI parameter (e.g. usize::MAX) cannot
+        // overflow and panic in debug builds; the .min() then clamps (L1).
+        'B' => state.row = state.row.saturating_add(amount).min(state.rows() - 1),
+        'C' => state.col = state.col.saturating_add(amount).min(state.cols() - 1),
         'D' => state.col = state.col.saturating_sub(amount),
         'E' => {
-            state.row = (state.row + amount).min(state.rows() - 1);
+            state.row = state.row.saturating_add(amount).min(state.rows() - 1);
             state.col = 0;
         }
         'F' => {
@@ -462,5 +464,14 @@ mod tests {
     fn render_terminal_restores_main_screen_after_alternate_screen() {
         let raw = "shell\x1b[?1049h\x1b[Hagent\x1b[?1049l\r\n$ ";
         assert_eq!(render_terminal(raw, 3, 20), "shell\n$");
+    }
+
+    #[test]
+    fn render_terminal_survives_huge_cursor_move_params() {
+        // L1: an enormous CSI parameter must not overflow-panic (debug build).
+        // Movement is clamped to the grid; the text still renders.
+        let raw = "hi\x1b[18446744073709551615Cx\x1b[18446744073709551615Bx\x1b[18446744073709551615Ex";
+        let out = render_terminal(raw, 4, 20);
+        assert!(out.contains("hi"), "got: {out:?}");
     }
 }

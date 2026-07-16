@@ -290,6 +290,20 @@ impl TeamsHostManager {
         ))
     }
 
+    /// Drop a correlation entry once its fallback window has closed (whether
+    /// the teammate ended up hosted or fell back). Without this the `pending`
+    /// map grows monotonically for the life of a long-running host lead.
+    pub fn clear_pending(&self, lead_id: u32, agent_id: &str) {
+        if let Some(entry) = self.lock().get(&lead_id) {
+            entry
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(agent_id);
+        }
+    }
+
     /// Flag a lead as downgraded to observe (host unavailable).
     pub fn mark_fallback(&self, lead_id: u32) {
         if let Some(entry) = self.lock().get(&lead_id) {
@@ -362,10 +376,6 @@ impl<R: Runtime> PaneHost for PtygridPaneHost<R> {
             )));
         }
 
-        // Record that the shim actually drove a spawn (defeats fallback).
-        self.shared.host_used.store(true, Ordering::SeqCst);
-        self.shared.last_spawn_ms.store(now_ms(), Ordering::SeqCst);
-
         let manager = self.manager()?;
 
         // Host always spawns; a reached limit only means "paneless + banner".
@@ -406,6 +416,14 @@ impl<R: Runtime> PaneHost for PtygridPaneHost<R> {
                 SPAWN_ROWS,
             )
             .map_err(HostError::Internal)?;
+
+        // Only now that the PTY actually exists do we record the spawn and
+        // defeat the observe fallback (H1). Recording before the spawn would
+        // let `last_spawn_ms >= hook_at` correlate to `Hosted` even when the
+        // spawn failed, leaving the teammate with neither a host nor an
+        // observe pane.
+        self.shared.host_used.store(true, Ordering::SeqCst);
+        self.shared.last_spawn_ms.store(now_ms(), Ordering::SeqCst);
         Ok(context_id_for(id))
     }
 
@@ -708,7 +726,11 @@ pub fn watch_for_fallback<R: Runtime>(
         let Some(host_mgr) = app.try_state::<TeamsHostManager>() else {
             return;
         };
-        if host_mgr.correlation(lead_id, &agent_id, now_ms()) != Some(HostCorrelation::Fallback) {
+        let correlation = host_mgr.correlation(lead_id, &agent_id, now_ms());
+        // The correlation window has closed; drop the pending entry regardless
+        // of the outcome so `pending` does not leak over the lead's lifetime.
+        host_mgr.clear_pending(lead_id, &agent_id);
+        if correlation != Some(HostCorrelation::Fallback) {
             return;
         }
         host_mgr.mark_fallback(lead_id);
@@ -952,6 +974,11 @@ mod tests {
         // An unregistered agent has no correlation.
         assert_eq!(m.correlation(1, "other", now_ms()), None);
 
+        // M6: clearing the pending entry (as `watch_for_fallback` does when its
+        // window closes) removes the correlation so the map does not leak.
+        m.clear_pending(1, "a1");
+        assert_eq!(m.correlation(1, "a1", now_ms() + 5000), None);
+
         // Fallback flag surfaces in the snapshot.
         assert_eq!(m.snapshot(), vec![(1, false)]);
         m.mark_fallback(1);
@@ -1076,6 +1103,38 @@ mod tests {
             host.kill("not-a-context"),
             Err(HostError::ContextNotFound(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_failure_does_not_defeat_fallback() {
+        // H1: a spawn that fails (binary passes the allowlist but does not
+        // exist) must NOT record `host_used` / `last_spawn_ms`, otherwise the
+        // fallback correlation would report `Hosted` and the teammate would be
+        // silently dropped (no host pane, no observe pane).
+        let (_app, host) = mock_host(&["ptygrid-missing-binary-xyz"]);
+        let err = host.spawn_agent(SpawnAgentParams {
+            command: vec!["/ptygrid-missing-binary-xyz".into()],
+            cwd: None,
+            env: Default::default(),
+            metadata: Default::default(),
+        });
+        assert!(matches!(err, Err(HostError::Internal(_))), "got: {err:?}");
+        assert!(!host.shared.host_used.load(Ordering::SeqCst));
+        assert_eq!(host.shared.last_spawn_ms.load(Ordering::SeqCst), 0);
+
+        // A successful spawn, by contrast, does record the spawn.
+        let (_app2, host2) = mock_host(&["cat"]);
+        host2
+            .spawn_agent(SpawnAgentParams {
+                command: vec!["/bin/cat".into()],
+                cwd: None,
+                env: Default::default(),
+                metadata: Default::default(),
+            })
+            .expect("spawn should succeed");
+        assert!(host2.shared.host_used.load(Ordering::SeqCst));
+        assert!(host2.shared.last_spawn_ms.load(Ordering::SeqCst) > 0);
     }
 
     // ----- end-to-end over a real socket (server + real PaneHost) -----

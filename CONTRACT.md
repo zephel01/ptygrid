@@ -61,7 +61,7 @@ processes:                 # 任意。エージェントでない常駐プロセ
     autostart: false
 ```
 
-- Rust側の型: `Config { project: Option<String>, agents: Vec<AgentDef>, processes: Vec<AgentDef> }`（processes省略時は空Vec）。
+- Rust側の型: `Config { project: Option<String>, agents: Vec<AgentDef>, processes: Vec<AgentDef> }`（`agents`・`processes` とも省略時は空Vec。`queen:` / `processes:` / `teammates:` のみの config も有効）。
 - YAML crate は **serde_norway**（serde_yaml後継fork）を使用。
 - parseエラーは `Err(String)`（行番号含むメッセージそのまま）で返す。
 

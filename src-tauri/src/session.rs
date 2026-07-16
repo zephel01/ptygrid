@@ -193,6 +193,44 @@ fn append_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
     }
 }
 
+/// Decode a freshly-read PTY chunk into an emittable UTF-8 string, carrying an
+/// incomplete trailing multibyte sequence (at most 3 bytes) across calls so a
+/// codepoint split at an 8192-byte read boundary is not mangled into U+FFFD.
+/// Genuinely invalid bytes mid-stream are flushed lossily so `carry` can never
+/// grow without bound. The session ring buffer stays byte-based; only the
+/// `pty-output` emit stream uses this (M1).
+fn decode_stream_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    carry.extend_from_slice(chunk);
+    let keep_from = match std::str::from_utf8(carry) {
+        Ok(_) => carry.len(),
+        // `error_len() == None` means the invalid bytes are an incomplete
+        // trailing sequence at end of input: emit the valid prefix, keep the
+        // tail (<=3 bytes) for the next read.
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        // A genuine invalid byte not at the tail: flush everything lossily so
+        // we never stall / accumulate on real garbage.
+        Err(_) => carry.len(),
+    };
+    // `keep_from` is a char boundary, so this prefix is valid UTF-8 (lossy
+    // performs no substitution) unless we deliberately flushed garbage above.
+    let text = String::from_utf8_lossy(&carry[..keep_from]).into_owned();
+    carry.drain(..keep_from);
+    text
+}
+
+/// Whether a `kill()` error means the process has already exited (ESRCH). Such
+/// a "failure" is benign: the reader thread still reaps and removes the slot,
+/// so `kill_pty` should report success rather than a spurious error (L5).
+fn is_process_gone(err: &std::io::Error) -> bool {
+    // ESRCH is 3 on both Linux and macOS; fall back to the message so the
+    // check survives platforms that surface it differently.
+    err.raw_os_error() == Some(3)
+        || err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("no such process")
+}
+
 fn session_info(id: u32, slot: &SessionSlot) -> SessionInfo {
     SessionInfo {
         id,
@@ -568,7 +606,15 @@ impl PtyManager {
         slot.manual_kill = true;
         match slot.live.as_mut() {
             Some(live) => {
-                live.child.kill().map_err(|e| format!("kill failed: {e}"))?;
+                // A child that has already exited but not yet been reaped by
+                // the reader thread makes kill() fail with ESRCH ("no such
+                // process"). That is not a real failure: the reader will still
+                // observe EOF and remove the slot, so report success (L5).
+                if let Err(e) = live.child.kill() {
+                    if !is_process_gone(&e) {
+                        return Err(format!("kill failed: {e}"));
+                    }
+                }
                 // reader thread handles reaping/eventing/removal
             }
             None => {
@@ -1181,6 +1227,10 @@ fn spawn_reader_thread<R: Runtime>(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        // Holds an incomplete trailing multibyte UTF-8 sequence between reads
+        // so a codepoint split at the read boundary emits intact (M1). The
+        // ring buffer below stays byte-based and is unaffected.
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1200,8 +1250,10 @@ fn spawn_reader_thread<R: Runtime>(
                     if !is_current {
                         return; // stale: no EOF handling either
                     }
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app.emit("pty-output", OutputPayload { id, data });
+                    let data = decode_stream_chunk(&mut carry, &buf[..n]);
+                    if !data.is_empty() {
+                        let _ = app.emit("pty-output", OutputPayload { id, data });
+                    }
                 }
             }
         }
@@ -1386,6 +1438,62 @@ mod tests {
         assert_eq!(buf, b"12345678");
         append_capped(&mut buf, b"9", 8);
         assert_eq!(buf, b"23456789");
+    }
+
+    // ----- M1: multibyte-safe output streaming -----
+
+    #[test]
+    fn decode_stream_carries_split_multibyte_across_8k_reads() {
+        // Japanese + emoji text well over 8KB, fed in 8192-byte PTY reads.
+        // Every read boundary that lands mid-codepoint must round-trip without
+        // a single U+FFFD replacement character.
+        let text = "こんにちは世界🌍テスト".repeat(600);
+        assert!(text.len() > 8192, "fixture must exceed one read");
+        let bytes = text.as_bytes();
+        let mut carry = Vec::new();
+        let mut out = String::new();
+        for chunk in bytes.chunks(8192) {
+            out.push_str(&decode_stream_chunk(&mut carry, chunk));
+        }
+        assert!(carry.is_empty(), "complete input leaves no carry");
+        assert_eq!(out, text);
+        assert!(!out.contains('\u{FFFD}'), "no mojibake at any seam");
+    }
+
+    #[test]
+    fn decode_stream_holds_incomplete_tail_until_completed() {
+        // A 3-byte codepoint split 1/2 across two reads.
+        let ch = "あ"; // 3 bytes: E3 81 82
+        let bytes = ch.as_bytes();
+        let mut carry = Vec::new();
+        let first = decode_stream_chunk(&mut carry, &bytes[..1]);
+        assert_eq!(first, "", "incomplete lead byte emits nothing");
+        assert_eq!(carry.len(), 1);
+        let second = decode_stream_chunk(&mut carry, &bytes[1..]);
+        assert_eq!(second, ch, "completed codepoint emits intact");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn decode_stream_flushes_genuine_garbage_lossily() {
+        // A genuinely invalid byte (not an incomplete tail) must not stall the
+        // stream; it is flushed lossily and the carry is drained.
+        let mut carry = Vec::new();
+        let out = decode_stream_chunk(&mut carry, &[b'a', 0xFF, b'b']);
+        assert!(carry.is_empty());
+        assert!(out.starts_with('a') && out.ends_with('b'));
+        assert!(out.contains('\u{FFFD}'));
+    }
+
+    // ----- L5: kill() ESRCH classification -----
+
+    #[test]
+    fn process_gone_recognizes_esrch() {
+        assert!(is_process_gone(&std::io::Error::from_raw_os_error(3)));
+        assert!(is_process_gone(&std::io::Error::other(
+            "No such process (os error 3)",
+        )));
+        assert!(!is_process_gone(&std::io::Error::from_raw_os_error(1)));
     }
 
     // ----- pure EOF/autorestart decision -----

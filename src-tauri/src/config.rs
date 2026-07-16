@@ -23,6 +23,9 @@ use crate::pty::home_dir;
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    // `agents` is optional (M3): a config with only `queen:` / `processes:` /
+    // `teammates:` is valid and defaults to an empty agent list.
+    #[serde(default)]
     pub agents: Vec<AgentDef>,
     #[serde(default)]
     pub processes: Vec<AgentDef>,
@@ -46,7 +49,13 @@ impl QueenConfig {
         self.enabled.unwrap_or(true)
     }
     pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or(crate::queen::DEFAULT_PORT)
+        // `port: 0` would bind an arbitrary OS-assigned ephemeral port rather
+        // than the documented default, so treat it like a missing value and
+        // fall back to DEFAULT_PORT (L9).
+        match self.port {
+            Some(p) if p != 0 => p,
+            _ => crate::queen::DEFAULT_PORT,
+        }
     }
 }
 
@@ -639,8 +648,8 @@ fn start_watcher(
     let file_name = file.file_name().map(|n| n.to_os_string());
 
     let mut watcher = notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
+        move |res: Result<notify::Event, notify::Error>| match res {
+            Ok(event) => {
                 let relevant = event
                     .paths
                     .iter()
@@ -650,6 +659,9 @@ fn start_watcher(
                     let _ = tx.send(());
                 }
             }
+            // A watcher error (e.g. the watched directory was removed/renamed)
+            // silently stops config reloads; surface it instead of dropping it (L8).
+            Err(error) => eprintln!("config watcher error: {error}"),
         },
     )
     .map_err(|e| format!("watcher create failed: {e}"))?;
@@ -820,6 +832,26 @@ agents:
         let q = cfg.queen.unwrap();
         assert!(!q.effective_enabled());
         assert_eq!(q.effective_port(), 40100);
+
+        // L9: `port: 0` is not an ephemeral-port request; fall back to default.
+        let cfg = parse_config("agents: []\nqueen:\n  port: 0").unwrap();
+        let q = cfg.queen.unwrap();
+        assert_eq!(q.port, Some(0));
+        assert_eq!(q.effective_port(), crate::queen::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn agents_field_is_optional() {
+        // M3: a config with only `queen:` (no `agents:`) must parse, with
+        // `agents` defaulting to empty.
+        let cfg = parse_config("queen: {}").unwrap();
+        assert!(cfg.agents.is_empty());
+        assert!(cfg.queen.is_some());
+
+        // Only `processes:` is likewise valid without `agents:`.
+        let cfg = parse_config("processes:\n  - name: web\n    cmd: npm run dev\n").unwrap();
+        assert!(cfg.agents.is_empty());
+        assert_eq!(cfg.processes.len(), 1);
     }
 
     #[test]
