@@ -108,7 +108,10 @@ export type QueenStatus = {
   enabled: boolean;
   running: boolean;
   port?: number;
+  /** Token-free display URL (tooltip). Not usable for connecting. */
   url?: string;
+  /** Per-run `/mcp` auth token; appended to build the register URL. */
+  token?: string;
   error?: string;
 };
 

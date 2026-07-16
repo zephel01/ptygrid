@@ -67,6 +67,33 @@ impl ServerHandler for Dummy {
     }
 }
 
+/// Minimal `/mcp` token guard mirroring queen.rs (query `?token=` or Bearer).
+/// Keeps this smoke honest that rmcp's client works through a token-carrying URL.
+async fn mcp_auth(
+    axum::extract::State(token): axum::extract::State<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ok_query = req
+        .uri()
+        .query()
+        .map(|q| q.split('&').any(|p| p == format!("token={token}")))
+        .unwrap_or(false);
+    let ok_bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == token)
+        .unwrap_or(false);
+    if ok_query || ok_bearer {
+        next.run(req).await
+    } else {
+        axum::http::StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
 fn args(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     serde_json::from_value(v).expect("args must be an object")
 }
@@ -88,13 +115,21 @@ async fn main() -> anyhow::Result<()> {
             Default::default(),
             StreamableHttpServerConfig::default(),
         );
-    let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    // Mirror queen.rs Finding S1: guard /mcp with a per-run token so this smoke
+    // proves the token-carrying URL still completes a full MCP handshake.
+    let token = "smoketoken0123456789abcdef".to_string();
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn_with_state(
+            token.clone(),
+            mcp_auth,
+        ));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    let url = format!("http://{addr}/mcp");
+    let url = format!("http://{addr}/mcp?token={token}");
     println!("server listening at {url}");
 
     // ---- client: initialize ----

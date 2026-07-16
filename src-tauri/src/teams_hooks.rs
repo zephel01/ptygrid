@@ -61,8 +61,10 @@ impl Default for TeamsHooks {
     }
 }
 
-/// 256-bit random token, lowercase hex. Uses `getrandom` (OS CSPRNG).
-fn generate_token() -> String {
+/// 256-bit random token, lowercase hex. Uses `getrandom` (OS CSPRNG). Shared
+/// with the Queen `/mcp` auth layer (`queen.rs`), which mints its own token the
+/// same way — one token per purpose, both non-persistent.
+pub(crate) fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).expect("getrandom: OS entropy unavailable");
     hex_encode(&bytes)
@@ -76,6 +78,21 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Constant-time byte comparison for secret tokens. Returns false immediately
+/// on a length mismatch (token lengths are fixed 64-hex, so length is not a
+/// secret), otherwise folds every byte so the running time does not depend on
+/// where a mismatch occurs. Shared by the hook and Queen `/mcp` auth checks.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------- lifecycle event kinds ----------
@@ -511,7 +528,7 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|got| got == expected)
+        .map(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
 }
 

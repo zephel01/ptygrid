@@ -79,7 +79,7 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 - **ツールバー左**: 「+ Shell」ボタン(ペイン追加)、**作業フォルダ**の入力欄＋「読み込み」ボタン(例 `~/works/hoge`。先頭 `~` 可)、読み込み後は設定ファイルの由来バッジ(`設定: プロジェクト内 / 起動フォルダ / ~/.ptygrid / 既定`)と ptygrid.yml で定義したエージェントのチップ(クリックで起動)。読み込み成功時は開いているシェルのペインが作業フォルダへ自動 cd します
 - **ツールバー右**: Gitパネルのボタン、全ペインのCPU/メモリ合計、「● Queen :39237」バッジ、ペイン数
   - 🟢 緑 = 稼働中 / 🔴 赤 = 停止 / ⚪ 灰 = 無効(`queen.enabled: false`)
-  - クリックで Claude Code 用の登録コマンドをクリップボードにコピー
+  - クリックで Claude Code 用の登録コマンド(認証トークン込み)をクリップボードにコピー。トークンは再起動ごとに変わるため、再起動後は再登録が必要
 
 ### 作業フォルダのサジェスト
 
@@ -216,8 +216,9 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.worktree.base` | - | `HEAD` | worktree branchの起点となるbranch/tag/commit |
 | `.worktree.setup` | - | - | worktree作成後、agent cwdで一度だけ実行するsetup command |
 
-> すべてのセッションには環境変数 `QUEEN_URL`(例: `http://127.0.0.1:39237/mcp`)が注入されます。
-> ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を実行してください。
+> すべてのセッションには環境変数 `QUEEN_URL`(例: `http://127.0.0.1:39237/mcp?token=<token>`)が
+> 注入されます(認証トークン込み)。ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を
+> 実行してください。
 
 ## Worktree 分離
 
@@ -286,32 +287,46 @@ Queen はアプリ内に常駐する MCP サーバーです(streamable HTTP、bi
 各エージェント CLI に MCP サーバーとして登録すると、そのエージェントが
 [18個のツール](#queen-ツールリファレンス)を使えるようになります。
 
+> 🔑 **認証トークンについて（重要）**
+> Queen は 127.0.0.1 限定ですが、同一ホストの別プロセスや DNS リバインディングした Web ページ
+> からの不正アクセスを防ぐため、`/mcp` は**認証トークン + Host/Origin 検証**で保護されています。
+> 登録 URL には `?token=<トークン>` が付きます。
+> **このトークンはアプリを起動するたびに変わります(非永続)。アプリを再起動したら、各 CLI で
+> 登録をやり直してください。** 実際の URL は必ずツールバーの「● Queen」バッジをクリックして
+> コピーしてください(下記コマンドの `<token>` はプレースホルダです)。
+
 ### Claude Code
 
 ```bash
-claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+# <token> と <port> はバッジのコピーで実値に置き換わります
+claude mcp add -s user --transport http queen "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
 > ⚠️ **`-s user` を必ず付けてください。** デフォルトの local スコープは「コマンドを実行した
 > ディレクトリ限定」の登録になるため、ペインの作業ディレクトリと違う場所で登録すると
 > Claude Code から Queen が見えません(実例あり)。プロジェクト単位で共有したい場合は
 > `-s project`(`.mcp.json` がリポジトリに作られる)も使えます。
+>
+> 再起動でトークンが変わったら `claude mcp remove queen` してから登録し直すか、上書き登録します。
 
 ### Codex CLI
 
-`~/.codex/config.toml` に追記:
+`~/.codex/config.toml` に追記(URL に token を含める):
 
 ```toml
 [mcp_servers.queen]
-url = "http://127.0.0.1:39237/mcp"
+url = "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
 ### Grok CLI
 
 ```bash
-grok mcp add -s user -t http queen http://127.0.0.1:39237/mcp
+grok mcp add -s user -t http queen "http://127.0.0.1:39237/mcp?token=<token>"
 grok mcp doctor    # 接続確認(handshake OK / 18 tools discovered が出れば成功)
 ```
+
+> ℹ️ トークンは URL クエリで渡すため、CLI 側で `--header` などの追加設定は不要です。
+> どうしてもヘッダで渡したい場合は `Authorization: Bearer <token>` も受理されます。
 
 ### ポートについて
 

@@ -110,20 +110,23 @@ processes:
 
 ### Queen を各 CLI に登録する
 
-ツールバー右の「● Queen :39237」バッジをクリックすると登録コマンドがコピーされます。
+ツールバー右の「● Queen :39237」バッジをクリックすると、認証トークン込みの登録コマンドが
+コピーされます。`/mcp` は token + Host/Origin 検証で保護されており、URL には `?token=<token>`
+が付きます。**トークンはアプリ起動ごとに変わる(非永続)ため、再起動したら再登録してください。**
+下記の `<token>` はプレースホルダなので、実際はバッジのコピーを使ってください。
 
 ```bash
 # Claude Code(-s user 必須。local スコープはディレクトリ限定になる罠あり)
-claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+claude mcp add -s user --transport http queen "http://127.0.0.1:39237/mcp?token=<token>"
 
 # Grok CLI
-grok mcp add -s user -t http queen http://127.0.0.1:39237/mcp
+grok mcp add -s user -t http queen "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
 ```toml
 # Codex CLI (~/.codex/config.toml)
 [mcp_servers.queen]
-url = "http://127.0.0.1:39237/mcp"
+url = "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
 詳しい使い方は **[ユーザーガイド](docs/userguide.md)** を、ハマりどころは [トラブルシューティング](docs/troubleshooting.md) を参照してください。

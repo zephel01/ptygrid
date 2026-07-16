@@ -118,19 +118,29 @@
     else if (q.port) lines.push(`http://127.0.0.1:${q.port}/mcp`);
     if (q.error) lines.push(`エラー: ${q.error}`);
     if (!q.running) lines.push("停止中");
+    // アプリ再起動ごとにトークンが変わるため、登録は再起動のたびにやり直す。
+    lines.push("クリックで token 込み登録コマンドをコピー（再起動ごとに再登録が必要）");
     return lines.join("\n") || "Queen MCP サーバー";
   });
+
+  /** Token-carrying register URL (falls back to the token-free URL if the
+   *  token is unavailable — e.g. server not yet running). */
+  function queenRegisterUrl(q: NonNullable<typeof ui.queenStatus>): string {
+    const base = q.url ?? `http://127.0.0.1:${q.port}/mcp`;
+    return q.token ? `${base}?token=${q.token}` : base;
+  }
 
   async function copyQueenCommand(): Promise<void> {
     const q = ui.queenStatus;
     if (!isTauri() || !q || (!q.url && !q.port)) return;
-    const url = q.url ?? `http://127.0.0.1:${q.port}/mcp`;
+    const url = queenRegisterUrl(q);
     // -s user: デフォルトの local スコープは「実行したディレクトリ限定」のため、
     // ペインの cwd と登録時の cwd が違うと接続できない。user スコープで全体登録する。
     const cmd = `claude mcp add -s user --transport http queen ${url}`;
     try {
       await navigator.clipboard.writeText(cmd);
-      addNotice("登録コマンドをコピーしました", cmd);
+      // 認証トークンはアプリ再起動ごとに変わる（非永続）。再起動後は再登録が必要。
+      addNotice("登録コマンドをコピーしました（再起動ごとに再登録が必要）", cmd);
     } catch (err) {
       ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
     }

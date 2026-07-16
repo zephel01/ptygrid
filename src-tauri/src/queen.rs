@@ -8,6 +8,12 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use axum::{
+    extract::{Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Response},
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -52,6 +58,11 @@ struct QueenStatusInner {
 /// Managed Tauri state describing the Queen server.
 pub struct QueenStatus {
     inner: Mutex<QueenStatusInner>,
+    /// Non-persistent 256-bit token authorizing `/mcp` requests for this app
+    /// run. Minted once at launch and never written to disk, so a registered
+    /// MCP URL is only valid until the app restarts. Immutable, so it lives
+    /// outside the mutex.
+    token: String,
 }
 
 impl QueenStatus {
@@ -61,7 +72,13 @@ impl QueenStatus {
                 desired_port: DEFAULT_PORT,
                 ..Default::default()
             }),
+            token: crate::teams_hooks::generate_token(),
         }
+    }
+
+    /// The `/mcp` auth token for this app run (distinct from the hook token).
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     fn lock(&self) -> MutexGuard<'_, QueenStatusInner> {
@@ -85,16 +102,19 @@ impl QueenStatus {
             enabled: inner.enabled,
             running: inner.running,
             port: inner.port,
+            // Display URL, token-free: shown in tooltips and never a secret.
             url: inner
                 .running
                 .then(|| inner.port.map(url_for_port))
                 .flatten(),
+            // The frontend appends this to build the token-carrying register URL.
+            token: self.token.clone(),
             error: inner.error.clone(),
         }
     }
 }
 
-/// `queen_status` return: { enabled, running, port?, url?, error? }.
+/// `queen_status` return: { enabled, running, port?, url?, token, error? }.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueenStatusInfo {
     pub enabled: bool,
@@ -103,12 +123,21 @@ pub struct QueenStatusInfo {
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// `/mcp` auth token for this app run (non-persistent).
+    pub token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+/// Token-free display URL (tooltips, docs). Not usable for connecting.
 fn url_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// Connect URL with the auth token embedded, injected into session env and used
+/// to build the register command. MCP clients use it verbatim.
+fn env_url_for_port(port: u16, token: &str) -> String {
+    format!("http://127.0.0.1:{port}/mcp?token={token}")
 }
 
 /// QUEEN_URL value injected into every spawned session's env. Uses the bound
@@ -117,11 +146,16 @@ fn url_for_port(port: u16) -> String {
 /// Generic over the runtime so session.rs can be tested with MockRuntime.
 pub fn current_env_url<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
     let status = app.try_state::<QueenStatus>()?;
-    let inner = status.lock();
-    if !inner.enabled {
+    let (enabled, port) = {
+        let inner = status.lock();
+        (inner.enabled, inner.port.unwrap_or(inner.desired_port))
+    };
+    if !enabled {
         return None;
     }
-    Some(url_for_port(inner.port.unwrap_or(inner.desired_port)))
+    // Sessions get the token-carrying URL so the agent CLI can connect without
+    // any extra `--header` configuration.
+    Some(env_url_for_port(port, status.token()))
 }
 
 // ---------- lifecycle ----------
@@ -214,12 +248,21 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
                 Default::default(),
                 StreamableHttpServerConfig::default(),
             );
+        // Security (Finding S1): gate `/mcp` behind a per-run token plus a
+        // Host/Origin allow-list (DNS-rebinding defense). The layer wraps only
+        // the /mcp router; the hook receiver is merged afterwards so it keeps
+        // its own Bearer auth untouched.
+        let mcp_auth_state = McpAuthState {
+            token: app.state::<QueenStatus>().token().to_string(),
+            port,
+        };
+        let mcp = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(from_fn_with_state(mcp_auth_state, mcp_auth));
         // Phase 4.0: the teammate hook receiver shares this 127.0.0.1 server,
         // co-located with /mcp. Its own module owns all the hook logic.
         let hooks_token = app.state::<crate::teams_hooks::TeamsHooks>().token().to_string();
-        let router = axum::Router::new()
-            .nest_service("/mcp", service)
-            .merge(crate::teams_hooks::router(app.clone(), hooks_token));
+        let router = mcp.merge(crate::teams_hooks::router(app.clone(), hooks_token));
 
         status_update(&|inner| {
             inner.running = true;
@@ -242,6 +285,118 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
             }
         });
     });
+}
+
+// ---------- /mcp auth layer (Finding S1) ----------
+
+/// State captured by the `/mcp` auth middleware: the per-run token and the
+/// bound port (for the Host allow-list). Cloned per request by axum.
+#[derive(Clone)]
+struct McpAuthState {
+    token: String,
+    port: u16,
+}
+
+/// axum middleware: enforce the Host/Origin allow-list and token before a
+/// request reaches the MCP service. 403 for a non-loopback Host/Origin (DNS
+/// rebinding), 401 for a missing/wrong token.
+async fn mcp_auth(State(state): State<McpAuthState>, req: Request, next: Next) -> Response {
+    match authorize_mcp(req.headers(), req.uri().query(), state.port, &state.token) {
+        Ok(()) => next.run(req).await,
+        Err(code) => code.into_response(),
+    }
+}
+
+/// Pure auth decision for `/mcp`. Checks (1) the Host header is loopback and, if
+/// it carries a port, matches the bound one; (2) any Origin header is loopback;
+/// (3) the token matches via `?token=` query or `Authorization: Bearer`.
+fn authorize_mcp(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    port: u16,
+    token: &str,
+) -> Result<(), StatusCode> {
+    // Host/Origin allow-list first: a rebinding attacker still sends its own
+    // hostname in Host, so a non-loopback Host/Origin is rejected outright.
+    if !host_is_loopback(headers, port) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !origin_is_loopback_or_absent(headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if mcp_token_matches(headers, query, token) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// The Host header must be present, name a loopback host (`127.0.0.1` /
+/// `localhost`), and — when it carries a port — match the bound port.
+fn host_is_loopback(headers: &HeaderMap, port: u16) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        // HTTP/1.1 always sends Host; its absence is treated as suspicious.
+        return false;
+    };
+    let host = host.trim();
+    let (name, port_ok) = match host.rsplit_once(':') {
+        Some((name, p)) => (name, p == port.to_string()),
+        None => (host, true),
+    };
+    is_loopback_name(name) && port_ok
+}
+
+/// An absent Origin is fine (native MCP clients send none). When present it must
+/// be an `http(s)` URL whose host is loopback (any port); anything else — a real
+/// web origin or a `null` origin — is rejected.
+fn origin_is_loopback_or_absent(headers: &HeaderMap) -> bool {
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(origin) => origin_is_loopback(origin.trim()),
+    }
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let name = authority
+        .rsplit_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(authority);
+    is_loopback_name(name)
+}
+
+fn is_loopback_name(name: &str) -> bool {
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
+}
+
+/// Token accepted from `?token=<hex>` (preferred: no client header config) or an
+/// `Authorization: Bearer <hex>` header. Compared in constant time.
+fn mcp_token_matches(headers: &HeaderMap, query: Option<&str>, expected: &str) -> bool {
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                if crate::teams_hooks::constant_time_eq(value.as_bytes(), expected.as_bytes()) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(bearer) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        if crate::teams_hooks::constant_time_eq(bearer.as_bytes(), expected.as_bytes()) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------- MCP server (the 5 contract tools) ----------
@@ -916,6 +1071,218 @@ mod tests {
     #[test]
     fn url_formatting() {
         assert_eq!(url_for_port(39237), "http://127.0.0.1:39237/mcp");
+        // The session-injected / register URL carries the token as a query param.
+        assert_eq!(
+            env_url_for_port(39237, "deadbeef"),
+            "http://127.0.0.1:39237/mcp?token=deadbeef"
+        );
+    }
+
+    // ---------- /mcp auth decision (Finding S1) ----------
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    const TOK: &str = "0123456789abcdef";
+
+    #[test]
+    fn authorize_accepts_query_token_with_loopback_host() {
+        let h = headers(&[("host", "127.0.0.1:39237")]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Ok(())
+        );
+        // localhost host + no port also accepted
+        let h = headers(&[("host", "localhost")]);
+        assert_eq!(authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK), Ok(()));
+    }
+
+    #[test]
+    fn authorize_accepts_bearer_token() {
+        let h = headers(&[("host", "127.0.0.1:39237"), ("authorization", "Bearer 0123456789abcdef")]);
+        assert_eq!(authorize_mcp(&h, None, 39237, TOK), Ok(()));
+    }
+
+    #[test]
+    fn authorize_rejects_missing_or_wrong_token_401() {
+        let h = headers(&[("host", "127.0.0.1:39237")]);
+        assert_eq!(authorize_mcp(&h, None, 39237, TOK), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(
+            authorize_mcp(&h, Some("token=wrong"), 39237, TOK),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        let h = headers(&[("host", "127.0.0.1:39237"), ("authorization", "Bearer wrong")]);
+        assert_eq!(authorize_mcp(&h, None, 39237, TOK), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn authorize_rejects_non_loopback_host_403() {
+        // Rebinding: host resolves to 127.0.0.1 but Host still carries the domain.
+        let h = headers(&[("host", "evil.example.com:39237")]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // Missing Host is rejected too.
+        let h = headers(&[]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // Loopback host but wrong port.
+        let h = headers(&[("host", "127.0.0.1:1234")]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_non_loopback_origin_403() {
+        let h = headers(&[("host", "127.0.0.1:39237"), ("origin", "https://evil.example.com")]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // A `null` origin (sandboxed page) is not loopback.
+        let h = headers(&[("host", "127.0.0.1:39237"), ("origin", "null")]);
+        assert_eq!(
+            authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn authorize_accepts_loopback_origin() {
+        let h = headers(&[("host", "127.0.0.1:39237"), ("origin", "http://localhost:39237")]);
+        assert_eq!(authorize_mcp(&h, Some("token=0123456789abcdef"), 39237, TOK), Ok(()));
+    }
+
+    // ---------- /mcp auth layer over the wire ----------
+
+    /// Minimal blocking HTTP/1.1 client: sends a GET with optional headers and
+    /// returns the numeric status code. Mirrors the teams_hooks test client.
+    async fn get_status(
+        addr: std::net::SocketAddr,
+        path: &str,
+        host: Option<&str>,
+        origin: Option<&str>,
+        auth: Option<&str>,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        let path = path.to_string();
+        let host = host.map(|s| s.to_string());
+        let origin = origin.map(|s| s.to_string());
+        let auth = auth.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let mut req = format!("GET {path} HTTP/1.1\r\n");
+            if let Some(h) = host {
+                req.push_str(&format!("Host: {h}\r\n"));
+            }
+            if let Some(o) = origin {
+                req.push_str(&format!("Origin: {o}\r\n"));
+            }
+            if let Some(a) = auth {
+                req.push_str(&format!("Authorization: {a}\r\n"));
+            }
+            req.push_str("Connection: close\r\n\r\n");
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp.split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Bind the real `mcp_auth` layer over a trivial 200 handler and return the
+    /// bound address plus the port. Isolates the auth boundary from rmcp.
+    async fn serve_guarded(token: &str) -> (std::net::SocketAddr, u16) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let router = axum::Router::new()
+            .route("/mcp", axum::routing::any(|| async { "ok" }))
+            .layer(from_fn_with_state(
+                McpAuthState {
+                    token: token.to_string(),
+                    port,
+                },
+                mcp_auth,
+            ));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (addr, port)
+    }
+
+    #[tokio::test]
+    async fn mcp_layer_allows_correct_token_and_rejects_the_rest() {
+        let (addr, port) = serve_guarded(TOK).await;
+        let good_host = format!("127.0.0.1:{port}");
+
+        // query token + loopback host -> passes through to the 200 handler
+        let code = get_status(addr, &format!("/mcp?token={TOK}"), Some(&good_host), None, None).await;
+        assert_eq!(code, 200);
+        // bearer token also accepted
+        let code = get_status(
+            addr,
+            "/mcp",
+            Some(&good_host),
+            None,
+            Some(&format!("Bearer {TOK}")),
+        )
+        .await;
+        assert_eq!(code, 200);
+        // loopback origin still fine
+        let code = get_status(
+            addr,
+            &format!("/mcp?token={TOK}"),
+            Some(&good_host),
+            Some(&format!("http://127.0.0.1:{port}")),
+            None,
+        )
+        .await;
+        assert_eq!(code, 200);
+
+        // missing token -> 401
+        let code = get_status(addr, "/mcp", Some(&good_host), None, None).await;
+        assert_eq!(code, 401);
+        // wrong token -> 401
+        let code = get_status(addr, "/mcp?token=nope", Some(&good_host), None, None).await;
+        assert_eq!(code, 401);
+        // non-loopback Host -> 403 (even with a valid token)
+        let code = get_status(
+            addr,
+            &format!("/mcp?token={TOK}"),
+            Some("evil.example.com"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(code, 403);
+        // non-loopback Origin -> 403
+        let code = get_status(
+            addr,
+            &format!("/mcp?token={TOK}"),
+            Some(&good_host),
+            Some("https://evil.example.com"),
+            None,
+        )
+        .await;
+        assert_eq!(code, 403);
     }
 
     #[test]

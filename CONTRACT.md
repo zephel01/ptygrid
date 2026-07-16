@@ -127,7 +127,7 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
     port: 39237        # default 39237
   ```
 - アプリ起動時に自動起動。load_config でポートが変わった場合のみ再起動。
-- **Queen が spawn した（= mterm.yml 定義由来の）セッションにも、アプリが spawn する全セッションにも、env `QUEEN_URL=http://127.0.0.1:<port>/mcp` を注入する**（エージェントが自分の接続先を知れるように）。
+- **Queen が spawn した（= mterm.yml 定義由来の）セッションにも、アプリが spawn する全セッションにも、env `QUEEN_URL=http://127.0.0.1:<port>/mcp?token=<token>` を注入する**（エージェントが自分の接続先を知れるように）。トークンについては後述の「Queen 認証」を参照。
 
 ## MCP tools（Phase 2時点の基本5種）
 
@@ -142,22 +142,48 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 - `agent` の名前解決(Phase 2時点): 定義名→その名前で実行中の最新セッション。`#12`形式は
   id直指定。見つからなければerrorに実行中一覧を含める。この推測規則はPhase 3.6で廃止され、
   現在は`#id`優先かつ名前が一意な場合だけ解決する。
-- セキュリティ: bind は 127.0.0.1 のみ。spawn は許可リスト（config定義名）のみ。認証はPhase 2では無し（localhost限定で許容）。
+- セキュリティ: bind は 127.0.0.1 のみ。spawn は許可リスト（config定義名）のみ。**認証は当初 Phase 2 では無しだったが、Finding S1 対応で token + Host/Origin 検証を追加した（下記「Queen 認証」）。**
 
 ## Backend 追加実装
 
 - **出力リングバッファ**: 各セッションの reader thread が emit と同時に slot 内バッファ（上限 256 KiB、超過分は先頭から破棄）へ追記。restart でクリアしない（世代をまたいで連続、`— restarted —` 等の区切りは不要）。
 - **ANSIストリップ**: CSI/OSC/単独ESCシーケンス除去のユーティリティ + 単体テスト。
-- 新 Tauri command: `queen_status` → `{ enabled: bool, running: bool, port?: number, url?: string, error?: string }`
+- 新 Tauri command: `queen_status` → `{ enabled: bool, running: bool, port?: number, url?: string, token: string, error?: string }`（`url` は token 抜きの表示用、`token` は登録 URL 組み立て用。「Queen 認証」参照）
 - 新 event: `queen-notify` `{ title: string, message: string }`（notifyツール呼び出し時にemit）
 - rmcp の API 使用パターンは **スタンドアロン検証 crate（mcp-server-check/、pty-core-checkと同方式）** で実証してから本体に組み込む。tokio runtime は `tauri::async_runtime` を利用。
 
 ## Frontend 追加実装
 
 - **未知セッションのペイン自動生成**: `session-state` で未知の id が来たら（= Queen の spawn_agent 由来）自動でペインを追加。9面上限なら日本語バナーで通知（セッション自体は動き続ける）。
-- **Queenステータス**: ツールバー右側に `● Queen :39237`（running=緑/停止=赤/無効=灰）。クリックで登録コマンド `claude mcp add --transport http queen http://127.0.0.1:<port>/mcp` をクリップボードにコピーし「コピーしました」トースト。ツールチップに URL。
+- **Queenステータス**: ツールバー右側に `● Queen :39237`（running=緑/停止=赤/無効=灰）。クリックで登録コマンド `claude mcp add -s user --transport http queen http://127.0.0.1:<port>/mcp?token=<token>` をクリップボードにコピーし「コピーしました（再起動ごとに再登録が必要）」トースト。ツールチップには token 抜きの URL と「再登録が必要」注記。
 - **queen-notify** 受信 → タイトル+本文のトースト（自動消滅5秒、複数スタック可）。
 - `queen_status` は起動時と config 再読込後に取得。
+
+## Queen 認証（token + Host/Origin 検証, Finding S1）
+
+`/mcp` は無認証だと 127.0.0.1 に到達できる同一ホストの別プロセス/別ユーザーや、DNS
+リバインディングした悪意ある Web ページから全ツール（`send_message` 経由の任意ペイン
+stdin 書込 → RCE 含む）を呼べた。これを塞ぐため以下を契約に追加する。
+
+- **token 生成**: アプリ起動ごとに 256bit ランダム（lowercase hex）を 1 つ生成し、`QueenStatus`
+  が保持する。**非永続**（毎回変わる・ディスクに書かない）。teammate hooks の Bearer トークン
+  とは**別トークン**（用途別）。生成方式は共通（`getrandom` / OS CSPRNG）。
+- **`/mcp` 検証（axum middleware）**: リクエストを以下の順に検証する。
+  1. **Host allow-list**: `Host` ヘッダが loopback ホスト（`127.0.0.1` / `localhost`）であり、
+     ポートを含む場合は bind 済みポートと一致すること。Host 欠落・非 loopback は **403**。
+  2. **Origin allow-list**: `Origin` ヘッダが存在する場合、`http(s)://` の loopback オリジンで
+     あること。非 loopback（実 Web オリジン・`null`）は **403**（DNS リバインディング対策）。
+  3. **token**: URL クエリ `?token=<hex>`（MCP クライアントは URL をそのまま使うだけでよい）
+     **または** `Authorization: Bearer <hex>` のどちらかが一致すること。両方欠落/不一致は **401**。
+  - token 比較は**定数時間**（`teams_hooks::constant_time_eq`）。同関数で hooks 側 Bearer 比較も
+    定数時間化した（Finding S7/L12c）。
+- **middleware のスコープ**: layer は `/mcp` ルーターにのみ適用し、`/hooks/v1/*`（既存 Bearer）や
+  teams-backend Unix ソケット（既存 token）には非回帰。
+- **`QUEEN_URL` 形式変更**: セッション env へ注入する URL は
+  `http://127.0.0.1:<port>/mcp?token=<token>`（token 込み）。表示用 URL（tooltip・`queen_status.url`）
+  は従来どおり token 抜き。
+- **既存ユーザーへの影響**: 登録 URL に token が入るため、公開済みの旧手順で登録済みのユーザーは
+  **再登録が必要**。さらに token は再起動ごとに変わるため、**アプリを再起動したら都度再登録**する。
 
 ---
 
