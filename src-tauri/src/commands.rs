@@ -91,6 +91,13 @@ pub fn register_teammate_hooks(app: AppHandle, scope: String) -> Result<Register
     teams_hooks::register(&app, &scope)
 }
 
+/// Phase 4.2: report active host leads (mode, fallback state, live teammate
+/// session ids) for the Teammates panel.
+#[tauri::command]
+pub fn teams_host_status(app: AppHandle) -> Result<crate::teams_host::TeamsHostStatus, String> {
+    Ok(crate::teams_host::status(&app))
+}
+
 /// Launch a loaded agent/process definition by name.
 #[tauri::command]
 pub fn spawn_agent(

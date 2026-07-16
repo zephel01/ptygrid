@@ -827,6 +827,156 @@ type SessionInfo = {
 
 ---
 
+# Phase 4.2 追加契約（host モード: 実 PTY teammate ペイン）
+
+Phase 4.2 は方式A（tmux シム）を **既定オフの opt-in 実験機能**として実装する。`agents[].teams.mode:
+host` を指定した lead を、ptygrid 同梱の tmux 互換シム + per-lead Unix socket サーバとともに起動し、
+Claude Code の split-pane teammate（独立 `claude` プロセス）を **ネイティブな対話 PTY ペイン**として
+ホストする。Phase 0〜4.1 は互換維持（既存 PTY 経路・Queen MCP 契約・observe transcript に非回帰）。
+socket RPC プロトコル本体は `src-tauri/teams-backend/`（「Phase 4.x 準備契約」）。
+
+## 有効化条件（completion gate）
+
+- `agents[].teams.enabled: true` **かつ** `mode: host` の lead でのみ有効（`AgentTeamsConfig::is_host()`）。
+- opt-in なしでは **env 注入も socket サーバ起動もシム配置も一切行わない**。global `teammates.enabled`
+  には依存しない（host は per-agent opt-in）。
+- host は unix のみ（Windows は非対応: 何もせず通常セッションとして起動）。
+
+## ptygrid.yml 拡張（`agents[].teams` の host 用 field、すべて任意）
+
+```yaml
+agents:
+  - name: claude
+    cmd: claude
+    teams:
+      enabled: true
+      mode: host                 # observe | host。host で 4.2 の実 PTY ホスト
+      max_panes: 3               # この lead の teammate ペイン上限、1..9 clamp
+      teammate_binaries:         # split-window で PTY 起動を許可する argv0 basename。既定 ["claude"]
+        - claude
+      fallback_to_observe: true  # host 未使用時に observe へ自動降格。既定 true
+```
+
+```ts
+type AgentTeamsConfig = {
+  enabled?: boolean; mode?: "observe" | "host"; maxPanes?: number; transcriptTail?: boolean;
+  teammateBinaries?: string[];   // host only, default ["claude"]（空配列は既定へ collapse）
+  fallbackToObserve?: boolean;   // host only, default true
+};
+```
+
+- 未知 field は無視。`teammate_binaries` が空/未指定なら `["claude"]`。
+
+## lead PTY への env 注入（host lead spawn 時のみ）
+
+| env | 値 |
+|---|---|
+| `PTYGRID_TEAMS_SOCK` | `app-data/teams/run/lead-<sessionId>.sock` |
+| `PTYGRID_TEAMS_TOKEN` | per-lead ランダム 256bit（lowercase hex、非永続） |
+| `TMUX` | `<sock>,<ptygrid pid>,0` |
+| `TMUX_PANE` | `%0`（lead 自身） |
+| `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` | `1` |
+| `PATH` | 先頭に `app-data/teams/bin` を付加（シム `tmux` を優先） |
+
+## シムのアプリ内蔵（cmux 方式・シムバイナリは同梱しない）
+
+- host lead 起動時、`app-data/teams/bin/tmux` に実行スクリプトを冪等生成（0755）:
+  `#!/bin/sh\nexec "<ptygrid 実行ファイル絶対パス>" __tmux-compat "$@"\n`（`std::env::current_exe()`）。
+- ptygrid は `argv[1] == "__tmux-compat"` で起動されると、残り引数を tmux サブコマンドとして
+  `teams_backend::shim`（parse/execute）+ 内蔵 blocking `SocketClient` で処理し、**GUI を初期化せず即 exit**。
+  NoOp / `list-sessions` は socket 不要。他は `PTYGRID_TEAMS_SOCK`/`TOKEN` で socket に接続。
+
+## socket サーバのライフサイクル
+
+- host lead ごとに `teams_backend::server::{bind_socket, serve}`（`ServerConfig { auth_token }`）を
+  spawn（socket 0600 / 親 dir 0700）。`initialize` の `auth_token` 検証必須。
+- lead の pty-exit（セッションが Running/Restarting/Starting を外れる）を監視タスクが検知したら
+  サーバ task を abort し socket file を削除。
+- restart_session（同一 id 再起動）ではサーバを張り直さず既存 socket/env を再利用する。
+
+## PaneHost セマンティクス（socket RPC → 実 PTY）
+
+- **context_id**: lead = `%0`、teammate = `%<sessionId>`（`%0` は書込/capture 時 lead に解決）。
+- `spawn_agent`: argv0 basename を `teammate_binaries` で検証（違反は `SPAWN_DENIED`）。lead の解決済み
+  cwd（worktree 含む）を既定 cwd に、lead env + RPC env をマージして **既存 PTY spawn 基盤**で teammate
+  セッションを生成（`SessionKind::Pty` + teammate メタ `{ leadId, mode: "host", role }`。role は
+  `metadata.name`→`role`）。
+- **上限（host）**: `teams.max_panes` / `teammates.global_max_panes` / グリッド 9 のいずれか到達時も
+  **セッションは生成する**（作業を止めない）。グリッドには載せず paneless とし `teammate-banner` を emit
+  （spec 6.2.5）。
+- `write`(base64 decode 済みバイト) → 既存 stdin 書込。`capture`(lines?) → `read_output` と同じ ANSI
+  再構成テキストの末尾 N 行。`kill` → autorestart を発火させない kill。`focus` → `teammate-focus { id }`。
+- `list` / `get_self_id`: lead=`%0`、teammate=`%<sessionId>`。
+- teammate セッション終了は `context_exited { context_id, exit_code }`（push）で socket へ broadcast。
+
+## フォールバック検知（spec 6.3・2 秒窓）
+
+- host lead で `SubagentStart` により teammate を検知してから **2 秒**以内に、その lead の socket へ
+  `spawn_agent` RPC（= `split-window`）が来なければ「シム未使用（in-process フォールバック）」と判定。
+  相関は時間窓ベースの純関数（`teams_host::correlate_fallback`）。
+- host lead では `SubagentStart` で **即座に transcript ペインを作らず**、この 2 秒窓を待つ。
+- 判定が fallback のとき: `fallback_to_observe: true` なら 4.1 の observe（read-only transcript ペイン）を
+  生成、`teammate-fallback { leadId, agentId, reason }` を emit、lead を「fallback 中」状態にする。
+
+## 追加 Tauri Event / Command
+
+| event | payload | 説明 |
+|---|---|---|
+| `teammate-focus` | `{ id: number }` | tmux `select-pane` 相当。該当ペインを強調（frontend は次段） |
+| `teammate-fallback` | `{ leadId: number, agentId: string, reason: string }` | host 未使用で observe 降格したとき |
+| `teammate-banner` | `{ message: string }` | host 上限超過時にも emit（4.1 と同一経路） |
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `teams_host_status` | なし | `{ leads: [{ id, mode, fallback, teammates: number[] }] }` | 稼働中 host lead と live teammate 一覧 |
+
+## `SessionInfo.teammate`（additive・host teammate にも付与）
+
+```ts
+type SessionInfo = {
+  /* 既存 */ kind?: "pty" | "transcript";
+  teammate?: { role?: string; leadId: number; mode: "observe" | "host" };
+};
+```
+
+- host teammate は `kind: "pty"` + `teammate.mode: "host"`。observe transcript は
+  `kind: "transcript"` + `teammate.mode: "observe"`。
+
+## ProjectState 除外
+
+- teammate セッション（observe transcript と host teammate PTY の双方）は ephemeral であり
+  `ProjectState.sessions` に **保存しない**。除外は kind ではなく **teammate メタ**で掛かる
+  （`project_state::persistable_pane_ids` は `(id, is_teammate)` で不変条件を保持・単体テスト可能）。
+  frontend は保存前に `SessionInfo.teammate` を持つペインを除外する。
+
+## 許可リスト spawn との関係（spec 7.1・3 段）
+
+teammate spawn は Queen MCP `spawn_agent`（config 定義名の allowlist）を経由せず、専用チャネルを通る:
+(1) `teams.mode: host` の config opt-in、(2) `PTYGRID_TEAMS_TOKEN` の socket ハンドシェイク、
+(3) `teammate_binaries`（既定 `["claude"]`）による argv0 basename 検証。Queen `spawn_agent` の
+allowlist セマンティクスは不変。
+
+## Frontend（Phase 4.2 で実装した UI 挙動）
+
+backend 契約（上記イベント/コマンド/型）は不変。frontend は以下の挙動でこれらを消費する:
+
+- **host teammate ペイン**（`kind: "pty"` + `teammate.mode: "host"`）は通常 PTY ペインとして
+  xterm でホストし対話可能。ヘッダーは `claude·team #<id> ▸<role>` + lead 併記 `↳#<leadId>`
+  （role/lead は欠落時省略）、状態ドットは既存 PTY の running/exited を流用。⟳restart / ⤢maximize 可。
+- **close は確認付き**（実プロセス kill の破壊的操作）。インライン確認「teammate を停止しますか？」を
+  挟み、確定時のみ `kill_pty`。observe transcript の close（tail 停止のみ）とは別扱い。
+- `teammate-focus { id }` 受信で該当ペインを約 1.6 秒ハイライト（枠のアクセントリング）。
+- `teammate-fallback` 受信で toast 通知 + `teams_host_status` を再取得。lead が `fallback: true` の間、
+  Teammates バッジは赤ドット + 「host: フォールバック中」を表示する。
+- **Teammates パネル**は開時に `teams_host_status` を取得し、host lead ごとに mode / fallback /
+  teammate 一覧を表示。paneless teammate（`teammate` を持つが `ui.panes` に無い session）には
+  「グリッドへ表示」ボタン（9 面上限内で pane 追加）。lead が host 一覧から消え（終了）かつ teammate
+  PTY が生存している場合は「lead 終了済み（孤立 teammate）」として列挙し「停止」ボタン（`kill_pty`）を出す。
+- **ProjectState 除外**: 保存対象ペインは `SessionInfo.teammate` を持つ session（observe transcript /
+  host teammate の双方）を除外する（kind ではなく teammate メタで判定。CONTRACT の不変条件と一致）。
+
+---
+
 # 設定ファイル名の変更（ptygrid.yml / legacy mterm.yml）
 
 config filenameを`mterm.yml`から`ptygrid.yml`へ変更する。migration設計として

@@ -102,10 +102,16 @@ impl HooksScope {
     }
 }
 
-/// Phase 4.1 per-agent `teams:` block. Governs whether this lead's teammates /
-/// subagents get read-only transcript panes auto-generated on `SubagentStart`.
+/// Phase 4.1/4.2 per-agent `teams:` block. Governs whether this lead's
+/// teammates / subagents get panes auto-generated. In `observe` mode a
+/// read-only transcript pane is created on `SubagentStart` (Phase 4.1). In
+/// `host` mode (Phase 4.2) the lead is started with the tmux shim + a per-lead
+/// socket server so split-pane teammates are hosted as real interactive PTY
+/// panes; `teammate_binaries` and `fallback_to_observe` apply only to host.
 /// Everything is optional; omitting the block leaves the agent unchanged.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+///
+/// Not `Copy`: `teammate_binaries` carries an owned `Vec<String>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentTeamsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -115,6 +121,15 @@ pub struct AgentTeamsConfig {
     pub max_panes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_tail: Option<bool>,
+    /// Host mode only: argv0 basenames allowed to be spawned as split-window
+    /// teammates. Default `["claude"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate_binaries: Option<Vec<String>>,
+    /// Host mode only: fall back to a read-only observe transcript pane when a
+    /// teammate is detected via hook but the shim never drives a spawn (the
+    /// #6447-style breakage). Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_to_observe: Option<bool>,
 }
 
 impl AgentTeamsConfig {
@@ -122,11 +137,9 @@ impl AgentTeamsConfig {
     pub fn effective_enabled(&self) -> bool {
         self.enabled.unwrap_or(false)
     }
-    /// Default `observe`. In Phase 4.1 `host` behaves identically to `observe`
-    /// (a read-only transcript pane); the real PTY host lands in Phase 4.2, so
-    /// this accessor is part of the stable schema surface but not yet a
-    /// behavior branch.
-    #[allow(dead_code)]
+    /// Default `observe`. Phase 4.2 makes `host` a real behavior branch (see
+    /// [`crate::teams_host`]): a host lead is spawned with the tmux shim and a
+    /// per-lead socket server, and hosts split-pane teammates as real PTYs.
     pub fn effective_mode(&self) -> TeamsMode {
         self.mode.unwrap_or_default()
     }
@@ -139,9 +152,25 @@ impl AgentTeamsConfig {
     pub fn effective_transcript_tail(&self) -> bool {
         self.transcript_tail.unwrap_or(true)
     }
+    /// Host mode only. Default `["claude"]`. Empty lists collapse to the
+    /// default so a `teammate_binaries: []` never disables all spawns silently.
+    pub fn effective_teammate_binaries(&self) -> Vec<String> {
+        match &self.teammate_binaries {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec!["claude".to_string()],
+        }
+    }
+    /// Host mode only. Default true.
+    pub fn effective_fallback_to_observe(&self) -> bool {
+        self.fallback_to_observe.unwrap_or(true)
+    }
+    /// Whether this lead should run the Phase 4.2 real-PTY host path.
+    pub fn is_host(&self) -> bool {
+        self.effective_enabled() && self.effective_mode() == TeamsMode::Host
+    }
 }
 
-/// `observe | host` (default observe). Phase 4.1 treats `host` as `observe`.
+/// `observe | host` (default observe). Phase 4.2 makes `host` a real behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TeamsMode {
@@ -854,22 +883,77 @@ agents:
         // Empty block -> same effective defaults.
         let cfg =
             parse_config("agents:\n  - name: claude\n    cmd: claude\n    teams: {}\n").unwrap();
-        let t = cfg.agents[0].teams.unwrap();
+        let t = cfg.agents[0].teams.clone().unwrap();
         assert!(!t.effective_enabled());
         assert_eq!(t.effective_mode(), TeamsMode::Observe);
         assert_eq!(t.effective_max_panes(), 3);
         assert!(t.effective_transcript_tail());
+        assert!(!t.is_host());
 
         // Explicit values incl. host mode and an out-of-range max_panes clamp.
         let cfg = parse_config(
             "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      enabled: true\n      mode: host\n      max_panes: 99\n      transcript_tail: false\n",
         )
         .unwrap();
-        let t = cfg.agents[0].teams.unwrap();
+        let t = cfg.agents[0].teams.clone().unwrap();
         assert!(t.effective_enabled());
         assert_eq!(t.effective_mode(), TeamsMode::Host);
         assert_eq!(t.effective_max_panes(), 9);
         assert!(!t.effective_transcript_tail());
+        assert!(t.is_host());
+    }
+
+    #[test]
+    fn agent_teams_host_only_fields_default_and_parse() {
+        // Defaults: allowlist is ["claude"], fallback_to_observe is true.
+        let d = AgentTeamsConfig::default();
+        assert_eq!(d.effective_teammate_binaries(), vec!["claude".to_string()]);
+        assert!(d.effective_fallback_to_observe());
+
+        // Explicit host fields parse.
+        let cfg = parse_config(
+            "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      enabled: true\n      mode: host\n      teammate_binaries: [claude, claude-next]\n      fallback_to_observe: false\n",
+        )
+        .unwrap();
+        let t = cfg.agents[0].teams.clone().unwrap();
+        assert_eq!(
+            t.effective_teammate_binaries(),
+            vec!["claude".to_string(), "claude-next".to_string()]
+        );
+        assert!(!t.effective_fallback_to_observe());
+        assert!(t.is_host());
+
+        // An empty allowlist never disables all spawns: it collapses to default.
+        let cfg = parse_config(
+            "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      teammate_binaries: []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.agents[0].teams.clone().unwrap().effective_teammate_binaries(),
+            vec!["claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_host_requires_both_enabled_and_mode_host() {
+        // enabled + host => host path.
+        let host = parse_config(
+            "agents:\n  - name: c\n    cmd: c\n    teams:\n      enabled: true\n      mode: host\n",
+        )
+        .unwrap();
+        assert!(host.agents[0].teams.clone().unwrap().is_host());
+        // host mode but disabled => not a host lead (opt-in gate).
+        let disabled = parse_config(
+            "agents:\n  - name: c\n    cmd: c\n    teams:\n      enabled: false\n      mode: host\n",
+        )
+        .unwrap();
+        assert!(!disabled.agents[0].teams.clone().unwrap().is_host());
+        // enabled but observe => not host.
+        let observe = parse_config(
+            "agents:\n  - name: c\n    cmd: c\n    teams:\n      enabled: true\n      mode: observe\n",
+        )
+        .unwrap();
+        assert!(!observe.agents[0].teams.clone().unwrap().is_host());
     }
 
     #[test]
@@ -879,7 +963,7 @@ agents:
             "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      enabled: true\n      teammate_binaries: [claude]\n      future_flag: 7\n",
         )
         .unwrap();
-        assert!(cfg.agents[0].teams.unwrap().effective_enabled());
+        assert!(cfg.agents[0].teams.clone().unwrap().effective_enabled());
     }
 
     #[test]

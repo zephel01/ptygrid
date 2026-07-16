@@ -13,6 +13,7 @@
     dismissNotice,
     refreshQueenStatus,
     refreshTeammateHooks,
+    refreshTeamsHostStatus,
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
@@ -20,6 +21,7 @@
   import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
   import type {
     ConfigInfo,
+    HostLeadStatus,
     LogicalSession,
     ProjectState,
     SessionInfo,
@@ -137,12 +139,20 @@
   let teammatesPanelOpen = $state(false);
   let registering = $state(false);
 
+  // Phase 4.2: any host lead that fell back to observe (host unavailable).
+  let hostFallbackActive = $derived.by(
+    () => ui.teamsHost?.leads.some((l) => l.fallback) ?? false,
+  );
+
   let teammatesClass = $derived.by(() => {
     if (!isTauri()) return "queen-off";
+    if (hostFallbackActive) return "queen-error";
     return ui.teammateHooks?.enabled ? "queen-running" : "queen-off";
   });
   let teammatesTooltip = $derived.by(() => {
     if (!isTauri()) return "Tauri 実行環境なし（デモモード）";
+    if (hostFallbackActive)
+      return "host: フォールバック中（ネイティブペイン化に失敗し observe へ降格）";
     const t = ui.teammateHooks;
     if (!t) return "Teammate hooks（状態未取得）";
     return t.enabled
@@ -329,10 +339,15 @@
     return mode === "auto" ? "auto" : (Number(mode) as 1 | 2 | 3);
   }
 
-  // Phase 4.1: read-only transcript panes are ephemeral and excluded from
-  // persistence (they are re-created by the lead on resume).
+  // Phase 4.1/4.2: teammate panes (observe transcript AND host PTY) are
+  // ephemeral and excluded from persistence — the exclusion keys off the
+  // teammate meta, not the kind (CONTRACT: ProjectState 除外). They are
+  // re-created by the lead on resume.
   let persistablePanes = $derived(
-    ui.panes.filter((id) => ui.sessions[id]?.kind !== "transcript"),
+    ui.panes.filter((id) => {
+      const s = ui.sessions[id];
+      return !s?.teammate && s?.kind !== "transcript";
+    }),
   );
 
   function logicalSession(id: number): LogicalSession {
@@ -485,6 +500,8 @@
       void refreshQueenStatus();
       // teammates.enabled / hook_notifications may have changed too.
       void refreshTeammateHooks();
+      // host leads may have started/stopped after a config change.
+      void refreshTeamsHostStatus();
       return info;
     } finally {
       loadingConfig = false;
@@ -593,6 +610,104 @@
     return `claude·sub #${id}${role ? ` ▸${role}` : ""} 📖RO`;
   }
 
+  // Phase 4.2 host teammate pane header, e.g. `claude·team #7 ▸reviewer`.
+  // The literal `claude·team` mirrors the observe transcript header; the role
+  // and lead id (`↳#<leadId>`) are omitted when unavailable.
+  function hostTeammateTitle(id: number): string {
+    const role = ui.sessions[id]?.teammate?.role;
+    return `claude·team #${id}${role ? ` ▸${role}` : ""}`;
+  }
+
+  // Phase 4.2: closing a host teammate kills a real process, so it is gated
+  // behind a small inline confirm (no confirm() precedent in the app).
+  let killConfirmId = $state<number | null>(null);
+
+  function requestCloseHostTeammate(id: number): void {
+    killConfirmId = id;
+  }
+  function confirmCloseHostTeammate(id: number): void {
+    killConfirmId = null;
+    closePane(id);
+  }
+  function cancelCloseHostTeammate(): void {
+    killConfirmId = null;
+  }
+
+  // Phase 4.2: promote a paneless teammate onto the grid (reuses addPane; the
+  // existing session-state path already tracks it in ui.sessions). Guarded by
+  // the 9-pane cap so we never exceed the grid limit.
+  function showTeammatePane(id: number): void {
+    if (ui.panes.includes(id)) return;
+    if (ui.panes.length >= MAX_PANES) {
+      ui.errorBanner = `ペイン数が上限（${MAX_PANES}）に達しています。既存のペインを閉じてから表示してください。`;
+      return;
+    }
+    addPane(id);
+  }
+
+  async function stopOrphanTeammate(id: number): Promise<void> {
+    if (isTauri()) {
+      try {
+        await invokeCmd<void>("kill_pty", { id });
+      } catch (err) {
+        ui.errorBanner = `teammate の停止に失敗しました (kill_pty #${id}): ${err}`;
+        return;
+      }
+    }
+    if (ui.panes.includes(id)) closePane(id);
+    else delete ui.sessions[id];
+    void refreshTeamsHostStatus();
+  }
+
+  // Every live host-teammate PTY session (kind:"pty" + teammate.mode:"host").
+  let hostTeammateSessions = $derived.by(() =>
+    Object.values(ui.sessions).filter(
+      (s) => s.teammate?.mode === "host",
+    ),
+  );
+
+  // Lead ids that teams_host_status currently reports as active host leads.
+  let liveHostLeadIds = $derived.by(
+    () => new Set((ui.teamsHost?.leads ?? []).map((l) => l.id)),
+  );
+
+  // Orphaned host teammates: their lead is no longer an active host lead
+  // (lead exited / torn down) yet the teammate PTY is still alive.
+  let orphanTeammates = $derived.by(() =>
+    hostTeammateSessions.filter((s) => {
+      const leadId = s.teammate!.leadId;
+      const lead = ui.sessions[leadId];
+      const leadAlive =
+        liveHostLeadIds.has(leadId) ||
+        (lead !== undefined &&
+          (lead.state === "running" ||
+            lead.state === "starting" ||
+            lead.state === "restarting"));
+      return !leadAlive;
+    }),
+  );
+
+  // Role/state for a teammate id shown in the Teammates panel list.
+  function teammateRow(id: number): {
+    id: number;
+    role?: string;
+    paneless: boolean;
+    state?: string;
+  } {
+    const s = ui.sessions[id];
+    return {
+      id,
+      role: s?.teammate?.role,
+      paneless: !ui.panes.includes(id),
+      state: s?.state,
+    };
+  }
+
+  async function openTeammatesPanel(): Promise<void> {
+    teammatesPanelOpen = !teammatesPanelOpen;
+    if (teammatesPanelOpen) void refreshTeamsHostStatus();
+  }
+
   function formatCpu(percent: number): string {
     return `${percent.toFixed(1)}%`;
   }
@@ -659,6 +774,7 @@
       await initGlobalListeners();
       void refreshQueenStatus();
       void refreshTeammateHooks();
+      void refreshTeamsHostStatus();
       void loadDirSuggestions();
       let restored = false;
       try {
@@ -818,12 +934,12 @@
     <div class="teammates-wrap">
       <button
         class="queen-badge {teammatesClass}"
-        onclick={() => (teammatesPanelOpen = !teammatesPanelOpen)}
+        onclick={openTeammatesPanel}
         title={teammatesTooltip}
         aria-label="Teammate hooks（クリックで設定パネル）"
       >
         <span class="queen-dot"></span>
-        Teammates
+        Teammates{hostFallbackActive ? " ⚠" : ""}
       </button>
       {#if teammatesPanelOpen}
         <div class="teammates-panel" role="dialog" aria-label="Teammate hooks 設定">
@@ -860,6 +976,73 @@
               >
                 {registering ? "登録中…" : "settings.json へ登録 (user)"}
               </button>
+            </div>
+            <div class="tm-events">
+              <div class="tm-subhead">host モード（実 PTY teammate）</div>
+              {#if (ui.teamsHost?.leads.length ?? 0) === 0 && orphanTeammates.length === 0}
+                <div class="tm-empty">
+                  稼働中の host lead はありません（ptygrid.yml の teams.mode: host）
+                </div>
+              {:else}
+                {#each ui.teamsHost?.leads ?? [] as lead (lead.id)}
+                  <div class="tm-lead">
+                    <div class="tm-lead-head">
+                      <span class="tm-lead-id">lead #{lead.id}</span>
+                      <span
+                        class="tm-lead-badge {lead.fallback
+                          ? 'tm-badge-warn'
+                          : 'tm-badge-ok'}"
+                      >
+                        {lead.fallback ? "host: フォールバック中" : "host"}
+                      </span>
+                    </div>
+                    {#if lead.teammates.length === 0}
+                      <div class="tm-empty">teammate なし</div>
+                    {:else}
+                      {#each lead.teammates.map(teammateRow) as tm (tm.id)}
+                        <div class="tm-teammate">
+                          <span class="tm-teammate-label">
+                            #{tm.id}{tm.role ? ` ▸${tm.role}` : ""}
+                            {tm.paneless ? "（グリッド外）" : ""}
+                          </span>
+                          {#if tm.paneless}
+                            <button
+                              class="btn btn-small"
+                              onclick={() => showTeammatePane(tm.id)}
+                              disabled={!canAddPane}
+                              title="このteammateをグリッドに表示"
+                            >
+                              グリッドへ表示
+                            </button>
+                          {/if}
+                        </div>
+                      {/each}
+                    {/if}
+                  </div>
+                {/each}
+                {#if orphanTeammates.length > 0}
+                  <div class="tm-lead">
+                    <div class="tm-lead-head">
+                      <span class="tm-lead-id">lead 終了済み（孤立 teammate）</span>
+                    </div>
+                    {#each orphanTeammates as s (s.id)}
+                      <div class="tm-teammate">
+                        <span class="tm-teammate-label">
+                          #{s.id}{s.teammate?.role ? ` ▸${s.teammate.role}` : ""}
+                          ↳#{s.teammate?.leadId}
+                        </span>
+                        <button
+                          class="btn btn-small tm-stop"
+                          onclick={() => stopOrphanTeammate(s.id)}
+                          title="この孤立 teammate プロセスを停止"
+                        >
+                          停止
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              {/if}
             </div>
             <div class="tm-events">
               <div class="tm-subhead">直近のイベント</div>
@@ -922,7 +1105,11 @@
                 <Pane minSize={5}>
                   {@const session = ui.sessions[id]}
                   {@const resources = ui.resources[id]}
-                  <section class="pane" class:is-max={ui.maximizedId === id}>
+                  <section
+                    class="pane"
+                    class:is-max={ui.maximizedId === id}
+                    class:pane-focused={ui.focusedTeammates[id]}
+                  >
                     {#if session?.kind === "transcript"}
                       {@const stopped = session.state === "exited"}
                       <header class="pane-header">
@@ -959,6 +1146,78 @@
                       </header>
                       <div class="pane-body">
                         <TranscriptPane sessionId={id} {stopped} />
+                      </div>
+                    {:else if session?.teammate?.mode === "host"}
+                      <header class="pane-header">
+                        <span
+                          class="dot state-{session?.state ?? 'starting'}"
+                          title={session?.state ?? "starting"}
+                        ></span>
+                        <span
+                          class="pane-title"
+                          title="host teammate（実 PTY・対話可能）"
+                        >
+                          {hostTeammateTitle(id)}
+                        </span>
+                        <span class="lead-ref" title="親 lead セッション">
+                          ↳#{session.teammate.leadId}
+                        </span>
+                        {#if session?.state === "exited"}
+                          <span class="exit-code">
+                            exit {session.code ?? "?"}
+                          </span>
+                        {/if}
+                        {#if resources && session?.state === "running"}
+                          <span
+                            class="resource-usage"
+                            title={`${resources.processCount} processes · ${resources.memoryBytes.toLocaleString()} bytes`}
+                          >
+                            CPU {formatCpu(resources.cpuPercent)} · {formatMemory(resources.memoryBytes)}
+                          </span>
+                        {/if}
+                        <span class="spacer"></span>
+                        {#if killConfirmId === id}
+                          <span class="kill-confirm" role="alertdialog">
+                            <span class="kill-confirm-text">teammate を停止しますか？</span>
+                            <button
+                              class="btn btn-small tm-stop"
+                              onclick={() => confirmCloseHostTeammate(id)}
+                            >
+                              停止
+                            </button>
+                            <button
+                              class="btn btn-small"
+                              onclick={cancelCloseHostTeammate}
+                            >
+                              取消
+                            </button>
+                          </span>
+                        {:else}
+                          <button
+                            class="pane-btn"
+                            title="再起動"
+                            onclick={() => restartSession(id)}
+                          >
+                            ⟳
+                          </button>
+                          <button
+                            class="pane-btn"
+                            title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                            onclick={() => toggleMaximize(id)}
+                          >
+                            ⤢
+                          </button>
+                          <button
+                            class="pane-btn pane-btn-close"
+                            title="閉じる（teammate プロセスを停止します）"
+                            onclick={() => requestCloseHostTeammate(id)}
+                          >
+                            ✕
+                          </button>
+                        {/if}
+                      </header>
+                      <div class="pane-body">
+                        <Terminal sessionId={id} title={hostTeammateTitle(id)} />
                       </div>
                     {:else}
                       <header class="pane-header">
@@ -1389,6 +1648,75 @@
     white-space: nowrap;
   }
 
+  /* host mode: per-lead status + teammate list */
+  .tm-lead {
+    margin-bottom: 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #333;
+  }
+
+  .tm-lead:last-child {
+    border-bottom: none;
+  }
+
+  .tm-lead-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 2px;
+  }
+
+  .tm-lead-id {
+    color: #d0d0d0;
+    font-family: Menlo, monospace;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .tm-lead-badge {
+    font-size: 10px;
+    border-radius: 8px;
+    padding: 0 6px;
+  }
+
+  .tm-badge-ok {
+    color: #7cc27e;
+    border: 1px solid #3f6b3f;
+    background: #23301f;
+  }
+
+  .tm-badge-warn {
+    color: #f1b0b0;
+    border: 1px solid #6b2b2b;
+    background: #301f1f;
+  }
+
+  .tm-teammate {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 1px 0 1px 10px;
+  }
+
+  .tm-teammate-label {
+    color: #cfcfcf;
+    font-family: Menlo, monospace;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tm-stop {
+    color: #f1b0b0;
+    border-color: #6b2b2b;
+  }
+
+  .tm-stop:hover:not(:disabled) {
+    background: #4b1e1e;
+  }
+
   /* ---- banners / toast ---- */
 
   .banner {
@@ -1656,6 +1984,25 @@
     color: #8a9aa8;
     font-family: Menlo, monospace;
     font-size: 10px;
+  }
+
+  /* teammate-focus pulse: a short accent ring around the focused pane */
+  .pane.pane-focused {
+    box-shadow: inset 0 0 0 2px #4a9be0;
+    transition: box-shadow 0.2s ease;
+  }
+
+  /* inline confirm for the destructive host-teammate close */
+  .kill-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .kill-confirm-text {
+    color: #e5c07b;
+    font-size: 10px;
+    white-space: nowrap;
   }
 
   .pane-body {

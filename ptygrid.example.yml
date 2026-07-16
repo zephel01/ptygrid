@@ -44,9 +44,22 @@ agents:
     # spawns a subagent (requires teammates.enabled above). Optional.
     # teams:
     #   enabled: true
-    #   mode: observe        # observe | host (host is Phase 4.2; == observe in 4.1)
+    #   mode: observe        # observe | host
     #   max_panes: 3
     #   transcript_tail: true
+    #
+    # Phase 4.2 host (experimental, off by default, Unix only): host Claude
+    # Code split-pane teammates as native interactive PTY panes. ptygrid drops
+    # in a tmux-compat shim + per-lead Unix socket and injects the required env
+    # (incl. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1) automatically — no manual
+    # setup. If the shim is not used within 2s, it falls back to observe.
+    # Requires enabled: true AND mode: host (opt-in; nothing runs otherwise).
+    # teams:
+    #   enabled: true
+    #   mode: host
+    #   max_panes: 3
+    #   teammate_binaries: ["claude"]  # argv0 basenames allowed to spawn (default ["claude"])
+    #   fallback_to_observe: true      # auto-downgrade to observe when host is unused (default true)
 
   - name: codex
     cmd: "codex"

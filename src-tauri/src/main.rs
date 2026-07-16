@@ -2,6 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Phase 4.2: when invoked as the in-app tmux shim (`__tmux-compat`), handle
+    // the tmux subcommand over the per-lead socket and exit WITHOUT starting any
+    // GUI. Must run before Tauri/fix-path-env setup.
+    if let Some(code) = ptygrid_lib::run_tmux_compat_if_requested() {
+        std::process::exit(code);
+    }
     // Capture the process launch directory (the folder ptygrid was started
     // from) FIRST, before fix-path-env or any Tauri setup runs, so config
     // resolution can use it as the ② launch-folder candidate even if a later

@@ -17,3 +17,5 @@ pub mod protocol;
 #[cfg(unix)]
 pub mod server;
 pub mod shim;
+#[cfg(unix)]
+pub mod shim_client;

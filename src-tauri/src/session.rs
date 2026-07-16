@@ -71,8 +71,9 @@ pub enum SessionKind {
     Transcript,
 }
 
-/// Teammate metadata carried on a `transcript` session's `SessionInfo`
-/// (Phase 4.1). Mode is always `"observe"` in 4.1 (host == observe).
+/// Teammate metadata carried on a teammate session's `SessionInfo`. Present on
+/// `transcript` sessions (mode `"observe"`, Phase 4.1) and on host-teammate
+/// `pty` sessions (mode `"host"`, Phase 4.2).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeammateInfo {
@@ -118,6 +119,10 @@ struct LaunchSpec {
     name: Option<String>,
     /// Display command; also what gets executed (via shell when shell_wrap).
     cmd: String,
+    /// Extra argv passed to `cmd` when `!shell_wrap` (host teammate spawns use
+    /// pre-split argv from the pane-backend protocol). Empty for shell-wrapped
+    /// definitions and single-program shells.
+    args: Vec<String>,
     /// true: run via `/bin/sh -c` (Windows: `powershell -Command`).
     shell_wrap: bool,
     cwd: Option<PathBuf>,
@@ -136,13 +141,16 @@ struct LivePty {
     child: Box<dyn Child + Send + Sync>,
 }
 
-/// Internal teammate metadata for a `transcript` slot. `agent_id` lets
-/// `SubagentStop` locate the slot again; it is not serialized on the wire.
+/// Internal teammate metadata for a teammate slot (transcript or host PTY).
+/// `agent_id` lets `SubagentStop` locate a transcript slot again; it is not
+/// serialized on the wire. `mode` is `"observe"` for transcript slots and
+/// `"host"` for host-teammate PTY slots.
 #[derive(Clone)]
 struct TeammateSlotMeta {
     agent_id: String,
     role: Option<String>,
     lead_id: u32,
+    mode: &'static str,
 }
 
 /// A session slot. The id is stable across restarts; only the contents
@@ -199,8 +207,7 @@ fn session_info(id: u32, slot: &SessionSlot) -> SessionInfo {
         teammate: slot.teammate.as_ref().map(|m| TeammateInfo {
             role: m.role.clone(),
             lead_id: m.lead_id,
-            // Phase 4.1: host and observe both surface as read-only observe.
-            mode: "observe",
+            mode: m.mode,
         }),
     }
 }
@@ -257,7 +264,11 @@ fn command_for_spec(spec: &LaunchSpec, queen_url: Option<&str>) -> CommandBuilde
             c
         }
     } else {
-        CommandBuilder::new(&spec.cmd)
+        let mut c = CommandBuilder::new(&spec.cmd);
+        for arg in &spec.args {
+            c.arg(arg);
+        }
+        c
     };
     cmd.env("TERM", "xterm-256color");
     if let Some(url) = queen_url {
@@ -352,6 +363,7 @@ impl PtyManager {
         let spec = LaunchSpec {
             name: None,
             cmd: cmd.unwrap_or_else(pty::default_shell),
+            args: Vec::new(),
             shell_wrap: false,
             cwd: cwd
                 .map(PathBuf::from)
@@ -410,9 +422,19 @@ impl PtyManager {
             Some(prepared) => (prepared.cwd, Some(prepared.info)),
             None => (config::resolve_cwd(config_dir, def.cwd.as_deref()), None),
         };
+        // Reserve the id up front so a Phase 4.2 host lead can bind its per-lead
+        // socket at teams/run/lead-<id>.sock and inject the matching env before
+        // the PTY is spawned. Opt-in only: nothing runs unless `teams.mode:
+        // host`. All host orchestration lives in teams_host, off this path.
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut env = env;
+        if def.teams.as_ref().is_some_and(|t| t.is_host()) {
+            env.extend(crate::teams_host::setup_lead(&app, id, def, &cwd, &env));
+        }
         let spec = LaunchSpec {
             name: Some(def.name.clone()),
             cmd: command_for_definition(def, logical_resume).to_string(),
+            args: Vec::new(),
             shell_wrap: true,
             cwd: Some(cwd),
             env,
@@ -420,13 +442,14 @@ impl PtyManager {
             worktree,
         };
         let preserved_worktree = spec.worktree.as_ref().map(|info| info.path.clone());
-        self.create_session(app, spec, cols, rows).map_err(|error| {
-            if let Some(path) = preserved_worktree {
-                format!("{error}; locked worktree was kept at {path}")
-            } else {
-                error
-            }
-        })
+        self.create_session_with_id(app, spec, cols, rows, id)
+            .map_err(|error| {
+                if let Some(path) = preserved_worktree {
+                    format!("{error}; locked worktree was kept at {path}")
+                } else {
+                    error
+                }
+            })
     }
 
     fn create_session<R: Runtime>(
@@ -437,6 +460,19 @@ impl PtyManager {
         rows: u16,
     ) -> Result<u32, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.create_session_with_id(app, spec, cols, rows, id)
+    }
+
+    /// Like [`create_session`] but for a caller-reserved id (host leads reserve
+    /// their id before spawn to set up the socket + env).
+    fn create_session_with_id<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        spec: LaunchSpec,
+        cols: u16,
+        rows: u16,
+        id: u32,
+    ) -> Result<u32, String> {
         {
             let mut sessions = self.lock_sessions();
             sessions.insert(
@@ -469,6 +505,12 @@ impl PtyManager {
     }
 
     pub fn write_pty(&self, id: u32, data: String) -> Result<(), String> {
+        self.write_pty_bytes(id, data.as_bytes())
+    }
+
+    /// Raw-bytes stdin write (Phase 4.2 host teammate `write`, whose payload is
+    /// arbitrary decoded key bytes rather than a UTF-8 string).
+    pub fn write_pty_bytes(&self, id: u32, data: &[u8]) -> Result<(), String> {
         // Fix #1: clone the per-session writer handle under the map lock,
         // then DROP the map lock before the blocking write. A stalled PTY
         // input side must not wedge other sessions, and must not deadlock
@@ -485,8 +527,7 @@ impl PtyManager {
             Arc::clone(&live.writer)
         };
         let mut w = lock_writer(&writer);
-        w.write_all(data.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
+        w.write_all(data).map_err(|e| format!("write failed: {e}"))?;
         w.flush().map_err(|e| format!("flush failed: {e}"))?;
         Ok(())
     }
@@ -806,6 +847,7 @@ impl PtyManager {
                     spec: LaunchSpec {
                         name: role.clone(),
                         cmd: "transcript".to_string(),
+                        args: Vec::new(),
                         shell_wrap: false,
                         cwd: None,
                         env: Vec::new(),
@@ -828,6 +870,7 @@ impl PtyManager {
                         agent_id,
                         role,
                         lead_id,
+                        mode: "observe",
                     }),
                 },
             );
@@ -868,6 +911,137 @@ impl PtyManager {
         let id = info.id;
         let _ = app.emit("session-state", &info);
         Some(id)
+    }
+
+    // ---------- host teammate (real PTY) sessions, Phase 4.2 ----------
+
+    /// Spawn a split-window teammate as a real PTY session owned by `lead_id`.
+    /// `argv` is pre-split (argv0 already allowlist-checked by the caller);
+    /// runs with no shell wrap, no autorestart, and carries host teammate meta
+    /// (`mode: "host"`). Returns the new session id (its context id is
+    /// `%<id>`). Uses the same PTY spawn machinery as ordinary sessions.
+    #[allow(clippy::too_many_arguments)] // mirrors the pane-backend spawn shape
+    pub fn spawn_teammate<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        argv: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        lead_id: u32,
+        role: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<u32, String> {
+        if argv.is_empty() {
+            return Err("empty teammate command".to_string());
+        }
+        let cmd = argv[0].clone();
+        let args = argv[1..].to_vec();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut sessions = self.lock_sessions();
+            sessions.insert(
+                id,
+                SessionSlot {
+                    spec: LaunchSpec {
+                        name: role.clone(),
+                        cmd,
+                        args,
+                        shell_wrap: false,
+                        cwd,
+                        env,
+                        autorestart: AutoRestart::Never,
+                        worktree: None,
+                    },
+                    generation: 0,
+                    state: SessionState::Starting,
+                    code: None,
+                    restart_count: 0,
+                    manual_kill: false,
+                    live: None,
+                    cols,
+                    rows,
+                    spawned_at: Instant::now(),
+                    output: Vec::new(),
+                    kind: SessionKind::Pty,
+                    teammate: Some(TeammateSlotMeta {
+                        agent_id: String::new(),
+                        role,
+                        lead_id,
+                        mode: "host",
+                    }),
+                },
+            );
+        }
+        match spawn_into_slot(&app, &self.sessions, &self.generations, id, 0) {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                self.lock_sessions().remove(&id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Live host-teammate PTY session ids owned by `lead_id`, sorted ascending.
+    pub fn host_teammate_ids(&self, lead_id: u32) -> Vec<u32> {
+        let sessions = self.lock_sessions();
+        let mut ids: Vec<u32> = sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.kind == SessionKind::Pty
+                    && s.teammate
+                        .as_ref()
+                        .is_some_and(|m| m.lead_id == lead_id && m.mode == "host")
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Current state of a session, or None when it no longer exists. The host
+    /// socket monitor uses this to detect that a lead has exited so it can tear
+    /// down the per-lead server + socket file.
+    pub fn session_state(&self, id: u32) -> Option<SessionState> {
+        self.lock_sessions().get(&id).map(|slot| slot.state)
+    }
+
+    /// `(id, state, code)` for every host-teammate PTY session of `lead_id`.
+    /// The host socket monitor diffs these across ticks to broadcast
+    /// `context_exited` for teammates that exit or are removed.
+    pub fn host_teammate_states(&self, lead_id: u32) -> Vec<(u32, SessionState, Option<i32>)> {
+        let sessions = self.lock_sessions();
+        let mut v: Vec<(u32, SessionState, Option<i32>)> = sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.kind == SessionKind::Pty
+                    && s.teammate
+                        .as_ref()
+                        .is_some_and(|m| m.lead_id == lead_id && m.mode == "host")
+            })
+            .map(|(id, s)| (*id, s.state, s.code))
+            .collect();
+        v.sort_by_key(|t| t.0);
+        v
+    }
+
+    /// Pane-limit inputs for a host lead's `split-window`: (this lead's live
+    /// host-teammate count, total teammate sessions incl. transcripts, total
+    /// sessions). Cheap snapshot under the lock.
+    pub fn host_limit_inputs(&self, lead_id: u32) -> (usize, usize, usize) {
+        let sessions = self.lock_sessions();
+        let total = sessions.len();
+        let mut per_lead_host = 0usize;
+        let mut total_teammates = 0usize;
+        for slot in sessions.values() {
+            if let Some(meta) = &slot.teammate {
+                total_teammates += 1;
+                if meta.mode == "host" && meta.lead_id == lead_id {
+                    per_lead_host += 1;
+                }
+            }
+        }
+        (per_lead_host, total_teammates, total)
     }
 }
 

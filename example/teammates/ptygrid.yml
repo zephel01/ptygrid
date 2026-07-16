@@ -1,6 +1,7 @@
-# teammates — Claude Code の subagent / teammate をペインで観測（Phase 4.0/4.1）
+# teammates — Claude Code の subagent / teammate をペインで観測/ホスト（Phase 4.0/4.1/4.2）
 # lead の Claude Code が subagent を起動すると、read-only の transcript ペインが
-# 自動で追加される（observe モード）。
+# 自動で追加される（observe モード）。mode: host にすると split-pane teammate を
+# 実 PTY の対話ペインとしてホストできる（Phase 4.2・実験機能・下記コメント参照）。
 #
 # 事前準備（一度だけ）:
 #   1. この設定を読み込むと、ツールバーに Teammates バッジが現れる
@@ -25,9 +26,17 @@ agents:
     autostart: true
     teams:
       enabled: true          # この lead の subagent をペイン化する
-      mode: observe          # observe | host（host は Phase 4.2。4.1 では observe と同挙動）
+      mode: observe          # observe | host
       max_panes: 3           # この lead が生む teammate ペインの上限
       transcript_tail: true  # false にするとペインは作らず通知のみ
+      # Phase 4.2 host（実験機能・既定オフ・Unix 専用）:
+      #   mode: host にすると、split-pane teammate（独立 claude プロセス）を実 PTY の
+      #   対話ペインとしてホストする。tmux 互換シムと per-lead socket、必要な env
+      #   （CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 含む）は ptygrid が自動注入する。
+      #   2 秒以内にシム経由の split-window が来なければ observe へ自動降格する。
+      # mode: host
+      # teammate_binaries: ["claude"]  # PTY 起動を許可する argv0 basename（既定 ["claude"]）
+      # fallback_to_observe: true      # host 未使用時に observe へ降格（既定 true）
 
   # teams ブロックを省略したエージェントは従来どおり（ペイン自動追加なし）
   - name: codex

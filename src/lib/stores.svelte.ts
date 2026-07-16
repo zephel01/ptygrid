@@ -12,9 +12,12 @@ import type {
   SessionResourceUsage,
   SessionInfo,
   TeammateBannerPayload,
+  TeammateFallbackPayload,
+  TeammateFocusPayload,
   TeammateHooksInfo,
   TeammateLifecycleKind,
   TeammateLifecyclePayload,
+  TeamsHostStatus,
   TranscriptOutputPayload,
 } from "./types";
 import { isTauri } from "./tauri";
@@ -50,9 +53,16 @@ export const ui = $state({
   teammateEvents: [] as TeammateEvent[],
   /** Accumulated read-only transcript text keyed by transcript session id. */
   transcripts: {} as Record<number, string>,
+  /** Phase 4.2: latest teams_host_status (host leads + live teammate ids). */
+  teamsHost: null as TeamsHostStatus | null,
+  /** Phase 4.2: session ids briefly highlighted by a teammate-focus event. */
+  focusedTeammates: {} as Record<number, true>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
 });
+
+/** How long a teammate-focus highlight stays on a pane (ms). */
+const FOCUS_PULSE_MS = 1600;
 
 /** Per-transcript rolling text cap (chars); oldest is dropped past this. */
 const TRANSCRIPT_CAP = 256 * 1024;
@@ -100,6 +110,17 @@ export async function refreshTeammateHooks(): Promise<void> {
     ui.teammateHooks = await invoke<TeammateHooksInfo>("teammate_hooks_info");
   } catch {
     ui.teammateHooks = null;
+  }
+}
+
+/** Fetch teams_host_status (Teammates panel open + on teammate-fallback). */
+export async function refreshTeamsHostStatus(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    ui.teamsHost = await invoke<TeamsHostStatus>("teams_host_status");
+  } catch {
+    ui.teamsHost = null;
   }
 }
 
@@ -209,6 +230,24 @@ export async function initGlobalListeners(): Promise<void> {
   await listen<TeammateBannerPayload>("teammate-banner", (event) => {
     // Follows the Phase 2 9-pane banner path (ui.errorBanner).
     ui.errorBanner = event.payload.message;
+  });
+
+  await listen<TeammateFocusPayload>("teammate-focus", (event) => {
+    // tmux select-pane 相当: 該当ペインの枠を短時間ハイライトする。
+    const { id } = event.payload;
+    ui.focusedTeammates[id] = true;
+    setTimeout(() => {
+      delete ui.focusedTeammates[id];
+    }, FOCUS_PULSE_MS);
+  });
+
+  await listen<TeammateFallbackPayload>("teammate-fallback", () => {
+    // host が使われず observe 降格した。toast + host 状態を更新する。
+    addNotice(
+      "teammate を host できませんでした",
+      "ネイティブペインにホストできず、読み取り専用ビューにフォールバックしました。",
+    );
+    void refreshTeamsHostStatus();
   });
 
   await listen<TeammateLifecyclePayload>("teammate-lifecycle", (event) => {

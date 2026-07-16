@@ -50,17 +50,18 @@ export type SessionInfo = {
   worktree?: WorktreeInfo;
   /** Phase 4.1: "pty"（既定）| "transcript"（読み取り専用ペイン） */
   kind?: SessionKind;
-  /** Phase 4.1: transcript セッションにのみ付与される teammate メタ */
+  /** Phase 4.1/4.2: teammate セッション（observe transcript / host PTY）に付与 */
   teammate?: TeammateInfo;
 };
 
 export type SessionKind = "pty" | "transcript";
 
-/** Phase 4.1: transcript ペインの teammate メタ（mode は 4.1 では常に observe） */
+/** teammate メタ。observe=read-only transcript（kind:"transcript"）、
+ * host=実 PTY teammate（kind:"pty"、Phase 4.2）。 */
 export type TeammateInfo = {
   role?: string;
   leadId: number;
-  mode: "observe";
+  mode: "observe" | "host";
 };
 
 export type WorktreeInfo = {
@@ -145,6 +146,25 @@ export type TeammateLifecyclePayload = {
 export type TranscriptOutputPayload = { id: number; text: string };
 /** teammate-banner: ペイン上限超過などのバナー通知 */
 export type TeammateBannerPayload = { message: string };
+
+// Phase 4.2 (host: 実 PTY teammate ペイン)
+/** teammate-focus: tmux select-pane 相当。該当ペインを一時的に強調する */
+export type TeammateFocusPayload = { id: number };
+/** teammate-fallback: host 未使用で observe 降格したときの通知 */
+export type TeammateFallbackPayload = {
+  leadId: number;
+  agentId: string;
+  reason: string;
+};
+/** teams_host_status: 稼働中 host lead ごとの状態と live teammate 一覧 */
+export type TeamsHostStatus = { leads: HostLeadStatus[] };
+export type HostLeadStatus = {
+  id: number;
+  mode: string;
+  fallback: boolean;
+  /** この lead が所有する live host-teammate セッション id */
+  teammates: number[];
+};
 
 // Phase 3.1 (read-only Git status/diff)
 export type GitFileStatus = {

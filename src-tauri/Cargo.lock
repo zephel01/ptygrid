@@ -2607,6 +2607,7 @@ name = "ptygrid"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "fix-path-env",
  "getrandom 0.2.17",
  "notify",
@@ -2619,6 +2620,7 @@ dependencies = [
  "sysinfo",
  "tauri",
  "tauri-build",
+ "teams-backend",
  "tokio",
  "tokio-util",
 ]
@@ -3708,6 +3710,16 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.3+spec-1.1.0",
+]
+
+[[package]]
+name = "teams-backend"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

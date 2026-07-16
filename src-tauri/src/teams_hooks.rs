@@ -293,6 +293,10 @@ struct LeadCandidate {
     cwd: Option<PathBuf>,
     max_panes: u32,
     transcript_tail: bool,
+    /// Phase 4.2: this lead runs the real-PTY host path (`teams.mode: host`).
+    is_host: bool,
+    /// Phase 4.2 host only: downgrade to observe when the shim is never driven.
+    fallback_to_observe: bool,
 }
 
 /// Outcome of the pane-limit / attribution decision for a `SubagentStart`.
@@ -396,6 +400,8 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
             cwd: cwd.as_deref().map(normalize_path),
             max_panes: teams.effective_max_panes(),
             transcript_tail: teams.effective_transcript_tail(),
+            is_host: teams.is_host(),
+            fallback_to_observe: teams.effective_fallback_to_observe(),
         });
     }
 
@@ -405,6 +411,33 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
         .map(|c| normalize_path(Path::new(c)));
     let lead_index = resolve_lead_index(&leads, hook_cwd.as_deref());
     let lead = lead_index.map(|i| &leads[i]);
+
+    // Phase 4.2: for an active host lead, do NOT create a transcript pane now.
+    // A split-window RPC should host the teammate as a real PTY; only fall back
+    // to observe if none arrives within the correlation window (spec 6.3).
+    if let Some(lead) = lead {
+        if lead.is_host
+            && app
+                .try_state::<crate::teams_host::TeamsHostManager>()
+                .is_some_and(|m| m.is_host_lead(lead.id))
+        {
+            let agent_id = payload.agent_id.clone().unwrap_or_default();
+            let role = payload.agent_type.clone();
+            let path = validated_transcript_path(app, payload);
+            if let Some(m) = app.try_state::<crate::teams_host::TeamsHostManager>() {
+                m.note_teammate_hook(lead.id, &agent_id);
+            }
+            crate::teams_host::watch_for_fallback(
+                app.clone(),
+                lead.id,
+                agent_id,
+                role,
+                path,
+                lead.fallback_to_observe,
+            );
+            return;
+        }
+    }
 
     let global_max = cfg
         .teammates
@@ -426,18 +459,7 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
             let lead_id = lead.expect("Create implies a lead").id;
             let agent_id = payload.agent_id.clone().unwrap_or_default();
             let role = payload.agent_type.clone();
-            // Only tail a payload path that passes the $HOME/.claude guard;
-            // otherwise the pane shows status only.
-            let home = app.path().home_dir().ok();
-            let path = payload
-                .transcript_path
-                .as_deref()
-                .map(PathBuf::from)
-                .filter(|p| {
-                    home.as_deref()
-                        .map(|h| crate::transcript::validate_transcript_path(p, h))
-                        .unwrap_or(false)
-                });
+            let path = validated_transcript_path(app, payload);
             manager.create_transcript_session(app.clone(), agent_id, role, lead_id, path);
         }
         PaneDecision::StatusOnly => {
@@ -453,6 +475,25 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
             let _ = app.emit("teammate-banner", serde_json::json!({ "message": message }));
         }
     }
+}
+
+/// The payload's `transcript_path` if and only if it passes the
+/// `$HOME/.claude/` guard; otherwise None (pane shows status only). Shared by
+/// the observe Create path and the host fallback path.
+fn validated_transcript_path<R: Runtime>(
+    app: &AppHandle<R>,
+    payload: &HookPayload,
+) -> Option<PathBuf> {
+    let home = app.path().home_dir().ok();
+    payload
+        .transcript_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| {
+            home.as_deref()
+                .map(|h| crate::transcript::validate_transcript_path(p, h))
+                .unwrap_or(false)
+        })
 }
 
 /// `SubagentStop`: transition the owning transcript session to `stopped`.
@@ -884,6 +925,8 @@ mod tests {
             cwd: cwd.map(PathBuf::from),
             max_panes,
             transcript_tail,
+            is_host: false,
+            fallback_to_observe: true,
         }
     }
 

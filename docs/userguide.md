@@ -369,7 +369,7 @@ agents:
     cwd: "."
     teams:
       enabled: true         # この lead で transcript ペイン化を行う
-      mode: observe         # observe | host(host は Phase 4.2。4.1 では observe と同じ)
+      mode: observe         # observe | host(host は Phase 4.2 で実 PTY 化。下記参照)
       max_panes: 3          # この lead が生む transcript ペインの上限(default 3)
       transcript_tail: true # false なら通知だけでペインは作らない(default true)
 ```
@@ -387,6 +387,57 @@ agents:
   ペインは作らず日本語バナーで通知します。
 - 安全のため、tail するのは `$HOME/.claude/` 配下の絶対パスのみです。それ以外や path 不明の場合は
   ステータス表示のみになります。transcript セッションはセッション復元(resume)の対象外です。
+
+### host: 実 PTY teammate ペイン(Phase 4.2・実験機能・既定オフ)
+
+`mode: host` にすると、Claude Code の split-pane teammate(独立した `claude` プロセス)を
+ptygrid の **ネイティブな対話 PTY ペイン**としてホストします。read-only の observe と違い、
+teammate ペインに直接キー入力でき、resize・スクロールバック・Queen 接続まで通常ペインと
+同等に扱えます。**opt-in の実験機能で、既定はオフ**です。
+
+```yaml
+teammates:
+  enabled: true             # 注: host は per-agent opt-in のためグローバル enabled には依存しません
+agents:
+  - name: claude
+    cmd: claude
+    cwd: "."
+    teams:
+      enabled: true
+      mode: host                 # observe | host。host で実 PTY ホスト
+      max_panes: 3               # この lead の teammate ペイン上限(1..9)
+      teammate_binaries:         # split-window で PTY 起動を許可する argv0 basename(default ["claude"])
+        - claude
+      fallback_to_observe: true  # host 未使用時に observe へ自動降格(default true)
+```
+
+有効化と仕組み:
+
+- 有効化条件は `enabled: true` **かつ** `mode: host` の lead のみです。opt-in が無ければ、env 注入も
+  socket サーバ起動もシム配置も **一切行いません**。host は Unix 専用です(Windows では通常セッション
+  として起動)。
+- lead 起動時、ptygrid が **tmux 互換シムと per-lead の Unix socket サーバを自動配置**し、必要な
+  環境変数(`TMUX` / `TMUX_PANE` / `PTYGRID_TEAMS_SOCK` / `PTYGRID_TEAMS_TOKEN` / `PATH` 先頭へ
+  シム追加)を lead PTY に自動注入します。**`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` も ptygrid が
+  自動注入する**ので、ユーザーが手動で設定する必要はありません。設定は config-as-code が原則で、
+  UI からの一時有効化は行いません。
+- Claude Code が teammate を split-window で起動すると、`claude·team #<id> ▸<役割>` ヘッダーの
+  対話 PTY ペインが増えます。親 lead は `↳#<id>` で併記されます。状態ドットは通常 PTY と同じ
+  running / exited(+ exit code)です。⟳再起動・⤢最大化ができます。
+- teammate ペインの **閉じるは実プロセスの kill(破壊的操作)**なので、確認(「teammate を停止
+  しますか？」)を挟みます。
+- **フォールバック**: teammate 検知から 2 秒以内にシム経由の split-window RPC が来ない場合、
+  Claude Code が in-process にフォールバックした(シムが使われなかった)と判断します。
+  `fallback_to_observe: true` なら自動で observe(read-only transcript ペイン)へ降格し、
+  トーストで通知します。この間 Teammates バッジは「host: フォールバック中」を表示します。
+- **上限超過**: `teams.max_panes` / `teammates.global_max_panes` / グリッド9面のいずれかに達しても、
+  host では teammate セッション自体は生成します(作業を止めない)。ただしグリッドには載せず paneless
+  とし、日本語バナーで通知します。Teammates パネルの一覧から「グリッドへ表示」で昇格できます。
+- **孤立 teammate**: lead が終了すると、その host teammate PTY は孤立しうります。Teammates パネルは
+  「lead 終了済み(孤立 teammate)」として列挙し、「停止」ボタンで掃除できます。
+- teammate spawn は Queen の allowlist(`spawn_agent`)を経由せず、(1) config の opt-in、
+  (2) socket トークンのハンドシェイク、(3) `teammate_binaries`(既定 `["claude"]`)の argv0 basename
+  検証の3段で保護されます。teammate セッションはセッション復元(resume)の対象外です。
 
 ## Queen ツールリファレンス
 

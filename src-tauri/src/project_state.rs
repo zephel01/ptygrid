@@ -47,18 +47,21 @@ struct LastProject {
     config_dir: String,
 }
 
-/// Phase 4.1: read-only transcript (teammate observe) panes are ephemeral and
-/// must never be persisted — they are re-created by the lead on resume, never
-/// as a logical resume target. Given `(pane_id, is_transcript)` pairs, return
-/// the ids that are eligible for persistence. The frontend applies the same
-/// rule before building a `ProjectState`; keeping it here makes the exclusion
-/// invariant unit-testable and documents that `LogicalSession` has no
-/// transcript variant by construction.
+/// Phase 4.1/4.2: teammate panes are ephemeral and must never be persisted —
+/// they are re-created by the lead on resume, never as a logical resume target.
+/// This covers both observe transcript panes (Phase 4.1) and host-teammate PTY
+/// panes (Phase 4.2): the exclusion is keyed on the teammate marker, NOT on the
+/// session kind, so a host teammate (a `pty` session carrying teammate meta) is
+/// excluded too. Given `(pane_id, is_teammate)` pairs, return the ids eligible
+/// for persistence. The frontend applies the same rule (any pane whose
+/// `SessionInfo.teammate` is set) before building a `ProjectState`; keeping it
+/// here makes the exclusion invariant unit-testable and documents that
+/// `LogicalSession` has no teammate variant by construction.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn persistable_pane_ids(panes: &[(u32, bool)]) -> Vec<u32> {
     panes
         .iter()
-        .filter(|(_, is_transcript)| !is_transcript)
+        .filter(|(_, is_teammate)| !is_teammate)
         .map(|(id, _)| *id)
         .collect()
 }
@@ -256,14 +259,15 @@ mod tests {
     }
 
     #[test]
-    fn transcript_panes_are_excluded_from_persistence() {
-        // A mix of pty panes (false) and transcript panes (true): only the
-        // pty panes survive, order preserved.
+    fn teammate_panes_are_excluded_from_persistence() {
+        // A mix of ordinary panes (false) and teammate panes (true) — the
+        // teammate marker covers both observe transcripts and host-teammate
+        // PTYs. Only the ordinary panes survive, order preserved.
         let panes = [(1, false), (2, true), (3, false), (4, true)];
         assert_eq!(persistable_pane_ids(&panes), vec![1, 3]);
-        // All transcript => nothing persisted.
+        // All teammate => nothing persisted.
         assert!(persistable_pane_ids(&[(7, true), (8, true)]).is_empty());
-        // All pty => everything persisted.
+        // All ordinary => everything persisted.
         assert_eq!(persistable_pane_ids(&[(5, false), (6, false)]), vec![5, 6]);
     }
 
