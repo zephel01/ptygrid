@@ -37,6 +37,12 @@
     status?.files.some((file) => hasIndexChange(file)) ?? false,
   );
 
+  // Monotonic generation tokens: after an await we only apply a result if its
+  // request is still the latest one, so a slow earlier request can't overwrite
+  // newer status/diff/error state (BUG-4).
+  let statusGen = 0;
+  let diffGen = 0;
+
   function dirArgs(): { dir?: string } {
     return activeDir ? { dir: activeDir } : {};
   }
@@ -77,11 +83,14 @@
   }
 
   async function refresh(): Promise<void> {
+    const gen = ++statusGen;
     loadingStatus = true;
     error = null;
     operationMessage = null;
     try {
-      status = await invokeCmd<GitStatusInfo>("git_status", dirArgs());
+      const next = await invokeCmd<GitStatusInfo>("git_status", dirArgs());
+      if (gen !== statusGen) return; // superseded by a newer refresh
+      status = next;
       if (
         selectedPath &&
         !status.files.some((file) => file.path === selectedPath)
@@ -93,11 +102,12 @@
       );
       await loadDiff(selectedPath, staged);
     } catch (err) {
+      if (gen !== statusGen) return;
       status = null;
       diff = null;
       error = String(err);
     } finally {
-      loadingStatus = false;
+      if (gen === statusGen) loadingStatus = false;
     }
   }
 
@@ -113,20 +123,24 @@
     path: string | null,
     nextStaged: boolean,
   ): Promise<void> {
+    const gen = ++diffGen;
     loadingDiff = true;
     error = null;
     staged = nextStaged;
     try {
-      diff = await invokeCmd<GitDiffInfo>("git_diff", {
+      const next = await invokeCmd<GitDiffInfo>("git_diff", {
         ...dirArgs(),
         ...(path ? { path } : {}),
         staged: nextStaged,
       });
+      if (gen !== diffGen) return; // a newer diff request superseded this one
+      diff = next;
     } catch (err) {
+      if (gen !== diffGen) return;
       diff = null;
       error = String(err);
     } finally {
-      loadingDiff = false;
+      if (gen === diffGen) loadingDiff = false;
     }
   }
 

@@ -14,6 +14,7 @@
     refreshQueenStatus,
     refreshTeammateHooks,
     refreshTeamsHostStatus,
+    markPaneClosed,
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
@@ -142,6 +143,9 @@
   // an absolutely-positioned dropdown. We compute its viewport coordinates
   // from the badge element when opening.
   let teammatesBadgeEl = $state<HTMLButtonElement | null>(null);
+  // Toolbar element ref: the badge scrolls with the toolbar's overflow-x, so
+  // the open panel must re-anchor on toolbar scroll, not just window resize.
+  let toolbarEl = $state<HTMLDivElement | null>(null);
   let teammatesPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
   let registering = $state(false);
 
@@ -594,9 +598,15 @@
   }
 
   function closePane(id: number): void {
+    // Tombstone the id first so a late session-state event racing the kill
+    // can't resurrect this pane as a zombie (BUG-2).
+    markPaneClosed(id);
     if (isTauri()) {
-      // best-effort; pane close is authoritative on the frontend
-      invokeCmd<void>("kill_pty", { id }).catch(() => {});
+      // pane close is authoritative on the frontend, but a real kill failure
+      // (orphaned process) must be surfaced, not silently swallowed (BUG-5).
+      invokeCmd<void>("kill_pty", { id }).catch((err) => {
+        ui.errorBanner = `ペインの停止に失敗しました (kill_pty #${id}): ${err}`;
+      });
     }
     ui.panes = ui.panes.filter((p) => p !== id);
     if (ui.maximizedId === id) ui.maximizedId = null;
@@ -765,8 +775,14 @@
     ui.layoutMode = restoreLayoutMode(saved.layoutMode);
     const resumedByIndex: Array<number | undefined> = [];
     const errors: string[] = [];
+    let skippedForCap = 0;
     for (const [index, session] of saved.sessions.entries()) {
-      if (ui.panes.length >= MAX_PANES) break;
+      if (ui.panes.length >= MAX_PANES) {
+        // Remaining saved sessions can't be restored past the pane cap; report
+        // the count instead of dropping them silently (BUG-9).
+        skippedForCap = saved.sessions.length - index;
+        break;
+      }
       try {
         const id = await invokeCmd<number>("resume_logical_session", {
           session,
@@ -795,6 +811,11 @@
     if (saved.maximizedIndex !== undefined) {
       ui.maximizedId = resumedByIndex[saved.maximizedIndex] ?? null;
     }
+    if (skippedForCap > 0) {
+      errors.push(
+        `ペイン上限(${MAX_PANES})のため${skippedForCap}件を復元しませんでした`,
+      );
+    }
     if (errors.length > 0) {
       ui.errorBanner = `一部のセッションを復元できませんでした: ${errors.join(" / ")}`;
     }
@@ -805,10 +826,14 @@
   onMount(() => {
     // Keep the fixed-position Teammates panel anchored to its badge when the
     // window is resized while the panel is open.
-    const onResize = () => {
+    const onReposition = () => {
       if (teammatesPanelOpen) positionTeammatesPanel();
     };
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", onReposition);
+    // Toolbar overflow-x:auto scrolls the anchor badge; keep the fixed panel
+    // aligned to it while it is open (BUG-7).
+    const toolbar = toolbarEl;
+    toolbar?.addEventListener("scroll", onReposition);
 
     (async () => {
       if (!isTauri()) {
@@ -853,13 +878,14 @@
     })();
 
     return () => {
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", onReposition);
+      toolbar?.removeEventListener("scroll", onReposition);
     };
   });
 </script>
 
 <main>
-  <div class="toolbar">
+  <div class="toolbar" bind:this={toolbarEl}>
     <span class="title">ptygrid</span>
 
     <div class="tb-group">

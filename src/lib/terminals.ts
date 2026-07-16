@@ -30,6 +30,10 @@ export type TermHandle = {
 
 const handles = new Map<number, TermHandle>();
 const pending = new Map<number, Promise<TermHandle>>();
+// Ids whose TermHandle creation is still in flight but which were disposed
+// before the creation resolved. The resolved handle must be disposed (not
+// registered), otherwise a closed pane's xterm + pty-output listener leak.
+const canceledPending = new Set<number>();
 
 export function getTermHandle(id: number): TermHandle | undefined {
   return handles.get(id);
@@ -41,7 +45,14 @@ export function writeToTerm(id: number, data: string): void {
 }
 
 export function disposeTermHandle(id: number): void {
-  handles.get(id)?.dispose();
+  const existing = handles.get(id);
+  if (existing) {
+    existing.dispose(); // dispose() removes it from `handles`
+  } else if (pending.has(id)) {
+    // Creation still in flight: flag it so the resolved handle is disposed
+    // instead of registered (prevents a resurrected leak — see BUG-1).
+    canceledPending.add(id);
+  }
   pending.delete(id);
 }
 
@@ -51,8 +62,15 @@ export async function ensureTermHandle(id: number): Promise<TermHandle> {
   const inFlight = pending.get(id);
   if (inFlight) return inFlight;
   const creation = createTermHandle(id).then((handle) => {
-    handles.set(id, handle);
     pending.delete(id);
+    // If the pane was closed while this creation was in flight, dispose the
+    // freshly built handle instead of registering it.
+    if (canceledPending.has(id)) {
+      canceledPending.delete(id);
+      handle.dispose();
+      return handle;
+    }
+    handles.set(id, handle);
     return handle;
   });
   pending.set(id, creation);

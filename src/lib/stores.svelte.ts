@@ -64,6 +64,9 @@ export const ui = $state({
 /** How long a teammate-focus highlight stays on a pane (ms). */
 const FOCUS_PULSE_MS = 1600;
 
+/** Active teammate-focus fade-out timers, keyed by session id (BUG-6). */
+const focusTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
 /** Per-transcript rolling text cap (chars); oldest is dropped past this. */
 const TRANSCRIPT_CAP = 256 * 1024;
 
@@ -77,6 +80,31 @@ const MAX_TEAMMATE_EVENTS = 10;
 let nextTeammateKey = 0;
 
 export const MAX_PANES = 9;
+
+/**
+ * Ids of panes the user just closed. A late `session-state` (running /
+ * restarting) event that arrives after we removed the pane locally but before
+ * the backend kill lands must NOT resurrect it as a zombie pane (BUG-2). The
+ * tombstone is short-lived so a genuinely new session reusing the id later is
+ * still tracked normally.
+ */
+const closedTombstones = new Map<number, number>(); // id -> expiry epoch ms
+const TOMBSTONE_TTL_MS = 5000;
+
+/** Register a just-closed pane id so late session-state events are ignored. */
+export function markPaneClosed(id: number): void {
+  closedTombstones.set(id, Date.now() + TOMBSTONE_TTL_MS);
+}
+
+function isTombstoned(id: number): boolean {
+  const expiry = closedTombstones.get(id);
+  if (expiry === undefined) return false;
+  if (Date.now() > expiry) {
+    closedTombstones.delete(id);
+    return false;
+  }
+  return true;
+}
 
 const NOTICE_TTL_MS = 5000;
 let nextNoticeKey = 0;
@@ -174,6 +202,11 @@ export async function initGlobalListeners(): Promise<void> {
     // entry + pane): ignore instead of resurrecting an orphan entry.
     if (payload.state === "exited") return;
 
+    // Recently closed by the user: a delayed running/restarting event (kill
+    // not yet reflected, or a restart racing a close) must not resurrect the
+    // pane as a zombie (BUG-2). The tombstone expires after a short window.
+    if (isTombstoned(payload.id)) return;
+
     // Unknown live session => spawned outside the UI (Queen's spawn_agent
     // MCP tool). Track it and auto-open a pane.
     ui.sessions[payload.id] = payload;
@@ -198,14 +231,20 @@ export async function initGlobalListeners(): Promise<void> {
 
   await listen<PtyExitPayload>("pty-exit", (event) => {
     const session = ui.sessions[event.payload.id];
-    if (session && session.state !== "restarting") {
+    delete ui.resources[event.payload.id];
+    // Already known to be restarting: this is an intentional restart cycle, so
+    // suppress the exit banner entirely (avoids duplicate/misleading output).
+    if (session && session.state === "restarting") return;
+    if (session) {
       session.state = "exited";
       session.code = event.payload.code;
     }
-    delete ui.resources[event.payload.id];
+    // Muted grey divider rather than an alarming red "[process exited]"
+    // banner: autorestart emits pty-exit before session-state(restarting)
+    // arrives, so a red banner falsely reads as a crash every restart (BUG-3).
     writeToTerm(
       event.payload.id,
-      `\r\n\x1b[1;31m[process exited with code ${event.payload.code ?? "unknown"}]\x1b[0m\r\n`,
+      `\r\n\x1b[2m— exited (code ${event.payload.code ?? "unknown"}) —\x1b[0m\r\n`,
     );
   });
 
@@ -236,9 +275,15 @@ export async function initGlobalListeners(): Promise<void> {
     // tmux select-pane 相当: 該当ペインの枠を短時間ハイライトする。
     const { id } = event.payload;
     ui.focusedTeammates[id] = true;
-    setTimeout(() => {
+    // Keep one timer per id and reset it on each focus so a rapid re-focus (or
+    // a reused id after a close) can't clear the wrong/newer highlight (BUG-6).
+    const prev = focusTimers.get(id);
+    if (prev !== undefined) clearTimeout(prev);
+    const timer = setTimeout(() => {
       delete ui.focusedTeammates[id];
+      focusTimers.delete(id);
     }, FOCUS_PULSE_MS);
+    focusTimers.set(id, timer);
   });
 
   await listen<TeammateFallbackPayload>("teammate-fallback", () => {
