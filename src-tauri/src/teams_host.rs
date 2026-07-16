@@ -1090,11 +1090,16 @@ mod tests {
         let (_app, host) = mock_host(&["cat"]);
         let host_arc: Arc<dyn PaneHost> = Arc::new(host);
 
-        let sock = std::env::temp_dir().join(format!(
-            "ptygrid-hostsock-{}-{}.sock",
+        // Put the socket inside a dedicated sub-directory, not directly under
+        // the shared temp dir: bind_socket() chmods the socket's parent to
+        // 0700, and a CI runner can't chmod a shared /tmp it doesn't own
+        // (EPERM). The parent must be a dir we created ourselves.
+        let sock_dir = std::env::temp_dir().join(format!(
+            "ptygrid-hostsock-{}-{}",
             std::process::id(),
             now_ms()
         ));
+        let sock = sock_dir.join("host.sock");
         let listener = bind_socket(&sock).unwrap();
         let cfg = ServerConfig {
             auth_token: Some("tok".into()),
@@ -1141,6 +1146,6 @@ mod tests {
         assert!(out.contains("beep-7"), "captured: {out:?}");
 
         server.abort();
-        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&sock_dir);
     }
 }
