@@ -1,0 +1,124 @@
+# ptygrid 作業計画 (plan.md)
+
+更新日: 2026-07-16 / 実装基準: Phase 4.1 + UXトラック完了時点
+
+この文書は「いま何が終わっていて、次に何をやるか」と「バージョンの付け方」を
+1か所にまとめる作業計画である。Phase 3.x の詳細な実績とリリース規律は
+[phase3.md](phase3.md)、teams 機能の設計は
+[spec-claude-teams-panes.md](spec-claude-teams-panes.md)、方向性の背景は
+[competitive-landscape.md](competitive-landscape.md) を参照。
+
+---
+
+## 1. 現在地サマリ
+
+### 完了済み
+
+| Phase | 内容 | 状態 |
+|---|---|---|
+| 0 | 単一 PTY ペイン | ✅ |
+| 1 | マルチペイン + config-as-code（現 `ptygrid.yml`）、autostart/restart | ✅ |
+| 2〜2.1 | Queen（内蔵 MCP サーバー、基本5 tools）+ ドッグフーディング反映 | ✅ |
+| 3.0〜3.8 | Git status/diff/stage/commit、opt-in worktree 分離、logical resume、リソース監視、Queen pins/notes/inbox/reply/await（18 tools） | ✅ |
+| 3.9 | Linux テスト対応（PATH 復元、Ubuntu CI、`.deb`/AppImage） | ✅ |
+| 4.0 | teammate hooks 受信基盤（`/hooks/v1/*`、token 認可、toast、Teammates バッジ、`teammates:` ブロック、settings.json 半自動登録） | ✅ |
+| 4.1 | observe: `transcript` ペイン種別（PTY なし論理セッション）、SubagentStart で read-only tail 自動生成、`agents[].teams`、上限/9面/path 検証 | ✅ |
+
+### Phase 4 計画外で入った UX トラック（コミット済み）
+
+| 内容 | コミット |
+|---|---|
+| 設定ファイル名を `ptygrid.yml` へ変更（`mterm.yml` は作業フォルダ内のみ互換） | da40cb0 |
+| 用途別サンプル `example/{basic,multi-agent,web-dev,worktree,teammates}` | da40cb0 |
+| 一括cd（ツールバー → のちに読み込みへ統合） | cf42ced, 77d0271 |
+| プロジェクト欄を作業フォルダ化、設定探索を 作業→起動→`~/.ptygrid` に分離、origin バッジ | acbed94 |
+| 設定なしフォールバック（既定設定で開く）+ 読み込み = シェルペイン一括cd | 0530e3b |
+| cd…ボタン撤去、作業フォルダ入力のフォルダサジェスト（projects root 自動記憶） | a3a769a |
+
+### 実装済みだが未配線の基盤
+
+- `src-tauri/teams-backend/`: CustomPaneBackend 提案（anthropics/claude-code#26572）
+  準拠の JSON-RPC 2.0 ソケットサーバ + `ptygrid-tmux-shim`。Phase 4.2 の土台。
+  テスト30件・app 本体からは未使用。
+
+---
+
+## 2. 次の作業（優先順）
+
+### Phase 4.2 — host モード（tmux シムによる実 PTY teammate ペイン）【実験・既定オフ】
+
+仕様は spec-claude-teams-panes.md 6.2/6.3 章。基盤 crate は済みのため、残りは配線。
+
+| # | 作業 | 備考 |
+|---|---|---|
+| 1 | session manager での `PaneHost` 実装（spawn=既存PTY基盤 / write / capture=read_output再構成 / kill / focus / exit通知） | teams-backend の trait に適合 |
+| 2 | host lead 起動時の環境注入（`PTYGRID_TEAMS_SOCK/TOKEN`、`TMUX`/`TMUX_PANE`、`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`、shim の PATH 先頭注入、app-data への shim 配置） | `teams.mode: host` の opt-in 時のみ |
+| 3 | teammate binary allowlist（`teams.teammate_binaries`、既定 `[claude]`）の強制 | spawn_denied (-32001) |
+| 4 | フォールバック検知: hook で teammate 検知後 2 秒以内に `split-window` RPC が来なければ observe へ自動降格 + 通知 | cmux #6447 型の破損対策 |
+| 5 | 9面/max_panes 超過時の paneless 継続、lead 終了時の孤立 teammate 掃除確認 UI | |
+| 6 | Claude Code 実機での手動検証（spec 10.3 の手順） | macOS 必須、Linux はベストエフォート |
+
+Completion gate: 互換 Claude Code で teammate がネイティブ対話ペイン化 /
+シム未使用時は observe へ降格+通知 / opt-in なしでは一切起動しない / allowlist 強制。
+
+### Phase 4.3 — Queen team preset（方式C、Claude Code 内部に非依存）
+
+- `ptygrid.yml` の team preset（複数 agent の一括起動 ergonomics）を検討し、
+  既存 `spawn_agent` 逐次呼び出しに対する投資対効果を判断してから実装する
+  （spec 11 章の未解決事項）。
+
+### 継続ウォッチ / バックログ
+
+- **anthropics/claude-code#26572**（CustomPaneBackend 公式化）: 採用されたら
+  シム撤去 + `CLAUDE_PANE_BACKEND_SOCKET` 広告へ移行（teams-backend はそのまま使える）
+- 通知リング / 要承認ハイライト（competitive-landscape の「次に取る UX」。
+  4.0 の teammate permission 表示を汎用化）
+- hook token の固定化オプション（起動ごと再生成による settings.json 更新摩擦の解消）
+- Linux 実機検証の継続、Windows 移植（[porting.md](porting.md)）
+- License 決定（公開前に必須）
+
+---
+
+## 3. バージョニング規約
+
+現状の `version` は 3 ファイルとも `0.1.0` のまま実態とズレているため、次の規約で運用する。
+
+### 規約（SemVer 0.y.z、1.0 まで）
+
+- **y（minor）= Phase 番号**。Phase 4 系の間は `0.4.z`、Phase 5 系に入ったら `0.5.0` から。
+  過去に当てはめると Phase 3.9 時点 ≒ `0.3.9` 相当（遡及タグは付けない）。
+- **z（patch）= その Phase 内のリリース連番**。機能追加・修正の区別はしない
+  （pre-1.0 の SemVer では minor が破壊的変更の単位のため、これで矛盾しない）。
+- **破壊的変更**（config スキーマ・IPC/MCP 契約・保存データ）は pre-1.0 でも
+  「CONTRACT.md への契約追記 + 互換パス（例: mterm.yml フォールバック）」を必須とし、
+  やむを得ず互換を切る場合は y を上げて README に移行手順を書く。
+- **1.0.0 の条件**: License 決定、macOS 安定 + Linux beta 卒業、teams host（4.2）の
+  実機安定、config スキーマ凍結。
+
+### 直近のバージョン割り当て
+
+| バージョン | 内容 |
+|---|---|
+| **v0.4.0** | Phase 4.0（hooks 受信基盤）〜 Phase 4.1（observe）+ UXトラック一式 = **現時点の main。次のタグはこれ** |
+| v0.4.1 | Phase 4.2（host モード実験） |
+| v0.4.2 | Phase 4.3（Queen team preset）または 4.2 の修正 |
+| v0.5.0 | Phase 5 系の最初のリリース（スコープは 4.3 完了時に決定） |
+
+### リリース手順（タグ付けの作法）
+
+1. `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の
+   `version` を一致させて更新（`Cargo.lock` は `cargo check` で追従）
+2. 全チェック（`cargo test` / `clippy` / `npm run check` / `npm run build`）通過を確認
+3. `git tag -a vX.Y.Z -m "<リリース概要>"` → push（annotated タグのみ。軽量タグは使わない）
+4. 変更履歴は当面 CHANGELOG.md を作らず「タグメッセージ + `git log` + 本文書の表」で代替。
+   公開（License 決定）のタイミングで CHANGELOG.md 化を再検討
+5. 将来課題: 3 ファイルの version 同期を `scripts/` の bump スクリプトにする（未着手）
+
+---
+
+## 4. 運用メモ
+
+- 各リリースは phase3.md の規律を踏襲する: CONTRACT 先行追記、`lib.rs`/hot path に
+  新ロジックを置かない、unit + integration テスト、両プラットフォーム CI 通過、
+  該当挙動のみ userguide 更新。
+- 本文書は Phase の完了・計画変更のたびに「現在地サマリ」と「次の作業」を更新する。
