@@ -1,6 +1,6 @@
 # ptygrid 設計・アーキテクチャ
 
-更新日: 2026-07-16 / 実装基準: Phase 3.8
+更新日: 2026-07-16 / 実装基準: Phase 3.9
 
 この文書は現在の実装構造と、変更時に守る設計判断をまとめます。初期調査と競合上の
 位置づけは[competitive-landscape.md](competitive-landscape.md)、IPCの正確な型と制限は
@@ -10,6 +10,7 @@
 
 ptygridは、複数のAI CLIや開発processを最大9個のPTYペインで並行実行し、内蔵MCP
 server Queenを通して相互に読み書き・協調させるmacOS向けdesktop applicationです。
+Linuxにも同じruntime経路を実装していますが、Phase 3.9時点ではテスト対応（beta）です。
 
 設計上の中心は次の4点です。
 
@@ -60,6 +61,7 @@ SQLite処理を混在させません。
 | Git | installed `git` executable | native hooks、signing、config、worktree semanticsを維持 |
 | process monitor | sysinfo | 1 samplerで全session process treeを集計 |
 | Queen storage | rusqlite + bundled SQLite | transaction、schema version、project分離 |
+| GUI PATH recovery | fix-path-env-rs | Linux/macOSのdesktop起動でもuser導入CLIを解決 |
 
 Gitに`git2`は使用しません。command文字列をshellへ渡さず、構造化した引数でinstalled
 `git`を起動します。これによりuserのGit hooksと署名設定を通常のGitと同じように扱います。
@@ -169,7 +171,8 @@ CPUは1 coreを100%とするためmulti-core workloadは100%を超えます。me
 
 ## 10. Release status
 
-Phase 0〜2.1とPhase 3.0〜3.8は実装済みです。Phase 3の全段階releaseは完了しました。
+Phase 0〜2.1とPhase 3.0〜3.9は実装済みです。3.9でLinuxテスト対応としてnative build、
+Ubuntu CI、`.deb` / AppImage packaging、GUI起動時のPATH復元を追加しました。
 詳細なgateは[phase3.md](phase3.md)を参照してください。
 
 ## 11. 変更時の原則
@@ -179,4 +182,4 @@ Phase 0〜2.1とPhase 3.0〜3.8は実装済みです。Phase 3の全段階releas
 - destructive Git/worktree操作を推測で行わない
 - 同名sessionやstale revisionを自動選択・自動上書きしない
 - backendは`cargo test` / `cargo check`、frontendは`svelte-check` / production buildを通す
-- macOS以外は未検証として扱い、platform固有process取得をfallback可能に保つ
+- macOS / Linux betaのCIを維持し、platform固有process取得をfallback可能に保つ

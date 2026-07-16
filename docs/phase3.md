@@ -1,6 +1,6 @@
 # Phase 3 staged delivery plan
 
-Last updated: 2026-07-16. Releases 3.0 through 3.8 are complete.
+Last updated: 2026-07-16. Releases 3.0 through 3.9 are complete.
 
 Phase 3 is delivered as a sequence of independently releasable changes. Each
 release must preserve the Phase 0–2.1 IPC contract unless its own contract
@@ -19,6 +19,7 @@ section explicitly extends it, and must pass both Rust and frontend checks.
 | 3.6 ✅ | Durable Queen pins and notes | Project-scoped transactional storage and CRUD tools |
 | 3.7 ✅ | Durable Queen inbox and reply | Stable message IDs, acknowledgement, and reply correlation |
 | 3.8 ✅ | Cancellable Queen `await` | Cursor-based wait, bounded timeout, MCP cancellation support |
+| 3.9 ✅ | Linux desktop beta support | Login-shell PATH recovery, Ubuntu native-build CI, `.deb` and AppImage bundles; real-machine validation continues |
 
 ## Fixed design decisions
 

@@ -33,8 +33,34 @@ ptygrid のインストールから、`mterm.yml` の書き方、Queen(内蔵 MC
 
 - Rust(rustup でインストール)
 - Node.js 20+
-- Xcode Command Line Tools(macOS)
 - Git
+- macOS: Xcode Command Line Tools
+- Linux: WebKitGTK 4.1などのTauri system dependencies
+
+### Linux（Ubuntu / Debian・テスト対応）
+
+Ubuntu 22.04またはDebian 12以降を基準にしています。開発・build用依存を導入します:
+
+> Linux版はPhase 3.9時点でテスト対応（beta）です。build・package生成はCIで検証していますが、
+> desktop環境やdistributionごとの安定動作は実機検証を継続しています。
+
+```bash
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+通常の開発起動はmacOSと同じです。Linux packageを作る場合は次を実行します:
+
+```bash
+npm install
+npm run tauri dev
+npm run bundle:linux   # .deb + AppImage
+```
+
+成果物は`src-tauri/target/release/bundle/deb/`と`appimage/`へ出力されます。
+デスクトップランチャーから起動した場合も、起動時にlogin shell由来の`PATH`を復元するため、
+ユーザーが導入したClaude Code / Codex / Grok / GitをPTYから起動できます。
 
 ```bash
 git clone https://github.com/zephel01/ptygrid.git

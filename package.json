@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "bundle:linux": "tauri build --bundles deb,appimage",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {

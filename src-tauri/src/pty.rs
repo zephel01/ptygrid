@@ -114,3 +114,16 @@ pub fn home_dir() -> Option<String> {
         std::env::var("HOME").ok().filter(|s| !s.is_empty())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_resolves_current_process_from_proc() {
+        let name = process_name(std::process::id() as i32)
+            .expect("the current test process must exist in /proc");
+        assert!(!name.trim().is_empty());
+        assert!(!name.contains('/'));
+    }
+}

@@ -32,6 +32,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 tokio-util = "0.7"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Tauri's recommended fix for GUI launches not inheriting the user's shell PATH
+# on Linux/macOS (also covers Windows PATH inheritance edge cases).
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", rev = "c4c45d503ea115a839aae718d02f79e7c7f0f673" }
 
 [dev-dependencies]
 # Enables tauri::test::mock_app() (MockRuntime) for session state-machine tests.
