@@ -7,11 +7,15 @@
 export type ConfigOrigin = "project" | "launch" | "global" | "default";
 
 /** path=実際に読んだ設定ファイル、dir=作業フォルダ（プロジェクト境界）、
- * origin=path の由来。 */
+ * origin=path の由来。
+ * trusted=自動コマンド実行（autostart / worktree.setup）を許可してよいか
+ * （Finding S2）。global/default は常に true、project/launch は該当フォルダが
+ * 信頼済み集合にある場合のみ true。false でも load 自体は成功する。 */
 export type ConfigInfo = {
   path: string;
   dir: string;
   origin: ConfigOrigin;
+  trusted: boolean;
   config: Config;
 };
 

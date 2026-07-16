@@ -12,6 +12,7 @@ mod session;
 mod teams_hooks;
 mod teams_host;
 mod transcript;
+mod trust;
 mod worktree;
 
 pub use config::capture_launch_dir;
@@ -61,6 +62,8 @@ pub fn run() {
             commands::resize_pty,
             commands::kill_pty,
             commands::load_config,
+            commands::trust_working_folder,
+            commands::is_working_folder_trusted,
             commands::spawn_agent,
             commands::restart_session,
             commands::list_sessions,

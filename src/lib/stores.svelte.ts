@@ -45,6 +45,9 @@ export const ui = $state({
   errorBanner: null as string | null,
   /** Path from the last `config-changed` event (shows the reload toast). */
   configChangedPath: null as string | null,
+  /** Untrusted (project/launch) config awaiting a "trust this folder" decision
+   * before its autostart commands may run (Finding S2). null when none pending. */
+  trustPrompt: null as ConfigInfo | null,
   /** Queen MCP server status (null until first queen_status fetch). */
   queenStatus: null as QueenStatus | null,
   /** Teammate hooks info (null until first teammate_hooks_info fetch). */

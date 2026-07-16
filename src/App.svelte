@@ -487,6 +487,60 @@
     }
   }
 
+  // Spawn every `autostart: true` agent/process of a loaded config, in order,
+  // up to the pane cap. Callers must have already cleared the trust gate.
+  async function runAutostart(info: ConfigInfo): Promise<void> {
+    const autostarts = [...info.config.agents, ...info.config.processes].filter(
+      (d) => d.autostart,
+    );
+    for (const def of autostarts) {
+      if (ui.panes.length >= MAX_PANES) break;
+      await spawnAgent(def.name);
+    }
+  }
+
+  // Finding S2 trust gate: a project/launch config from an untrusted folder may
+  // define attacker-controlled `cmd`/`worktree.setup` (and leak host env via
+  // `${VAR}`), so its autostart commands are NOT run automatically. Instead we
+  // surface a one-time "trust this folder?" prompt; global/default configs are
+  // trusted implicitly and autostart immediately. Manual agent-chip launches and
+  // viewing the config are never blocked — only this automatic loop is gated.
+  async function maybeAutostart(info: ConfigInfo): Promise<void> {
+    if (info.trusted) {
+      await runAutostart(info);
+      return;
+    }
+    const hasAutostart = [...info.config.agents, ...info.config.processes].some(
+      (d) => d.autostart,
+    );
+    // Only bother the user when there is actually something that would autostart.
+    if (hasAutostart) ui.trustPrompt = info;
+  }
+
+  // User accepted the trust prompt: persist the folder as trusted, then run the
+  // autostart loop that was withheld. Subsequent loads of this folder report
+  // `trusted: true` and skip the prompt.
+  async function onTrustFolder(): Promise<void> {
+    const info = ui.trustPrompt;
+    if (!info) return;
+    if (!isTauri()) {
+      ui.trustPrompt = null;
+      return;
+    }
+    try {
+      await invokeCmd<{ trusted: boolean }>("trust_working_folder", {
+        dir: info.dir,
+      });
+      ui.trustPrompt = null;
+      if (ui.configInfo && ui.configInfo.dir === info.dir) {
+        ui.configInfo = { ...ui.configInfo, trusted: true };
+      }
+      await runAutostart(info);
+    } catch (err) {
+      ui.errorBanner = `フォルダの信頼設定に失敗しました (trust_working_folder): ${err}`;
+    }
+  }
+
   // 設定ファイルの由来を短い日本語ラベルにする（origin バッジ・成功トースト用）。
   function originLabel(origin: ConfigInfo["origin"]): string {
     switch (origin) {
@@ -516,6 +570,8 @@
       });
       ui.configInfo = info;
       ui.configChangedPath = null;
+      // Drop any stale trust prompt; maybeAutostart re-raises it if still needed.
+      ui.trustPrompt = null;
       // Queen may have been restarted if the port changed in ptygrid.yml.
       void refreshQueenStatus();
       // teammates.enabled / hook_notifications may have changed too.
@@ -866,14 +922,7 @@
       try {
         if (!restored) {
           const info = await loadConfig();
-          const autostarts = [
-            ...info.config.agents,
-            ...info.config.processes,
-          ].filter((d) => d.autostart);
-          for (const def of autostarts) {
-            if (ui.panes.length >= MAX_PANES) break;
-            await spawnAgent(def.name);
-          }
+          await maybeAutostart(info);
         }
       } catch (err) {
         const msg = String(err);
@@ -1436,6 +1485,28 @@
       </button>
     </div>
   {/if}
+
+  {#if ui.trustPrompt}
+    <div class="toast trust-toast" role="alertdialog" aria-label="フォルダの信頼確認">
+      <span class="toast-text">
+        このフォルダ（{ui.trustPrompt.dir}）の設定は未確認です。定義されたコマンドを自動起動しますか？
+      </span>
+      <button
+        class="btn btn-small"
+        onclick={onTrustFolder}
+        title="このフォルダを信頼し、autostart 対象を起動します"
+      >
+        信頼して起動
+      </button>
+      <button
+        class="btn btn-small"
+        onclick={() => (ui.trustPrompt = null)}
+        title="起動せずに閉じる（エージェントチップから手動起動は可能）"
+      >
+        後で
+      </button>
+    </div>
+  {/if}
 </main>
 
 <style>
@@ -1918,6 +1989,15 @@
 
   .toast-text {
     color: #e5c07b;
+  }
+
+  /* Trust prompt: warn-tinted variant, wider to fit the folder path + question. */
+  .trust-toast {
+    border-color: #b5893a;
+    max-width: 520px;
+  }
+  .trust-toast .toast-text {
+    color: #e0a94f;
   }
 
   /* ---- grid ---- */

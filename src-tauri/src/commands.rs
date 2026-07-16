@@ -71,6 +71,25 @@ pub fn load_config(
     Ok(info)
 }
 
+/// Trust a working folder for autostart / `worktree.setup` (security Finding
+/// S2). After this, a `project`/`launch`-origin config loaded from `dir` reports
+/// `trusted: true` and the frontend runs its autostart loop. `~` is expanded and
+/// the path canonicalized before storage. Idempotent.
+#[tauri::command]
+pub fn trust_working_folder(app: AppHandle, dir: String) -> Result<crate::trust::TrustInfo, String> {
+    crate::trust::add_trusted(&app, &dir)
+}
+
+/// Report whether a working folder is in the trusted set (folder-level, origin
+/// agnostic). Optional companion to `trust_working_folder`.
+#[tauri::command]
+pub fn is_working_folder_trusted(
+    app: AppHandle,
+    dir: String,
+) -> Result<crate::trust::TrustInfo, String> {
+    crate::trust::check_trusted(&app, &dir)
+}
+
 /// Return the built-in Queen MCP server status.
 #[tauri::command]
 pub fn queen_status(status: State<'_, QueenStatus>) -> Result<QueenStatusInfo, String> {

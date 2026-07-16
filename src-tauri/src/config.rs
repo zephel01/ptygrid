@@ -270,11 +270,20 @@ pub enum ConfigOrigin {
 /// folder** (the project boundary — cwd/Queen/Git/project-state base), which is
 /// independent of where the config file lives; `origin` names which of the
 /// three search locations `path` came from.
+///
+/// `trusted` (security Finding S2, additive) reports whether this config may be
+/// used to *automatically* run commands (autostart / `worktree.setup`). It is
+/// always true for `origin` `Global` (`~/.ptygrid`) and `Default` (the built-in
+/// config); for `Project`/`Launch` it is true only when the working folder has
+/// been explicitly trusted (see [`crate::trust`]). Loading always succeeds; the
+/// frontend uses this flag to gate the autostart loop, not to block viewing the
+/// config or manual, user-initiated launches.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigInfo {
     pub path: String,
     pub dir: String,
     pub origin: ConfigOrigin,
+    pub trusted: bool,
     pub config: Config,
 }
 
@@ -459,6 +468,11 @@ impl ConfigManager {
         // and ends its throttle thread via channel disconnect).
         let watch_dir = path.parent().unwrap_or(dir_path.as_path()).to_path_buf();
         let watcher = start_watcher(app.clone(), &watch_dir, &path)?;
+        // Security Finding S2: is this config trusted for autostart /
+        // worktree.setup? Global/Default are always trusted; project/launch
+        // require an explicit trust decision for the working folder. Loading
+        // itself is never blocked — only the frontend autostart loop is gated.
+        let trusted = crate::trust::is_trusted(app, origin, &dir_path);
         let dir = dir_path.display().to_string();
         inner.dir = Some(dir_path);
         inner.config = Some(config.clone());
@@ -468,6 +482,7 @@ impl ConfigManager {
             path: path.display().to_string(),
             dir,
             origin,
+            trusted,
             config,
         })
     }

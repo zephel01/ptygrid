@@ -1168,3 +1168,86 @@ type ConfigInfo = { path: string; dir: string; origin: ConfigOrigin; config: Con
   （例:「作業フォルダ: ~/works/notemake（設定: 既定） / 2ペインに cd を送信」）。
   **起動時の自動loadでは cd を送信しない**（`allow_default`も付けない）。
 - 既存のReload / config-changed挙動は不変。
+
+---
+
+# Security 追加契約 (config trust 境界 / CSP)
+
+両エージェントはこの契約に**厳密に**従うこと。既存のコマンド/イベント/`ConfigInfo`は
+互換維持（本節はいずれも additive）。背景は
+[docs/inside/security-review-2026-07-16.md](docs/inside/security-review-2026-07-16.md)
+Finding 2（S2）/ Finding 4（S4）。
+
+## config trust 境界（S2）
+
+repo 同梱の `ptygrid.yml`（`origin: "project" / "launch"`）は `cmd` / `resume` /
+`worktree.setup` を定義でき、これらはコマンド自動実行に繋がる（`${VAR}` 展開で host
+環境変数の持ち出しも可能）。悪意あるリポジトリを `cd` して読み込んだだけで発火するのを
+防ぐため、**自動コマンド実行を「信頼済みフォルダ」ゲートの配下**に置く。
+
+### 信頼状態の永続化
+
+- 信頼済み作業フォルダの**正規化済み絶対パス集合**を Tauri app-data 直下の
+  `trusted-folders.json` に保存する（`app-settings.json` と同階層・同流儀）。
+
+  ```json
+  { "version": 1, "folders": ["/home/user/works/project"] }
+  ```
+
+- `app_settings` と同じ on-disk 規律: version 付き JSON、未知の version は開かず拒否、
+  書き込みは atomic（temp + rename）。
+- パスは保存・比較の前に `canonicalize`（`~` 展開＋symlink/`.`/`..` 解決）する。
+  symlink 経由でのゲート回避を防ぐため。
+
+### origin ごとの信頼扱い
+
+- `origin: "global"`（`~/.ptygrid`）と `origin: "default"`（組み込み既定）は
+  **常に信頼済み**扱い（ユーザー自身のグローバル設定）。
+- `origin: "project" / "launch"` は、その作業フォルダが信頼集合に**在るときのみ**信頼済み。
+
+### `ConfigInfo.trusted`（additive）
+
+```ts
+type ConfigInfo = {
+  path: string; dir: string; origin: ConfigOrigin;
+  trusted: boolean; config: Config;
+};
+```
+
+- `trusted` = この config を**自動コマンド実行に使ってよいか**。上記 origin ルールで決まる。
+- **`load_config` 自体は `trusted` の値に関わらず成功する**（設定の閲覧・ペイン表示・
+  エージェントチップからの手動起動は常に可能）。`trusted` は frontend のゲート判定用。
+
+### 新コマンド
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `trust_working_folder` | `{ dir: string }` | `{ trusted: boolean }` | `dir`（`~`展開＋canonicalize）を信頼集合へ追加（冪等）。常に `{ trusted: true }` |
+| `is_working_folder_trusted` | `{ dir: string }` | `{ trusted: boolean }` | 集合内メンバシップ（フォルダ単位、origin 非依存）を返す |
+
+### ゲート挙動（frontend）
+
+- 起動時の autostart ループは **`ConfigInfo.trusted === true` のときのみ**実行する。
+  `false` かつ autostart 対象がある場合は、**確認バナー**
+  （「このフォルダ（&lt;dir&gt;）の設定は未確認です。定義されたコマンドを自動起動しますか？」）
+  を出し、autostart は保留する。
+- ユーザーが「信頼して起動」を押すと `trust_working_folder` を呼び、以後そのフォルダは
+  信頼済み。押した後に保留していた autostart を実行する。
+- **手動起動（エージェント/プロセスチップの ▶）はゲート対象外**（ユーザーの明示操作）。
+  ゲートするのは autostart と worktree.setup を伴う**自動**実行のみ。未信頼フォルダで
+  worktree.setup を伴う spawn を手動で行う場合の扱いは将来検討（最小方針: 未信頼では
+  autostart を止める、が主目的）。
+
+## Content Security Policy（S4）
+
+`tauri.conf.json` の `app.security.csp` を `null` から明示値へ:
+
+```
+default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:
+```
+
+- `script-src 'self'`: Vite ビルド成果物のみ（inline script なし、`{@html}` 不使用）。
+- `connect-src`: Tauri IPC（`ipc:` / `http://ipc.localhost`）。
+- `style-src 'unsafe-inline'`: Svelte / xterm.js / svelte-splitpanes のスタイル注入に必要。
+- `img-src 'self' data:`: `data:` 画像許可（ビルド後の CSS に `data:` フォントは無し）。
+- 多層防御目的（現状ライブな XSS シンクは未検出）。webview 実機確認は別途。
