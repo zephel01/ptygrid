@@ -2,14 +2,14 @@
 [workspace]
 
 [package]
-name = "multi-terminal"
+name = "ptygrid"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-agent terminal app (Phase 0: single-pane PTY)"
+description = "Multi-agent terminal workspace with PTY grid orchestration"
 authors = ["zephel01"]
 
 [lib]
-name = "multi_terminal_lib"
+name = "ptygrid_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

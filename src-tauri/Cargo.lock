@@ -1940,24 +1940,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "multi-terminal"
-version = "0.1.0"
-dependencies = [
- "axum",
- "notify",
- "portable-pty",
- "rmcp",
- "serde",
- "serde_json",
- "serde_norway",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2555,6 +2537,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "ptygrid"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "notify",
+ "portable-pty",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

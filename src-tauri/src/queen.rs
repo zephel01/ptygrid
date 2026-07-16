@@ -421,7 +421,7 @@ impl QueenServer {
         ok_json(&serde_json::json!({ "id": id }))
     }
 
-    #[tool(description = "Show a toast notification in the multi-terminal UI")]
+    #[tool(description = "Show a toast notification in the ptygrid UI")]
     fn notify(
         &self,
         Parameters(NotifyRequest { title, message }): Parameters<NotifyRequest>,
@@ -441,7 +441,7 @@ impl ServerHandler for QueenServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Queen: the multi-terminal orchestrator. Use list_agents to see \
+                "Queen: the ptygrid orchestrator. Use list_agents to see \
                  sessions and definitions, read_output to inspect a pane, \
                  send_message to type into a pane, spawn_agent to start a \
                  config-defined agent, and notify to toast the user.",
