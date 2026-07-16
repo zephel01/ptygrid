@@ -1,6 +1,8 @@
-# IPC Contract (backend ⇄ frontend)
+# IPC / Service Contract (backend ⇄ frontend / Queen)
 
-> Phase 0 の契約はそのまま有効。Phase 1 の追加分は末尾のセクション参照。
+> この文書は段階releaseごとの差分契約を時系列で保持する。前のPhaseと後のPhaseが競合する
+> 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 3.6。
+> 操作方法と現在仕様の要約は[docs/userguide.md](docs/userguide.md)を参照。
 
 ## Phase 0 (基本PTY)
 
@@ -127,7 +129,7 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 - アプリ起動時に自動起動。load_config でポートが変わった場合のみ再起動。
 - **Queen が spawn した（= mterm.yml 定義由来の）セッションにも、アプリが spawn する全セッションにも、env `QUEEN_URL=http://127.0.0.1:<port>/mcp` を注入する**（エージェントが自分の接続先を知れるように）。
 
-## MCP tools（5種、名前・引数は固定）
+## MCP tools（Phase 2時点の基本5種）
 
 | tool | 引数 (JSON Schema相当) | 返り値(text content) | 説明 |
 |---|---|---|---|
@@ -137,7 +139,9 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 | `spawn_agent` | `{ name: string }` | `{ id }` のJSON | **mterm.yml で定義された名前のみ**起動可（許可リスト方式）。未定義名はエラー |
 | `notify` | `{ title: string, message: string }` | `"ok"` | フロントにトースト通知を出す |
 
-- `agent` の名前解決: 定義名→その名前で実行中の最新セッション。`#12` 形式はid直指定。見つからなければエラーメッセージに実行中一覧を含める。
+- `agent` の名前解決(Phase 2時点): 定義名→その名前で実行中の最新セッション。`#12`形式は
+  id直指定。見つからなければerrorに実行中一覧を含める。この推測規則はPhase 3.6で廃止され、
+  現在は`#id`優先かつ名前が一意な場合だけ解決する。
 - セキュリティ: bind は 127.0.0.1 のみ。spawn は許可リスト（config定義名）のみ。認証はPhase 2では無し（localhost限定で許容）。
 
 ## Backend 追加実装
@@ -162,7 +166,9 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 実運用（docs/troubleshooting.md）で判明した問題への対応。
 
 1. **フォアグラウンドプロセスの可視化**: `SessionInfo` に `foreground?: string` を追加（そのPTYのフォアグラウンドプロセス名。取得不能時は省略）。`list_agents` の sessions に含める。ペイン内で手動起動された CLI（zsh の中の codex 等）を発見可能にする。
-2. **名前解決の拡張**: `read_output` / `send_message` の `agent` は「定義名 → セッション名 → **フォアグラウンドプロセス名**（完全一致、複数マッチ時は最新ID）→ `#<id>`」の順で解決する。
+2. **名前解決の拡張(当時)**: `read_output` / `send_message`の`agent`は「定義名 →
+   session名 → foreground process名 → `#<id>`」へ拡張した。複数match時に最新IDを選ぶ規則は
+   Phase 3.6で廃止され、現在は候補IDを返して曖昧errorにする。
 3. **read_output のCR処理**: ANSI除去後、各行について `\r` で上書きされた部分を畳み込み、最終状態のみ返す（TUIスピナー残骸対策）。`raw: true` では従来通り無加工。
 4. **send_message の説明文強化**: MCPツールのdescriptionに「対話型TUIのcomposerに未送信テキストが残っている場合があるため、送信前に read_output で状態確認を推奨。text を空にして submit=true でEnterのみ送出可能」と明記（挙動自体は不変）。
 

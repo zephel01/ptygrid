@@ -2,7 +2,7 @@
 
 調査日: 2026-07-16(grok による Web 横断調査、32+ サイト。docs/design.md の記述を起点に更新)
 
-> 本文中の「multi-terminal」は本プロジェクト(現名称: **ptygrid**)を指す。
+> 外部projectの数値は調査日時点のsnapshot。ptygridの実装状況はPhase 3.6へ更新済み。
 
 ## design.md (2026-07-15) からのアップデート
 
@@ -21,13 +21,13 @@
 
 - **worktree で隔離する系**: Claude Squad / Parallel Code / Conductor / Superset
   — エージェントごとに git worktree を切って並列実行、diff レビューで統合
-- **同一画面で協調する系**: HiveTerm / **multi-terminal**
+- **同一画面で協調する系**: HiveTerm / **ptygrid**
   — マルチペイン + オーケストレーター(Queen)でエージェント同士が読み書きし合う
 
 ```
                 協調・MCP・config-as-code が強い
                           ↑
-              HiveTerm ●  │  ● multi-terminal  ← ここを埋めている
+              HiveTerm ●  │  ● ptygrid  ← ここを埋めている
                           │
     Architect ●           │            ● cmux
   ← worktree 並列が強い ──┼── 端末プリミティブが強い →
@@ -51,14 +51,16 @@ cmux は端末として最強だが Queen 型ではない。Superset / Conductor
 | 中 | cmux | 通知 UX、CLI プログラマビリティ(GPL・macOS 専用) |
 | 低(仕様のみ) | HiveTerm | 製品 UX・Queen tools の上限仕様 |
 
-## multi-terminal の勝ち筋 / 次に取る機能
+## ptygrid の勝ち筋 / 次に取る機能
 
-**すでに持っている強み(Phase 2)**: HiveTerm 路線の最小コア(マルチペイン + mterm.yml + Queen 5 tools)が動いている。OSS でここまで揃っている例はほぼ無い。
+**すでに持っている強み(Phase 3.6)**: マルチペイン + mterm.yml + Queen 13 toolsに加え、
+Git review/commit、任意worktree分離、logical resume、process-tree resource監視、競合安全な
+Pins/Notesまで一体化している。
 
 | 優先 | 内容 | 競合が強い領域 |
 |---|---|---|
-| Phase 3 前半 | Git diff / commit、worktree オプション | Superset / Parallel Code / Conductor |
-| Queen 拡張 | pins/notes、inbox/reply、await(HiveTerm 20 tools 方向) | HiveTerm 本体 |
+| 実装済み | Git diff/commit、worktree option、pins/notes | Superset / Parallel Code / Conductor / HiveTerm |
+| 次: Phase 3.7–3.8 | inbox/reply、cancellable await | HiveTerm 本体 |
 | UX | 通知リング / 「要承認」ハイライト | cmux / Architect |
 | 差別化維持 | config-as-code + 許可リスト付き spawn | ほとんど誰も両立していない |
 
@@ -72,5 +74,5 @@ cmux は端末として最強だが Queen 型ではない。Superset / Conductor
 
 - **製品としての最接近**: HiveTerm(クローズド・仕様の本家)
 - **OSS スター最大**: cmux(端末プリミティブ)と Superset(worktree IDE)
-- **思想の分岐**: worktree で隔離する系 vs 同一画面で協調する系 → multi-terminal は後者
+- **思想の分岐**: worktreeで隔離する系 vs 同一画面で協調する系 → ptygridは後者を基本にしつつopt-in isolationも提供
 - **自作の正当性**: 近い OSS はライセンスか設計思想がズレており、「Tauri + mterm.yml + Queen」の OSS 実装は依然ほぼ空白

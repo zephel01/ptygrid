@@ -1,5 +1,7 @@
 # Phase 3 staged delivery plan
 
+Last updated: 2026-07-16. Releases 3.0 through 3.6 are complete; 3.7 is next.
+
 Phase 3 is delivered as a sequence of independently releasable changes. Each
 release must preserve the Phase 0–2.1 IPC contract unless its own contract
 section explicitly extends it, and must pass both Rust and frontend checks.
@@ -34,6 +36,10 @@ section explicitly extends it, and must pass both Rust and frontend checks.
   the shell process.
 - Queen inbox data is separate from `send_message`: the former is durable and
   cooperative, while the latter writes directly to a live PTY.
+- Queen session names resolve only when unique. `#<id>` is the exact form;
+  duplicate definition or foreground names fail with candidate IDs.
+- Durable Queen records use optimistic revision checks. Stale update/delete
+  requests fail transactionally instead of overwriting another agent's work.
 
 ## Release discipline
 
