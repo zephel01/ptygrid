@@ -528,16 +528,24 @@
         return "起動フォルダ";
       case "global":
         return "~/.ptygrid";
+      case "default":
+        return "既定";
     }
   }
 
-  async function loadConfig(dir?: string): Promise<ConfigInfo> {
+  // `allowDefault` opts into the built-in default config when no ptygrid.yml is
+  // found anywhere (manual load only — the startup auto-load omits it so its
+  // `not_found:` fallback is preserved).
+  async function loadConfig(
+    dir?: string,
+    allowDefault = false,
+  ): Promise<ConfigInfo> {
     loadingConfig = true;
     try {
-      const info = await invokeCmd<ConfigInfo>(
-        "load_config",
-        dir ? { dir } : {},
-      );
+      const info = await invokeCmd<ConfigInfo>("load_config", {
+        ...(dir ? { dir } : {}),
+        ...(allowDefault ? { allowDefault: true } : {}),
+      });
       ui.configInfo = info;
       ui.configChangedPath = null;
       // Queen may have been restarted if the port changed in ptygrid.yml.
@@ -550,16 +558,54 @@
     }
   }
 
+  // Send `cd '<dir>'` + Enter to the default (shell-only) target panes, reusing
+  // the bulk-cd logic. `includeNonShell` is false so panes running a CLI are
+  // skipped. Returns how many panes received it; 0 targets is not an error.
+  async function sendCdToShells(dir: string): Promise<number> {
+    if (dir.trim() === "") return 0;
+    // list_sessions is the only source of foreground names — refresh so the
+    // shell-only filter skips CLI panes accurately (best-effort).
+    await refreshForegroundInfo();
+    const targets = selectCdTargets(cdPaneSessions, false);
+    if (targets.length === 0) return 0;
+    const data = `${buildCdCommand(dir)}\r`; // Enter is a carriage return
+    let sent = 0;
+    for (const target of targets) {
+      try {
+        if (isTauri()) {
+          await invokeCmd<void>("write_pty", { id: target.id, data });
+        } else {
+          writeToTerm(target.id, data); // demo mode: local echo only
+        }
+        sent += 1;
+      } catch (err) {
+        ui.errorBanner = `cd の一括送信に失敗しました (write_pty #${target.id}): ${err}`;
+      }
+    }
+    return sent;
+  }
+
   async function onLoadClick(): Promise<void> {
     if (!isTauri()) {
       ui.errorBanner =
         "設定の読み込み (load_config) には Tauri 実行環境が必要です。";
       return;
     }
+    const rawInput = configDirInput.trim();
     try {
-      const info = await loadConfig(configDirInput.trim() || undefined);
+      // Manual load opts into the built-in default so a missing config file
+      // still succeeds (and can cd); the startup auto-load does not.
+      const info = await loadConfig(rawInput || undefined, true);
       ui.errorBanner = null;
-      addNotice(`設定を読み込みました（${originLabel(info.origin)}）`, info.path);
+      // 読み込み成功 = 作業フォルダ確定。cd と同じ動きで、開いているシェルの
+      // ペインをその作業フォルダへ移動させる。
+      const sent = await sendCdToShells(info.dir);
+      const shownDir = rawInput || info.dir;
+      const cdPart = sent > 0 ? `${sent}ペインに cd を送信` : "cd 対象のペインなし";
+      addNotice(
+        `作業フォルダ: ${shownDir}（設定: ${originLabel(info.origin)}） / ${cdPart}`,
+        info.path,
+      );
     } catch (err) {
       ui.errorBanner = String(err);
     }
@@ -766,7 +812,9 @@
         {#if ui.configInfo}
           <span
             class="origin-badge"
-            title={`設定ファイル: ${ui.configInfo.path}\n作業フォルダ: ${ui.configInfo.dir}`}
+            title={ui.configInfo.origin === "default"
+              ? `設定ファイルなし（組み込みの既定設定）。\n${ui.configInfo.path} を作成すると自動で読み込みます。\n作業フォルダ: ${ui.configInfo.dir}`
+              : `設定ファイル: ${ui.configInfo.path}\n作業フォルダ: ${ui.configInfo.dir}`}
           >
             設定: {originLabel(ui.configInfo.origin)}
           </span>

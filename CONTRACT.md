@@ -936,11 +936,27 @@ legacy filenameを引き続き受理し、wire formatは変更しない。
      （`fix_path_env::fix()`より前）に`capture_launch_dir`で一度だけ捕捉し、`OnceLock`で固定。
    - 起動フォルダが作業フォルダと同一パスの場合は重複試行しない。
 3. `~/.ptygrid/ptygrid.yml`（グローバル設定）→ `origin: "global"`
-- どこにも無ければ、試した全candidateを列挙したエラー（先頭は既存の`not_found:`を維持し、
-  frontendの起動時fallback判定を壊さない）。
+- どこにも無い場合の扱いは`allow_default`引数で分岐する（下記「設定なしフォールバック」）。
 - file watcherは**実際に読み込んだファイルの親ディレクトリ**を監視する（既存挙動の一般化）。
   グローバル設定を読んだ場合は`~/.ptygrid`を、起動フォルダ設定を読んだ場合は起動フォルダを
   監視することになる。`config-changed` event・Reload挙動は不変。
+
+## 設定なしフォールバック（`allow_default`）
+
+`load_config`はoptionalな`allow_default: bool`引数を取る（省略時 `false`。JS側は camelCase
+`allowDefault`）。
+
+- `allow_default: true`（**手動読み込み**）で3か所すべてに設定が無い場合、エラーにせず
+  **組み込みの既定設定**（`Config::default()` = `project: None` / `agents: []` /
+  `processes: []` / `queen: None`（＝既定でenabled・既定ポート）/ `teammates: None`）で成功し、
+  `origin: "default"`を返す。
+  - この場合の`path`は空文字ではなく、**読み込む予定だった第一候補 `<作業フォルダ>/ptygrid.yml`**
+    （実在しないパス）。後からユーザーがそこに yml を作成した際、watcherが検出できるようにするため。
+  - watcherは`<作業フォルダ>`を監視し、`<作業フォルダ>/ptygrid.yml`の出現/変更で`config-changed`を
+    emitする（既存のReloadトーストで反映）。legacy `mterm.yml`の出現までは追わない。
+- `allow_default: false`（**起動時の自動load**）で3か所すべてに設定が無い場合は従来どおり、
+  試した全candidateを列挙した`not_found:`エラーを返す（frontendの起動時fallback＝adhocシェル1枚を
+  開く挙動を壊さない）。実在ファイルのparse/readエラーは`allow_default`に関係なく常にエラー。
 
 ## プロジェクト境界のセマンティクス（重要）
 
@@ -952,17 +968,24 @@ legacy filenameを引き続き受理し、wire formatは変更しない。
 ## `ConfigInfo` 拡張（additive）
 
 ```ts
-type ConfigOrigin = "project" | "launch" | "global";
+type ConfigOrigin = "project" | "launch" | "global" | "default";
 type ConfigInfo = { path: string; dir: string; origin: ConfigOrigin; config: Config };
 ```
 
 - `path` = 実際に読み込んだ設定ファイル、`dir` = 作業フォルダ、`origin` = `path`の由来。
-  既存の`path` / `dir`フィールドは意味を明確化しただけで型は不変、`origin`のみ追加。
+  既存の`path` / `dir`フィールドは意味を明確化しただけで型は不変、`origin`に`"default"`のみ追加。
+  `origin: "default"`のときは設定ファイルが実在せず、`path`は上記のとおり第一候補パス。
 
 ## Frontend
 
 - ツールバーの「プロジェクト」欄を「作業フォルダ」に変更。placeholderは
   `作業フォルダ（例: ~/works/hoge。先頭 ~ 可）`、tooltipで探索順を説明。
 - 読み込み成功後、読み込みボタン付近に**origin バッジ**（`設定: プロジェクト内 / 起動フォルダ /
-  ~/.ptygrid`、hoverで実pathと作業フォルダ）を表示。手動読み込み成功トーストにも設定元を含める。
+  ~/.ptygrid / 既定`）を表示。hoverで実pathと作業フォルダ、`既定`のときは「設定ファイルなし。
+  `<作業フォルダ>/ptygrid.yml`を作成すると自動で読み込みます」を表示。
+- **手動読み込み成功時は `cd` と同じ動き**: 開いているシェルのペイン（既定対象＝
+  `selectCdTargets(sessions, false)`、CLI実行中ペインは除外）へ `cd '<作業フォルダ>'` + Enter を
+  送信する。対象0件でもエラーにしない。成功トーストは設定元と cd 件数を統合して1つ
+  （例:「作業フォルダ: ~/works/notemake（設定: 既定） / 2ペインに cd を送信」）。
+  **起動時の自動loadでは cd を送信しない**（`allow_default`も付けない）。
 - 既存のReload / config-changed挙動は不変。

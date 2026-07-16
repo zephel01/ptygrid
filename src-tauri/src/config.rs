@@ -15,7 +15,11 @@ use crate::pty::home_dir;
 
 /// `Config { project?, agents, processes }` — processes defaults to empty Vec.
 /// Phase 2 adds the optional `queen:` block; Phase 4.0 the `teammates:` block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Config::default()` is the **built-in default config** used as the no-config
+/// fallback (see [`ConfigManager::load`]): `project: None`, empty `agents` /
+/// `processes`, `queen: None` (Queen enabled with defaults), `teammates: None`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -209,12 +213,17 @@ pub enum AutoRestart {
 /// - `Project`: inside the working folder (`<work>/ptygrid.yml` or legacy `mterm.yml`)
 /// - `Launch`:  the app launch folder (`<launch>/ptygrid.yml`)
 /// - `Global`:  the per-user global config (`~/.ptygrid/ptygrid.yml`)
+/// - `Default`: no config file was found in any of the three locations and the
+///   built-in default config was used ([`Config::default`]); the `path` reported
+///   alongside is the first candidate `<work>/ptygrid.yml` that *would* have been
+///   read, so a later-created file there is detected by the watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigOrigin {
     Project,
     Launch,
     Global,
+    Default,
 }
 
 /// Return type of the `load_config` command.
@@ -347,7 +356,20 @@ impl ConfigManager {
     /// the working folder need not contain a config file. The config + working
     /// folder are stored and the file watcher is (re)started on the folder that
     /// holds the file that was actually loaded.
-    pub fn load(&self, app: &AppHandle, dir: Option<String>) -> Result<ConfigInfo, String> {
+    ///
+    /// When `allow_default` is true and no config file is found in any of the
+    /// three search locations, the built-in default config ([`Config::default`])
+    /// is used with `origin: Default` instead of erroring; the watcher is started
+    /// on `<work>/ptygrid.yml` so a file the user creates there afterwards emits
+    /// `config-changed`. When `allow_default` is false (the startup auto-load
+    /// path), a missing config still yields the `not_found:` error so the
+    /// frontend's startup fallback keeps its previous behavior.
+    pub fn load(
+        &self,
+        app: &AppHandle,
+        dir: Option<String>,
+        allow_default: bool,
+    ) -> Result<ConfigInfo, String> {
         let mut inner = self.lock();
 
         let dir_path = match dir {
@@ -375,11 +397,22 @@ impl ConfigManager {
         }
 
         let home = home_dir().map(PathBuf::from);
-        let (path, origin) =
-            resolve_config_path(&dir_path, launch_dir().as_deref(), home.as_deref())?;
+        let (path, origin) = resolve_config_source(
+            &dir_path,
+            launch_dir().as_deref(),
+            home.as_deref(),
+            allow_default,
+        )?;
 
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
-        let config = parse_config(&text)?;
+        // `origin == Default` means no file was found and the built-in default is
+        // used; `path` is the `<work>/ptygrid.yml` we would have read (watched
+        // below). Any other origin points at a real file to read + parse.
+        let config = if origin == ConfigOrigin::Default {
+            Config::default()
+        } else {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
+            parse_config(&text)?
+        };
 
         // Watch the parent dir of the file that was ACTUALLY loaded. When a
         // launch-folder or global (~/.ptygrid) config is used, this watches that
@@ -520,23 +553,47 @@ fn resolve_config_path_pure(
     Err(tried)
 }
 
-/// Resolve the config file for a `load` call using the real filesystem. See
-/// [`resolve_config_path_pure`] for the search order. On failure the error
-/// begins with `not_found:` (matched by the frontend startup fallback) and
-/// lists every candidate that was tried.
-fn resolve_config_path(
+/// Pure config-*source* resolution: [`resolve_config_path_pure`] plus the
+/// built-in default fallback. When a file is found it is returned as-is; when
+/// none is found and `allow_default` is true, `(<work>/ptygrid.yml, Default)` is
+/// returned (the caller uses [`Config::default`] and watches that path); when
+/// none is found and `allow_default` is false, the tried-candidate list is
+/// returned as `Err` for the caller to format. `is_file` is injected for tests.
+fn resolve_config_source_pure(
     work: &Path,
     launch: Option<&Path>,
     home: Option<&Path>,
+    is_file: &dyn Fn(&Path) -> bool,
+    allow_default: bool,
+) -> Result<(PathBuf, ConfigOrigin), Vec<PathBuf>> {
+    match resolve_config_path_pure(work, launch, home, is_file) {
+        Ok(found) => Ok(found),
+        Err(_) if allow_default => Ok((work.join(CONFIG_FILE_NAME), ConfigOrigin::Default)),
+        Err(tried) => Err(tried),
+    }
+}
+
+/// Resolve the config source for a `load` call using the real filesystem. See
+/// [`resolve_config_source_pure`] for the search order and the default fallback.
+/// On failure (no file and `allow_default` is false) the error begins with
+/// `not_found:` (matched by the frontend startup fallback) and lists every
+/// candidate that was tried.
+fn resolve_config_source(
+    work: &Path,
+    launch: Option<&Path>,
+    home: Option<&Path>,
+    allow_default: bool,
 ) -> Result<(PathBuf, ConfigOrigin), String> {
-    resolve_config_path_pure(work, launch, home, &|p| p.is_file()).map_err(|tried| {
-        let list = tried
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("not_found: no ptygrid.yml found; tried {list}")
-    })
+    resolve_config_source_pure(work, launch, home, &|p| p.is_file(), allow_default).map_err(
+        |tried| {
+            let list = tried
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("not_found: no ptygrid.yml found; tried {list}")
+        },
+    )
 }
 
 /// Watch the config directory (non-recursive) and emit `config-changed`
@@ -845,22 +902,23 @@ agents:
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Neither file (no launch/global): clear error naming both candidates.
-        let err = resolve_config_path(&dir, None, None).unwrap_err();
+        // Neither file (no launch/global, allow_default=false): clear error
+        // naming both candidates.
+        let err = resolve_config_source(&dir, None, None, false).unwrap_err();
         assert!(err.starts_with("not_found:"));
         assert!(err.contains("ptygrid.yml") && err.contains("mterm.yml"));
 
         // Legacy only: mterm.yml is accepted (origin Project).
         std::fs::write(dir.join(LEGACY_CONFIG_FILE_NAME), "agents: []\n").unwrap();
         assert_eq!(
-            resolve_config_path(&dir, None, None).unwrap(),
+            resolve_config_source(&dir, None, None, false).unwrap(),
             (dir.join(LEGACY_CONFIG_FILE_NAME), ConfigOrigin::Project)
         );
 
         // Both present: ptygrid.yml wins.
         std::fs::write(dir.join(CONFIG_FILE_NAME), "agents: []\n").unwrap();
         assert_eq!(
-            resolve_config_path(&dir, None, None).unwrap(),
+            resolve_config_source(&dir, None, None, false).unwrap(),
             (dir.join(CONFIG_FILE_NAME), ConfigOrigin::Project)
         );
 
@@ -981,6 +1039,93 @@ agents:
                 home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
             ]
         );
+    }
+
+    // ---- built-in default fallback (no config file anywhere) ----
+
+    #[test]
+    fn default_config_is_empty_with_queen_enabled() {
+        // The no-config fallback: no project, no agents/processes, no queen /
+        // teammates blocks (so Queen defaults to enabled on its default port).
+        let cfg = Config::default();
+        assert_eq!(cfg.project, None);
+        assert!(cfg.agents.is_empty());
+        assert!(cfg.processes.is_empty());
+        assert!(cfg.queen.is_none());
+        assert!(cfg.teammates.is_none());
+        // queen: None means "enabled with default port" via the effective helpers.
+        let q = cfg.queen.unwrap_or_default();
+        assert!(q.effective_enabled());
+        assert_eq!(q.effective_port(), crate::queen::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn config_origin_default_serializes_to_lowercase() {
+        // Wire value of the new origin is "default".
+        assert_eq!(
+            serde_json::to_string(&ConfigOrigin::Default).unwrap(),
+            "\"default\""
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_when_nothing_found_and_allowed() {
+        // No file in any of the three locations + allow_default=true: resolve to
+        // the built-in default, reporting the first candidate <work>/ptygrid.yml
+        // as the path (what a later-created file there would be).
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+        let (path, origin) =
+            resolve_config_source_pure(work, Some(launch), Some(home), &present(&[]), true).unwrap();
+        assert_eq!(path, work.join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Default);
+    }
+
+    #[test]
+    fn no_default_when_nothing_found_and_not_allowed() {
+        // Same absence, allow_default=false: still the not_found candidate list
+        // (startup auto-load path keeps its previous behavior).
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+        let tried =
+            resolve_config_source_pure(work, Some(launch), Some(home), &present(&[]), false)
+                .unwrap_err();
+        assert_eq!(
+            tried,
+            vec![
+                work.join(CONFIG_FILE_NAME),
+                work.join(LEGACY_CONFIG_FILE_NAME),
+                launch.join(CONFIG_FILE_NAME),
+                home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_fall_back_to_default_when_a_file_exists() {
+        // A real file anywhere in the search order wins over the default, even
+        // when allow_default=true — the fallback only fires when all three miss.
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+
+        // Working-folder file wins.
+        let in_work = vec![work.join(CONFIG_FILE_NAME)];
+        let (path, origin) =
+            resolve_config_source_pure(work, Some(launch), Some(home), &present(&in_work), true)
+                .unwrap();
+        assert_eq!(path, work.join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Project);
+
+        // Global-only file also wins over the default (origin Global, not Default).
+        let in_global = vec![home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME)];
+        let (path, origin) =
+            resolve_config_source_pure(work, Some(launch), Some(home), &present(&in_global), true)
+                .unwrap();
+        assert_eq!(path, home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Global);
     }
 
     #[test]

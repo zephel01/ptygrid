@@ -53,13 +53,19 @@ pub fn kill_pty(manager: State<'_, PtyManager>, id: u32) -> Result<(), String> {
 /// Load config for working folder `dir` (the project boundary; `~` expanded),
 /// resolving the config file as working folder → launch folder → `~/.ptygrid`,
 /// start watching the loaded file, and apply Queen config.
+///
+/// `allow_default` (default false) opts into the built-in default config when no
+/// file is found anywhere, so a manual load succeeds (and can `cd`) without a
+/// config file. The startup auto-load omits it, keeping the `not_found:` error
+/// and its existing frontend fallback.
 #[tauri::command]
 pub fn load_config(
     app: AppHandle,
     config: State<'_, ConfigManager>,
     dir: Option<String>,
+    allow_default: Option<bool>,
 ) -> Result<ConfigInfo, String> {
-    let info = config.load(&app, dir)?;
+    let info = config.load(&app, dir, allow_default.unwrap_or(false))?;
     let q = info.config.queen.unwrap_or_default();
     queen::apply(&app, q.effective_enabled(), q.effective_port());
     Ok(info)
