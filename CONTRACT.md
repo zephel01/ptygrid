@@ -436,3 +436,69 @@ type SessionResourcesPayload = {
 - toolbar右側に、最新batch内の全sessionを合算した
   `Σ CPU n.n% · n MiB/GiB`を表示する。追加samplingは行わない。
 - batch eventごとにresource mapを1回だけ置換し、exit/restart/close時は対象値を削除する。
+
+---
+
+# Phase 3.6 追加契約（durable Queen pins / notes）
+
+Phase 3.6はQueen MCPを13 toolsへ拡張し、読み込まれたprojectに紐づく短い共有値と
+共有noteを永続化する。Phase 2/2.1の「同名なら最新IDを選ぶ」規則は廃止し、曖昧な
+宛先への誤送信を拒否する。
+
+## Queen MCP tools
+
+| tool | args | returns | 説明 |
+|---|---|---|---|
+| `set_pin` | `{ key, value, expectedRevision? }` | `{ pin }` | 新規pinを作成、またはrevision一致時だけ更新 |
+| `list_pins` | `{}` | `{ pins }` | project内pinをkey順で返す |
+| `delete_pin` | `{ key, expectedRevision }` | `{ deleted: true, key }` | revision一致時だけ削除 |
+| `create_note` | `{ title, body, tags? }` | `{ note }` | noteを作成 |
+| `list_notes` | `{ query?, limit? }` | `{ notes }` | title/body/tagsを任意検索し、更新日時の降順で返す |
+| `get_note` | `{ id }` | `{ note }` | project内noteを取得 |
+| `update_note` | `{ id, expectedRevision, title?, body?, tags? }` | `{ note }` | 指定fieldをrevision一致時だけ更新 |
+| `delete_note` | `{ id, expectedRevision }` | `{ deleted: true, id }` | revision一致時だけ削除 |
+
+```ts
+type Pin = {
+  key: string;
+  value: string;
+  revision: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+type Note = {
+  id: number;
+  title: string;
+  body: string;
+  tags: string[];
+  revision: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+```
+
+## 保存と競合制御
+
+- 保存先はTauri app-data配下の`queen/queen.sqlite3`。repository内には書かない。
+- project scopeは読み込まれた`mterm.yml`のcanonical directory pathとする。
+  project未読込時、pins/notes toolsはerrorにする。
+- schemaは`PRAGMA user_version = 1`。未知の新しいversionは起動時に拒否する。
+- 1つの`Mutex<Connection>`でprocess内writeを直列化し、各mutationはSQLiteの
+  `BEGIN IMMEDIATE` transactionとして実行する。永続DBはWAL、busy timeout 5秒とする。
+- 新規pinは`expectedRevision`を省略する。既存pinの更新、pin/noteの削除、noteの更新は
+  現在の`revision`と一致する正の`expectedRevision`を必須とする。
+- 成功した更新は`revision`を1増やす。同じrevisionを複数agentが同時更新しても1件だけが
+  成功し、後続は`conflict`でrollbackする。stale update/deleteによるlost updateを許さない。
+- note IDはDB内で一意かつ安定。異なるprojectのnoteはIDを知っていても取得・変更できない。
+- 上限はprojectごとにpin 256件、note 10,000件。key 128 bytes、value 16 KiB、
+  title 256 bytes、body 64 KiB、tag 32件・各64 bytes。`list_notes`は最大200件。
+
+## Session宛先の識別
+
+- pane headerは名前がある場合も常に`<name> #<id>`を表示する。
+- `agent: "#<id>"`はsession IDを厳密指定し、最優先で解決する。
+- 定義/session名、次にforeground process名は完全一致かつ候補が1つの場合だけ解決する。
+- 同名のCodex/Claude/Grok等が複数ある場合、最新IDを推測してはならない。曖昧errorに
+  全候補を`#<id>`形式で含め、callerに厳密指定を求める。
+- session IDは現在のapp実行中の識別子であり、app再起動後は`list_agents`で再取得する。

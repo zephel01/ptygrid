@@ -144,5 +144,6 @@ export async function initGlobalListeners(): Promise<void> {
 }
 
 export function paneTitle(id: number): string {
-  return ui.sessions[id]?.name ?? `shell #${id}`;
+  const name = ui.sessions[id]?.name;
+  return name ? `${name} #${id}` : `shell #${id}`;
 }

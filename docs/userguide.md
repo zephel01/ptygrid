@@ -205,7 +205,7 @@ project directoryが移動した、または定義が削除された場合は画
 
 Queen はアプリ内に常駐する MCP サーバーです(streamable HTTP、bind は 127.0.0.1 のみ)。
 各エージェント CLI に MCP サーバーとして登録すると、そのエージェントが
-[5つのツール](#queen-ツールリファレンス)を使えるようになります。
+[13個のツール](#queen-ツールリファレンス)を使えるようになります。
 
 ### Claude Code
 
@@ -231,7 +231,7 @@ url = "http://127.0.0.1:39237/mcp"
 
 ```bash
 grok mcp add -s user -t http queen http://127.0.0.1:39237/mcp
-grok mcp doctor    # 接続確認(handshake OK / 5 tools discovered が出れば成功)
+grok mcp doctor    # 接続確認(handshake OK / 13 tools discovered が出れば成功)
 ```
 
 ### ポートについて
@@ -249,17 +249,43 @@ grok mcp doctor    # 接続確認(handshake OK / 5 tools discovered が出れば
 | `send_message` | `agent`, `text`, `submit?`(default true) | 指定ペインの stdin へ書き込み。`submit: true` で末尾に Enter を付与 |
 | `spawn_agent` | `name` | **mterm.yml で定義された名前のみ**起動可(許可リスト方式) |
 | `notify` | `title`, `message` | アプリ内トースト通知を表示 |
+| `set_pin` | `key`, `value`, `expectedRevision?` | project内の短い共有値を作成・安全に更新。既存値の更新には現在のrevisionが必須 |
+| `list_pins` | なし | project内のpinとrevisionをkey順で一覧表示 |
+| `delete_pin` | `key`, `expectedRevision` | revisionが一致するpinだけ削除 |
+| `create_note` | `title`, `body`, `tags?` | project内に永続noteを作成 |
+| `list_notes` | `query?`, `limit?`(default 50, max 200) | noteを更新日時の新しい順で検索・一覧表示 |
+| `get_note` | `id` | 安定したIDでnoteを1件取得 |
+| `update_note` | `id`, `expectedRevision`, `title?`, `body?`, `tags?` | revisionが一致するnoteの指定fieldだけ更新 |
+| `delete_note` | `id`, `expectedRevision` | revisionが一致するnoteだけ削除 |
 
 ### 宛先(`agent`)の名前解決
 
-`read_output` / `send_message` の宛先は次の順で解決されます:
+各ペインのheaderは `codex #4`、`claude #5` のように名前とsession IDを表示します。
+`list_agents`でも現在のIDを確認できます。`read_output` / `send_message` の宛先は次の順で
+解決されます:
 
-1. **mterm.yml の定義名**(同名で複数実行中なら最新セッション)
-2. **セッション名**
-3. **フォアグラウンドプロセス名**(完全一致。zsh ペイン内で手動起動した `codex` も `"codex"` で指せる)
-4. **`#<id>`** — セッション ID の直指定(例: `"#2"`)
+1. **`#<id>`** — session IDの厳密指定(例: `"#4"`)。複数ペイン時はこれを推奨
+2. **mterm.yml の定義名 / session名** — 完全一致し、実行中の候補が1つだけの場合
+3. **foreground process名** — 完全一致し、候補が1つだけの場合。shell内で手動起動した
+   `codex` / `claude` / `grok`も判定できる
 
-見つからない場合、エラーメッセージに実行中セッションの一覧(fg プロセス名付き)が含まれます。
+同じ名前やforeground processが複数ある場合は、最新ペインを推測して送信せず、
+`use one of: #2, #4`のように候補IDを返します。例えばCodexが3面あるなら
+`agent: "codex"`ではなく`agent: "#4"`と伝えてください。定義できるペインには
+`codex-impl`、`codex-review`、`claude-test`のようなrole名を付けると、人にもagentにも
+意図が分かりやすくなります。見つからない場合も、errorに実行中sessionの一覧
+(foreground process名付き)が含まれます。
+
+### Pins / Notes の同時編集
+
+PinsとNotesは読み込んだ`mterm.yml`のdirectory単位で分離され、app-data内のSQLiteへ
+永続化されます。repository内に管理fileは作りません。各recordには単調増加する`revision`があり、
+既存recordの更新・削除では、直前に取得した`expectedRevision`が一致した場合だけcommitされます。
+
+複数agentが同じrevisionを同時更新した場合は、先に成立した1件だけが成功します。後続は
+`conflict`になり、新しい内容を上書きしたり削除したりしません。`list_pins` / `get_note`で
+最新版を読み直し、内容をmergeしてから新しいrevisionでretryしてください。異なるkeyやnote IDは
+独立して更新できます。
 
 ## 実践レシピ: エージェント間協調
 

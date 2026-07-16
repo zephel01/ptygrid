@@ -339,14 +339,7 @@ impl PtyManager {
         rows: u16,
         saved_worktree: Option<WorktreeInfo>,
     ) -> Result<u32, String> {
-        self.launch_agent(
-            app,
-            def,
-            config_dir,
-            (cols, rows),
-            true,
-            saved_worktree,
-        )
+        self.launch_agent(app, def, config_dir, (cols, rows), true, saved_worktree)
     }
 
     fn launch_agent<R: Runtime>(
@@ -367,10 +360,7 @@ impl PtyManager {
         };
         let (cwd, worktree) = match prepared {
             Some(prepared) => (prepared.cwd, Some(prepared.info)),
-            None => (
-                config::resolve_cwd(config_dir, def.cwd.as_deref()),
-                None,
-            ),
+            None => (config::resolve_cwd(config_dir, def.cwd.as_deref()), None),
         };
         let spec = LaunchSpec {
             name: Some(def.name.clone()),
@@ -487,9 +477,7 @@ impl PtyManager {
         slot.manual_kill = true;
         match slot.live.as_mut() {
             Some(live) => {
-                live.child
-                    .kill()
-                    .map_err(|e| format!("kill failed: {e}"))?;
+                live.child.kill().map_err(|e| format!("kill failed: {e}"))?;
                 // reader thread handles reaping/eventing/removal
             }
             None => {
@@ -592,12 +580,10 @@ impl PtyManager {
         Ok(String::from_utf8_lossy(&slot.output).to_string())
     }
 
-    /// Queen name resolution (Phase 2.1 order):
-    ///   1. definition/session name — most recent (highest id) RUNNING match;
-    ///   2. foreground process name — exact, case-sensitive; multiple
-    ///      matches -> highest id (finds CLIs launched manually inside a
-    ///      shell pane, e.g. codex inside zsh);
-    ///   3. `"#<id>"` — direct session id.
+    /// Queen resolves `"#<id>"` first, then an exact unique definition/session
+    /// name, and finally an exact unique foreground process name.
+    /// Duplicate names are rejected with candidate ids instead of silently
+    /// selecting one and risking delivery to the wrong terminal.
     /// Errors list the running sessions including their foreground names,
     /// so the message is self-documenting.
     pub fn resolve_agent(&self, agent: &str) -> Result<u32, String> {
@@ -610,29 +596,49 @@ impl PtyManager {
     where
         F: Fn(i32) -> Option<String>,
     {
+        // Exact ids identify one session and are never ambiguous.
+        if let Some(id_str) = agent.strip_prefix('#') {
+            let id: u32 = id_str
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid session id '{agent}'"))?;
+            if self.lock_sessions().contains_key(&id) {
+                return Ok(id);
+            }
+            return Err(format!("session {agent} not found"));
+        }
+
         // Snapshot running sessions (id, name, fg pid) under the lock; the
         // pid->name lookup happens after the lock is dropped (macOS shells
         // out to ps).
-        let (name_match, mut running): (Option<u32>, Vec<(u32, Option<String>, Option<i32>)>) = {
+        let (mut name_matches, mut running) = {
             let sessions = self.lock_sessions();
-            let name_match = sessions
+            let name_matches = sessions
                 .iter()
                 .filter(|(_, s)| {
                     s.state == SessionState::Running && s.spec.name.as_deref() == Some(agent)
                 })
                 .map(|(id, _)| *id)
-                .max();
+                .collect::<Vec<_>>();
             let running = sessions
                 .iter()
                 .filter(|(_, s)| s.state == SessionState::Running)
                 .map(|(id, s)| (*id, s.spec.name.clone(), foreground_pid(s)))
-                .collect();
-            (name_match, running)
+                .collect::<Vec<_>>();
+            (name_matches, running)
         };
 
-        // 1. definition/session name
-        if let Some(id) = name_match {
-            return Ok(id);
+        // 2. definition/session name
+        name_matches.sort_unstable();
+        match name_matches.as_slice() {
+            [id] => return Ok(*id),
+            [] => {}
+            ids => {
+                return Err(format!(
+                    "ambiguous session name '{agent}'; use one of: {}",
+                    format_ids(ids)
+                ));
+            }
         }
 
         running.sort_by_key(|(id, _, _)| *id);
@@ -641,14 +647,21 @@ impl PtyManager {
             .map(|(id, name, pid)| (id, name, pid.and_then(&resolve_process)))
             .collect();
 
-        // 2. foreground process name (exact, case-sensitive, highest id)
-        if let Some(id) = with_fg
+        // 3. foreground process name (exact, case-sensitive, unique only)
+        let fg_matches: Vec<u32> = with_fg
             .iter()
             .filter(|(_, _, fg)| fg.as_deref() == Some(agent))
             .map(|(id, _, _)| *id)
-            .max()
-        {
-            return Ok(id);
+            .collect();
+        match fg_matches.as_slice() {
+            [id] => return Ok(*id),
+            [] => {}
+            ids => {
+                return Err(format!(
+                    "ambiguous foreground process '{agent}'; use one of: {}",
+                    format_ids(ids)
+                ));
+            }
         }
 
         let running_list = if with_fg.is_empty() {
@@ -667,25 +680,18 @@ impl PtyManager {
                 .join(", ")
         };
 
-        // 3. "#<id>" direct id
-        if let Some(id_str) = agent.strip_prefix('#') {
-            let id: u32 = id_str
-                .trim()
-                .parse()
-                .map_err(|_| format!("invalid session id '{agent}'"))?;
-            if self.lock_sessions().contains_key(&id) {
-                return Ok(id);
-            }
-            return Err(format!(
-                "session {agent} not found. running sessions: {running_list}"
-            ));
-        }
-
         Err(format!(
             "no running session or foreground process named '{agent}'. \
              running sessions: {running_list}"
         ))
     }
+}
+
+fn format_ids(ids: &[u32]) -> String {
+    ids.iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------- spawn / reader / autorestart machinery (detached-thread safe) ----------
@@ -1199,18 +1205,21 @@ mod tests {
             "foreground name in list_sessions"
         );
 
-        // Foreground resolution: exact match, multiple matches -> highest id.
+        // Duplicate foreground names are never guessed: callers must use #id.
         // (poll: id2's child may become the fg pgrp slightly after id1's)
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match manager.resolve_agent_with("cat", |_| Some("cat".to_string())) {
-                Ok(id) if id == id2 => break,
-                r if Instant::now() >= deadline => {
-                    panic!("expected resolve_agent(\"cat\") == Ok({id2}), got {r:?}")
-                }
-                _ => std::thread::sleep(Duration::from_millis(50)),
+        let duplicate_error = loop {
+            let result = manager.resolve_agent_with("cat", |_| Some("cat".to_string()));
+            if matches!(&result, Err(error) if error.contains("ambiguous foreground")) {
+                break result.unwrap_err();
             }
-        }
+            if Instant::now() >= deadline {
+                panic!("expected ambiguous foreground error, got {result:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(duplicate_error.contains(&format!("#{id1}")));
+        assert!(duplicate_error.contains(&format!("#{id2}")));
         // Case-sensitive: no match, and the error lists sessions with fg names.
         let err = manager
             .resolve_agent_with("CAT", |_| Some("cat".to_string()))
@@ -1227,6 +1236,33 @@ mod tests {
         // verified indirectly: an exited session has no live PTY.)
         manager.kill_pty(id1).unwrap();
         manager.kill_pty(id2).unwrap();
+    }
+
+    #[test]
+    fn duplicate_definition_names_require_an_exact_session_id() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let config =
+            config::parse_config("agents:\n  - name: worker\n    cmd: exec /bin/cat\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let first = manager
+            .spawn_agent(handle.clone(), &config.agents[0], &cwd, 80, 24)
+            .unwrap();
+        let second = manager
+            .spawn_agent(handle, &config.agents[0], &cwd, 80, 24)
+            .unwrap();
+
+        let error = manager.resolve_agent_with("worker", |_| None).unwrap_err();
+        assert!(error.contains("ambiguous session name"));
+        assert!(error.contains(&format!("#{first}")));
+        assert!(error.contains(&format!("#{second}")));
+        assert_eq!(
+            manager.resolve_agent_with(&format!("#{first}"), |_| None),
+            Ok(first)
+        );
+
+        manager.kill_pty(first).unwrap();
+        manager.kill_pty(second).unwrap();
     }
 
     /// End-to-end sanity for fix #1: write_pty round-trips through a real

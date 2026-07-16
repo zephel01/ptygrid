@@ -5,6 +5,7 @@ mod git_service;
 mod project_state;
 mod pty;
 mod queen;
+mod queen_store;
 mod resource_monitor;
 mod session;
 mod worktree;
@@ -12,6 +13,7 @@ mod worktree;
 use config::ConfigManager;
 use queen::QueenStatus;
 use session::PtyManager;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,6 +22,11 @@ pub fn run() {
         .manage(ConfigManager::new())
         .manage(QueenStatus::new())
         .setup(|app| {
+            let app_data = app.path().app_data_dir()?;
+            let queen_store =
+                queen_store::QueenStore::open(&app_data.join("queen").join("queen.sqlite3"))
+                    .map_err(std::io::Error::other)?;
+            app.manage(queen_store);
             // Queen starts with defaults; load_config may adjust it later.
             queen::start_default(&app.handle().clone());
             resource_monitor::start(&app.handle().clone());

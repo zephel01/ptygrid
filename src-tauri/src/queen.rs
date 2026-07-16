@@ -9,19 +9,20 @@
 use std::sync::{Mutex, MutexGuard};
 
 use rmcp::{
-    ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
+    ErrorData, ServerHandler,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ConfigManager;
+use crate::queen_store::QueenStore;
 use crate::session::{PtyManager, SessionState};
 
 /// Contract default port; fallback +1 each up to DEFAULT_PORT+9 (39246).
@@ -163,7 +164,9 @@ pub fn apply(app: &AppHandle, enabled: bool, port: u16) {
 /// Bind 127.0.0.1 only, trying `base`..`base+9`.
 async fn bind_with_fallback(base: u16) -> Option<(tokio::net::TcpListener, u16)> {
     for offset in 0..PORT_TRIES {
-        let Some(p) = base.checked_add(offset) else { break };
+        let Some(p) = base.checked_add(offset) else {
+            break;
+        };
         if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
             return Some((listener, p));
         }
@@ -253,6 +256,19 @@ impl QueenServer {
     fn config(&self) -> tauri::State<'_, ConfigManager> {
         self.app.state::<ConfigManager>()
     }
+
+    fn store(&self) -> tauri::State<'_, QueenStore> {
+        self.app.state::<QueenStore>()
+    }
+
+    fn project_dir(&self) -> Result<std::path::PathBuf, ErrorData> {
+        self.config().current().map(|(_, dir)| dir).ok_or_else(|| {
+            ErrorData::invalid_params(
+                "no project loaded; load an mterm.yml before using pins or notes",
+                None,
+            )
+        })
+    }
 }
 
 fn ok_text(text: impl Into<String>) -> CallToolResult {
@@ -260,8 +276,8 @@ fn ok_text(text: impl Into<String>) -> CallToolResult {
 }
 
 fn ok_json(value: &serde_json::Value) -> Result<CallToolResult, ErrorData> {
-    let text = serde_json::to_string(value)
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+    let text =
+        serde_json::to_string(value).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     Ok(ok_text(text))
 }
 
@@ -309,6 +325,80 @@ pub struct NotifyRequest {
     pub title: String,
     #[schemars(description = "notification body")]
     pub message: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPinRequest {
+    #[schemars(description = "project-scoped pin key (max 128 bytes)")]
+    pub key: String,
+    #[schemars(description = "small durable value (max 16 KiB)")]
+    pub value: String,
+    #[schemars(
+        description = "required when replacing an existing pin; must equal its latest revision"
+    )]
+    pub expected_revision: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePinRequest {
+    pub key: String,
+    #[schemars(description = "revision returned by list_pins or set_pin")]
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNoteRequest {
+    #[schemars(description = "note title (max 256 bytes)")]
+    pub title: String,
+    #[schemars(description = "note body (max 64 KiB)")]
+    pub body: String,
+    #[schemars(description = "optional tags (max 32 tags, 64 bytes each)")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListNotesRequest {
+    #[schemars(description = "optional case-insensitive title/body/tag substring")]
+    pub query: Option<String>,
+    #[schemars(description = "maximum notes to return (default 50, max 200)")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetNoteRequest {
+    pub id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateNoteRequest {
+    pub id: i64,
+    #[schemars(description = "revision returned by get_note, list_notes, or create_note")]
+    pub expected_revision: i64,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    #[schemars(description = "when present, replaces the complete tag list")]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNoteRequest {
+    pub id: i64,
+    #[schemars(description = "revision returned by get_note or list_notes")]
+    pub expected_revision: i64,
+}
+
+fn queen_data_error(error: String) -> ErrorData {
+    if error.starts_with("Queen database error") {
+        ErrorData::internal_error(error, None)
+    } else {
+        ErrorData::invalid_params(error, None)
+    }
 }
 
 #[tool_router]
@@ -434,18 +524,144 @@ impl QueenServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(ok_text("ok"))
     }
+
+    #[tool(
+        description = "Create or safely update a small project-scoped pin. Creating a new key omits expectedRevision. Updating an existing key requires its latest revision; stale writes fail instead of overwriting another agent's change. Returns {pin}."
+    )]
+    fn set_pin(
+        &self,
+        Parameters(SetPinRequest {
+            key,
+            value,
+            expected_revision,
+        }): Parameters<SetPinRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let pin = self
+            .store()
+            .set_pin(&project, key, value, expected_revision)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "pin": pin }))
+    }
+
+    #[tool(description = "List all durable pins for the loaded project, including revisions")]
+    fn list_pins(&self) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let pins = self.store().list_pins(&project).map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "pins": pins }))
+    }
+
+    #[tool(
+        description = "Delete a project pin only if expectedRevision still matches. A stale delete fails without removing newer content."
+    )]
+    fn delete_pin(
+        &self,
+        Parameters(DeletePinRequest {
+            key,
+            expected_revision,
+        }): Parameters<DeletePinRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        self.store()
+            .delete_pin(&project, key.clone(), expected_revision)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "deleted": true, "key": key }))
+    }
+
+    #[tool(
+        description = "Create a durable project-scoped note. Returns {note} with a stable id and revision."
+    )]
+    fn create_note(
+        &self,
+        Parameters(CreateNoteRequest { title, body, tags }): Parameters<CreateNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let note = self
+            .store()
+            .create_note(&project, title, body, tags.unwrap_or_default())
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "note": note }))
+    }
+
+    #[tool(
+        description = "List project notes newest-first, optionally filtering title, body, and tags. Returns revisions required for safe updates."
+    )]
+    fn list_notes(
+        &self,
+        Parameters(ListNotesRequest { query, limit }): Parameters<ListNotesRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let notes = self
+            .store()
+            .list_notes(&project, query, limit.unwrap_or(50))
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "notes": notes }))
+    }
+
+    #[tool(description = "Get one project note by stable id")]
+    fn get_note(
+        &self,
+        Parameters(GetNoteRequest { id }): Parameters<GetNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let note = self
+            .store()
+            .get_note(&project, id)
+            .map_err(queen_data_error)?
+            .ok_or_else(|| ErrorData::invalid_params(format!("note {id} not found"), None))?;
+        ok_json(&serde_json::json!({ "note": note }))
+    }
+
+    #[tool(
+        description = "Update selected fields of a project note only if expectedRevision matches. Stale writes fail without overwriting another agent's change."
+    )]
+    fn update_note(
+        &self,
+        Parameters(UpdateNoteRequest {
+            id,
+            expected_revision,
+            title,
+            body,
+            tags,
+        }): Parameters<UpdateNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let note = self
+            .store()
+            .update_note(&project, id, expected_revision, title, body, tags)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "note": note }))
+    }
+
+    #[tool(
+        description = "Delete a project note only if expectedRevision still matches. A stale delete fails without removing newer content."
+    )]
+    fn delete_note(
+        &self,
+        Parameters(DeleteNoteRequest {
+            id,
+            expected_revision,
+        }): Parameters<DeleteNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        self.store()
+            .delete_note(&project, id, expected_revision)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "deleted": true, "id": id }))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for QueenServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Queen: the ptygrid orchestrator. Use list_agents to see \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Queen: the ptygrid orchestrator. Use list_agents to see \
                  sessions and definitions, read_output to inspect a pane, \
                  send_message to type into a pane, spawn_agent to start a \
-                 config-defined agent, and notify to toast the user.",
-            )
+                 config-defined agent, notify to toast the user, and durable \
+                 pins/notes to coordinate project knowledge. When multiple \
+                 sessions share a name, address the exact session as #<id>.",
+        )
     }
 }
 
@@ -465,5 +681,33 @@ mod tests {
     #[test]
     fn url_formatting() {
         assert_eq!(url_for_port(39237), "http://127.0.0.1:39237/mcp");
+    }
+
+    #[test]
+    fn phase_3_6_exposes_all_thirteen_tools() {
+        let mut names: Vec<_> = QueenServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "create_note",
+                "delete_note",
+                "delete_pin",
+                "get_note",
+                "list_agents",
+                "list_notes",
+                "list_pins",
+                "notify",
+                "read_output",
+                "send_message",
+                "set_pin",
+                "spawn_agent",
+                "update_note",
+            ]
+        );
     }
 }
