@@ -1,0 +1,34 @@
+# Keep this crate independent from the ptygrid app crate, like the
+# pty-core-check / mcp-server-check smoke-test crates. The app crate will
+# take a path dependency on this library when Phase 4.2 wires it in.
+[workspace]
+
+[package]
+name = "teams-backend"
+version = "0.1.0"
+edition = "2021"
+description = "ptygrid teams pane-backend: CustomPaneBackend-style JSON-RPC 2.0 socket server + tmux shim"
+authors = ["zephel01"]
+
+[lib]
+name = "teams_backend"
+
+[[bin]]
+name = "ptygrid-tmux-shim"
+path = "src/bin/ptygrid-tmux-shim.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+anyhow = "1"
