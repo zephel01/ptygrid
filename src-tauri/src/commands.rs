@@ -11,6 +11,7 @@ use crate::git_service::{self, GitCommitInfo, GitDiffInfo, GitStatusInfo};
 use crate::project_state::{self, LogicalSession, ProjectState};
 use crate::queen::{self, QueenStatus, QueenStatusInfo};
 use crate::session::{PtyManager, SessionInfo};
+use crate::teams_hooks::{self, RegisterResult, TeammateHooksInfo};
 
 /// Start a PTY-backed shell and return its session id.
 #[tauri::command]
@@ -65,6 +66,20 @@ pub fn load_config(
 #[tauri::command]
 pub fn queen_status(status: State<'_, QueenStatus>) -> Result<QueenStatusInfo, String> {
     Ok(status.info())
+}
+
+/// Return teammate hooks info (enabled/notifications/port/token/scope) so the
+/// frontend can build a settings.json snippet.
+#[tauri::command]
+pub fn teammate_hooks_info(app: AppHandle) -> Result<TeammateHooksInfo, String> {
+    Ok(teams_hooks::hooks_info(&app))
+}
+
+/// Merge the ptygrid HTTP hooks into `~/.claude/settings.json` (user) or
+/// `<project>/.claude/settings.json` (project), preserving existing content.
+#[tauri::command]
+pub fn register_teammate_hooks(app: AppHandle, scope: String) -> Result<RegisterResult, String> {
+    teams_hooks::register(&app, &scope)
 }
 
 /// Launch a loaded agent/process definition by name.

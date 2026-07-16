@@ -71,6 +71,14 @@ impl QueenStatus {
         }
     }
 
+    /// Port the server is (or will be) reachable on: the bound port when
+    /// running, otherwise the configured desired port. Used by the teammate
+    /// hooks, which share this server.
+    pub fn effective_port(&self) -> u16 {
+        let inner = self.lock();
+        inner.port.unwrap_or(inner.desired_port)
+    }
+
     pub fn info(&self) -> QueenStatusInfo {
         let inner = self.lock();
         QueenStatusInfo {
@@ -206,7 +214,12 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
                 Default::default(),
                 StreamableHttpServerConfig::default(),
             );
-        let router = axum::Router::new().nest_service("/mcp", service);
+        // Phase 4.0: the teammate hook receiver shares this 127.0.0.1 server,
+        // co-located with /mcp. Its own module owns all the hook logic.
+        let hooks_token = app.state::<crate::teams_hooks::TeamsHooks>().token().to_string();
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .merge(crate::teams_hooks::router(app.clone(), hooks_token));
 
         status_update(&|inner| {
             inner.running = true;

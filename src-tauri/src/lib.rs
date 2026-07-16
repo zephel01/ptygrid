@@ -8,12 +8,14 @@ mod queen;
 mod queen_store;
 mod resource_monitor;
 mod session;
+mod teams_hooks;
 mod worktree;
 
 use config::ConfigManager;
 use queen::QueenStatus;
 use session::PtyManager;
 use tauri::Manager;
+use teams_hooks::TeamsHooks;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -21,6 +23,7 @@ pub fn run() {
         .manage(PtyManager::new())
         .manage(ConfigManager::new())
         .manage(QueenStatus::new())
+        .manage(TeamsHooks::new())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let queen_store =
@@ -45,6 +48,8 @@ pub fn run() {
             commands::load_project_state,
             commands::resume_logical_session,
             commands::queen_status,
+            commands::teammate_hooks_info,
+            commands::register_teammate_hooks,
             commands::git_status,
             commands::git_diff,
             commands::git_stage,

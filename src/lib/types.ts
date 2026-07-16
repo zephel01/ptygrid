@@ -87,6 +87,33 @@ export type QueenStatus = {
 
 export type QueenNotifyPayload = { title: string; message: string };
 
+// Phase 4.0 (teammate hooks 受信基盤)
+export type TeammateHooksInfo = {
+  enabled: boolean;
+  hookNotifications: boolean;
+  port: number;
+  token: string;
+  hooksScope: "user" | "project";
+};
+
+export type TeammateLifecycleKind =
+  | "subagent-start"
+  | "subagent-stop"
+  | "teammate-idle"
+  | "task-created"
+  | "task-completed";
+
+export type TeammateLifecyclePayload = {
+  kind: TeammateLifecycleKind;
+  sessionId?: string;
+  agentId?: string;
+  agentType?: string;
+  taskId?: string;
+  taskName?: string;
+  status?: string;
+  cwd?: string;
+};
+
 // Phase 3.1 (read-only Git status/diff)
 export type GitFileStatus = {
   path: string;

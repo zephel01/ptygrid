@@ -11,6 +11,9 @@ import type {
   SessionResourcesPayload,
   SessionResourceUsage,
   SessionInfo,
+  TeammateHooksInfo,
+  TeammateLifecycleKind,
+  TeammateLifecyclePayload,
 } from "./types";
 import { isTauri } from "./tauri";
 import { writeToTerm } from "./terminals";
@@ -39,9 +42,22 @@ export const ui = $state({
   configChangedPath: null as string | null,
   /** Queen MCP server status (null until first queen_status fetch). */
   queenStatus: null as QueenStatus | null,
+  /** Teammate hooks info (null until first teammate_hooks_info fetch). */
+  teammateHooks: null as TeammateHooksInfo | null,
+  /** Most recent teammate-lifecycle events (newest first, capped). */
+  teammateEvents: [] as TeammateEvent[],
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
 });
+
+/** A received teammate-lifecycle event, kept for the Teammates panel. */
+export type TeammateEvent = TeammateLifecyclePayload & {
+  key: number;
+  atMs: number;
+};
+
+const MAX_TEAMMATE_EVENTS = 10;
+let nextTeammateKey = 0;
 
 export const MAX_PANES = 9;
 
@@ -67,6 +83,37 @@ export async function refreshQueenStatus(): Promise<void> {
   } catch (err) {
     ui.queenStatus = { enabled: true, running: false, error: String(err) };
   }
+}
+
+/** Fetch teammate_hooks_info (startup + after each successful load_config). */
+export async function refreshTeammateHooks(): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    ui.teammateHooks = await invoke<TeammateHooksInfo>("teammate_hooks_info");
+  } catch {
+    ui.teammateHooks = null;
+  }
+}
+
+const TEAMMATE_KIND_LABELS: Record<TeammateLifecycleKind, string> = {
+  "subagent-start": "が起動",
+  "subagent-stop": "が停止",
+  "teammate-idle": "がアイドル",
+  "task-created": "のタスクを作成",
+  "task-completed": "のタスクが完了",
+};
+
+/** Short Japanese toast text for a teammate-lifecycle event. */
+function teammateToast(ev: TeammateLifecyclePayload): string {
+  const who =
+    ev.agentType ??
+    ev.agentId ??
+    ev.taskName ??
+    ev.taskId ??
+    ev.sessionId ??
+    "teammate";
+  return `🤝 teammate ${who} ${TEAMMATE_KIND_LABELS[ev.kind]}`;
 }
 
 let listenersInitialized = false;
@@ -140,6 +187,23 @@ export async function initGlobalListeners(): Promise<void> {
 
   await listen<QueenNotifyPayload>("queen-notify", (event) => {
     addNotice(event.payload.title, event.payload.message);
+  });
+
+  await listen<TeammateLifecyclePayload>("teammate-lifecycle", (event) => {
+    const ev: TeammateEvent = {
+      ...event.payload,
+      key: ++nextTeammateKey,
+      atMs: Date.now(),
+    };
+    ui.teammateEvents = [ev, ...ui.teammateEvents].slice(
+      0,
+      MAX_TEAMMATE_EVENTS,
+    );
+    // Toast only when hook notifications are on (backend still emits so the
+    // Teammates panel stays current regardless).
+    if (ui.teammateHooks?.hookNotifications) {
+      addNotice(teammateToast(event.payload));
+    }
   });
 }
 

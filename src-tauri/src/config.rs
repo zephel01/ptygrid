@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 /// `Config { project?, agents, processes }` — processes defaults to empty Vec.
-/// Phase 2 adds the optional `queen:` block.
+/// Phase 2 adds the optional `queen:` block; Phase 4.0 the `teammates:` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22,6 +22,8 @@ pub struct Config {
     pub processes: Vec<AgentDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queen: Option<QueenConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammates: Option<TeammatesConfig>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -39,6 +41,59 @@ impl QueenConfig {
     }
     pub fn effective_port(&self) -> u16 {
         self.port.unwrap_or(crate::queen::DEFAULT_PORT)
+    }
+}
+
+/// Phase 4.0 global `teammates:` block. Governs whether teammate hook events
+/// are emitted/toasted and where `register_teammate_hooks` writes by default.
+/// `agents[].teams` (per-agent teammate config) is Phase 4.1, not parsed here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct TeammatesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook_notifications: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_max_panes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_scope: Option<HooksScope>,
+}
+
+impl TeammatesConfig {
+    /// Default false: hook events are received (token still checked) but not
+    /// emitted/toasted until the user opts in.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+    pub fn effective_hook_notifications(&self) -> bool {
+        self.hook_notifications.unwrap_or(true)
+    }
+    /// Default 6, clamped into the 1..=9 pane range. Consumed by the Phase 4.1
+    /// pane-limit logic; parsed and clamped here so the schema is stable now.
+    #[allow(dead_code)]
+    pub fn effective_global_max_panes(&self) -> u32 {
+        self.global_max_panes.unwrap_or(6).clamp(1, 9)
+    }
+    pub fn effective_hooks_scope(&self) -> HooksScope {
+        self.hooks_scope.unwrap_or_default()
+    }
+}
+
+/// Where `register_teammate_hooks` writes the Claude Code hooks by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HooksScope {
+    #[default]
+    User,
+    Project,
+}
+
+impl HooksScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HooksScope::User => "user",
+            HooksScope::Project => "project",
+        }
     }
 }
 
@@ -229,6 +284,15 @@ impl ConfigManager {
             dir,
             config,
         })
+    }
+
+    /// Inject a config + directory directly, bypassing file IO and the
+    /// watcher. Test-only; `load` requires a concrete Wry `AppHandle`.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, dir: PathBuf, config: Config) {
+        let mut inner = self.lock();
+        inner.dir = Some(dir);
+        inner.config = Some(config);
     }
 
     /// Current loaded config + its directory (Queen list_agents).
@@ -458,6 +522,53 @@ agents:
         let q = cfg.queen.unwrap();
         assert!(!q.effective_enabled());
         assert_eq!(q.effective_port(), 40100);
+    }
+
+    #[test]
+    fn teammates_block_defaults_and_clamp() {
+        // No teammates block at all -> None; effective defaults on Default.
+        let cfg = parse_config("agents: []").unwrap();
+        assert!(cfg.teammates.is_none());
+        let defaults = TeammatesConfig::default();
+        assert!(!defaults.effective_enabled());
+        assert!(defaults.effective_hook_notifications());
+        assert_eq!(defaults.effective_global_max_panes(), 6);
+        assert_eq!(defaults.effective_hooks_scope(), HooksScope::User);
+
+        // Empty block -> same effective defaults.
+        let cfg = parse_config("agents: []\nteammates: {}").unwrap();
+        let t = cfg.teammates.unwrap();
+        assert_eq!(t.enabled, None);
+        assert!(!t.effective_enabled());
+        assert!(t.effective_hook_notifications());
+        assert_eq!(t.effective_global_max_panes(), 6);
+        assert_eq!(t.effective_hooks_scope(), HooksScope::User);
+
+        // Explicit values, including out-of-range panes that clamp to 1..=9.
+        let cfg = parse_config(
+            "agents: []\nteammates:\n  enabled: true\n  hook_notifications: false\n  global_max_panes: 42\n  hooks_scope: project",
+        )
+        .unwrap();
+        let t = cfg.teammates.unwrap();
+        assert!(t.effective_enabled());
+        assert!(!t.effective_hook_notifications());
+        assert_eq!(t.effective_global_max_panes(), 9);
+        assert_eq!(t.effective_hooks_scope(), HooksScope::Project);
+
+        // Below the range clamps up to 1.
+        let cfg = parse_config("agents: []\nteammates:\n  global_max_panes: 0").unwrap();
+        assert_eq!(cfg.teammates.unwrap().effective_global_max_panes(), 1);
+    }
+
+    #[test]
+    fn teammates_block_ignores_unknown_fields() {
+        // Unknown keys are ignored (no deny_unknown_fields), known ones parse.
+        let cfg = parse_config(
+            "agents: []\nteammates:\n  enabled: true\n  future_option: 123\n  nested:\n    a: b",
+        )
+        .unwrap();
+        let t = cfg.teammates.unwrap();
+        assert!(t.effective_enabled());
     }
 
     #[test]

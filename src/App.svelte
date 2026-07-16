@@ -11,6 +11,7 @@
     addNotice,
     dismissNotice,
     refreshQueenStatus,
+    refreshTeammateHooks,
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
@@ -127,6 +128,95 @@
     } catch (err) {
       ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
     }
+  }
+
+  // ---- Teammates badge (Phase 4.0 hooks) ----
+  let teammatesPanelOpen = $state(false);
+  let registering = $state(false);
+
+  let teammatesClass = $derived.by(() => {
+    if (!isTauri()) return "queen-off";
+    return ui.teammateHooks?.enabled ? "queen-running" : "queen-off";
+  });
+  let teammatesTooltip = $derived.by(() => {
+    if (!isTauri()) return "Tauri 実行環境なし（デモモード）";
+    const t = ui.teammateHooks;
+    if (!t) return "Teammate hooks（状態未取得）";
+    return t.enabled
+      ? "Teammate hooks 有効（クリックで設定）"
+      : "Teammate hooks 無効（mterm.yml の teammates.enabled: true で有効化）";
+  });
+
+  // The hooks JSON snippet (token embedded) users paste into settings.json.
+  let hooksSnippet = $derived.by(() => {
+    const t = ui.teammateHooks;
+    if (!t) return "";
+    const events: [string, string][] = [
+      ["SubagentStart", "subagent-start"],
+      ["SubagentStop", "subagent-stop"],
+      ["TeammateIdle", "teammate-idle"],
+      ["TaskCreated", "task-created"],
+      ["TaskCompleted", "task-completed"],
+    ];
+    const hooks: Record<string, unknown> = {};
+    for (const [event, suffix] of events) {
+      hooks[event] = [
+        {
+          hooks: [
+            {
+              type: "http",
+              url: `http://127.0.0.1:${t.port}/hooks/v1/${suffix}`,
+              headers: { Authorization: `Bearer ${t.token}` },
+            },
+          ],
+        },
+      ];
+    }
+    return JSON.stringify({ hooks }, null, 2);
+  });
+
+  async function copyHooksSnippet(): Promise<void> {
+    if (!hooksSnippet) return;
+    try {
+      await navigator.clipboard.writeText(hooksSnippet);
+      addNotice("hooks 設定スニペットをコピーしました");
+    } catch (err) {
+      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+    }
+  }
+
+  async function registerHooks(): Promise<void> {
+    if (!isTauri() || registering) return;
+    registering = true;
+    try {
+      const result = await invokeCmd<{ written: boolean; path: string }>(
+        "register_teammate_hooks",
+        { scope: "user" },
+      );
+      addNotice(
+        result.written
+          ? "settings.json に登録しました"
+          : "settings.json は既に最新です",
+        result.path,
+      );
+    } catch (err) {
+      ui.errorBanner = `hooks の登録に失敗しました (register_teammate_hooks): ${err}`;
+    } finally {
+      registering = false;
+    }
+  }
+
+  const TEAMMATE_KIND_TEXT: Record<string, string> = {
+    "subagent-start": "起動",
+    "subagent-stop": "停止",
+    "teammate-idle": "アイドル",
+    "task-created": "タスク作成",
+    "task-completed": "タスク完了",
+  };
+  function teammateEventLabel(ev: { kind: string; agentType?: string; agentId?: string; taskName?: string; taskId?: string; sessionId?: string }): string {
+    const who =
+      ev.agentType ?? ev.agentId ?? ev.taskName ?? ev.taskId ?? ev.sessionId ?? "teammate";
+    return `${who} · ${TEAMMATE_KIND_TEXT[ev.kind] ?? ev.kind}`;
   }
 
   // ---- actions ----
@@ -271,6 +361,8 @@
       ui.configChangedPath = null;
       // Queen may have been restarted if the port changed in mterm.yml.
       void refreshQueenStatus();
+      // teammates.enabled / hook_notifications may have changed too.
+      void refreshTeammateHooks();
       return info;
     } finally {
       loadingConfig = false;
@@ -395,6 +487,7 @@
       }
       await initGlobalListeners();
       void refreshQueenStatus();
+      void refreshTeammateHooks();
       let restored = false;
       try {
         restored = await restoreProjectState();
@@ -533,6 +626,66 @@
       <span class="queen-dot"></span>
       {queenLabel}
     </button>
+    <div class="teammates-wrap">
+      <button
+        class="queen-badge {teammatesClass}"
+        onclick={() => (teammatesPanelOpen = !teammatesPanelOpen)}
+        title={teammatesTooltip}
+        aria-label="Teammate hooks（クリックで設定パネル）"
+      >
+        <span class="queen-dot"></span>
+        Teammates
+      </button>
+      {#if teammatesPanelOpen}
+        <div class="teammates-panel" role="dialog" aria-label="Teammate hooks 設定">
+          <div class="tm-head">
+            <span class="tm-title">Teammate hooks</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (teammatesPanelOpen = false)}
+              title="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+          {#if !isTauri()}
+            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+          {:else if !ui.teammateHooks}
+            <p class="tm-note">状態を取得中…</p>
+          {:else}
+            <p class="tm-note">
+              状態:
+              {ui.teammateHooks.enabled ? "有効" : "無効"} ·
+              通知: {ui.teammateHooks.hookNotifications ? "オン" : "オフ"} ·
+              ポート :{ui.teammateHooks.port}
+            </p>
+            <div class="tm-actions">
+              <button class="btn btn-small" onclick={copyHooksSnippet}>
+                スニペットをコピー
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={registerHooks}
+                disabled={registering}
+                title="~/.claude/settings.json へ登録"
+              >
+                {registering ? "登録中…" : "settings.json へ登録 (user)"}
+              </button>
+            </div>
+            <div class="tm-events">
+              <div class="tm-subhead">直近のイベント</div>
+              {#if ui.teammateEvents.length === 0}
+                <div class="tm-empty">まだイベントはありません</div>
+              {:else}
+                {#each ui.teammateEvents as ev (ev.key)}
+                  <div class="tm-event">{teammateEventLabel(ev)}</div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
     {#if totalResources.sessionCount > 0}
       <span
         class="total-resources"
@@ -917,6 +1070,84 @@
 
   .queen-off {
     opacity: 0.7;
+  }
+
+  /* ---- teammates panel (popover under the badge) ---- */
+
+  .teammates-wrap {
+    position: relative;
+    align-self: center;
+    margin-right: 8px;
+  }
+
+  .teammates-wrap .queen-badge {
+    margin-right: 0;
+  }
+
+  .teammates-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 120;
+    width: 340px;
+    background: #2d2d30;
+    border: 1px solid #4a4a4a;
+    border-radius: 6px;
+    padding: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    white-space: normal;
+  }
+
+  .tm-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+
+  .tm-title {
+    font-weight: 700;
+    color: #e8e8e8;
+  }
+
+  .tm-note {
+    margin: 0 0 8px;
+    color: #b5b5b5;
+    font-size: 11px;
+  }
+
+  .tm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .tm-events {
+    border-top: 1px solid #3d3d3d;
+    padding-top: 6px;
+  }
+
+  .tm-subhead {
+    color: #8a8a8a;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    margin-bottom: 4px;
+  }
+
+  .tm-empty {
+    color: #6f6f6f;
+    font-size: 11px;
+  }
+
+  .tm-event {
+    color: #cfcfcf;
+    font-family: Menlo, monospace;
+    font-size: 11px;
+    padding: 2px 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* ---- banners / toast ---- */
