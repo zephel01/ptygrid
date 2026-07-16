@@ -1,7 +1,7 @@
 # IPC / Service Contract (backend ⇄ frontend / Queen)
 
 > この文書は段階releaseごとの差分契約を時系列で保持する。前のPhaseと後のPhaseが競合する
-> 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 3.7。
+> 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 3.8。
 > 操作方法と現在仕様の要約は[docs/userguide.md](docs/userguide.md)を参照。
 
 ## Phase 0 (基本PTY)
@@ -558,3 +558,35 @@ type InboxMessage = {
 - message本文は更新・削除しない。誤送信訂正・retention policyはPhase 3.7の対象外。
 - storageは既存`queen/queen.sqlite3`をschema version 2へtransactional migrationする。
   project scope、WAL、busy timeout、repositoryへfileを作らない規則はPhase 3.6を継承する。
+
+---
+
+# Phase 3.8 追加契約（cancellable Queen `await`）
+
+Phase 3.8はQueen MCPを18 toolsへ拡張し、Inbox messageをbusy pollingせず待つread-only tool
+`await`を追加する。
+
+## Queen MCP tool
+
+| tool | args | returns | 説明 |
+|---|---|---|---|
+| `await` | `{ mailbox, afterId?, includeAcknowledged?, limit?, timeoutMs? }` | `{ messages, nextCursor, timedOut }` | cursorより後のmessage到着、timeout、MCP cancellationのいずれかまで待つ |
+
+## Await semantics
+
+- mailbox、afterId、includeAcknowledged、limitのfilterは`list_inbox`と同一。defaultは
+  `afterId: 0`、`includeAcknowledged: false`、`limit: 50`。
+- `timeoutMs`は1〜300,000、default 30,000。無制限waitは提供しない。
+- 呼出時点ですでに一致messageがあれば待たずに返す。messageがある場合は
+  `timedOut: false`、`nextCursor`は返却最大ID。
+- deadlineまでにmessageがなければ`messages: []`、入力afterIdを`nextCursor`、
+  `timedOut: true`として正常returnする。timeoutはerrorにしない。
+- Queen Storeはprocess内のInbox generationを`tokio::sync::watch`で通知する。
+  waiterは通知をsubscribeしてから初回queryすることで、queryとwait開始の間のlost wakeupを防ぐ。
+- `send_inbox` / `reply_inbox`はDB transaction commit後にgenerationを1増やす。
+  rollback、ackだけの変更では新規message通知を出さない。
+- rmcpがrequestに付与する`CancellationToken`をtool handlerへextractし、MCP
+  `notifications/cancelled`受信時はwaitを直ちに終了してcancellation errorを返す。
+  cancellationはInboxをack/updateせず、cursorも永続化しない。
+- 同時にmessage、timeout、cancellationがreadyの場合はcancellationを優先する。
+- wait中はSQLite connection mutexやsession map lockを保持しない。通知ごとの短いqueryだけを行う。

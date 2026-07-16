@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const MAX_PINS_PER_PROJECT: i64 = 256;
 const MAX_NOTES_PER_PROJECT: i64 = 10_000;
@@ -58,8 +60,25 @@ pub struct InboxMessage {
     pub created_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxWait {
+    Messages(Vec<InboxMessage>),
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxWaitOptions {
+    pub mailbox: String,
+    pub after_id: i64,
+    pub include_acknowledged: bool,
+    pub limit: u32,
+    pub timeout: Duration,
+}
+
 pub struct QueenStore {
     connection: Mutex<Connection>,
+    inbox_generation: watch::Sender<u64>,
 }
 
 impl QueenStore {
@@ -184,8 +203,10 @@ impl QueenStore {
                 ));
             }
         }
+        let (inbox_generation, _) = watch::channel(0);
         Ok(Self {
             connection: Mutex::new(connection),
+            inbox_generation,
         })
     }
 
@@ -543,6 +564,7 @@ impl QueenStore {
         let message = get_inbox_from(&transaction, &project, id)?
             .ok_or_else(|| "inbox message was inserted but could not be read back".to_string())?;
         transaction.commit().map_err(db_error)?;
+        self.notify_inbox();
         Ok(message)
     }
 
@@ -682,7 +704,59 @@ impl QueenStore {
         let reply = get_inbox_from(&transaction, &project, reply_id)?
             .ok_or_else(|| "inbox reply was inserted but could not be read back".to_string())?;
         transaction.commit().map_err(db_error)?;
+        self.notify_inbox();
         Ok(reply)
+    }
+
+    pub async fn await_inbox(
+        &self,
+        project: &Path,
+        options: InboxWaitOptions,
+        cancellation: CancellationToken,
+    ) -> Result<InboxWait, String> {
+        let InboxWaitOptions {
+            mailbox,
+            after_id,
+            include_acknowledged,
+            limit,
+            timeout,
+        } = options;
+        let mut changes = self.inbox_generation.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(InboxWait::Cancelled);
+            }
+            let messages = self.list_inbox(
+                project,
+                mailbox.clone(),
+                after_id,
+                include_acknowledged,
+                limit,
+            )?;
+            if cancellation.is_cancelled() {
+                return Ok(InboxWait::Cancelled);
+            }
+            if !messages.is_empty() {
+                return Ok(InboxWait::Messages(messages));
+            }
+
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(InboxWait::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Ok(InboxWait::TimedOut),
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Err("Queen inbox notification channel closed".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn notify_inbox(&self) {
+        self.inbox_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -870,6 +944,16 @@ mod tests {
         (root, one, two)
     }
 
+    fn wait_options(after_id: i64, timeout: Duration) -> InboxWaitOptions {
+        InboxWaitOptions {
+            mailbox: "codex".to_string(),
+            after_id,
+            include_acknowledged: false,
+            limit: 50,
+            timeout,
+        }
+    }
+
     #[test]
     fn pins_upsert_delete_persist_and_are_project_scoped() {
         let (root, one, two) = projects();
@@ -1037,6 +1121,7 @@ mod tests {
     fn inbox_is_project_scoped_and_acknowledgement_is_idempotent() {
         let (root, one, two) = projects();
         let store = QueenStore::open_in_memory().unwrap();
+        let initial_generation = *store.inbox_generation.borrow();
         let message = store
             .send_inbox(
                 &one,
@@ -1046,6 +1131,8 @@ mod tests {
                 "Please inspect the migration.".to_string(),
             )
             .unwrap();
+        let sent_generation = *store.inbox_generation.borrow();
+        assert_eq!(sent_generation, initial_generation + 1);
         assert_eq!(message.root_message_id, message.id);
         assert_eq!(message.in_reply_to_id, None);
         assert_eq!(message.acknowledged_at_ms, None);
@@ -1067,6 +1154,7 @@ mod tests {
         let acknowledged = store
             .ack_inbox(&one, message.id, "codex-review".to_string())
             .unwrap();
+        assert_eq!(*store.inbox_generation.borrow(), sent_generation);
         assert!(acknowledged.acknowledged_at_ms.is_some());
         let repeated = store
             .ack_inbox(&one, message.id, "codex-review".to_string())
@@ -1142,6 +1230,93 @@ mod tests {
         assert_eq!(claude_inbox.len(), 1);
         assert_eq!(claude_inbox[0].id, reply.id);
         assert!(claude_inbox[0].acknowledged_at_ms.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn await_inbox_returns_immediately_wakes_times_out_and_cancels() {
+        let (root, one, _) = projects();
+        let store = Arc::new(QueenStore::open_in_memory().unwrap());
+        let existing = store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "existing".to_string(),
+                "ready".to_string(),
+            )
+            .unwrap();
+        let pre_cancelled = CancellationToken::new();
+        pre_cancelled.cancel();
+        assert_eq!(
+            store
+                .await_inbox(&one, wait_options(0, Duration::from_secs(1)), pre_cancelled,)
+                .await
+                .unwrap(),
+            InboxWait::Cancelled
+        );
+        let immediate = store
+            .await_inbox(
+                &one,
+                wait_options(0, Duration::from_secs(1)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(immediate, InboxWait::Messages(vec![existing.clone()]));
+
+        let waiting_store = Arc::clone(&store);
+        let waiting_project = one.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .await_inbox(
+                    &waiting_project,
+                    wait_options(existing.id, Duration::from_secs(1)),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let arrived = store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "new".to_string(),
+                "wake up".to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            waiting.await.unwrap().unwrap(),
+            InboxWait::Messages(vec![arrived.clone()])
+        );
+
+        let timed_out = store
+            .await_inbox(
+                &one,
+                wait_options(arrived.id, Duration::from_millis(5)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timed_out, InboxWait::TimedOut);
+
+        let cancellation = CancellationToken::new();
+        let cancel_handle = cancellation.clone();
+        let cancelling_store = Arc::clone(&store);
+        let cancelling_project = one.clone();
+        let cancelling = tokio::spawn(async move {
+            cancelling_store
+                .await_inbox(
+                    &cancelling_project,
+                    wait_options(arrived.id, Duration::from_secs(1)),
+                    cancellation,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancel_handle.cancel();
+        assert_eq!(cancelling.await.unwrap().unwrap(), InboxWait::Cancelled);
         let _ = std::fs::remove_dir_all(root);
     }
 

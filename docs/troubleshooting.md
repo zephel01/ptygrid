@@ -133,3 +133,10 @@ curl -s -X POST http://127.0.0.1:39237/mcp ... \
   senderとrecipientが同じでも別projectからは見えない。
 - **replyできない**: `reply_inbox.sender`は元messageのrecipientと完全一致する必要がある。
   messageの`recipient`を確認し、表示名やsession IDへ置き換えない。
+
+### `await`が空で返る
+
+- `timedOut: true`ならerrorではなく正常なdeadline到達。返された`nextCursor`で再度待てる。
+- `afterId`より小さいIDは返らない。履歴確認は`list_inbox`で`afterId: 0`を使う。
+- defaultではack済みmessageを除外する。必要なら`includeAcknowledged: true`を指定する。
+- cancellation errorはMCP clientがrequestをcancelした結果。messageやack状態は変更されていない。

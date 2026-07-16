@@ -1,6 +1,6 @@
 # ptygrid 設計・アーキテクチャ
 
-更新日: 2026-07-16 / 実装基準: Phase 3.7
+更新日: 2026-07-16 / 実装基準: Phase 3.8
 
 この文書は現在の実装構造と、変更時に守る設計判断をまとめます。初期調査と競合上の
 位置づけは[competitive-landscape.md](competitive-landscape.md)、IPCの正確な型と制限は
@@ -39,7 +39,7 @@ server Queenを通して相互に読み書き・協調させるmacOS向けdeskto
 │ worktree.rs          opt-in linked worktree creation/reuse      │
 │ project_state.rs     versioned logical session persistence      │
 │ resource_monitor.rs  shared process-tree CPU/RSS sampler        │
-│ queen.rs             rmcp Streamable HTTP server / 17 tools     │
+│ queen.rs             rmcp Streamable HTTP server / 18 tools     │
 │ queen_store.rs       SQLite pins/notes/inbox with transactions  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -107,12 +107,13 @@ Queenの`agent`解決順は次のとおりです。
 Queenは`127.0.0.1`だけにbindするrmcp Streamable HTTP serverです。default portは39237、
 使用中なら39246まで順に試します。全sessionへ実際のURLを`QUEEN_URL`として渡します。
 
-Phase 3.7時点の17 tools:
+Phase 3.8時点の18 tools:
 
 - live session: `list_agents`, `read_output`, `send_message`, `spawn_agent`, `notify`
 - durable pins: `set_pin`, `list_pins`, `delete_pin`
 - durable notes: `create_note`, `list_notes`, `get_note`, `update_note`, `delete_note`
 - durable inbox: `send_inbox`, `list_inbox`, `ack_inbox`, `reply_inbox`
+- wait: `await`
 
 `spawn_agent`は現在の`mterm.yml`定義名だけを許可します。Pins/Notes/Inboxは読み込まれた
 canonical config directoryでscopeし、project未読込時は使用できません。
@@ -120,6 +121,11 @@ canonical config directoryでscopeし、project未読込時は使用できませ
 Inboxはlive PTYへ書く`send_message`と分離した追記専用channelです。app再起動で変わる
 session `#id`ではなくstable mailbox名を使います。replyは元送受信者を反転し、root IDを
 継承してthreadを形成します。reply作成は元messageのacknowledgementと同じtransactionで行います。
+
+`await`はInbox generationを`tokio::sync::watch`で購読してから初回queryするため、queryと
+sleep開始の間に届いたmessageを取りこぼしません。wait中はDB mutexを保持せず、message commit時の
+通知で短いqueryを再実行します。rmcpのrequest cancellation token、最大5分のdeadline、既存messageの
+即時returnを同じselect loopで扱います。
 
 ## 7. 永続化と同時更新
 
@@ -163,7 +169,7 @@ CPUは1 coreを100%とするためmulti-core workloadは100%を超えます。me
 
 ## 10. Release status
 
-Phase 0〜2.1とPhase 3.0〜3.7は実装済みです。次はcancellable `await` (3.8)です。
+Phase 0〜2.1とPhase 3.0〜3.8は実装済みです。Phase 3の全段階releaseは完了しました。
 詳細なgateは[phase3.md](phase3.md)を参照してください。
 
 ## 11. 変更時の原則

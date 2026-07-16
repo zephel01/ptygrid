@@ -22,7 +22,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ConfigManager;
-use crate::queen_store::QueenStore;
+use crate::queen_store::{InboxWait, InboxWaitOptions, QueenStore};
 use crate::session::{PtyManager, SessionState};
 
 /// Contract default port; fallback +1 each up to DEFAULT_PORT+9 (39246).
@@ -434,6 +434,21 @@ pub struct ReplyInboxRequest {
     pub body: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AwaitInboxRequest {
+    #[schemars(description = "stable recipient mailbox to wait for")]
+    pub mailbox: String,
+    #[schemars(description = "return only messages with ids greater than this cursor (default 0)")]
+    pub after_id: Option<i64>,
+    #[schemars(description = "include acknowledged messages (default false)")]
+    pub include_acknowledged: Option<bool>,
+    #[schemars(description = "maximum messages to return (default 50, max 200)")]
+    pub limit: Option<u32>,
+    #[schemars(description = "bounded wait in milliseconds (default 30000, range 1..300000)")]
+    pub timeout_ms: Option<u64>,
+}
+
 fn queen_data_error(error: String) -> ErrorData {
     if error.starts_with("Queen database error") {
         ErrorData::internal_error(error, None)
@@ -774,6 +789,69 @@ impl QueenServer {
             .map_err(queen_data_error)?;
         ok_json(&serde_json::json!({ "message": message }))
     }
+
+    #[tool(
+        name = "await",
+        description = "Wait without busy polling for durable inbox messages after a stable id cursor. Returns immediately for existing matches, or {messages: [], nextCursor: afterId, timedOut: true} at the bounded deadline. MCP request cancellation stops the wait without acknowledging or changing messages."
+    )]
+    async fn await_inbox(
+        &self,
+        cancellation: CancellationToken,
+        Parameters(AwaitInboxRequest {
+            mailbox,
+            after_id,
+            include_acknowledged,
+            limit,
+            timeout_ms,
+        }): Parameters<AwaitInboxRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let after_id = after_id.unwrap_or(0);
+        let timeout_ms = timeout_ms.unwrap_or(30_000);
+        if !(1..=300_000).contains(&timeout_ms) {
+            return Err(ErrorData::invalid_params(
+                "timeoutMs must be between 1 and 300000",
+                None,
+            ));
+        }
+        let outcome = self
+            .store()
+            .await_inbox(
+                &project,
+                InboxWaitOptions {
+                    mailbox,
+                    after_id,
+                    include_acknowledged: include_acknowledged.unwrap_or(false),
+                    limit: limit.unwrap_or(50),
+                    timeout: std::time::Duration::from_millis(timeout_ms),
+                },
+                cancellation,
+            )
+            .await
+            .map_err(queen_data_error)?;
+        match outcome {
+            InboxWait::Messages(messages) => {
+                let next_cursor = messages
+                    .last()
+                    .map(|message| message.id)
+                    .unwrap_or(after_id);
+                ok_json(&serde_json::json!({
+                    "messages": messages,
+                    "nextCursor": next_cursor,
+                    "timedOut": false,
+                }))
+            }
+            InboxWait::TimedOut => ok_json(&serde_json::json!({
+                "messages": [],
+                "nextCursor": after_id,
+                "timedOut": true,
+            })),
+            InboxWait::Cancelled => Err(ErrorData::internal_error(
+                "await cancelled by MCP client",
+                None,
+            )),
+        }
+    }
 }
 
 #[tool_handler]
@@ -784,8 +862,8 @@ impl ServerHandler for QueenServer {
                  sessions and definitions, read_output to inspect a pane, \
                  send_message to type into a pane, spawn_agent to start a \
                  config-defined agent, notify to toast the user, and durable \
-                 pins/notes and durable inbox/reply to coordinate project \
-                 knowledge. When multiple \
+                 pins/notes and durable inbox/reply/await to coordinate \
+                 project knowledge. When multiple \
                  sessions share a name, address the exact session as #<id>.",
         )
     }
@@ -810,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_3_7_exposes_all_seventeen_tools() {
+    fn phase_3_8_exposes_all_eighteen_tools() {
         let mut names: Vec<_> = QueenServer::tool_router()
             .list_all()
             .into_iter()
@@ -821,6 +899,7 @@ mod tests {
             names,
             [
                 "ack_inbox",
+                "await",
                 "create_note",
                 "delete_note",
                 "delete_pin",
