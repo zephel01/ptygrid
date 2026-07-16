@@ -137,6 +137,12 @@
 
   // ---- Teammates badge (Phase 4.0 hooks) ----
   let teammatesPanelOpen = $state(false);
+  // Anchor rect for the Teammates panel. The panel is rendered position:fixed
+  // (not absolute) because the toolbar uses overflow-x:auto, which would clip
+  // an absolutely-positioned dropdown. We compute its viewport coordinates
+  // from the badge element when opening.
+  let teammatesBadgeEl = $state<HTMLButtonElement | null>(null);
+  let teammatesPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
   let registering = $state(false);
 
   // Phase 4.2: any host lead that fell back to observe (host unavailable).
@@ -703,9 +709,21 @@
     };
   }
 
+  function positionTeammatesPanel(): void {
+    if (!teammatesBadgeEl) return;
+    const rect = teammatesBadgeEl.getBoundingClientRect();
+    // Right-align the panel to the badge, but keep a small margin from the
+    // viewport edge so it never gets clipped off-screen.
+    const right = Math.max(6, window.innerWidth - rect.right);
+    teammatesPanelPos = { top: rect.bottom + 6, right };
+  }
+
   async function openTeammatesPanel(): Promise<void> {
     teammatesPanelOpen = !teammatesPanelOpen;
-    if (teammatesPanelOpen) void refreshTeamsHostStatus();
+    if (teammatesPanelOpen) {
+      positionTeammatesPanel();
+      void refreshTeamsHostStatus();
+    }
   }
 
   function formatCpu(percent: number): string {
@@ -764,6 +782,13 @@
 
   // ---- startup flow per contract ----
   onMount(() => {
+    // Keep the fixed-position Teammates panel anchored to its badge when the
+    // window is resized while the panel is open.
+    const onResize = () => {
+      if (teammatesPanelOpen) positionTeammatesPanel();
+    };
+    window.addEventListener("resize", onResize);
+
     (async () => {
       if (!isTauri()) {
         // Plain-browser fallback: fake two panes with local echo.
@@ -805,6 +830,10 @@
         persistenceReady = true;
       }
     })();
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+    };
   });
 </script>
 
@@ -933,6 +962,7 @@
     </button>
     <div class="teammates-wrap">
       <button
+        bind:this={teammatesBadgeEl}
         class="queen-badge {teammatesClass}"
         onclick={openTeammatesPanel}
         title={teammatesTooltip}
@@ -942,7 +972,12 @@
         Teammates{hostFallbackActive ? " ⚠" : ""}
       </button>
       {#if teammatesPanelOpen}
-        <div class="teammates-panel" role="dialog" aria-label="Teammate hooks 設定">
+        <div
+          class="teammates-panel"
+          role="dialog"
+          aria-label="Teammate hooks 設定"
+          style="top: {teammatesPanelPos.top}px; right: {teammatesPanelPos.right}px;"
+        >
           <div class="tm-head">
             <span class="tm-title">Teammate hooks</span>
             <button
@@ -1583,11 +1618,12 @@
   }
 
   .teammates-panel {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
+    position: fixed;
     z-index: 120;
     width: 340px;
+    max-width: calc(100vw - 12px);
+    max-height: calc(100vh - 60px);
+    overflow-y: auto;
     background: #2d2d30;
     border: 1px solid #4a4a4a;
     border-radius: 6px;
