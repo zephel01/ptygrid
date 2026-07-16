@@ -17,11 +17,7 @@
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
-  import {
-    buildCdCommand,
-    resolveCdInput,
-    selectCdTargets,
-  } from "./lib/broadcast";
+  import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
   import type {
     ConfigInfo,
     LogicalSession,
@@ -226,23 +222,22 @@
     return `${who} · ${TEAMMATE_KIND_TEXT[ev.kind] ?? ev.kind}`;
   }
 
-  // ---- bulk cd (send `cd <dir>` + Enter to several panes at once) ----
-  let cdPopoverOpen = $state(false);
-  // Kept for the whole app session (App is the root, never unmounted).
-  let cdDir = $state("");
-  let cdIncludeNonShell = $state(false);
-  let cdWrapEl = $state<HTMLElement | undefined>(undefined);
-  // ---- projects root (bulk-cd helper) ----
-  // Persisted app setting: a fixed parent dir whose child folders are the
-  // usual cd targets. `null` until fetched / when never configured.
-  let cdProjectsRoot = $state<string | null>(null);
-  let cdRootInput = $state(""); // edit field for changing the root
-  let cdRootError = $state("");
-  let cdProjectDirs = $state<string[]>([]);
-  let cdDirsTruncated = $state(false);
-  let cdDirsError = $state("");
-  // Which listed folder is currently selected (for highlight); "" = none.
-  let cdSelectedDir = $state("");
+  // ---- projects root suggestions for the working-folder input ----
+  // The working-folder input offers a <datalist> of `<projectsRoot>/<name>`
+  // entries to prevent typos. `projectsRoot` is a persisted app setting
+  // (get/set_projects_root) and its child folders come from list_project_dirs.
+  // Best-effort: any failure or an unset root simply yields no suggestions.
+  let projectsRoot = $state<string | null>(null);
+  let projectDirs = $state<string[]>([]);
+
+  // `<root>/<name>` for each listed folder. The root keeps its verbatim form
+  // (a leading `~` is preserved) so a home-relative root stays home-relative.
+  let dirSuggestions = $derived.by(() => {
+    const root = projectsRoot;
+    if (!root) return [];
+    const base = root.replace(/\/+$/, "");
+    return projectDirs.map((name) => `${base}/${name}`);
+  });
 
   // Ordered SessionInfo for the currently open panes (skips ids with no entry).
   let cdPaneSessions = $derived(
@@ -250,12 +245,10 @@
       .map((id) => ui.sessions[id])
       .filter((s): s is SessionInfo => Boolean(s)),
   );
-  // Target selection is a pure function (src/lib/broadcast.ts).
-  let cdTargets = $derived(selectCdTargets(cdPaneSessions, cdIncludeNonShell));
-  let cdCanSend = $derived(cdDir.trim() !== "" && cdTargets.length > 0);
 
   // list_sessions is the only source of foreground process names (session-state
-  // events omit them); refresh on open so the shell-only default is accurate.
+  // events omit them); refresh before a bulk cd so the shell-only default is
+  // accurate.
   async function refreshForegroundInfo(): Promise<void> {
     if (!isTauri()) return;
     try {
@@ -269,116 +262,56 @@
     }
   }
 
-  function toggleCdPopover(): void {
-    cdPopoverOpen = !cdPopoverOpen;
-    if (cdPopoverOpen) {
-      void refreshForegroundInfo();
-      void loadProjectsRoot();
-    }
-  }
-
-  // Fetch the persisted projects root, then (if set) its child folders. Runs
-  // each time the popover opens so external changes are reflected.
-  async function loadProjectsRoot(): Promise<void> {
+  // Fetch the persisted projects root and its child folders for the suggestion
+  // list. Runs at startup and when the working-folder input gains focus so a
+  // freshly-set root (e.g. after a manual load) is reflected. Errors and an
+  // unset root both clear the suggestions silently (no UI noise).
+  async function loadDirSuggestions(): Promise<void> {
     if (!isTauri()) return;
-    cdRootError = "";
-    try {
-      const res = await invokeCmd<{ root: string | null }>("get_projects_root");
-      cdProjectsRoot = res.root;
-      cdRootInput = res.root ?? "";
-      if (res.root) await loadProjectDirs();
-      else {
-        cdProjectDirs = [];
-        cdDirsTruncated = false;
-      }
-    } catch (err) {
-      cdRootError = `プロジェクトルートの取得に失敗しました: ${err}`;
-    }
-  }
-
-  async function loadProjectDirs(): Promise<void> {
-    if (!isTauri()) return;
-    cdDirsError = "";
     try {
       const res = await invokeCmd<{
         root: string;
         dirs: string[];
         truncated: boolean;
       }>("list_project_dirs");
-      cdProjectDirs = res.dirs;
-      cdDirsTruncated = res.truncated;
-    } catch (err) {
-      cdProjectDirs = [];
-      cdDirsTruncated = false;
-      cdDirsError = `フォルダ一覧の取得に失敗しました: ${err}`;
+      projectsRoot = res.root;
+      projectDirs = res.dirs;
+    } catch {
+      projectsRoot = null;
+      projectDirs = [];
     }
   }
 
-  async function saveProjectsRoot(): Promise<void> {
+  // Parent of an absolute path, or null when it has no usable parent. A
+  // trailing slash is ignored; `/a/b` -> `/a`, `/a` -> `/`, a bare name -> null.
+  function parentDir(path: string): string | null {
+    const norm = path.replace(/\/+$/, "");
+    const idx = norm.lastIndexOf("/");
+    if (idx < 0) return null;
+    return idx === 0 ? "/" : norm.slice(0, idx);
+  }
+
+  // After a successful manual load, remember the loaded working folder's PARENT
+  // as the projects root so its siblings become working-folder suggestions.
+  // Skipped when the parent is `/` or the home directory itself (too broad to
+  // be a useful project container). Best-effort: failures are ignored, no toast.
+  async function rememberProjectsRoot(dir: string): Promise<void> {
     if (!isTauri()) return;
-    cdRootError = "";
+    const parent = parentDir(dir);
+    if (parent === null || parent === "/") return;
     try {
-      const res = await invokeCmd<{ root: string | null }>(
-        "set_projects_root",
-        { root: cdRootInput.trim() },
-      );
-      cdProjectsRoot = res.root;
-      cdSelectedDir = "";
-      await loadProjectDirs();
-    } catch (err) {
-      cdRootError = `${err}`;
+      const { homeDir } = await import("@tauri-apps/api/path");
+      if (parent === (await homeDir()).replace(/\/+$/, "")) return;
+    } catch {
+      // If home can't be determined, fall through and still try to save.
     }
-  }
-
-  // Click a listed folder: select it and drop `<root>/<name>` into the input.
-  function pickProjectDir(name: string): void {
-    cdSelectedDir = name;
-    cdDir = resolveCdInput(name, cdProjectsRoot);
-  }
-
-  // Close the popover on Escape or an outside click while it is open.
-  $effect(() => {
-    if (!cdPopoverOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") cdPopoverOpen = false;
-    };
-    const onDown = (e: MouseEvent) => {
-      if (cdWrapEl && !cdWrapEl.contains(e.target as Node)) {
-        cdPopoverOpen = false;
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("mousedown", onDown);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("mousedown", onDown);
-    };
-  });
-
-  async function sendBulkCd(): Promise<void> {
-    // A bare relative name is resolved against the projects root; absolute and
-    // `~`-prefixed inputs pass through unchanged (see resolveCdInput).
-    const dir = resolveCdInput(cdDir, cdProjectsRoot);
-    const targets = cdTargets;
-    if (dir === "" || targets.length === 0) return;
-    const cmd = buildCdCommand(dir);
-    const data = `${cmd}\r`; // Enter is a carriage return for the PTY
-    let sent = 0;
-    for (const target of targets) {
-      try {
-        if (isTauri()) {
-          await invokeCmd<void>("write_pty", { id: target.id, data });
-        } else {
-          writeToTerm(target.id, data); // demo mode: local echo only
-        }
-        sent += 1;
-      } catch (err) {
-        ui.errorBanner = `cd の一括送信に失敗しました (write_pty #${target.id}): ${err}`;
-      }
-    }
-    if (sent > 0) {
-      addNotice(`${sent}ペインに cd を送信しました`, cmd);
-      cdPopoverOpen = false;
+    try {
+      await invokeCmd<{ root: string | null }>("set_projects_root", {
+        root: parent,
+      });
+      await loadDirSuggestions();
+    } catch {
+      // Best-effort helper: never block the load or surface an error.
     }
   }
 
@@ -597,6 +530,9 @@
       // still succeeds (and can cd); the startup auto-load does not.
       const info = await loadConfig(rawInput || undefined, true);
       ui.errorBanner = null;
+      // 読み込み成功 = 作業フォルダ確定。その親ディレクトリをプロジェクトルート
+      // として自動記憶し、作業フォルダ入力欄のサジェスト元にする（best-effort）。
+      void rememberProjectsRoot(info.dir);
       // 読み込み成功 = 作業フォルダ確定。cd と同じ動きで、開いているシェルの
       // ペインをその作業フォルダへ移動させる。
       const sent = await sendCdToShells(info.dir);
@@ -723,6 +659,7 @@
       await initGlobalListeners();
       void refreshQueenStatus();
       void refreshTeammateHooks();
+      void loadDirSuggestions();
       let restored = false;
       try {
         restored = await restoreProjectState();
@@ -797,14 +734,21 @@
         <input
           class="dir-input"
           type="text"
+          list="dir-suggestions"
           placeholder="作業フォルダ（例: ~/works/hoge。先頭 ~ 可）"
           bind:value={configDirInput}
           title={"作業フォルダのパスを入力します（先頭 ~ はホーム展開）。\n" +
             "設定ファイル ptygrid.yml は 作業フォルダ内 → 起動フォルダ → ~/.ptygrid の順に探します。"}
+          onfocus={loadDirSuggestions}
           onkeydown={(e) => {
             if (e.key === "Enter") onLoadClick();
           }}
         />
+        <datalist id="dir-suggestions">
+          {#each dirSuggestions as dir (dir)}
+            <option value={dir}></option>
+          {/each}
+        </datalist>
         <button class="btn" onclick={onLoadClick} disabled={loadingConfig}>
           {loadingConfig ? "読み込み中…" : "読み込み"}
         </button>
@@ -854,132 +798,6 @@
     </div>
 
     <span class="spacer"></span>
-    <div class="cd-wrap" bind:this={cdWrapEl}>
-      <button
-        class="queen-badge cd-badge"
-        class:seg-active={cdPopoverOpen}
-        onclick={toggleCdPopover}
-        title="複数ペインへ cd をまとめて送信"
-        aria-label="一括 cd（複数ペインへ cd を送信）"
-      >
-        cd…
-      </button>
-      {#if cdPopoverOpen}
-        <div class="cd-panel" role="dialog" aria-label="一括 cd">
-          <div class="tm-head">
-            <span class="tm-title">一括 cd</span>
-            <button
-              class="btn btn-small"
-              onclick={() => (cdPopoverOpen = false)}
-              title="閉じる"
-            >
-              ✕
-            </button>
-          </div>
-          <p class="tm-note">
-            開いているペインへ <code>cd &lt;dir&gt;</code> + Enter をまとめて送信します。
-          </p>
-
-          <!-- projects root: fixed parent whose child folders are cd targets -->
-          <div class="cd-root">
-            <div class="cd-root-head">
-              <span class="cd-root-label">プロジェクトルート</span>
-              {#if cdProjectsRoot}
-                <code class="cd-root-cur" title={cdProjectsRoot}
-                  >{cdProjectsRoot}</code
-                >
-              {/if}
-            </div>
-            {#if !cdProjectsRoot}
-              <p class="tm-note cd-root-hint">
-                置き場所を設定すると、直下のフォルダ一覧から選んで一括cdできます。
-              </p>
-            {/if}
-            <div class="cd-root-edit">
-              <input
-                class="cd-input cd-root-input"
-                type="text"
-                placeholder="~/works/project"
-                bind:value={cdRootInput}
-                onkeydown={(e) => {
-                  if (e.key === "Enter") saveProjectsRoot();
-                }}
-              />
-              <button
-                class="btn btn-small"
-                onclick={saveProjectsRoot}
-                disabled={cdRootInput.trim() === ""}
-                title="プロジェクトルートを保存"
-              >
-                保存
-              </button>
-            </div>
-            {#if cdRootError}
-              <p class="cd-warn cd-root-err">{cdRootError}</p>
-            {/if}
-          </div>
-
-          {#if cdProjectsRoot}
-            {#if cdDirsError}
-              <p class="cd-warn">{cdDirsError}</p>
-            {:else if cdProjectDirs.length === 0}
-              <p class="tm-note">ルート直下にフォルダがありません。</p>
-            {:else}
-              <div class="cd-dirs" role="listbox" aria-label="プロジェクト一覧">
-                {#each cdProjectDirs as name (name)}
-                  <button
-                    type="button"
-                    class="cd-dir"
-                    class:cd-dir-active={cdSelectedDir === name}
-                    role="option"
-                    aria-selected={cdSelectedDir === name}
-                    onclick={() => pickProjectDir(name)}
-                    title={name}
-                  >
-                    {name}
-                  </button>
-                {/each}
-              </div>
-              {#if cdDirsTruncated}
-                <p class="cd-warn">一覧は200件で打ち切られています。</p>
-              {/if}
-            {/if}
-          {/if}
-
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="cd-input"
-            type="text"
-            placeholder="notemake / /path/to/project / ~/works/..."
-            bind:value={cdDir}
-            autofocus
-            onkeydown={(e) => {
-              if (e.key === "Enter" && cdCanSend) sendBulkCd();
-            }}
-          />
-          <label class="cd-check">
-            <input type="checkbox" bind:checked={cdIncludeNonShell} />
-            CLI実行中のペインにも送る
-          </label>
-          {#if cdIncludeNonShell}
-            <p class="cd-warn">⚠ 実行中のCLIへの入力になります。</p>
-          {/if}
-          <div class="cd-foot">
-            <span class="cd-preview">{cdTargets.length}ペインに送信</span>
-            <button
-              class="btn btn-small"
-              onclick={sendBulkCd}
-              disabled={!cdCanSend}
-              title={cdTargets.length === 0
-                ? "対象のペインがありません"
-                : "対象ペインへ cd を送信"}
-            >
-              送信
-            </button>
-          </div>
-        </div>
-      {/if}
-    </div>
     <button
       class="btn"
       class:seg-active={gitPanelOpen}
@@ -1569,172 +1387,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  /* ---- bulk cd (popover under the "cd…" badge) ---- */
-
-  .cd-wrap {
-    position: relative;
-    align-self: center;
-    margin-right: 8px;
-  }
-
-  .cd-wrap .queen-badge {
-    margin-right: 0;
-  }
-
-  .cd-badge.seg-active {
-    background: #3b5b7a;
-    color: #fff;
-    border-color: #3b5b7a;
-  }
-
-  .cd-panel {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    z-index: 120;
-    width: 300px;
-    background: #2d2d30;
-    border: 1px solid #4a4a4a;
-    border-radius: 6px;
-    padding: 10px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
-    white-space: normal;
-  }
-
-  .cd-panel code {
-    font-family: Menlo, monospace;
-    font-size: 10px;
-    color: #d0d0d0;
-  }
-
-  .cd-input {
-    width: 100%;
-    box-sizing: border-box;
-    background: #1b1b1b;
-    color: #ddd;
-    border: 1px solid #444;
-    border-radius: 4px;
-    padding: 4px 6px;
-    font-size: 12px;
-    margin-bottom: 8px;
-  }
-
-  .cd-input::placeholder {
-    color: #777;
-  }
-
-  /* ---- projects root row + folder list ---- */
-
-  .cd-root {
-    margin-bottom: 8px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid #3a3a3a;
-  }
-
-  .cd-root-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-
-  .cd-root-label {
-    color: #cfcfcf;
-    font-size: 11px;
-    font-weight: 600;
-  }
-
-  .cd-root-cur {
-    font-family: Menlo, monospace;
-    font-size: 10px;
-    color: #9cdcfe;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 170px;
-  }
-
-  .cd-root-hint {
-    margin: 2px 0 6px;
-  }
-
-  .cd-root-edit {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .cd-root-input {
-    margin-bottom: 0;
-  }
-
-  .cd-root-err {
-    word-break: break-word;
-  }
-
-  .cd-dirs {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    max-height: 120px;
-    overflow-y: auto;
-    margin-bottom: 8px;
-  }
-
-  .cd-dir {
-    background: #1b1b1b;
-    color: #ddd;
-    border: 1px solid #444;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 11px;
-    cursor: pointer;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .cd-dir:hover {
-    border-color: #5a7a9a;
-  }
-
-  .cd-dir-active {
-    background: #3b5b7a;
-    color: #fff;
-    border-color: #3b5b7a;
-  }
-
-  .cd-check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: #cfcfcf;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .cd-warn {
-    margin: 6px 0 0;
-    color: #e5c07b;
-    font-size: 10px;
-  }
-
-  .cd-foot {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    margin-top: 10px;
-  }
-
-  .cd-preview {
-    color: #b5b5b5;
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
   }
 
   /* ---- banners / toast ---- */
