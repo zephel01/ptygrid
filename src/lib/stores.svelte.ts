@@ -8,6 +8,8 @@ import type {
   PtyExitPayload,
   QueenNotifyPayload,
   QueenStatus,
+  SessionResourcesPayload,
+  SessionResourceUsage,
   SessionInfo,
 } from "./types";
 import { isTauri } from "./tauri";
@@ -21,6 +23,8 @@ export type Notice = { key: number; title: string; message: string };
 export const ui = $state({
   /** All known sessions keyed by id ({id, name?, cmd, state, code}). */
   sessions: {} as Record<number, SessionInfo>,
+  /** Latest process-tree CPU/memory sample keyed by session id. */
+  resources: {} as Record<number, SessionResourceUsage>,
   /** Ordered list of session ids that have an open pane (max 9). */
   panes: [] as number[],
   /** Session id of the maximized pane, or null. */
@@ -69,7 +73,7 @@ let listenersInitialized = false;
 
 /**
  * Set up the global listeners once:
- * session-state / pty-exit / config-changed / queen-notify.
+ * session-state / session-resources / pty-exit / config-changed / queen-notify.
  */
 export async function initGlobalListeners(): Promise<void> {
   if (listenersInitialized || !isTauri()) return;
@@ -87,6 +91,7 @@ export async function initGlobalListeners(): Promise<void> {
 
     if (known) {
       ui.sessions[payload.id] = payload;
+      if (payload.state !== "running") delete ui.resources[payload.id];
       return;
     }
 
@@ -105,12 +110,24 @@ export async function initGlobalListeners(): Promise<void> {
     ui.panes.push(payload.id);
   });
 
+  await listen<SessionResourcesPayload>("session-resources", (event) => {
+    const next: Record<number, SessionResourceUsage> = {};
+    for (const usage of event.payload.sessions) {
+      if (ui.sessions[usage.id]?.state === "running") {
+        next[usage.id] = usage;
+      }
+    }
+    // One assignment per sampler tick keeps all pane values consistent.
+    ui.resources = next;
+  });
+
   await listen<PtyExitPayload>("pty-exit", (event) => {
     const session = ui.sessions[event.payload.id];
     if (session && session.state !== "restarting") {
       session.state = "exited";
       session.code = event.payload.code;
     }
+    delete ui.resources[event.payload.id];
     writeToTerm(
       event.payload.id,
       `\r\n\x1b[1;31m[process exited with code ${event.payload.code ?? "unknown"}]\x1b[0m\r\n`,

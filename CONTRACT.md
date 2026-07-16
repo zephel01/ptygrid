@@ -389,3 +389,50 @@ type ProjectState = {
 - shell参照はdefault shellを新規起動する。以前のshell processやscrollbackには再接続しない。
 - 保存worktreeが存在し同じgit common-dirに属する場合はsetupを再実行せず再利用する。
   消失していれば現在のworktree定義から新規作成し、別repositoryを指す既存pathは拒否する。
+
+---
+
+# Phase 3.5 追加契約（process-tree resource monitoring）
+
+全sessionを1つの共有samplerで監視し、PTY直下のchild processだけでなく、その全子孫の
+CPU使用率とresident memoryをsession単位で合算する。
+
+## Event
+
+| event | payload | 発火タイミング |
+|---|---|---|
+| `session-resources` | `SessionResourcesPayload` | 1秒ごとに全running sessionを1 batchでemit |
+
+```ts
+type SessionResourceUsage = {
+  id: number;
+  cpuPercent: number;
+  memoryBytes: number;
+  processCount: number;
+};
+type SessionResourcesPayload = {
+  sampledAtMs: number;
+  sessions: SessionResourceUsage[];
+};
+```
+
+## Sampling semantics
+
+- `sysinfo::System`はアプリ全体で1 instanceだけ作り、1秒間隔で再利用する。
+  sessionごとのsampler threadや`ps` subprocessは作らない。
+- process情報は各tickで一度だけrefreshし、parent PID graphからPTY childをrootとする
+  全descendantを走査する。CPU、memory、process countはroot自身を含めて合算する。
+- `cpuPercent`は1 coreを100%とするprocess CPUの合計で、multi-core workloadでは100を超え得る。
+- `memoryBytes`は各processのresident memory byte数の合計。共有pageの重複排除はしない。
+- CPU deltaを有効にするため初回refreshはprime専用とし、1 interval後からemitする。
+- sample中に消失したroot、取得不能なprocess treeはそのbatchから省略する。
+  frontendはbatchにない古い値を削除する。
+- samplerはsession map lock中にPID snapshotだけを取り、OS refreshやtree集約中はlockを保持しない。
+
+## Frontend
+
+- 各running paneのheaderに`CPU n.n% · n MiB/GiB`を表示する。
+- tooltipに集約process countとbyte数を表示する。
+- toolbar右側に、最新batch内の全sessionを合算した
+  `Σ CPU n.n% · n MiB/GiB`を表示する。追加samplingは行わない。
+- batch eventごとにresource mapを1回だけ置換し、exit/restart/close時は対象値を削除する。

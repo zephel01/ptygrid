@@ -543,6 +543,23 @@ impl PtyManager {
         self.list_sessions_with(pty::process_name)
     }
 
+    /// Snapshot running PTY child roots for the shared resource sampler.
+    /// `process_id` is an in-memory child handle lookup; no OS query or
+    /// blocking work occurs while the sessions lock is held.
+    pub(crate) fn resource_roots(&self) -> Vec<(u32, u32)> {
+        let sessions = self.lock_sessions();
+        sessions
+            .iter()
+            .filter(|(_, slot)| slot.state == SessionState::Running)
+            .filter_map(|(id, slot)| {
+                slot.live
+                    .as_ref()
+                    .and_then(|live| live.child.process_id())
+                    .map(|pid| (*id, pid))
+            })
+            .collect()
+    }
+
     /// Resolver-injected variant used to keep process lookup independently
     /// testable on restricted hosts where `ps` or `/proc` is unavailable.
     fn list_sessions_with<F>(&self, resolve_process: F) -> Vec<SessionInfo>
@@ -1244,6 +1261,20 @@ mod tests {
             "expected echoed output, got: {seen:?}"
         );
 
+        manager.kill_pty(id).unwrap();
+    }
+
+    #[test]
+    fn resource_roots_expose_each_running_pty_child() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let id = manager
+            .spawn_shell(handle, 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+        let roots = manager.resource_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].0, id);
+        assert!(roots[0].1 > 0);
         manager.kill_pty(id).unwrap();
     }
 }

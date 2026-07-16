@@ -30,6 +30,7 @@ rmcp = { version = "1.8", features = [
 ] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio-util = "0.7"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 # Enables tauri::test::mock_app() (MockRuntime) for session state-machine tests.

@@ -64,6 +64,18 @@ export type PtyOutputPayload = { id: number; data: string };
 export type PtyExitPayload = { id: number; code: number | null };
 export type ConfigChangedPayload = { path: string };
 
+export type SessionResourceUsage = {
+  id: number;
+  cpuPercent: number;
+  memoryBytes: number;
+  processCount: number;
+};
+
+export type SessionResourcesPayload = {
+  sampledAtMs: number;
+  sessions: SessionResourceUsage[];
+};
+
 // Phase 2 (Queen: 内蔵MCPサーバー)
 export type QueenStatus = {
   enabled: boolean;

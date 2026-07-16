@@ -73,6 +73,19 @@
     }
     return [...byPath.values()];
   });
+  let totalResources = $derived.by(() => {
+    let cpuPercent = 0;
+    let memoryBytes = 0;
+    let processCount = 0;
+    let sessionCount = 0;
+    for (const usage of Object.values(ui.resources)) {
+      cpuPercent += usage.cpuPercent;
+      memoryBytes += usage.memoryBytes;
+      processCount += usage.processCount;
+      sessionCount += 1;
+    }
+    return { cpuPercent, memoryBytes, processCount, sessionCount };
+  });
 
   // ---- Queen status badge ----
   // green = running, red = enabled but stopped/errored, gray = disabled
@@ -309,11 +322,22 @@
     ui.panes = ui.panes.filter((p) => p !== id);
     if (ui.maximizedId === id) ui.maximizedId = null;
     disposeTermHandle(id);
+    delete ui.resources[id];
     delete ui.sessions[id];
   }
 
   function toggleMaximize(id: number): void {
     ui.maximizedId = ui.maximizedId === id ? null : id;
+  }
+
+  function formatCpu(percent: number): string {
+    return `${percent.toFixed(1)}%`;
+  }
+
+  function formatMemory(bytes: number): string {
+    const mib = bytes / (1024 * 1024);
+    if (mib < 1024) return `${mib < 10 ? mib.toFixed(1) : mib.toFixed(0)} MiB`;
+    return `${(mib / 1024).toFixed(1)} GiB`;
   }
 
   async function restoreProjectState(): Promise<boolean> {
@@ -509,6 +533,14 @@
       <span class="queen-dot"></span>
       {queenLabel}
     </button>
+    {#if totalResources.sessionCount > 0}
+      <span
+        class="total-resources"
+        title={`${totalResources.sessionCount} sessions · ${totalResources.processCount} processes · ${totalResources.memoryBytes.toLocaleString()} bytes`}
+      >
+        Σ CPU {formatCpu(totalResources.cpuPercent)} · {formatMemory(totalResources.memoryBytes)}
+      </span>
+    {/if}
     <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
   </div>
 
@@ -547,6 +579,7 @@
               {#each row as id (id)}
                 <Pane minSize={5}>
                   {@const session = ui.sessions[id]}
+                  {@const resources = ui.resources[id]}
                   <section class="pane" class:is-max={ui.maximizedId === id}>
                     <header class="pane-header">
                       <span
@@ -565,6 +598,14 @@
                       {#if session?.state === "exited"}
                         <span class="exit-code">
                           exit {session.code ?? "?"}
+                        </span>
+                      {/if}
+                      {#if resources && session?.state === "running"}
+                        <span
+                          class="resource-usage"
+                          title={`${resources.processCount} processes · ${resources.memoryBytes.toLocaleString()} bytes`}
+                        >
+                          CPU {formatCpu(resources.cpuPercent)} · {formatMemory(resources.memoryBytes)}
                         </span>
                       {/if}
                       <span class="spacer"></span>
@@ -825,6 +866,15 @@
     align-self: center;
   }
 
+  .total-resources {
+    align-self: center;
+    color: #b8c2cc;
+    font-family: Menlo, monospace;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
   .queen-badge {
     align-self: center;
     display: inline-flex;
@@ -1061,6 +1111,15 @@
     color: #9cdcfe;
     font-family: Menlo, monospace;
     font-size: 10px;
+  }
+
+  .resource-usage {
+    flex: 0 0 auto;
+    color: #a8b3bd;
+    font-family: Menlo, monospace;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .exit-code {

@@ -5,6 +5,7 @@ mod git_service;
 mod project_state;
 mod pty;
 mod queen;
+mod resource_monitor;
 mod session;
 mod worktree;
 
@@ -21,6 +22,7 @@ pub fn run() {
         .setup(|app| {
             // Queen starts with defaults; load_config may adjust it later.
             queen::start_default(&app.handle().clone());
+            resource_monitor::start(&app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

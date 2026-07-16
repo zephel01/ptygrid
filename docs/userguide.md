@@ -52,7 +52,7 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 - **ツールバー右**: 読み取り専用Gitパネルのボタンと「● Queen :39237」バッジ
   - 🟢 緑 = 稼働中 / 🔴 赤 = 停止 / ⚪ 灰 = 無効(`queen.enabled: false`)
   - クリックで Claude Code 用の登録コマンドをクリップボードにコピー
-- **各ペイン**: ヘッダーに名前と状態ドット(running / exited / restarting + exit code)、restart / close / maximize ボタン
+- **各ペイン**: ヘッダーに名前、状態ドット、process tree全体のCPU/メモリ使用量、restart / close / maximize ボタン
 - **トースト通知**: mterm.yml の変更検知(Reload)、Queen の `notify` ツール呼び出しなどが右上に表示(5秒で自動消滅)
 
 ## ペイン操作
@@ -67,6 +67,10 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 
 - ペインは**最大9面**。Queen の `spawn_agent` で起動されたセッションも自動でペインが追加されます(上限到達時はバナーで通知され、セッション自体は動き続けます)。
 - 出力はセッションごとにリングバッファ(256 KiB)へ保存され、restart をまたいで連続します。
+- CPU/メモリ表示は1秒ごとに更新されます。CPUは1 coreを100%として合算するため、
+  複数coreを使うsessionでは100%を超える場合があります。メモリはPTY childと全子孫の
+  resident memory合計です。ツールバー右側の`Σ CPU`表示は、現在監視できている
+  全running sessionの合計です。
 
 ## Git status / diff
 
