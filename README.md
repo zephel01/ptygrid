@@ -136,6 +136,7 @@ url = "http://127.0.0.1:39237/mcp"
 - [ ] **Phase 3** — Git diff/commit・worktree 分離・リソース監視・resume・Queen 拡張(pins/notes, inbox/reply, await)
 
 方向性の背景は [競合調査](docs/competitive-landscape.md) を参照(worktree 隔離系ではなく「同一画面で協調する系」を選んでいます)。
+Phase 3 は [段階リリース計画](docs/phase3.md) に沿って、互換性を保ちながら機能単位で進めます。
 
 ## 📚 ドキュメント
 

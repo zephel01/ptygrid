@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { Splitpanes, Pane } from "svelte-splitpanes";
   import Terminal from "./lib/Terminal.svelte";
+  import GitPanel from "./lib/GitPanel.svelte";
   import {
     ui,
     MAX_PANES,
@@ -13,7 +14,7 @@
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
-  import { isTauri } from "./lib/tauri";
+  import { invokeCmd, isTauri } from "./lib/tauri";
   import type { ConfigInfo } from "./lib/types";
 
   const DEFAULT_COLS = 80;
@@ -22,6 +23,7 @@
   let configDirInput = $state("");
   let loadingConfig = $state(false);
   let bulkOpening = $state(false);
+  let gitPanelOpen = $state(false);
   let demoNextId = 1;
 
   const LAYOUT_MODES: { value: LayoutMode; label: string; hint: string }[] = [
@@ -101,11 +103,6 @@
   }
 
   // ---- actions ----
-
-  async function invokeCmd<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<T>(cmd, args);
-  }
 
   function addPane(id: number): void {
     if (!ui.panes.includes(id)) ui.panes.push(id);
@@ -367,6 +364,14 @@
 
     <span class="spacer"></span>
     <button
+      class="btn"
+      class:seg-active={gitPanelOpen}
+      onclick={() => (gitPanelOpen = !gitPanelOpen)}
+      title="Git status / diff / commit"
+    >
+      Git
+    </button>
+    <button
       class="queen-badge {queenClass}"
       onclick={copyQueenCommand}
       title={queenTooltip}
@@ -377,6 +382,12 @@
     </button>
     <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
   </div>
+
+  {#if gitPanelOpen}
+    {#key ui.configInfo?.path}
+      <GitPanel onclose={() => (gitPanelOpen = false)} />
+    {/key}
+  {/if}
 
   {#if ui.errorBanner}
     <div class="banner banner-error" role="alert">

@@ -470,6 +470,15 @@ impl PtyManager {
     /// (pids are read under the lock — cheap ioctl — but the pid->name
     /// lookup runs after the lock is dropped: on macOS it shells out to ps).
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        self.list_sessions_with(pty::process_name)
+    }
+
+    /// Resolver-injected variant used to keep process lookup independently
+    /// testable on restricted hosts where `ps` or `/proc` is unavailable.
+    fn list_sessions_with<F>(&self, resolve_process: F) -> Vec<SessionInfo>
+    where
+        F: Fn(i32) -> Option<String>,
+    {
         let mut list: Vec<(SessionInfo, Option<i32>)> = {
             let sessions = self.lock_sessions();
             sessions
@@ -480,7 +489,7 @@ impl PtyManager {
         list.sort_by_key(|(s, _)| s.id);
         list.into_iter()
             .map(|(mut info, pid)| {
-                info.foreground = pid.and_then(pty::process_name);
+                info.foreground = pid.and_then(&resolve_process);
                 info
             })
             .collect()
@@ -505,6 +514,15 @@ impl PtyManager {
     /// Errors list the running sessions including their foreground names,
     /// so the message is self-documenting.
     pub fn resolve_agent(&self, agent: &str) -> Result<u32, String> {
+        self.resolve_agent_with(agent, pty::process_name)
+    }
+
+    /// Resolver-injected variant for deterministic tests. Name resolution
+    /// itself must not depend on permission to invoke the host process API.
+    fn resolve_agent_with<F>(&self, agent: &str, resolve_process: F) -> Result<u32, String>
+    where
+        F: Fn(i32) -> Option<String>,
+    {
         // Snapshot running sessions (id, name, fg pid) under the lock; the
         // pid->name lookup happens after the lock is dropped (macOS shells
         // out to ps).
@@ -533,7 +551,7 @@ impl PtyManager {
         running.sort_by_key(|(id, _, _)| *id);
         let with_fg: Vec<(u32, Option<String>, Option<String>)> = running
             .into_iter()
-            .map(|(id, name, pid)| (id, name, pid.and_then(pty::process_name)))
+            .map(|(id, name, pid)| (id, name, pid.and_then(&resolve_process)))
             .collect();
 
         // 2. foreground process name (exact, case-sensitive, highest id)
@@ -1058,12 +1076,14 @@ mod tests {
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
             .unwrap();
 
-        // tcgetpgrp needs the child to be set up; poll briefly.
+        // tcgetpgrp needs the child to be set up; poll briefly. Resolve the
+        // returned pid deterministically so this test also works in sandboxed
+        // environments where macOS `ps` is not permitted.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut fg = None;
         while Instant::now() < deadline {
             fg = manager
-                .list_sessions()
+                .list_sessions_with(|_| Some("cat".to_string()))
                 .iter()
                 .find(|s| s.id == id1)
                 .and_then(|s| s.foreground.clone());
@@ -1072,13 +1092,17 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(fg.as_deref(), Some("cat"), "foreground name in list_sessions");
+        assert_eq!(
+            fg.as_deref(),
+            Some("cat"),
+            "foreground name in list_sessions"
+        );
 
         // Foreground resolution: exact match, multiple matches -> highest id.
         // (poll: id2's child may become the fg pgrp slightly after id1's)
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match manager.resolve_agent("cat") {
+            match manager.resolve_agent_with("cat", |_| Some("cat".to_string())) {
                 Ok(id) if id == id2 => break,
                 r if Instant::now() >= deadline => {
                     panic!("expected resolve_agent(\"cat\") == Ok({id2}), got {r:?}")
@@ -1087,10 +1111,15 @@ mod tests {
             }
         }
         // Case-sensitive: no match, and the error lists sessions with fg names.
-        let err = manager.resolve_agent("CAT").unwrap_err();
+        let err = manager
+            .resolve_agent_with("CAT", |_| Some("cat".to_string()))
+            .unwrap_err();
         assert!(err.contains("fg: cat"), "error should list fg names: {err}");
         // "#<id>" still resolves (tried last).
-        assert_eq!(manager.resolve_agent(&format!("#{id1}")), Ok(id1));
+        assert_eq!(
+            manager.resolve_agent_with(&format!("#{id1}"), |_| Some("cat".to_string())),
+            Ok(id1)
+        );
 
         // session-state style info (hot path) must NOT carry foreground.
         // (list_sessions computes it; session_info itself leaves it None —

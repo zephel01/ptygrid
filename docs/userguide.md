@@ -9,11 +9,12 @@ ptygrid のインストールから、`mterm.yml` の書き方、Queen(内蔵 MC
 2. [インストールと起動](#インストールと起動)
 3. [画面の見方](#画面の見方)
 4. [ペイン操作](#ペイン操作)
-5. [mterm.yml リファレンス](#mtermyml-リファレンス)
-6. [Queen のセットアップ](#queen-のセットアップ)
-7. [Queen ツールリファレンス](#queen-ツールリファレンス)
-8. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
-9. [困ったときは](#困ったときは)
+5. [Git status / diff](#git-status--diff)
+6. [mterm.yml リファレンス](#mtermyml-リファレンス)
+7. [Queen のセットアップ](#queen-のセットアップ)
+8. [Queen ツールリファレンス](#queen-ツールリファレンス)
+9. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
+10. [困ったときは](#困ったときは)
 
 ---
 
@@ -30,6 +31,7 @@ ptygrid のインストールから、`mterm.yml` の書き方、Queen(内蔵 MC
 - Rust(rustup でインストール)
 - Node.js 20+
 - Xcode Command Line Tools(macOS)
+- Git
 
 ```bash
 git clone https://github.com/zephel01/ptygrid.git
@@ -45,7 +47,7 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 ## 画面の見方
 
 - **ツールバー左**: 「+ Shell」ボタン(ペイン追加)、mterm.yml で定義したエージェントのチップ(クリックで起動)
-- **ツールバー右**: 「● Queen :39237」バッジ — Queen の状態を表示
+- **ツールバー右**: 読み取り専用Gitパネルのボタンと「● Queen :39237」バッジ
   - 🟢 緑 = 稼働中 / 🔴 赤 = 停止 / ⚪ 灰 = 無効(`queen.enabled: false`)
   - クリックで Claude Code 用の登録コマンドをクリップボードにコピー
 - **各ペイン**: ヘッダーに名前と状態ドット(running / exited / restarting + exit code)、restart / close / maximize ボタン
@@ -63,6 +65,25 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 
 - ペインは**最大9面**。Queen の `spawn_agent` で起動されたセッションも自動でペインが追加されます(上限到達時はバナーで通知され、セッション自体は動き続けます)。
 - 出力はセッションごとにリングバッファ(256 KiB)へ保存され、restart をまたいで連続します。
+
+## Git status / diff
+
+ツールバー右の「Git」を押すと、現在のプロジェクトの変更ファイルとunified diffを
+右側パネルに表示します。ファイルを選択し、`Working tree` / `Staged` を切り替えられます。
+
+- `mterm.yml` 読込済みなら、そのファイルがあるディレクトリのリポジトリを使用します。
+- 未読込なら、ptygridを起動したカレントディレクトリを使用します。
+- external diff、textconv、pagerは実行しません。
+- diff表示は2 MiB、status表示は10,000ファイルで打ち切ります。
+- untracked fileも選択すると新規ファイルdiffを表示します。
+
+stage/unstageするには、対象ファイルのチェックボックスを選び、`Stage` または
+`Unstage` を押します。ファイル行を開くだけではindexは変更されません。
+
+commit欄へメッセージを入力して `Commit staged changes` を押すと、現在stage済みの
+変更だけをcommitします。未stageのファイルを暗黙に追加することはありません。
+リポジトリのpre-commit / commit-msgなどのhooksと署名設定は通常の`git commit`と
+同様に適用され、失敗した場合はGitのエラーがパネルに表示されます。
 
 ## mterm.yml リファレンス
 

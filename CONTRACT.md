@@ -165,3 +165,107 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 2. **名前解決の拡張**: `read_output` / `send_message` の `agent` は「定義名 → セッション名 → **フォアグラウンドプロセス名**（完全一致、複数マッチ時は最新ID）→ `#<id>`」の順で解決する。
 3. **read_output のCR処理**: ANSI除去後、各行について `\r` で上書きされた部分を畳み込み、最終状態のみ返す（TUIスピナー残骸対策）。`raw: true` では従来通り無加工。
 4. **send_message の説明文強化**: MCPツールのdescriptionに「対話型TUIのcomposerに未送信テキストが残っている場合があるため、送信前に read_output で状態確認を推奨。text を空にして submit=true でEnterのみ送出可能」と明記（挙動自体は不変）。
+
+---
+
+# Phase 3.0 追加契約（段階リリース基盤）
+
+Phase 3 は一括変更せず、[docs/phase3.md](docs/phase3.md) の順序で独立して
+リリースする。Phase 3.0 は内部構造とテスト基盤のみを変更し、Phase 0–2.1
+の IPC、設定スキーマ、UI挙動を一切変更しない。
+
+- Tauri command の引数・返り値・command名は従来どおり。
+- command handler は `commands.rs` をIPC境界とし、サービス実装から分離する。
+- foreground processの名前解決は注入可能にし、OSの `ps` / `/proc` 権限に
+  依存せず名前解決規則をテストできること。
+- Phase 3.1以降の契約は、各リリースの実装着手前に本ファイルへ追記する。
+
+---
+
+# Phase 3.1 追加契約（読み取り専用 Git status / diff）
+
+Phase 3.1 はGitリポジトリを読み取るだけで、index・worktree・refsを変更しない。
+Git操作はshellを介さず、インストール済みの `git` へ構造化した引数を渡す。
+
+## Tauri Commands
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `git_status` | `{ dir?: string }` | `GitStatusInfo` | porcelain形式で変更ファイル、branch、HEADを取得 |
+| `git_diff` | `{ dir?: string, path?: string, staged?: boolean }` | `GitDiffInfo` | unified diffを取得。`staged` default false |
+
+`dir` の省略時はロード済み `mterm.yml` のディレクトリ、それも無い場合は
+アプリのカレントディレクトリを使用する。Gitリポジトリ外なら
+`Err("not_a_git_repository: ...")` を返す。
+
+```ts
+type GitFileStatus = {
+  path: string;
+  originalPath?: string;
+  indexStatus: string;
+  worktreeStatus: string;
+};
+type GitStatusInfo = {
+  repoRoot: string;
+  branch?: string;
+  head: string;
+  files: GitFileStatus[];
+  truncated: boolean;
+};
+type GitDiffInfo = {
+  repoRoot: string;
+  path?: string;
+  staged: boolean;
+  text: string;
+  truncated: boolean;
+};
+```
+
+## 制限とセマンティクス
+
+- statusは最大10,000ファイル。超えた場合は `truncated: true`。
+- diffは最大2 MiB。超えた場合は末尾に切り詰め表示を追記し
+  `truncated: true`。
+- `path` の前には必ずGitの `--` separatorを付ける。
+- external diff、textconv、pagerは無効化する。
+- Phase 3.1ではuntracked file本文、stage、unstage、commitは対象外。
+
+---
+
+# Phase 3.2 追加契約（Git stage / unstage / inline commit）
+
+Phase 3.2 は明示的に選択されたpathだけをstage/unstageし、commitは呼出時点の
+indexだけを対象にする。ファイル選択やcommit操作による暗黙stageは禁止する。
+
+## Tauri Commands
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `git_stage` | `{ dir?: string, paths: string[] }` | `GitStatusInfo` | 指定pathをstageし、更新後statusを返す |
+| `git_unstage` | `{ dir?: string, paths: string[] }` | `GitStatusInfo` | 指定pathをunstageし、更新後statusを返す |
+| `git_commit` | `{ dir?: string, message: string }` | `GitCommitInfo` | 現在のindexをcommitする |
+
+```ts
+type GitCommitInfo = {
+  repoRoot: string;
+  oid: string;
+  summary: string;
+  output: string;
+};
+```
+
+## 制限とセマンティクス
+
+- `paths` は1件以上、最大1,000件。空文字は禁止。
+- path引数の前には必ず `--` separatorを置き、shellは使用しない。
+  `GIT_LITERAL_PATHSPECS=1` によりpathspec magicとして解釈しない。
+- stageは `git add -- <paths...>`。削除とuntracked fileも対象にできる。
+- unstageはHEADがあれば `git restore --staged`、unborn repositoryでは
+  `git rm --cached --ignore-unmatch` を使う。worktree本文は変更しない。
+- commit messageはコマンド引数にせずstdinから `git commit --file=-` へ渡す。
+- 空メッセージは禁止。`--no-verify` / `--no-gpg-sign` は付けず、Git hooksと
+  署名設定を尊重する。
+- commitはblocking Git processをTauriのblocking taskで実行し、UIスレッドを
+  直接ブロックしない。
+- untracked fileのdiffは、Gitが返した完全一致pathだけを対象にし、canonical pathが
+  repository外へ出る場合は拒否する。

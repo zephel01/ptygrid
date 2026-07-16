@@ -44,3 +44,34 @@ export type QueenStatus = {
 };
 
 export type QueenNotifyPayload = { title: string; message: string };
+
+// Phase 3.1 (read-only Git status/diff)
+export type GitFileStatus = {
+  path: string;
+  originalPath?: string;
+  indexStatus: string;
+  worktreeStatus: string;
+};
+
+export type GitStatusInfo = {
+  repoRoot: string;
+  branch?: string;
+  head: string;
+  files: GitFileStatus[];
+  truncated: boolean;
+};
+
+export type GitDiffInfo = {
+  repoRoot: string;
+  path?: string;
+  staged: boolean;
+  text: string;
+  truncated: boolean;
+};
+
+export type GitCommitInfo = {
+  repoRoot: string;
+  oid: string;
+  summary: string;
+  output: string;
+};
