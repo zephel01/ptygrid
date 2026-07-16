@@ -23,3 +23,9 @@ docs/note
 
 # ptygrid session cleanup staging (files the device bridge cannot delete)
 _to_delete/
+
+# config
+/ptygrid.yml
+
+# personal working config for this repo (kept out of version control)
+/ptygrid.yml
