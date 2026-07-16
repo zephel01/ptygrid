@@ -15,7 +15,7 @@
 // `200 {"decision":"allow"}` once the token checks out. When `teammates.enabled`
 // is false (the default) it still validates the token but skips the event emit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::{
     body::Bytes,
@@ -30,6 +30,11 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::config::ConfigManager;
 use crate::queen::QueenStatus;
+use crate::session::PtyManager;
+
+/// Hard grid ceiling shared with the frontend (`MAX_PANES`). A transcript pane
+/// is never created past it.
+const GRID_MAX_PANES: usize = 9;
 
 /// Managed Tauri state: the bearer token authorizing hook POSTs. Regenerated
 /// on every app launch and never written to disk, so registered settings.json
@@ -117,7 +122,6 @@ struct HookPayload {
     session_id: Option<String>,
     agent_id: Option<String>,
     agent_type: Option<String>,
-    #[allow(dead_code)]
     transcript_path: Option<String>,
     cwd: Option<String>,
     task_id: Option<String>,
@@ -253,8 +257,16 @@ fn process<R: Runtime>(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Token was valid; only emit when the feature is switched on.
+    // Token was valid; only emit / orchestrate when the feature is switched on.
     if teammates_enabled(&ctx.app) {
+        // Phase 4.1: subagent lifecycle drives read-only transcript panes.
+        // Runs before the event is built (which consumes `payload`).
+        match kind {
+            LifecycleKind::SubagentStart => handle_subagent_start(&ctx.app, &payload),
+            LifecycleKind::SubagentStop => handle_subagent_stop(&ctx.app, &payload),
+            _ => {}
+        }
+
         let event = LifecyclePayload {
             kind: kind.as_str(),
             session_id: payload.session_id,
@@ -269,6 +281,188 @@ fn process<R: Runtime>(
     }
 
     allow_response()
+}
+
+// ---------- Phase 4.1: transcript pane orchestration ----------
+
+/// A running lead candidate: a PTY session whose mterm.yml definition has
+/// `teams.enabled: true`, with the pane-limit inputs already resolved.
+struct LeadCandidate {
+    id: u32,
+    /// Normalized cwd for path comparison against the hook payload.
+    cwd: Option<PathBuf>,
+    max_panes: u32,
+    transcript_tail: bool,
+}
+
+/// Outcome of the pane-limit / attribution decision for a `SubagentStart`.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneDecision {
+    /// Create a read-only transcript pane for the resolved lead.
+    Create,
+    /// The lead has `transcript_tail: false`: lifecycle event only, no pane.
+    StatusOnly,
+    /// A pane limit was hit: show a banner, do not create the session.
+    RejectBanner(String),
+    /// No lead could be attributed: log only, no pane.
+    NoLead,
+}
+
+/// Resolve which lead a `SubagentStart` belongs to. Prefers a normalized cwd
+/// match (lowest id when several match); otherwise attributes to the sole
+/// enabled lead; otherwise None. Caller normalizes all paths beforehand.
+fn resolve_lead_index(leads: &[LeadCandidate], hook_cwd: Option<&Path>) -> Option<usize> {
+    if let Some(cwd) = hook_cwd {
+        let mut matched: Vec<usize> = leads
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.cwd.as_deref() == Some(cwd))
+            .map(|(i, _)| i)
+            .collect();
+        matched.sort_by_key(|&i| leads[i].id);
+        if let Some(&i) = matched.first() {
+            return Some(i);
+        }
+    }
+    if leads.len() == 1 {
+        return Some(0);
+    }
+    None
+}
+
+/// Pure pane-limit decision: per-lead `max_panes`, global `global_max_panes`,
+/// and the hard 9-pane grid ceiling. `None` lead means nothing was attributed.
+fn decide_transcript_pane(
+    lead: Option<&LeadCandidate>,
+    per_lead_count: usize,
+    total_transcripts: usize,
+    total_sessions: usize,
+    global_max_panes: usize,
+) -> PaneDecision {
+    let Some(lead) = lead else {
+        return PaneDecision::NoLead;
+    };
+    if !lead.transcript_tail {
+        return PaneDecision::StatusOnly;
+    }
+    if per_lead_count >= lead.max_panes as usize {
+        return PaneDecision::RejectBanner(format!(
+            "lead #{} の teammate ペイン上限（{}）に達したため、read-only ペインを追加できません。",
+            lead.id, lead.max_panes
+        ));
+    }
+    if total_transcripts >= global_max_panes {
+        return PaneDecision::RejectBanner(format!(
+            "teammate ペインの合計上限（{global_max_panes}）に達したため、read-only ペインを追加できません。"
+        ));
+    }
+    if total_sessions >= GRID_MAX_PANES {
+        return PaneDecision::RejectBanner(format!(
+            "ペイン上限（{GRID_MAX_PANES}）に達したため、read-only ペインを追加できません。"
+        ));
+    }
+    PaneDecision::Create
+}
+
+/// Lexical-and-symlink normalization for cwd comparison. Falls back to the
+/// input when the path cannot be canonicalized (e.g. does not exist).
+fn normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `SubagentStart`: attribute to a lead, apply pane limits, and (on Create)
+/// spawn a validated read-only transcript session.
+fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) {
+    let Some(manager) = app.try_state::<PtyManager>() else {
+        return;
+    };
+    let Some((cfg, _dir)) = app.try_state::<ConfigManager>().and_then(|cm| cm.current()) else {
+        return;
+    };
+
+    // Build lead candidates from running, named PTY sessions with teams.enabled.
+    let mut leads: Vec<LeadCandidate> = Vec::new();
+    for (id, name, cwd) in manager.running_named_sessions() {
+        let Some(name) = name else { continue };
+        let Some(def) = cfg.agents.iter().find(|d| d.name == name) else {
+            continue;
+        };
+        let teams = match &def.teams {
+            Some(t) if t.effective_enabled() => t,
+            _ => continue,
+        };
+        leads.push(LeadCandidate {
+            id,
+            cwd: cwd.as_deref().map(normalize_path),
+            max_panes: teams.effective_max_panes(),
+            transcript_tail: teams.effective_transcript_tail(),
+        });
+    }
+
+    let hook_cwd = payload
+        .cwd
+        .as_deref()
+        .map(|c| normalize_path(Path::new(c)));
+    let lead_index = resolve_lead_index(&leads, hook_cwd.as_deref());
+    let lead = lead_index.map(|i| &leads[i]);
+
+    let global_max = cfg
+        .teammates
+        .unwrap_or_default()
+        .effective_global_max_panes() as usize;
+    let (total_sessions, total_transcripts, per_lead) = manager.transcript_stats();
+    let per_lead_count = lead
+        .map(|l| per_lead.get(&l.id).copied().unwrap_or(0))
+        .unwrap_or(0);
+
+    match decide_transcript_pane(
+        lead,
+        per_lead_count,
+        total_transcripts,
+        total_sessions,
+        global_max,
+    ) {
+        PaneDecision::Create => {
+            let lead_id = lead.expect("Create implies a lead").id;
+            let agent_id = payload.agent_id.clone().unwrap_or_default();
+            let role = payload.agent_type.clone();
+            // Only tail a payload path that passes the $HOME/.claude guard;
+            // otherwise the pane shows status only.
+            let home = app.path().home_dir().ok();
+            let path = payload
+                .transcript_path
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|p| {
+                    home.as_deref()
+                        .map(|h| crate::transcript::validate_transcript_path(p, h))
+                        .unwrap_or(false)
+                });
+            manager.create_transcript_session(app.clone(), agent_id, role, lead_id, path);
+        }
+        PaneDecision::StatusOnly => {
+            // transcript_tail: false — the lifecycle event is enough.
+        }
+        PaneDecision::NoLead => {
+            eprintln!(
+                "teammate hook subagent-start: no teams-enabled lead matched (cwd={:?}); pane not created",
+                payload.cwd
+            );
+        }
+        PaneDecision::RejectBanner(message) => {
+            let _ = app.emit("teammate-banner", serde_json::json!({ "message": message }));
+        }
+    }
+}
+
+/// `SubagentStop`: transition the owning transcript session to `stopped`.
+fn handle_subagent_stop<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) {
+    let (Some(manager), Some(agent_id)) =
+        (app.try_state::<PtyManager>(), payload.agent_id.as_deref())
+    else {
+        return;
+    };
+    manager.stop_transcript_session(app.clone(), agent_id);
 }
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
@@ -680,6 +874,94 @@ mod tests {
                     .contains(".ptygrid-backup-")
             })
             .count()
+    }
+
+    // ---------- Phase 4.1: pane orchestration decisions ----------
+
+    fn lead(id: u32, cwd: Option<&str>, max_panes: u32, transcript_tail: bool) -> LeadCandidate {
+        LeadCandidate {
+            id,
+            cwd: cwd.map(PathBuf::from),
+            max_panes,
+            transcript_tail,
+        }
+    }
+
+    #[test]
+    fn resolve_lead_prefers_cwd_match_then_unique_lead() {
+        let leads = vec![
+            lead(3, Some("/proj/a"), 3, true),
+            lead(5, Some("/proj/b"), 3, true),
+        ];
+        // exact cwd match wins over id order
+        assert_eq!(
+            resolve_lead_index(&leads, Some(Path::new("/proj/b"))),
+            Some(1)
+        );
+        // no cwd match + two leads => ambiguous => None
+        assert_eq!(resolve_lead_index(&leads, Some(Path::new("/proj/z"))), None);
+        // no cwd + exactly one lead => that lead
+        let one = vec![lead(7, Some("/proj/a"), 3, true)];
+        assert_eq!(resolve_lead_index(&one, Some(Path::new("/proj/z"))), Some(0));
+        assert_eq!(resolve_lead_index(&one, None), Some(0));
+        // missing hook cwd + two leads => None
+        assert_eq!(resolve_lead_index(&leads, None), None);
+        // no leads => None
+        assert_eq!(resolve_lead_index(&[], Some(Path::new("/proj/a"))), None);
+    }
+
+    #[test]
+    fn resolve_lead_lowest_id_when_multiple_share_cwd() {
+        let leads = vec![
+            lead(9, Some("/proj/a"), 3, true),
+            lead(4, Some("/proj/a"), 3, true),
+        ];
+        // both match; the lowest id is chosen deterministically
+        assert_eq!(
+            resolve_lead_index(&leads, Some(Path::new("/proj/a"))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn decide_pane_create_and_status_only() {
+        let l = lead(3, Some("/proj/a"), 3, true);
+        assert_eq!(
+            decide_transcript_pane(Some(&l), 0, 0, 0, 6),
+            PaneDecision::Create
+        );
+        // transcript_tail: false => status only
+        let quiet = lead(3, Some("/proj/a"), 3, false);
+        assert_eq!(
+            decide_transcript_pane(Some(&quiet), 0, 0, 0, 6),
+            PaneDecision::StatusOnly
+        );
+        // no lead => NoLead
+        assert_eq!(
+            decide_transcript_pane(None, 0, 0, 0, 6),
+            PaneDecision::NoLead
+        );
+    }
+
+    #[test]
+    fn decide_pane_rejects_on_each_limit() {
+        let l = lead(3, Some("/proj/a"), 2, true);
+        // per-lead cap reached
+        assert!(matches!(
+            decide_transcript_pane(Some(&l), 2, 2, 2, 6),
+            PaneDecision::RejectBanner(_)
+        ));
+        // global cap reached (per-lead still has room)
+        let roomy = lead(3, Some("/proj/a"), 9, true);
+        assert!(matches!(
+            decide_transcript_pane(Some(&roomy), 0, 6, 6, 6),
+            PaneDecision::RejectBanner(_)
+        ));
+        // grid ceiling reached (per-lead + global still have room)
+        assert!(matches!(
+            decide_transcript_pane(Some(&roomy), 0, 0, GRID_MAX_PANES, 99),
+            PaneDecision::RejectBanner(_)
+        ));
     }
 
     // ---------- HTTP receiver ----------

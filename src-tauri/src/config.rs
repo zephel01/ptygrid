@@ -69,8 +69,7 @@ impl TeammatesConfig {
         self.hook_notifications.unwrap_or(true)
     }
     /// Default 6, clamped into the 1..=9 pane range. Consumed by the Phase 4.1
-    /// pane-limit logic; parsed and clamped here so the schema is stable now.
-    #[allow(dead_code)]
+    /// pane-limit logic.
     pub fn effective_global_max_panes(&self) -> u32 {
         self.global_max_panes.unwrap_or(6).clamp(1, 9)
     }
@@ -97,6 +96,54 @@ impl HooksScope {
     }
 }
 
+/// Phase 4.1 per-agent `teams:` block. Governs whether this lead's teammates /
+/// subagents get read-only transcript panes auto-generated on `SubagentStart`.
+/// Everything is optional; omitting the block leaves the agent unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct AgentTeamsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TeamsMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_panes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_tail: Option<bool>,
+}
+
+impl AgentTeamsConfig {
+    /// Default false: this lead does not produce teammate panes.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+    /// Default `observe`. In Phase 4.1 `host` behaves identically to `observe`
+    /// (a read-only transcript pane); the real PTY host lands in Phase 4.2, so
+    /// this accessor is part of the stable schema surface but not yet a
+    /// behavior branch.
+    #[allow(dead_code)]
+    pub fn effective_mode(&self) -> TeamsMode {
+        self.mode.unwrap_or_default()
+    }
+    /// Default 3, clamped into the 1..=9 pane range.
+    pub fn effective_max_panes(&self) -> u32 {
+        self.max_panes.unwrap_or(3).clamp(1, 9)
+    }
+    /// Default true: create a read-only transcript pane. When false the lead's
+    /// subagents only surface as lifecycle events / status, no pane.
+    pub fn effective_transcript_tail(&self) -> bool {
+        self.transcript_tail.unwrap_or(true)
+    }
+}
+
+/// `observe | host` (default observe). Phase 4.1 treats `host` as `observe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamsMode {
+    #[default]
+    Observe,
+    Host,
+}
+
 /// One agent or process definition (processes use the same shape, no
 /// `instructions` in practice but the field is simply optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +166,9 @@ pub struct AgentDef {
     pub resume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeConfig>,
+    /// Phase 4.1 per-agent teammate/observe config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teams: Option<AgentTeamsConfig>,
 }
 
 /// Optional per-definition linked-worktree isolation (Phase 3.3).
@@ -569,6 +619,48 @@ agents:
         .unwrap();
         let t = cfg.teammates.unwrap();
         assert!(t.effective_enabled());
+    }
+
+    #[test]
+    fn agent_teams_block_defaults_and_overrides() {
+        // No teams block -> None; Default gives the documented effective values.
+        let cfg = parse_config("agents:\n  - name: claude\n    cmd: claude\n").unwrap();
+        assert!(cfg.agents[0].teams.is_none());
+        let d = AgentTeamsConfig::default();
+        assert!(!d.effective_enabled());
+        assert_eq!(d.effective_mode(), TeamsMode::Observe);
+        assert_eq!(d.effective_max_panes(), 3);
+        assert!(d.effective_transcript_tail());
+
+        // Empty block -> same effective defaults.
+        let cfg =
+            parse_config("agents:\n  - name: claude\n    cmd: claude\n    teams: {}\n").unwrap();
+        let t = cfg.agents[0].teams.unwrap();
+        assert!(!t.effective_enabled());
+        assert_eq!(t.effective_mode(), TeamsMode::Observe);
+        assert_eq!(t.effective_max_panes(), 3);
+        assert!(t.effective_transcript_tail());
+
+        // Explicit values incl. host mode and an out-of-range max_panes clamp.
+        let cfg = parse_config(
+            "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      enabled: true\n      mode: host\n      max_panes: 99\n      transcript_tail: false\n",
+        )
+        .unwrap();
+        let t = cfg.agents[0].teams.unwrap();
+        assert!(t.effective_enabled());
+        assert_eq!(t.effective_mode(), TeamsMode::Host);
+        assert_eq!(t.effective_max_panes(), 9);
+        assert!(!t.effective_transcript_tail());
+    }
+
+    #[test]
+    fn agent_teams_block_ignores_unknown_fields() {
+        // Unknown keys are ignored; known ones still parse.
+        let cfg = parse_config(
+            "agents:\n  - name: claude\n    cmd: claude\n    teams:\n      enabled: true\n      teammate_binaries: [claude]\n      future_flag: 7\n",
+        )
+        .unwrap();
+        assert!(cfg.agents[0].teams.unwrap().effective_enabled());
     }
 
     #[test]

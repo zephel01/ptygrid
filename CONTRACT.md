@@ -698,3 +698,129 @@ type TeammateLifecyclePayload = {
   コピー、(b) user スコープの settings.json 登録ボタン、(c) 直近の teammate-lifecycle 一覧（最大10件）。
 - `teammate-lifecycle` 受信時、`hook_notifications` が有効なら既存 notice/toast 機構で
   日本語短文を表示する。
+
+---
+
+# Phase 4.1 追加契約（observe: read-only transcript ペイン）
+
+Phase 4.1 は方式B（hooks 観測）の中核を実装する。`SubagentStart` hook を受けて **PTY を持たない
+論理セッション（新種別 `transcript`）** を自動生成し、subagent の transcript JSONL を read-only で
+tail する。Phase 0〜4.0 は互換維持（既存 PTY 経路・Queen MCP 契約・IPC に非回帰）。方式A（host, 実 PTY）
+は Phase 4.2。**`agents[].teams.mode: host` は 4.1 では observe と同一挙動**（read-only transcript ペイン）
+とし、実 PTY ホストは 4.2 で実装する。
+
+## mterm.yml 拡張（`agents[].teams` ブロック、すべて任意）
+
+```yaml
+agents:
+  - name: claude
+    cmd: claude
+    teams:
+      enabled: false         # default false。この lead で teammate ペイン化を行う
+      mode: observe          # "observe" | "host"、default observe（4.1 では host も observe と同挙動）
+      max_panes: 3           # この lead が生む teammate ペイン上限、default 3、1..9 に clamp
+      transcript_tail: true  # default true。false なら subagent はステータス（lifecycle）のみ、ペイン非生成
+```
+
+- 未知field（`teammate_binaries` / `fallback_to_observe` 等の host 用 4.2 field 含む）は無視、欠落はデフォルト補完。
+- ブロック省略 = teammate ペイン化オフ（従来どおり）。
+
+```ts
+type AgentTeamsConfig = {
+  enabled?: boolean;              // default false
+  mode?: "observe" | "host";      // default "observe"（4.1 では host == observe）
+  maxPanes?: number;              // default 3, clamp 1..9
+  transcriptTail?: boolean;       // default true
+};
+// AgentDef へ teams?: AgentTeamsConfig を追加
+```
+
+## 新ペイン種別 `transcript`（PTY を持たない論理セッション）
+
+- backend の session map に、PTY・writer・reader thread・output ring（tail 整形テキストは
+  既存 output ring を流用）を **spawn しない**論理セッションを追加する。`u32` id + generation は
+  既存 PTY と同じ採番（`next_id` / `generations`）を共有する。
+- `SessionInfo` を additive に拡張（既存fieldは不変）:
+
+```ts
+type SessionInfo = {
+  /* 既存field... */
+  kind?: "pty" | "transcript";     // 既存セッションは常に "pty"
+  teammate?: {                     // transcript セッションにのみ付与
+    role?: string;                 // hook payload の agent_type
+    leadId: number;                // 親 lead セッションの #id
+    mode: "observe";               // 4.1 では常に observe（host も observe と表示）
+  };
+};
+```
+
+- `list_agents`（Queen MCP）の `sessions[]` に kind 付きで現れる。
+- `read_output`（Queen MCP）は transcript セッションに対し、**整形済みテキストをそのまま返す**
+  （ANSI 画面再構成は行わない。`raw` 指定は無視して整形済みを返す）。
+- `send_message`（Queen MCP）は transcript 宛先を **`invalid_params` で拒否**する
+  （read-only・stdin なし。「session #id is a read-only teammate transcript and cannot receive messages」）。
+- `restart_session` は transcript セッションを拒否する（respawn 対象の PTY spec を持たない）。
+- close（`kill_pty`）は論理セッションを map から除去するのみ。subagent プロセスには一切影響しない。
+
+## SubagentStart → transcript セッション自動生成
+
+`teammates.enabled: true` かつ以下の帰属・上限判定を満たすとき、`SubagentStart` 受信で transcript
+セッションを生成する（`teammates.enabled: false` の間は Phase 4.0 どおり emit/生成なし）。
+
+### lead 帰属
+
+- **lead 候補** = 実行中（running）の PTY セッションのうち、mterm.yml 定義に `teams.enabled: true` を持つもの。
+- hook payload の `cwd` を正規化パス（canonicalize、失敗時は入力パス）で lead 候補の cwd と比較し、
+  **一致する候補**へ帰属（複数一致時は最小 id）。
+- cwd 一致が無い場合、lead 候補が **ちょうど1つ**ならそれへ帰属。
+- それも無ければ **ペインを作らずログ（stderr）のみ**。
+
+### 上限（超過時はセッションを作らず日本語バナー通知のみ）
+
+- lead ごと `teams.max_panes`（該当 lead の transcript セッション数）。
+- 全体 `teammates.global_max_panes`（transcript セッション総数）。
+- グリッド 9 面（全セッション総数）。
+- いずれか超過時は **transcript 論理セッションを生成せず**、`teammate-banner` イベントでバナー通知する
+  （Phase 2 の 9 面上限バナー経路 = `ui.errorBanner` を踏襲）。transcript は paneless にしても tail コストが
+  無駄なため、4.1 では「作らない」を採用する。
+- `transcript_tail: false` の lead は、ペインを生成せず lifecycle イベント（ステータス）のみ。
+
+### SubagentStop
+
+- `SubagentStop` 受信で、該当 `agent_id` の transcript セッションを `stopped`（state=exited）へ遷移し、
+  tail を停止する（generation bump）。ペインは残置し最終状態を表示する。
+
+## transcript tail と path 検証
+
+- **path 検証（セキュリティ）**: hook payload の `transcript_path` は、**絶対パスかつ `$HOME/.claude/`
+  配下**（`..` 成分を含まない）のみ tail を許可する。それ以外はステータス表示のみに縮退する
+  （任意ファイル読み出しの踏み台化を防止）。`transcript_path` 欠落時も **フォールバック path 構築は行わず**
+  （[観測] 依存を避ける）ステータスのみ。
+- **tail 実装**: `notify` crate でファイル（親 dir）を watch し、失敗時・および常時 300ms のポーリングへ
+  フォールバックする。追記された JSONL の完全行のみをパースし、`role: text` を時系列連結した簡易テキストへ整形
+  （tool 呼び出しは `[tool_use: <name>]` の1行要約）。パース不能行・表示要素の無い行は **生表示せずスキップ**
+  してカウントする。
+- generation により stale watcher の emit・append を無効化する（既存 PTY reader と同じ規律）。
+- 新モジュール `src-tauri/src/transcript.rs` に隔離し、session hot path に混ぜない。
+
+## 追加 Tauri Event
+
+| event | payload | 説明 |
+|---|---|---|
+| `transcript-output` | `{ id: number, text: string }` | tail が整形した **追記分のみ**（既存 `pty-output` とは別イベント）。generation で stale 抑止 |
+| `teammate-banner` | `{ message: string }` | ペイン上限超過時のバナー（frontend は `ui.errorBanner` に表示） |
+
+## ProjectState
+
+- transcript セッションは ephemeral であり **`ProjectState.sessions` に保存しない**（Phase 3.4 継承・
+  logical resume の対象外）。`LogicalSession` に transcript variant は存在せず、frontend は保存前に
+  transcript ペインを除外する（backend `project_state::persistable_pane_ids` が同じ不変条件を単体テスト可能に保持）。
+  resume 後は lead の再起動により subagent が改めて生成される。
+
+## Frontend
+
+- transcript ペインは xterm ではなく **read-only のスクロールビュー**（等幅・追記で自動スクロール・
+  ユーザーが上へスクロール中は追従停止）。ヘッダーは `claude·sub #<id> ▸<role> 📖RO` + 親 lead 併記 `↳#<leadId>`、
+  状態ドット active（running）/ stopped（exited）。**restart ボタンなし**・close 可・maximize 可。
+- close は「tail 停止のみ・subagent には影響しない」旨を tooltip で明示する。
+- 9 面上限バナー・toast は既存経路（`ui.errorBanner` / notices）を流用する。

@@ -520,7 +520,11 @@ impl QueenServer {
         let (text, rows, cols) = manager
             .output_snapshot(id)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let text = if raw.unwrap_or(false) {
+        // Transcript sessions already hold formatted `role: text`; ANSI screen
+        // reconstruction would only mangle them, so pass the text through.
+        let is_transcript =
+            manager.session_kind(id) == Some(crate::session::SessionKind::Transcript);
+        let text = if raw.unwrap_or(false) || is_transcript {
             text
         } else {
             crate::ansi::render_terminal(&text, rows, cols)
@@ -545,6 +549,16 @@ impl QueenServer {
         let id = manager
             .resolve_agent(&agent)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
+        // Read-only transcript sessions have no stdin: reject clearly instead of
+        // failing later with a generic "not running" error.
+        if manager.session_kind(id) == Some(crate::session::SessionKind::Transcript) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "session #{id} is a read-only teammate transcript and cannot receive messages"
+                ),
+                None,
+            ));
+        }
         let mut data = text;
         if submit.unwrap_or(true) {
             data.push('\r');

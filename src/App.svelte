@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { Splitpanes, Pane } from "svelte-splitpanes";
   import Terminal from "./lib/Terminal.svelte";
+  import TranscriptPane from "./lib/TranscriptPane.svelte";
   import GitPanel from "./lib/GitPanel.svelte";
   import {
     ui,
@@ -233,6 +234,12 @@
     return mode === "auto" ? "auto" : (Number(mode) as 1 | 2 | 3);
   }
 
+  // Phase 4.1: read-only transcript panes are ephemeral and excluded from
+  // persistence (they are re-created by the lead on resume).
+  let persistablePanes = $derived(
+    ui.panes.filter((id) => ui.sessions[id]?.kind !== "transcript"),
+  );
+
   function logicalSession(id: number): LogicalSession {
     const session = ui.sessions[id];
     if (session?.name) {
@@ -251,12 +258,12 @@
     const maximizedIndex =
       ui.maximizedId === null
         ? undefined
-        : ui.panes.indexOf(ui.maximizedId);
+        : persistablePanes.indexOf(ui.maximizedId);
     return {
       version: 1,
       configDir: info.dir,
       layoutMode: savedLayoutMode(),
-      sessions: ui.panes.map(logicalSession),
+      sessions: persistablePanes.map(logicalSession),
       ...(maximizedIndex !== undefined && maximizedIndex >= 0
         ? { maximizedIndex }
         : {}),
@@ -416,10 +423,17 @@
     disposeTermHandle(id);
     delete ui.resources[id];
     delete ui.sessions[id];
+    delete ui.transcripts[id];
   }
 
   function toggleMaximize(id: number): void {
     ui.maximizedId = ui.maximizedId === id ? null : id;
+  }
+
+  // Phase 4.1 transcript pane header, e.g. `claude·sub #7 ▸reviewer 📖RO`.
+  function transcriptTitle(id: number): string {
+    const role = ui.sessions[id]?.teammate?.role;
+    return `claude·sub #${id}${role ? ` ▸${role}` : ""} 📖RO`;
   }
 
   function formatCpu(percent: number): string {
@@ -734,59 +748,98 @@
                   {@const session = ui.sessions[id]}
                   {@const resources = ui.resources[id]}
                   <section class="pane" class:is-max={ui.maximizedId === id}>
-                    <header class="pane-header">
-                      <span
-                        class="dot state-{session?.state ?? 'starting'}"
-                        title={session?.state ?? "starting"}
-                      ></span>
-                      <span class="pane-title">{paneTitle(id)}</span>
-                      {#if session?.worktree}
+                    {#if session?.kind === "transcript"}
+                      {@const stopped = session.state === "exited"}
+                      <header class="pane-header">
                         <span
-                          class="worktree-badge"
-                          title={`worktree: ${session.worktree.path}`}
-                        >
-                          ⑂ {session.worktree.branch}
-                        </span>
-                      {/if}
-                      {#if session?.state === "exited"}
-                        <span class="exit-code">
-                          exit {session.code ?? "?"}
-                        </span>
-                      {/if}
-                      {#if resources && session?.state === "running"}
+                          class="dot tstate-{stopped ? 'stopped' : 'active'}"
+                          title={stopped ? "stopped" : "active"}
+                        ></span>
                         <span
-                          class="resource-usage"
-                          title={`${resources.processCount} processes · ${resources.memoryBytes.toLocaleString()} bytes`}
+                          class="pane-title"
+                          title="read-only transcript（観測のみ・入力不可）"
                         >
-                          CPU {formatCpu(resources.cpuPercent)} · {formatMemory(resources.memoryBytes)}
+                          {transcriptTitle(id)}
                         </span>
-                      {/if}
-                      <span class="spacer"></span>
-                      <button
-                        class="pane-btn"
-                        title="再起動"
-                        onclick={() => restartSession(id)}
-                      >
-                        ⟳
-                      </button>
-                      <button
-                        class="pane-btn"
-                        title={ui.maximizedId === id ? "最大化解除" : "最大化"}
-                        onclick={() => toggleMaximize(id)}
-                      >
-                        ⤢
-                      </button>
-                      <button
-                        class="pane-btn pane-btn-close"
-                        title="閉じる（セッション終了）"
-                        onclick={() => closePane(id)}
-                      >
-                        ✕
-                      </button>
-                    </header>
-                    <div class="pane-body">
-                      <Terminal sessionId={id} title={paneTitle(id)} />
-                    </div>
+                        {#if session.teammate}
+                          <span class="lead-ref" title="親 lead セッション">
+                            ↳#{session.teammate.leadId}
+                          </span>
+                        {/if}
+                        <span class="spacer"></span>
+                        <button
+                          class="pane-btn"
+                          title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                          onclick={() => toggleMaximize(id)}
+                        >
+                          ⤢
+                        </button>
+                        <button
+                          class="pane-btn pane-btn-close"
+                          title="閉じる（tail 停止のみ・subagent には影響しません）"
+                          onclick={() => closePane(id)}
+                        >
+                          ✕
+                        </button>
+                      </header>
+                      <div class="pane-body">
+                        <TranscriptPane sessionId={id} {stopped} />
+                      </div>
+                    {:else}
+                      <header class="pane-header">
+                        <span
+                          class="dot state-{session?.state ?? 'starting'}"
+                          title={session?.state ?? "starting"}
+                        ></span>
+                        <span class="pane-title">{paneTitle(id)}</span>
+                        {#if session?.worktree}
+                          <span
+                            class="worktree-badge"
+                            title={`worktree: ${session.worktree.path}`}
+                          >
+                            ⑂ {session.worktree.branch}
+                          </span>
+                        {/if}
+                        {#if session?.state === "exited"}
+                          <span class="exit-code">
+                            exit {session.code ?? "?"}
+                          </span>
+                        {/if}
+                        {#if resources && session?.state === "running"}
+                          <span
+                            class="resource-usage"
+                            title={`${resources.processCount} processes · ${resources.memoryBytes.toLocaleString()} bytes`}
+                          >
+                            CPU {formatCpu(resources.cpuPercent)} · {formatMemory(resources.memoryBytes)}
+                          </span>
+                        {/if}
+                        <span class="spacer"></span>
+                        <button
+                          class="pane-btn"
+                          title="再起動"
+                          onclick={() => restartSession(id)}
+                        >
+                          ⟳
+                        </button>
+                        <button
+                          class="pane-btn"
+                          title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                          onclick={() => toggleMaximize(id)}
+                        >
+                          ⤢
+                        </button>
+                        <button
+                          class="pane-btn pane-btn-close"
+                          title="閉じる（セッション終了）"
+                          onclick={() => closePane(id)}
+                        >
+                          ✕
+                        </button>
+                      </header>
+                      <div class="pane-body">
+                        <Terminal sessionId={id} title={paneTitle(id)} />
+                      </div>
+                    {/if}
                   </section>
                 </Pane>
               {/each}
@@ -1401,6 +1454,22 @@
 
   .dot.state-exited {
     background: #e06c75;
+  }
+
+  /* transcript (observe) logical states */
+  .dot.tstate-active {
+    background: #4caf50;
+  }
+
+  .dot.tstate-stopped {
+    background: #888;
+  }
+
+  .lead-ref {
+    flex: 0 0 auto;
+    color: #8a9aa8;
+    font-family: Menlo, monospace;
+    font-size: 10px;
   }
 
   .pane-body {

@@ -9,6 +9,7 @@ mod queen_store;
 mod resource_monitor;
 mod session;
 mod teams_hooks;
+mod transcript;
 mod worktree;
 
 use config::ConfigManager;

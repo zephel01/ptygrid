@@ -306,6 +306,39 @@ teammates:
 > ⚠️ token はアプリ起動ごとに再生成され、ディスクに保存されません。アプリを再起動したら
 > スニペットの再コピー、または settings.json への再登録が必要です。
 
+### observe: read-only transcript ペイン(Phase 4.1)
+
+lead(親エージェント)が subagent を起動したとき、その transcript を **読み取り専用ペイン**として
+自動追加できます。有効化は lead の定義に `teams:` ブロックを足すだけです:
+
+```yaml
+teammates:
+  enabled: true       # グローバルの有効化(上記)も必要
+agents:
+  - name: claude
+    cmd: claude
+    cwd: "."
+    teams:
+      enabled: true         # この lead で transcript ペイン化を行う
+      mode: observe         # observe | host(host は Phase 4.2。4.1 では observe と同じ)
+      max_panes: 3          # この lead が生む transcript ペインの上限(default 3)
+      transcript_tail: true # false なら通知だけでペインは作らない(default true)
+```
+
+使い方と挙動:
+
+- Claude Code の `SubagentStart` hook を受けると、`~/.claude/` 配下の subagent transcript を
+  tail する `claude·sub #<id> ▸<役割> 📖RO` ペインが増えます。親 lead は `↳#<id>` で併記されます。
+- ペインは **読み取り専用**です。xterm ではなくスクロールビューで、`role: text` を時系列表示し、
+  ツール呼び出しは1行に要約します。入力はできません(Queen の `send_message` も拒否されます)。
+- 状態ドットは active(実行中)/ stopped(subagent 終了)。`SubagentStop` を受けると stopped になり、
+  ペインは残ります(自分で閉じるまで最終状態を表示)。
+- ペインを **閉じても subagent には影響しません**(tail を止めるだけです)。restart はできません。
+- 上限(lead ごとの `max_panes`、全体の `teammates.global_max_panes`、グリッド9面)を超えると、
+  ペインは作らず日本語バナーで通知します。
+- 安全のため、tail するのは `$HOME/.claude/` 配下の絶対パスのみです。それ以外や path 不明の場合は
+  ステータス表示のみになります。transcript セッションはセッション復元(resume)の対象外です。
+
 ## Queen ツールリファレンス
 
 | ツール | 引数 | 説明 |

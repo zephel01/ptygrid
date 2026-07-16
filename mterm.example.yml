@@ -21,6 +21,13 @@ queen:
   enabled: true   # default true; false stops the server
   port: 39237     # default 39237; if busy, +1 is tried up to 39246
 
+# teammates: global switch for receiving Claude Code teammate/subagent hooks
+# (Phase 4.0) and auto-adding read-only transcript panes (Phase 4.1). Optional.
+# teammates:
+#   enabled: false          # default false; true enables hook toasts + observe panes
+#   hook_notifications: true
+#   global_max_panes: 6     # total teammate panes across all leads (<=9)
+
 agents:
   - name: claude
     cmd: "claude"
@@ -29,6 +36,13 @@ agents:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
     autostart: false
     autorestart: never
+    # Phase 4.1 observe: auto-add a read-only transcript pane when this lead
+    # spawns a subagent (requires teammates.enabled above). Optional.
+    # teams:
+    #   enabled: true
+    #   mode: observe        # observe | host (host is Phase 4.2; == observe in 4.1)
+    #   max_panes: 3
+    #   transcript_tail: true
 
   - name: codex
     cmd: "codex"

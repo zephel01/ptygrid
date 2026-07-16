@@ -60,6 +60,28 @@ pub enum SessionState {
     Restarting,
 }
 
+/// Session flavor (Phase 4.1). `pty` is an ordinary PTY-backed session; a
+/// `transcript` session is a PTY-less logical session that tails a read-only
+/// teammate/subagent transcript. Existing sessions are always `pty` on the
+/// wire, so this is an additive field that does not break any prior consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    Pty,
+    Transcript,
+}
+
+/// Teammate metadata carried on a `transcript` session's `SessionInfo`
+/// (Phase 4.1). Mode is always `"observe"` in 4.1 (host == observe).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammateInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub lead_id: u32,
+    pub mode: &'static str,
+}
+
 /// Payload for `session-state` and item type of `list_sessions`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
@@ -79,6 +101,11 @@ pub struct SessionInfo {
     pub foreground: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// Phase 4.1: `pty` (default) or `transcript`.
+    pub kind: SessionKind,
+    /// Phase 4.1: present only on `transcript` sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<TeammateInfo>,
 }
 
 // ---------- internal types ----------
@@ -109,6 +136,15 @@ struct LivePty {
     child: Box<dyn Child + Send + Sync>,
 }
 
+/// Internal teammate metadata for a `transcript` slot. `agent_id` lets
+/// `SubagentStop` locate the slot again; it is not serialized on the wire.
+#[derive(Clone)]
+struct TeammateSlotMeta {
+    agent_id: String,
+    role: Option<String>,
+    lead_id: u32,
+}
+
 /// A session slot. The id is stable across restarts; only the contents
 /// (live PTY + generation) are swapped.
 struct SessionSlot {
@@ -128,6 +164,11 @@ struct SessionSlot {
     /// Rolling output buffer (cap OUTPUT_CAP, oldest bytes dropped).
     /// Deliberately NOT cleared on restart: it spans generations.
     output: Vec<u8>,
+    /// Phase 4.1: `Pty` for ordinary sessions, `Transcript` for PTY-less
+    /// read-only teammate transcript sessions.
+    kind: SessionKind,
+    /// Phase 4.1: teammate metadata, present only on transcript slots.
+    teammate: Option<TeammateSlotMeta>,
 }
 
 /// Append `chunk` to `buf`, dropping the oldest bytes beyond `cap`.
@@ -154,6 +195,13 @@ fn session_info(id: u32, slot: &SessionSlot) -> SessionInfo {
         // Hot emit paths never resolve the fg process; see SessionInfo docs.
         foreground: None,
         worktree: slot.spec.worktree.clone(),
+        kind: slot.kind,
+        teammate: slot.teammate.as_ref().map(|m| TeammateInfo {
+            role: m.role.clone(),
+            lead_id: m.lead_id,
+            // Phase 4.1: host and observe both surface as read-only observe.
+            mode: "observe",
+        }),
     }
 }
 
@@ -256,7 +304,7 @@ fn decide_eof(
     let wants_restart = match policy {
         AutoRestart::Never => false,
         AutoRestart::Always => true,
-        AutoRestart::OnFailure => code.map_or(true, |c| c != 0),
+        AutoRestart::OnFailure => code != Some(0),
     };
     if !manual_kill && wants_restart && count < MAX_AUTORESTARTS {
         EofAction::Restart {
@@ -405,6 +453,8 @@ impl PtyManager {
                     rows,
                     spawned_at: Instant::now(),
                     output: Vec::new(),
+                    kind: SessionKind::Pty,
+                    teammate: None,
                 },
             );
         }
@@ -496,6 +546,11 @@ impl PtyManager {
             let slot = sessions
                 .get_mut(&id)
                 .ok_or_else(|| format!("session {id} not found"))?;
+            if slot.kind == SessionKind::Transcript {
+                return Err(format!(
+                    "session {id} is a read-only transcript and cannot be restarted"
+                ));
+            }
             // Stale the current reader thread immediately.
             let new_gen = self.generations.fetch_add(1, Ordering::SeqCst);
             slot.generation = new_gen;
@@ -689,6 +744,147 @@ impl PtyManager {
             "no running session or foreground process named '{agent}'. \
              running sessions: {running_list}"
         ))
+    }
+
+    // ---------- transcript (read-only teammate) sessions, Phase 4.1 ----------
+
+    /// The kind of a session, if it exists. Queen's `send_message` uses this to
+    /// reject transcript destinations with a clear error.
+    pub fn session_kind(&self, id: u32) -> Option<SessionKind> {
+        self.lock_sessions().get(&id).map(|slot| slot.kind)
+    }
+
+    /// Running, named, PTY sessions with their resolved cwd. Used by the
+    /// teammate hook receiver to resolve which lead a `SubagentStart` belongs
+    /// to (transcript sessions are excluded — a lead is always a real PTY).
+    pub fn running_named_sessions(&self) -> Vec<(u32, Option<String>, Option<PathBuf>)> {
+        let sessions = self.lock_sessions();
+        sessions
+            .iter()
+            .filter(|(_, s)| s.state == SessionState::Running && s.kind == SessionKind::Pty)
+            .map(|(id, s)| (*id, s.spec.name.clone(), s.spec.cwd.clone()))
+            .collect()
+    }
+
+    /// (total sessions, total transcript sessions, transcript-count-per-lead).
+    /// Cheap snapshot under the lock for the pane-limit checks.
+    pub fn transcript_stats(&self) -> (usize, usize, HashMap<u32, usize>) {
+        let sessions = self.lock_sessions();
+        let total = sessions.len();
+        let mut transcripts = 0usize;
+        let mut per_lead: HashMap<u32, usize> = HashMap::new();
+        for slot in sessions.values() {
+            if slot.kind == SessionKind::Transcript {
+                transcripts += 1;
+                if let Some(meta) = &slot.teammate {
+                    *per_lead.entry(meta.lead_id).or_insert(0) += 1;
+                }
+            }
+        }
+        (total, transcripts, per_lead)
+    }
+
+    /// Create a PTY-less transcript session and return its stable id. Shares the
+    /// existing id + generation counters. When `transcript_path` is Some (it is
+    /// caller-validated to live under `$HOME/.claude/`), a background tail is
+    /// started; otherwise the pane shows status only. Emits `session-state`.
+    pub fn create_transcript_session<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        agent_id: String,
+        role: Option<String>,
+        lead_id: u32,
+        transcript_path: Option<PathBuf>,
+    ) -> u32 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let generation = self.generations.fetch_add(1, Ordering::SeqCst);
+        let info = {
+            let mut sessions = self.lock_sessions();
+            sessions.insert(
+                id,
+                SessionSlot {
+                    spec: LaunchSpec {
+                        name: role.clone(),
+                        cmd: "transcript".to_string(),
+                        shell_wrap: false,
+                        cwd: None,
+                        env: Vec::new(),
+                        autorestart: AutoRestart::Never,
+                        worktree: None,
+                    },
+                    generation,
+                    // A transcript is "active" (Running) until SubagentStop.
+                    state: SessionState::Running,
+                    code: None,
+                    restart_count: 0,
+                    manual_kill: false,
+                    live: None,
+                    cols: 0,
+                    rows: 0,
+                    spawned_at: Instant::now(),
+                    output: Vec::new(),
+                    kind: SessionKind::Transcript,
+                    teammate: Some(TeammateSlotMeta {
+                        agent_id,
+                        role,
+                        lead_id,
+                    }),
+                },
+            );
+            session_info(id, sessions.get(&id).expect("just inserted"))
+        };
+        let _ = app.emit("session-state", &info);
+
+        if let Some(path) = transcript_path {
+            let sessions = Arc::clone(&self.sessions);
+            let append: crate::transcript::AppendFn =
+                Arc::new(move |gen: u64, text: &str| transcript_append(&sessions, id, gen, text));
+            crate::transcript::spawn_tail(app, id, generation, path, append);
+        }
+        id
+    }
+
+    /// Transition the transcript session owning `agent_id` to `stopped`
+    /// (Exited). The pane stays; the tail thread stops (generation bump). No-op
+    /// when no such transcript session exists. Returns the affected id.
+    pub fn stop_transcript_session<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        agent_id: &str,
+    ) -> Option<u32> {
+        let info = {
+            let mut sessions = self.lock_sessions();
+            let entry = sessions.iter_mut().find(|(_, s)| {
+                s.kind == SessionKind::Transcript
+                    && s.teammate.as_ref().is_some_and(|m| m.agent_id == agent_id)
+            });
+            let (id, slot) = entry?;
+            let id = *id;
+            slot.state = SessionState::Exited;
+            // Bump the generation so the tail thread stops emitting.
+            slot.generation = self.generations.fetch_add(1, Ordering::SeqCst);
+            Some(session_info(id, slot))
+        }?;
+        let id = info.id;
+        let _ = app.emit("session-state", &info);
+        Some(id)
+    }
+}
+
+/// Generation-guarded append into a transcript slot's output ring. Returns
+/// whether the slot is still current (same generation, still a transcript);
+/// the tail thread uses the return value to detect that it has gone stale.
+/// Empty text is a pure liveness check (no mutation).
+fn transcript_append(sessions: &SharedSessions, id: u32, generation: u64, text: &str) -> bool {
+    let mut guard = lock_map(sessions);
+    match guard.get_mut(&id) {
+        Some(slot) if slot.generation == generation && slot.kind == SessionKind::Transcript => {
+            if !text.is_empty() {
+                append_capped(&mut slot.output, text.as_bytes(), OUTPUT_CAP);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1303,6 +1499,108 @@ mod tests {
         );
 
         manager.kill_pty(id).unwrap();
+    }
+
+    // ----- Phase 4.1: transcript sessions -----
+
+    #[test]
+    fn transcript_session_is_pty_less_and_stops_on_subagent_stop() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+
+        let id = manager.create_transcript_session(
+            handle.clone(),
+            "agent-1".to_string(),
+            Some("reviewer".to_string()),
+            3,
+            None, // no path -> status only, no tail thread
+        );
+
+        let sessions = manager.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        let info = &sessions[0];
+        assert_eq!(info.id, id);
+        assert_eq!(info.kind, SessionKind::Transcript);
+        assert_eq!(info.state, SessionState::Running); // "active"
+        let teammate = info.teammate.as_ref().expect("teammate meta present");
+        assert_eq!(teammate.role.as_deref(), Some("reviewer"));
+        assert_eq!(teammate.lead_id, 3);
+        assert_eq!(teammate.mode, "observe");
+        assert_eq!(manager.session_kind(id), Some(SessionKind::Transcript));
+
+        // ids are shared with the PTY counter: a following PTY session is id+1.
+        let shell = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+        assert_eq!(shell, id + 1);
+        assert_eq!(manager.session_kind(shell), Some(SessionKind::Pty));
+        // Killing a live PTY reaps asynchronously; wait for the slot to drop.
+        manager.kill_pty(shell).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while manager.session_kind(shell).is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(manager.session_kind(shell), None);
+
+        // SubagentStop transitions the matching transcript to exited (stopped).
+        let stopped = manager.stop_transcript_session(handle.clone(), "agent-1");
+        assert_eq!(stopped, Some(id));
+        let info = manager.list_sessions().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.state, SessionState::Exited); // "stopped"
+
+        // An unknown agent_id is a no-op.
+        assert_eq!(manager.stop_transcript_session(handle.clone(), "nope"), None);
+
+        // Pane close removes the transcript synchronously (no PTY to reap).
+        manager.kill_pty(id).unwrap();
+        assert!(manager.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn transcript_read_output_returns_appended_text_and_rejects_restart() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let id = manager.create_transcript_session(
+            handle.clone(),
+            "agent-2".to_string(),
+            None,
+            1,
+            None,
+        );
+
+        // Simulate a tail appending formatted text at the current generation.
+        let gen = manager.lock_sessions().get(&id).unwrap().generation;
+        assert!(transcript_append(&manager.sessions, id, gen, "user: hi\n"));
+        let (text, _rows, _cols) = manager.output_snapshot(id).unwrap();
+        assert_eq!(text, "user: hi\n");
+
+        // A stale generation must neither append nor report current.
+        assert!(!transcript_append(&manager.sessions, id, gen + 999, "assistant: stale\n"));
+        assert_eq!(manager.output_snapshot(id).unwrap().0, "user: hi\n");
+
+        // Transcript sessions can never be restarted (no PTY to respawn).
+        let err = manager.restart_session(handle, id).unwrap_err();
+        assert!(err.contains("transcript"), "unexpected error: {err}");
+
+        manager.kill_pty(id).unwrap();
+    }
+
+    #[test]
+    fn transcript_stats_and_lead_counts() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        manager.create_transcript_session(handle.clone(), "a".into(), None, 5, None);
+        manager.create_transcript_session(handle.clone(), "b".into(), None, 5, None);
+        manager.create_transcript_session(handle.clone(), "c".into(), None, 7, None);
+
+        let (total, transcripts, per_lead) = manager.transcript_stats();
+        assert_eq!(total, 3);
+        assert_eq!(transcripts, 3);
+        assert_eq!(per_lead.get(&5), Some(&2));
+        assert_eq!(per_lead.get(&7), Some(&1));
+
+        // Transcript sessions are never treated as leads.
+        assert!(manager.running_named_sessions().is_empty());
     }
 
     #[test]

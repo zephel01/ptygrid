@@ -47,6 +47,22 @@ struct LastProject {
     config_dir: String,
 }
 
+/// Phase 4.1: read-only transcript (teammate observe) panes are ephemeral and
+/// must never be persisted — they are re-created by the lead on resume, never
+/// as a logical resume target. Given `(pane_id, is_transcript)` pairs, return
+/// the ids that are eligible for persistence. The frontend applies the same
+/// rule before building a `ProjectState`; keeping it here makes the exclusion
+/// invariant unit-testable and documents that `LogicalSession` has no
+/// transcript variant by construction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn persistable_pane_ids(panes: &[(u32, bool)]) -> Vec<u32> {
+    panes
+        .iter()
+        .filter(|(_, is_transcript)| !is_transcript)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 fn project_key(path: &Path) -> String {
     struct Fnv64(u64);
     impl Hasher for Fnv64 {
@@ -237,6 +253,18 @@ mod tests {
         assert!(!stored.contains("env"));
         assert!(!stored.contains("secret"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transcript_panes_are_excluded_from_persistence() {
+        // A mix of pty panes (false) and transcript panes (true): only the
+        // pty panes survive, order preserved.
+        let panes = [(1, false), (2, true), (3, false), (4, true)];
+        assert_eq!(persistable_pane_ids(&panes), vec![1, 3]);
+        // All transcript => nothing persisted.
+        assert!(persistable_pane_ids(&[(7, true), (8, true)]).is_empty());
+        // All pty => everything persisted.
+        assert_eq!(persistable_pane_ids(&[(5, false), (6, false)]), vec![5, 6]);
     }
 
     #[test]

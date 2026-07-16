@@ -11,9 +11,11 @@ import type {
   SessionResourcesPayload,
   SessionResourceUsage,
   SessionInfo,
+  TeammateBannerPayload,
   TeammateHooksInfo,
   TeammateLifecycleKind,
   TeammateLifecyclePayload,
+  TranscriptOutputPayload,
 } from "./types";
 import { isTauri } from "./tauri";
 import { writeToTerm } from "./terminals";
@@ -46,9 +48,14 @@ export const ui = $state({
   teammateHooks: null as TeammateHooksInfo | null,
   /** Most recent teammate-lifecycle events (newest first, capped). */
   teammateEvents: [] as TeammateEvent[],
+  /** Accumulated read-only transcript text keyed by transcript session id. */
+  transcripts: {} as Record<number, string>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
 });
+
+/** Per-transcript rolling text cap (chars); oldest is dropped past this. */
+const TRANSCRIPT_CAP = 256 * 1024;
 
 /** A received teammate-lifecycle event, kept for the Teammates panel. */
 export type TeammateEvent = TeammateLifecyclePayload & {
@@ -187,6 +194,21 @@ export async function initGlobalListeners(): Promise<void> {
 
   await listen<QueenNotifyPayload>("queen-notify", (event) => {
     addNotice(event.payload.title, event.payload.message);
+  });
+
+  await listen<TranscriptOutputPayload>("transcript-output", (event) => {
+    const { id, text } = event.payload;
+    const prev = ui.transcripts[id] ?? "";
+    let next = prev + text;
+    if (next.length > TRANSCRIPT_CAP) {
+      next = next.slice(next.length - TRANSCRIPT_CAP);
+    }
+    ui.transcripts[id] = next;
+  });
+
+  await listen<TeammateBannerPayload>("teammate-banner", (event) => {
+    // Follows the Phase 2 9-pane banner path (ui.errorBanner).
+    ui.errorBanner = event.payload.message;
   });
 
   await listen<TeammateLifecyclePayload>("teammate-lifecycle", (event) => {

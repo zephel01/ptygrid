@@ -35,6 +35,19 @@ export type SessionInfo = {
   /** フォアグラウンドプロセス名（list_sessions取得時のみ。イベントでは省略） */
   foreground?: string;
   worktree?: WorktreeInfo;
+  /** Phase 4.1: "pty"（既定）| "transcript"（読み取り専用ペイン） */
+  kind?: SessionKind;
+  /** Phase 4.1: transcript セッションにのみ付与される teammate メタ */
+  teammate?: TeammateInfo;
+};
+
+export type SessionKind = "pty" | "transcript";
+
+/** Phase 4.1: transcript ペインの teammate メタ（mode は 4.1 では常に observe） */
+export type TeammateInfo = {
+  role?: string;
+  leadId: number;
+  mode: "observe";
 };
 
 export type WorktreeInfo = {
@@ -113,6 +126,12 @@ export type TeammateLifecyclePayload = {
   status?: string;
   cwd?: string;
 };
+
+// Phase 4.1 (observe: read-only transcript ペイン)
+/** transcript-output: 追記された整形済みテキストの差分（既存 pty-output とは別イベント） */
+export type TranscriptOutputPayload = { id: number; text: string };
+/** teammate-banner: ペイン上限超過などのバナー通知 */
+export type TeammateBannerPayload = { message: string };
 
 // Phase 3.1 (read-only Git status/diff)
 export type GitFileStatus = {
