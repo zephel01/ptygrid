@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+
+use crate::pty::home_dir;
 
 /// `Config { project?, agents, processes }` — processes defaults to empty Vec.
 /// Phase 2 adds the optional `queen:` block; Phase 4.0 the `teammates:` block.
@@ -202,11 +204,30 @@ pub enum AutoRestart {
     Always,
 }
 
+/// Where the config file that was actually loaded came from, relative to the
+/// working folder passed to `load_config`:
+/// - `Project`: inside the working folder (`<work>/ptygrid.yml` or legacy `mterm.yml`)
+/// - `Launch`:  the app launch folder (`<launch>/ptygrid.yml`)
+/// - `Global`:  the per-user global config (`~/.ptygrid/ptygrid.yml`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigOrigin {
+    Project,
+    Launch,
+    Global,
+}
+
 /// Return type of the `load_config` command.
+///
+/// `path` is the config file that was actually read; `dir` is the **working
+/// folder** (the project boundary — cwd/Queen/Git/project-state base), which is
+/// independent of where the config file lives; `origin` names which of the
+/// three search locations `path` came from.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigInfo {
     pub path: String,
     pub dir: String,
+    pub origin: ConfigOrigin,
     pub config: Config,
 }
 
@@ -269,6 +290,25 @@ pub fn expanded_env(def: &AgentDef) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Process launch directory (the folder ptygrid was started from, e.g. where
+/// `npm run tauri dev` was invoked). Captured once at the very start of `main`
+/// — before `fix_path_env::fix()` or any Tauri setup — because later startup
+/// steps could in principle change the process cwd. Used as the ② candidate in
+/// config resolution. `None` if the cwd could not be read.
+static LAUNCH_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Capture the current directory as the launch folder. Idempotent: only the
+/// first call wins. Call as early as possible in `main`.
+pub fn capture_launch_dir() {
+    let _ = LAUNCH_DIR.set(std::env::current_dir().ok());
+}
+
+/// The captured launch folder, if any. Returns `None` before `capture_launch_dir`
+/// has run (e.g. in unit tests, which inject the launch folder explicitly).
+fn launch_dir() -> Option<PathBuf> {
+    LAUNCH_DIR.get().cloned().flatten()
+}
+
 #[derive(Default)]
 struct ConfigStateInner {
     dir: Option<PathBuf>,
@@ -297,14 +337,21 @@ impl ConfigManager {
         }
     }
 
-    /// Implements the `load_config` command: read <dir>/ptygrid.yml (falling
-    /// back to the legacy <dir>/mterm.yml; dir omitted -> previous dir, first
-    /// time -> current dir), store the config, and (re)start the file watcher.
+    /// Implements the `load_config` command.
+    ///
+    /// `dir` is the **working folder** (the project boundary). A leading `~` is
+    /// expanded to the home directory; the folder must exist and be a directory.
+    /// When omitted, the previous working folder is reused (first time: the
+    /// current dir). The config file itself is resolved separately (working
+    /// folder → launch folder → `~/.ptygrid`; see [`resolve_config_path`]), so
+    /// the working folder need not contain a config file. The config + working
+    /// folder are stored and the file watcher is (re)started on the folder that
+    /// holds the file that was actually loaded.
     pub fn load(&self, app: &AppHandle, dir: Option<String>) -> Result<ConfigInfo, String> {
         let mut inner = self.lock();
 
         let dir_path = match dir {
-            Some(d) => PathBuf::from(d),
+            Some(d) => expand_working_dir(&d)?,
             None => match inner.dir.clone() {
                 Some(prev) => prev,
                 None => std::env::current_dir()
@@ -312,15 +359,35 @@ impl ConfigManager {
             },
         };
 
-        let path = resolve_config_path(&dir_path)?;
+        // The working folder must exist and be a directory (clear error otherwise);
+        // it is the project boundary regardless of where the config file lives.
+        let meta = std::fs::metadata(&dir_path).map_err(|e| {
+            format!(
+                "working folder {} is not accessible: {e}",
+                dir_path.display()
+            )
+        })?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "working folder {} is not a directory",
+                dir_path.display()
+            ));
+        }
 
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
+        let home = home_dir().map(PathBuf::from);
+        let (path, origin) =
+            resolve_config_path(&dir_path, launch_dir().as_deref(), home.as_deref())?;
+
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
         let config = parse_config(&text)?;
 
-        // Replace any existing watcher (dropping the old one stops it and
-        // ends its throttle thread via channel disconnect).
-        let watcher = start_watcher(app.clone(), &dir_path, &path)?;
+        // Watch the parent dir of the file that was ACTUALLY loaded. When a
+        // launch-folder or global (~/.ptygrid) config is used, this watches that
+        // folder — NOT the working folder — so edits to the loaded file are
+        // detected. Replace any existing watcher (dropping the old one stops it
+        // and ends its throttle thread via channel disconnect).
+        let watch_dir = path.parent().unwrap_or(dir_path.as_path()).to_path_buf();
+        let watcher = start_watcher(app.clone(), &watch_dir, &path)?;
         let dir = dir_path.display().to_string();
         inner.dir = Some(dir_path);
         inner.config = Some(config.clone());
@@ -329,6 +396,7 @@ impl ConfigManager {
         Ok(ConfigInfo {
             path: path.display().to_string(),
             dir,
+            origin,
             config,
         })
     }
@@ -378,24 +446,97 @@ impl ConfigManager {
 pub const CONFIG_FILE_NAME: &str = "ptygrid.yml";
 /// Legacy filename, still accepted so existing projects keep loading.
 pub const LEGACY_CONFIG_FILE_NAME: &str = "mterm.yml";
+/// Directory (under `$HOME`) holding the per-user global config.
+pub const GLOBAL_CONFIG_DIR: &str = ".ptygrid";
 
-/// Resolve the config file inside `dir`: prefer `ptygrid.yml`, fall back to
-/// the legacy `mterm.yml`. When both exist, `ptygrid.yml` wins (the watcher
-/// then only follows the file that was actually loaded).
-fn resolve_config_path(dir: &Path) -> Result<PathBuf, String> {
-    let preferred = dir.join(CONFIG_FILE_NAME);
-    if preferred.is_file() {
-        return Ok(preferred);
+/// Expand a leading `~` / `~/` in a working-folder input to the home directory.
+/// A `~name` form (named home) is not special-cased. Non-tilde paths pass
+/// through unchanged. Mirrors `app_settings::expand_tilde`.
+fn expand_working_dir(input: &str) -> Result<PathBuf, String> {
+    if input == "~" {
+        return home_dir()
+            .map(PathBuf::from)
+            .ok_or_else(|| "cannot determine home directory".to_string());
     }
-    let legacy = dir.join(LEGACY_CONFIG_FILE_NAME);
-    if legacy.is_file() {
-        return Ok(legacy);
+    if let Some(rest) = input.strip_prefix("~/") {
+        let home = home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
+        return Ok(Path::new(&home).join(rest));
     }
-    Err(format!(
-        "not_found: {} (also tried legacy {})",
-        preferred.display(),
-        legacy.display()
-    ))
+    Ok(PathBuf::from(input))
+}
+
+/// Pure config-file resolution shared by [`resolve_config_path`] and unit
+/// tests. Search order (first existing file wins):
+///
+/// 1. `<work>/ptygrid.yml`, then legacy `<work>/mterm.yml` (legacy fallback is
+///    the **working folder only**) — origin `Project`.
+/// 2. `<launch>/ptygrid.yml` (launch folder; skipped when it equals the working
+///    folder to avoid a duplicate try) — origin `Launch`.
+/// 3. `<home>/.ptygrid/ptygrid.yml` — origin `Global`.
+///
+/// `is_file` is injected so the order can be tested without touching the disk.
+/// On failure returns the full ordered list of candidates that were tried.
+fn resolve_config_path_pure(
+    work: &Path,
+    launch: Option<&Path>,
+    home: Option<&Path>,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Result<(PathBuf, ConfigOrigin), Vec<PathBuf>> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    // ① working folder: ptygrid.yml, then legacy mterm.yml.
+    let work_preferred = work.join(CONFIG_FILE_NAME);
+    if is_file(&work_preferred) {
+        return Ok((work_preferred, ConfigOrigin::Project));
+    }
+    tried.push(work_preferred);
+    let work_legacy = work.join(LEGACY_CONFIG_FILE_NAME);
+    if is_file(&work_legacy) {
+        return Ok((work_legacy, ConfigOrigin::Project));
+    }
+    tried.push(work_legacy);
+
+    // ② launch folder: ptygrid.yml only (no legacy). Skip when it is the same
+    // path as the working folder (already tried above).
+    if let Some(launch) = launch {
+        if launch != work {
+            let launch_preferred = launch.join(CONFIG_FILE_NAME);
+            if is_file(&launch_preferred) {
+                return Ok((launch_preferred, ConfigOrigin::Launch));
+            }
+            tried.push(launch_preferred);
+        }
+    }
+
+    // ③ global ~/.ptygrid/ptygrid.yml.
+    if let Some(home) = home {
+        let global = home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME);
+        if is_file(&global) {
+            return Ok((global, ConfigOrigin::Global));
+        }
+        tried.push(global);
+    }
+
+    Err(tried)
+}
+
+/// Resolve the config file for a `load` call using the real filesystem. See
+/// [`resolve_config_path_pure`] for the search order. On failure the error
+/// begins with `not_found:` (matched by the frontend startup fallback) and
+/// lists every candidate that was tried.
+fn resolve_config_path(
+    work: &Path,
+    launch: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<(PathBuf, ConfigOrigin), String> {
+    resolve_config_path_pure(work, launch, home, &|p| p.is_file()).map_err(|tried| {
+        let list = tried
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("not_found: no ptygrid.yml found; tried {list}")
+    })
 }
 
 /// Watch the config directory (non-recursive) and emit `config-changed`
@@ -704,21 +845,171 @@ agents:
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Neither file: clear error naming both candidates.
-        let err = resolve_config_path(&dir).unwrap_err();
+        // Neither file (no launch/global): clear error naming both candidates.
+        let err = resolve_config_path(&dir, None, None).unwrap_err();
+        assert!(err.starts_with("not_found:"));
         assert!(err.contains("ptygrid.yml") && err.contains("mterm.yml"));
 
-        // Legacy only: mterm.yml is accepted.
+        // Legacy only: mterm.yml is accepted (origin Project).
         std::fs::write(dir.join(LEGACY_CONFIG_FILE_NAME), "agents: []\n").unwrap();
         assert_eq!(
-            resolve_config_path(&dir).unwrap(),
-            dir.join(LEGACY_CONFIG_FILE_NAME)
+            resolve_config_path(&dir, None, None).unwrap(),
+            (dir.join(LEGACY_CONFIG_FILE_NAME), ConfigOrigin::Project)
         );
 
         // Both present: ptygrid.yml wins.
         std::fs::write(dir.join(CONFIG_FILE_NAME), "agents: []\n").unwrap();
-        assert_eq!(resolve_config_path(&dir).unwrap(), dir.join(CONFIG_FILE_NAME));
+        assert_eq!(
+            resolve_config_path(&dir, None, None).unwrap(),
+            (dir.join(CONFIG_FILE_NAME), ConfigOrigin::Project)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- pure config-file resolution (work -> launch -> ~/.ptygrid) ----
+
+    /// Build an `is_file` predicate from a fixed set of "existing" paths.
+    fn present(paths: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |p: &Path| paths.iter().any(|x| x == p)
+    }
+
+    #[test]
+    fn resolves_config_in_working_folder_first() {
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+
+        // ptygrid.yml in the working folder wins over launch and global.
+        let existing = vec![
+            work.join(CONFIG_FILE_NAME),
+            launch.join(CONFIG_FILE_NAME),
+            home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
+        ];
+        let (path, origin) =
+            resolve_config_path_pure(work, Some(launch), Some(home), &present(&existing)).unwrap();
+        assert_eq!(path, work.join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Project);
+    }
+
+    #[test]
+    fn working_folder_prefers_ptygrid_over_mterm() {
+        let work = Path::new("/work");
+        let existing = vec![work.join(CONFIG_FILE_NAME), work.join(LEGACY_CONFIG_FILE_NAME)];
+        let (path, origin) =
+            resolve_config_path_pure(work, None, None, &present(&existing)).unwrap();
+        assert_eq!(path, work.join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Project);
+
+        // Legacy-only still resolves inside the working folder.
+        let legacy_only = vec![work.join(LEGACY_CONFIG_FILE_NAME)];
+        let (path, origin) =
+            resolve_config_path_pure(work, None, None, &present(&legacy_only)).unwrap();
+        assert_eq!(path, work.join(LEGACY_CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Project);
+    }
+
+    #[test]
+    fn falls_back_to_launch_folder() {
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+
+        // Nothing in the working folder; launch has ptygrid.yml (global also has
+        // one, but launch is tried first).
+        let existing = vec![
+            launch.join(CONFIG_FILE_NAME),
+            home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
+        ];
+        let (path, origin) =
+            resolve_config_path_pure(work, Some(launch), Some(home), &present(&existing)).unwrap();
+        assert_eq!(path, launch.join(CONFIG_FILE_NAME));
+        assert_eq!(origin, ConfigOrigin::Launch);
+
+        // The launch folder does NOT honor the legacy mterm.yml name.
+        let legacy_launch = vec![launch.join(LEGACY_CONFIG_FILE_NAME)];
+        let err = resolve_config_path_pure(work, Some(launch), Some(home), &present(&legacy_launch))
+            .unwrap_err();
+        assert!(err.contains(&launch.join(CONFIG_FILE_NAME)));
+    }
+
+    #[test]
+    fn falls_back_to_global_ptygrid_dir() {
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+        let global = home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME);
+
+        let existing = vec![global.clone()];
+        let (path, origin) =
+            resolve_config_path_pure(work, Some(launch), Some(home), &present(&existing)).unwrap();
+        assert_eq!(path, global);
+        assert_eq!(origin, ConfigOrigin::Global);
+    }
+
+    #[test]
+    fn dedups_launch_when_equal_to_working_folder() {
+        // Launch == working folder: the launch candidate must not appear a
+        // second time in the tried list, and the (missing) global is last.
+        let work = Path::new("/work");
+        let home = Path::new("/home/user");
+        let tried =
+            resolve_config_path_pure(work, Some(work), Some(home), &present(&[])).unwrap_err();
+        assert_eq!(
+            tried,
+            vec![
+                work.join(CONFIG_FILE_NAME),
+                work.join(LEGACY_CONFIG_FILE_NAME),
+                home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_lists_every_tried_candidate() {
+        let work = Path::new("/work");
+        let launch = Path::new("/launch");
+        let home = Path::new("/home/user");
+        let tried =
+            resolve_config_path_pure(work, Some(launch), Some(home), &present(&[])).unwrap_err();
+        assert_eq!(
+            tried,
+            vec![
+                work.join(CONFIG_FILE_NAME),
+                work.join(LEGACY_CONFIG_FILE_NAME),
+                launch.join(CONFIG_FILE_NAME),
+                home.join(GLOBAL_CONFIG_DIR).join(CONFIG_FILE_NAME),
+            ]
+        );
+    }
+
+    #[test]
+    fn expands_leading_tilde_in_working_folder() {
+        // Point HOME at a known dir; `~` and `~/x` expand, others pass through.
+        let prev = std::env::var("HOME").ok();
+        // SAFETY: single-threaded test manipulating process env.
+        unsafe {
+            std::env::set_var("HOME", "/home/tester");
+        }
+        assert_eq!(expand_working_dir("~").unwrap(), PathBuf::from("/home/tester"));
+        assert_eq!(
+            expand_working_dir("~/works/hoge").unwrap(),
+            PathBuf::from("/home/tester/works/hoge")
+        );
+        assert_eq!(
+            expand_working_dir("/abs/path").unwrap(),
+            PathBuf::from("/abs/path")
+        );
+        // `~name` is not special-cased.
+        assert_eq!(
+            expand_working_dir("~alice/x").unwrap(),
+            PathBuf::from("~alice/x")
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 }

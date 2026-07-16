@@ -909,3 +909,60 @@ legacy filenameを引き続き受理し、wire formatは変更しない。
   `/`または`~`始まりはそのまま、それ以外はrootがあれば`<root>/<input>`、無ければそのまま。
   解決後の文字列を既存の`buildCdCommand`（`~`先頭とquote処理済み）へ渡す。
 - 対象選択（シェルのみ/全ペイン）・プレビュー・送信の挙動は不変。
+
+---
+
+# 作業フォルダと設定ファイル置き場所の分離
+
+`load_config`の`dir`引数の意味を**作業フォルダ（working folder / プロジェクト境界）**に
+変更し、設定ファイル`ptygrid.yml`の探索場所を作業フォルダから分離する。ツールバーの
+「作業フォルダ」欄には`~/works/hoge`のような作業フォルダのパスを入れ、設定ファイルは
+グローバル（`~/.ptygrid/`）やアプリ起動フォルダにも置けるようにする。wire formatは不変。
+
+## `load_config` の意味変更
+
+- `dir` = **作業フォルダ**。先頭`~` / `~/`はホームディレクトリへ展開してから使う
+  （`~name`は特別扱いしない）。展開後のパスが存在しない／ディレクトリでない場合は明確な
+  エラー（`working folder <path> is not a directory` 等）。
+- `dir`省略時の既定は従来どおり（前回の作業フォルダ→初回はカレントディレクトリ）。
+- 作業フォルダは設定ファイルを含まなくてよい（設定は別途下記の順で探索する）。
+
+## 設定ファイルの探索順（新 resolve ロジック）
+
+1. `<作業フォルダ>/ptygrid.yml`、無ければ `<作業フォルダ>/mterm.yml`
+   （**legacy互換は作業フォルダ内のみ**）→ `origin: "project"`
+2. `<アプリ起動フォルダ>/ptygrid.yml`（legacyフォールバックなし）→ `origin: "launch"`
+   - アプリ起動フォルダ = プロセス起動時のカレントディレクトリ。**起動シーケンスの最初**
+     （`fix_path_env::fix()`より前）に`capture_launch_dir`で一度だけ捕捉し、`OnceLock`で固定。
+   - 起動フォルダが作業フォルダと同一パスの場合は重複試行しない。
+3. `~/.ptygrid/ptygrid.yml`（グローバル設定）→ `origin: "global"`
+- どこにも無ければ、試した全candidateを列挙したエラー（先頭は既存の`not_found:`を維持し、
+  frontendの起動時fallback判定を壊さない）。
+- file watcherは**実際に読み込んだファイルの親ディレクトリ**を監視する（既存挙動の一般化）。
+  グローバル設定を読んだ場合は`~/.ptygrid`を、起動フォルダ設定を読んだ場合は起動フォルダを
+  監視することになる。`config-changed` event・Reload挙動は不変。
+
+## プロジェクト境界のセマンティクス（重要）
+
+- cwd解決の基準（`resolve_cwd`）、Queenのproject scope（pins/notes/inbox）、Gitパネル、
+  `project_state`の`dir`は、**設定ファイルの場所に関係なく常に作業フォルダ**を使う。
+  `ConfigManager::current()`が返す`dir`は作業フォルダであり、②/③から設定を読んでも
+  設定ファイル側のディレクトリにはならない。
+
+## `ConfigInfo` 拡張（additive）
+
+```ts
+type ConfigOrigin = "project" | "launch" | "global";
+type ConfigInfo = { path: string; dir: string; origin: ConfigOrigin; config: Config };
+```
+
+- `path` = 実際に読み込んだ設定ファイル、`dir` = 作業フォルダ、`origin` = `path`の由来。
+  既存の`path` / `dir`フィールドは意味を明確化しただけで型は不変、`origin`のみ追加。
+
+## Frontend
+
+- ツールバーの「プロジェクト」欄を「作業フォルダ」に変更。placeholderは
+  `作業フォルダ（例: ~/works/hoge。先頭 ~ 可）`、tooltipで探索順を説明。
+- 読み込み成功後、読み込みボタン付近に**origin バッジ**（`設定: プロジェクト内 / 起動フォルダ /
+  ~/.ptygrid`、hoverで実pathと作業フォルダ）を表示。手動読み込み成功トーストにも設定元を含める。
+- 既存のReload / config-changed挙動は不変。

@@ -1,6 +1,17 @@
 // TS types per CONTRACT.md (Phase 1 追加契約) — do not change shapes.
 
-export type ConfigInfo = { path: string; dir: string; config: Config };
+/** どの探索場所から設定ファイルを読んだか（作業フォルダ基準）:
+ * project=作業フォルダ内 / launch=アプリ起動フォルダ / global=~/.ptygrid */
+export type ConfigOrigin = "project" | "launch" | "global";
+
+/** path=実際に読んだ設定ファイル、dir=作業フォルダ（プロジェクト境界）、
+ * origin=path の由来。 */
+export type ConfigInfo = {
+  path: string;
+  dir: string;
+  origin: ConfigOrigin;
+  config: Config;
+};
 
 export type Config = {
   project?: string;

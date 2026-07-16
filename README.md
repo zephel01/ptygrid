@@ -86,7 +86,10 @@ npm run tauri dev    # 初回は Rust ビルドで数分
 
 ### エージェントを定義する
 
-プロジェクトルートに `ptygrid.yml` を置いてツールバーから読み込みます([注釈付きサンプル](ptygrid.example.yml) / [用途別サンプル集](example/README.md)):
+ツールバーの「作業フォルダ」欄に対象フォルダ（例 `~/works/hoge`。先頭 `~` 可）を入れて読み込みます。
+設定ファイル `ptygrid.yml` は **作業フォルダ内 → アプリ起動フォルダ → `~/.ptygrid/`** の順に探索されるので、
+プロジェクト直下に置いても、複数プロジェクト共通の設定を `~/.ptygrid/ptygrid.yml` に置いてもかまいません
+（旧名 `mterm.yml` は作業フォルダ内のみ互換読み込み）([注釈付きサンプル](ptygrid.example.yml) / [用途別サンプル集](example/README.md)):
 
 ```yaml
 project: my-app

@@ -50,7 +50,9 @@ pub fn kill_pty(manager: State<'_, PtyManager>, id: u32) -> Result<(), String> {
     manager.kill_pty(id)
 }
 
-/// Read `<dir>/ptygrid.yml` (legacy: mterm.yml), start watching it, and apply Queen config.
+/// Load config for working folder `dir` (the project boundary; `~` expanded),
+/// resolving the config file as working folder → launch folder → `~/.ptygrid`,
+/// start watching the loaded file, and apply Queen config.
 #[tauri::command]
 pub fn load_config(
     app: AppHandle,

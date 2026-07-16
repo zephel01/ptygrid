@@ -13,6 +13,7 @@ mod teams_hooks;
 mod transcript;
 mod worktree;
 
+pub use config::capture_launch_dir;
 use config::ConfigManager;
 use queen::QueenStatus;
 use session::PtyManager;

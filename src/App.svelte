@@ -519,6 +519,18 @@
     }
   }
 
+  // 設定ファイルの由来を短い日本語ラベルにする（origin バッジ・成功トースト用）。
+  function originLabel(origin: ConfigInfo["origin"]): string {
+    switch (origin) {
+      case "project":
+        return "プロジェクト内";
+      case "launch":
+        return "起動フォルダ";
+      case "global":
+        return "~/.ptygrid";
+    }
+  }
+
   async function loadConfig(dir?: string): Promise<ConfigInfo> {
     loadingConfig = true;
     try {
@@ -545,8 +557,9 @@
       return;
     }
     try {
-      await loadConfig(configDirInput.trim() || undefined);
+      const info = await loadConfig(configDirInput.trim() || undefined);
       ui.errorBanner = null;
+      addNotice(`設定を読み込みました（${originLabel(info.origin)}）`, info.path);
     } catch (err) {
       ui.errorBanner = String(err);
     }
@@ -733,13 +746,15 @@
     </div>
 
     <div class="tb-group">
-      <span class="tb-caption">プロジェクト</span>
+      <span class="tb-caption">作業フォルダ</span>
       <span class="tb-controls">
         <input
           class="dir-input"
           type="text"
-          placeholder="ptygrid.yml のあるディレクトリ"
+          placeholder="作業フォルダ（例: ~/works/hoge。先頭 ~ 可）"
           bind:value={configDirInput}
+          title={"作業フォルダのパスを入力します（先頭 ~ はホーム展開）。\n" +
+            "設定ファイル ptygrid.yml は 作業フォルダ内 → 起動フォルダ → ~/.ptygrid の順に探します。"}
           onkeydown={(e) => {
             if (e.key === "Enter") onLoadClick();
           }}
@@ -749,6 +764,12 @@
         </button>
 
         {#if ui.configInfo}
+          <span
+            class="origin-badge"
+            title={`設定ファイル: ${ui.configInfo.path}\n作業フォルダ: ${ui.configInfo.dir}`}
+          >
+            設定: {originLabel(ui.configInfo.origin)}
+          </span>
           <span class="project-name" title={ui.configInfo.path}>
             {ui.configInfo.config.project ?? "（名称未設定）"}
           </span>
@@ -1304,6 +1325,17 @@
 
   .dir-input::placeholder {
     color: #777;
+  }
+
+  .origin-badge {
+    align-self: center;
+    color: #b5b5b5;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 10px;
+    white-space: nowrap;
   }
 
   .project-name {
