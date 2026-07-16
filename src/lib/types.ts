@@ -16,6 +16,13 @@ export type AgentDef = {
   autostart?: boolean;
   autorestart?: "never" | "on-failure" | "always";
   instructions?: string;
+  worktree?: WorktreeConfig;
+};
+
+export type WorktreeConfig = {
+  enabled?: boolean;
+  base?: string;
+  setup?: string;
 };
 
 export type SessionInfo = {
@@ -26,6 +33,16 @@ export type SessionInfo = {
   code?: number | null;
   /** フォアグラウンドプロセス名（list_sessions取得時のみ。イベントでは省略） */
   foreground?: string;
+  worktree?: WorktreeInfo;
+};
+
+export type WorktreeInfo = {
+  name: string;
+  repoRoot: string;
+  path: string;
+  branch: string;
+  base: string;
+  locked: boolean;
 };
 
 export type SessionState = "starting" | "running" | "exited" | "restarting";

@@ -11,10 +11,11 @@ ptygrid のインストールから、`mterm.yml` の書き方、Queen(内蔵 MC
 4. [ペイン操作](#ペイン操作)
 5. [Git status / diff](#git-status--diff)
 6. [mterm.yml リファレンス](#mtermyml-リファレンス)
-7. [Queen のセットアップ](#queen-のセットアップ)
-8. [Queen ツールリファレンス](#queen-ツールリファレンス)
-9. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
-10. [困ったときは](#困ったときは)
+7. [Worktree 分離](#worktree-分離)
+8. [Queen のセットアップ](#queen-のセットアップ)
+9. [Queen ツールリファレンス](#queen-ツールリファレンス)
+10. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
+11. [困ったときは](#困ったときは)
 
 ---
 
@@ -126,9 +127,47 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.env` | - | - | 環境変数。値の `${VAR}` はホスト環境から展開(未定義は空文字) |
 | `.autostart` | - | `false` | 設定読込時に自動起動 |
 | `.autorestart` | - | `never` | `never` / `on-failure` / `always`。連続5回失敗で打ち切り |
+| `.worktree.enabled` | - | `false` | 定義の起動ごとにlinked worktreeと専用branchを作る |
+| `.worktree.base` | - | `HEAD` | worktree branchの起点となるbranch/tag/commit |
+| `.worktree.setup` | - | - | worktree作成後、agent cwdで一度だけ実行するsetup command |
 
 > すべてのセッションには環境変数 `QUEEN_URL`(例: `http://127.0.0.1:39237/mcp`)が注入されます。
 > ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を実行してください。
+
+## Worktree 分離
+
+同じrepositoryで複数agentが同時編集すると競合する場合、定義ごとにworktree分離を
+有効化できます。既定は無効で、従来どおり全agentが同じworkspaceを共有します。
+
+```yaml
+agents:
+  - name: codex
+    cmd: codex
+    cwd: packages/app
+    worktree:
+      enabled: true
+      base: HEAD
+      setup: npm install
+```
+
+有効な定義を起動すると、app-data配下に一意なlinked worktreeと
+`ptygrid/codex/...` branchを作り、ペインヘッダーにbranch名を表示します。
+`cwd` がrepository内のサブディレクトリなら、worktree内でも同じ相対位置から
+起動します。restart/autorestartでは同じworktreeを再利用します。実行中の
+worktreeはGitパネル上部の`Workspace`から選び、そのbranchのdiff確認・commitができます。
+
+worktreeはGitの自動pruneを避けるためlockされ、ptygridは自動削除しません。
+作業を回収・commitした後、不要になったworktreeは通常のGitコマンドで明示的に
+片付けてください。`<path>`と`<branch>`はペインのbranch表示とツールチップで確認できます。
+
+```bash
+git worktree unlock <path>
+git worktree remove <path>   # dirtyならGitが拒否する
+git branch -d <branch>
+```
+
+setupまたはagent起動に失敗してもworktreeは保持され、エラーにpathが表示されます。
+内容を確認せず`--force`で削除しないでください。
 
 ## Queen のセットアップ
 

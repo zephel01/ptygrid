@@ -11,7 +11,7 @@ section explicitly extends it, and must pass both Rust and frontend checks.
 | 3.0 ✅ | IPC boundary extraction and deterministic process-resolution tests | No wire-format or UI behavior changes; all existing checks pass |
 | 3.1 ✅ | Read-only Git status and diff | Works for normal repos and linked worktrees; never changes index/worktree |
 | 3.2 ✅ | Untracked diff plus explicit stage, unstage, and inline commit | Hooks/errors are surfaced; no implicit staging |
-| 3.3 | Optional per-agent worktree isolation | Safe naming/locking; dirty worktrees are never silently removed |
+| 3.3 ✅ | Optional per-agent worktree isolation | Safe naming/locking; dirty worktrees are never silently removed |
 | 3.4 | Versioned project state and logical session resume | No expanded environment values or secrets are persisted |
 | 3.5 | Per-session process-tree CPU/memory monitoring | One shared sampler; batched frontend updates |
 | 3.6 | Durable Queen pins and notes | Project-scoped transactional storage and CRUD tools |

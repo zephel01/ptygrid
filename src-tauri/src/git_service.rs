@@ -147,6 +147,10 @@ fn discover_root(dir: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(root))
 }
 
+pub(crate) fn repository_root(dir: &Path) -> Result<PathBuf, String> {
+    discover_root(dir)
+}
+
 fn branch_name(root: &Path) -> Result<Option<String>, String> {
     let output = checked_output(root, ["branch", "--show-current"])?;
     let branch = trimmed_stdout(output);

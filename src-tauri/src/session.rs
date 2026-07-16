@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::config::{self, AgentDef, AutoRestart};
 use crate::pty;
+use crate::worktree::{self, WorktreeInfo};
 
 /// Give up after this many consecutive automatic restarts.
 const MAX_AUTORESTARTS: u32 = 5;
@@ -76,6 +77,8 @@ pub struct SessionInfo {
     /// deliberately carry None (field omitted). Failure to resolve -> None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
 }
 
 // ---------- internal types ----------
@@ -93,6 +96,7 @@ struct LaunchSpec {
     cwd: Option<PathBuf>,
     env: Vec<(String, String)>,
     autorestart: AutoRestart,
+    worktree: Option<WorktreeInfo>,
 }
 
 /// The live PTY half of a slot; replaced wholesale on restart.
@@ -149,6 +153,7 @@ fn session_info(id: u32, slot: &SessionSlot) -> SessionInfo {
         code: slot.code,
         // Hot emit paths never resolve the fg process; see SessionInfo docs.
         foreground: None,
+        worktree: slot.spec.worktree.clone(),
     }
 }
 
@@ -297,6 +302,7 @@ impl PtyManager {
                 .or_else(|| pty::home_dir().map(PathBuf::from)),
             env: Vec::new(),
             autorestart: AutoRestart::Never,
+            worktree: None,
         };
         self.create_session(app, spec, cols, rows)
     }
@@ -310,15 +316,32 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) -> Result<u32, String> {
+        let env = config::expanded_env(def);
+        let prepared = worktree::prepare_for_agent(&app, def, config_dir, &env)?;
+        let (cwd, worktree) = match prepared {
+            Some(prepared) => (prepared.cwd, Some(prepared.info)),
+            None => (
+                config::resolve_cwd(config_dir, def.cwd.as_deref()),
+                None,
+            ),
+        };
         let spec = LaunchSpec {
             name: Some(def.name.clone()),
             cmd: def.cmd.clone(),
             shell_wrap: true,
-            cwd: Some(config::resolve_cwd(config_dir, def.cwd.as_deref())),
-            env: config::expanded_env(def),
+            cwd: Some(cwd),
+            env,
             autorestart: def.autorestart.unwrap_or_default(),
+            worktree,
         };
-        self.create_session(app, spec, cols, rows)
+        let preserved_worktree = spec.worktree.as_ref().map(|info| info.path.clone());
+        self.create_session(app, spec, cols, rows).map_err(|error| {
+            if let Some(path) = preserved_worktree {
+                format!("{error}; locked worktree was kept at {path}")
+            } else {
+                error
+            }
+        })
     }
 
     fn create_session<R: Runtime>(

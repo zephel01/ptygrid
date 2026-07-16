@@ -34,6 +34,13 @@ agents:
     cmd: "codex"
     cwd: "."
     autostart: false
+    # Optional linked-worktree isolation (default disabled).
+    # Each launch gets a locked branch under ptygrid/codex/... and runs from
+    # the app-data directory. Dirty worktrees are never removed automatically.
+    worktree:
+      enabled: false
+      base: HEAD
+      # setup: "npm install"
 
   - name: grok
     cmd: "grok"

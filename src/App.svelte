@@ -15,7 +15,7 @@
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
-  import type { ConfigInfo } from "./lib/types";
+  import type { ConfigInfo, WorktreeInfo } from "./lib/types";
 
   const DEFAULT_COLS = 80;
   const DEFAULT_ROWS = 24;
@@ -59,6 +59,13 @@
   let canAddPane = $derived(paneCount < MAX_PANES);
   let agentDefs = $derived(ui.configInfo?.config.agents ?? []);
   let processDefs = $derived(ui.configInfo?.config.processes ?? []);
+  let activeWorktrees = $derived.by(() => {
+    const byPath = new Map<string, WorktreeInfo>();
+    for (const session of Object.values(ui.sessions)) {
+      if (session.worktree) byPath.set(session.worktree.path, session.worktree);
+    }
+    return [...byPath.values()];
+  });
 
   // ---- Queen status badge ----
   // green = running, red = enabled but stopped/errored, gray = disabled
@@ -276,7 +283,7 @@
 
 <main>
   <div class="toolbar">
-    <span class="title">multi-terminal</span>
+    <span class="title">ptygrid</span>
 
     <div class="tb-group">
       <span class="tb-caption">ターミナル</span>
@@ -385,7 +392,10 @@
 
   {#if gitPanelOpen}
     {#key ui.configInfo?.path}
-      <GitPanel onclose={() => (gitPanelOpen = false)} />
+      <GitPanel
+        worktrees={activeWorktrees}
+        onclose={() => (gitPanelOpen = false)}
+      />
     {/key}
   {/if}
 
@@ -422,6 +432,14 @@
                         title={session?.state ?? "starting"}
                       ></span>
                       <span class="pane-title">{paneTitle(id)}</span>
+                      {#if session?.worktree}
+                        <span
+                          class="worktree-badge"
+                          title={`worktree: ${session.worktree.path}`}
+                        >
+                          ⑂ {session.worktree.branch}
+                        </span>
+                      {/if}
                       {#if session?.state === "exited"}
                         <span class="exit-code">
                           exit {session.code ?? "?"}
@@ -911,6 +929,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .worktree-badge {
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #9cdcfe;
+    font-family: Menlo, monospace;
+    font-size: 10px;
   }
 
   .exit-code {

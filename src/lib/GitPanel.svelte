@@ -6,12 +6,20 @@
     GitDiffInfo,
     GitFileStatus,
     GitStatusInfo,
+    WorktreeInfo,
   } from "./types";
 
   let {
     dir,
+    worktrees = [],
     onclose,
-  }: { dir?: string; onclose: () => void } = $props();
+  }: {
+    dir?: string;
+    worktrees?: WorktreeInfo[];
+    onclose: () => void;
+  } = $props();
+
+  let activeDir = $state<string | undefined>();
 
   let status = $state<GitStatusInfo | null>(null);
   let diff = $state<GitDiffInfo | null>(null);
@@ -28,6 +36,10 @@
   let hasStagedChanges = $derived(
     status?.files.some((file) => hasIndexChange(file)) ?? false,
   );
+
+  function dirArgs(): { dir?: string } {
+    return activeDir ? { dir: activeDir } : {};
+  }
 
   function statusCode(file: GitFileStatus): string {
     return `${file.indexStatus}${file.worktreeStatus}`;
@@ -69,7 +81,7 @@
     error = null;
     operationMessage = null;
     try {
-      status = await invokeCmd<GitStatusInfo>("git_status", dir ? { dir } : {});
+      status = await invokeCmd<GitStatusInfo>("git_status", dirArgs());
       if (
         selectedPath &&
         !status.files.some((file) => file.path === selectedPath)
@@ -106,7 +118,7 @@
     staged = nextStaged;
     try {
       diff = await invokeCmd<GitDiffInfo>("git_diff", {
-        ...(dir ? { dir } : {}),
+        ...dirArgs(),
         ...(path ? { path } : {}),
         staged: nextStaged,
       });
@@ -128,7 +140,7 @@
     operationMessage = null;
     try {
       status = await invokeCmd<GitStatusInfo>(command, {
-        ...(dir ? { dir } : {}),
+        ...dirArgs(),
         paths,
       });
       operationMessage = `${paths.length}件を${command === "git_stage" ? "stage" : "unstage"}しました。`;
@@ -154,7 +166,7 @@
     operationMessage = null;
     try {
       const committed = await invokeCmd<GitCommitInfo>("git_commit", {
-        ...(dir ? { dir } : {}),
+        ...dirArgs(),
         message: commitMessage,
       });
       commitMessage = "";
@@ -170,7 +182,19 @@
     }
   }
 
-  onMount(refresh);
+  onMount(() => {
+    activeDir = dir;
+    void refresh();
+  });
+
+  async function changeWorkspace(event: Event): Promise<void> {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    activeDir = value || dir;
+    selectedPath = null;
+    selectedPaths = [];
+    staged = false;
+    await refresh();
+  }
 </script>
 
 <aside class="git-panel" aria-label="Git changes">
@@ -191,6 +215,17 @@
   </header>
 
   {#if status}
+    {#if worktrees.length > 0}
+      <label class="workspace-select">
+        <span>Workspace</span>
+        <select value={activeDir ?? ""} onchange={changeWorkspace} disabled={mutating}>
+          <option value={dir ?? ""}>Project workspace</option>
+          {#each worktrees as worktree (worktree.path)}
+            <option value={worktree.path}>{worktree.branch}</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
     <div class="repo-root" title={status.repoRoot}>{status.repoRoot}</div>
     <div class="file-heading">
       <button
@@ -334,6 +369,25 @@
   .repo-root {
     color: #888;
     font-size: 10px;
+  }
+
+  .workspace-select {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    color: #888;
+    border-bottom: 1px solid #333;
+  }
+
+  .workspace-select select {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 3px 5px;
+    background: #181818;
+    color: #ddd;
   }
 
   .repo-root {

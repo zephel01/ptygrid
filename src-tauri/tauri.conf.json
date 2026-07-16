@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "multi-terminal",
+  "productName": "ptygrid",
   "version": "0.1.0",
   "identifier": "com.zephel01.multiterminal",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "multi-terminal",
+        "title": "ptygrid",
         "width": 1100,
         "height": 750
       }

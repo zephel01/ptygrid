@@ -58,6 +58,29 @@ pub struct AgentDef {
     pub autorestart: Option<AutoRestart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeConfig>,
+}
+
+/// Optional per-definition linked-worktree isolation (Phase 3.3).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorktreeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+}
+
+impl WorktreeConfig {
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn effective_base(&self) -> &str {
+        self.base.as_deref().unwrap_or("HEAD")
+    }
 }
 
 /// `never | on-failure | always` (default never).
@@ -345,6 +368,31 @@ processes:
         assert_eq!(cfg.processes.len(), 1);
         assert_eq!(cfg.processes[0].cmd, "npm run dev");
         assert_eq!(cfg.project, None);
+    }
+
+    #[test]
+    fn parses_opt_in_worktree_config() {
+        let yaml = r#"
+agents:
+  - name: isolated
+    cmd: codex
+    worktree:
+      enabled: true
+      base: main
+      setup: npm install
+  - name: shared
+    cmd: claude
+"#;
+        let cfg = parse_config(yaml).unwrap();
+        let isolated = cfg.agents[0].worktree.as_ref().unwrap();
+        assert!(isolated.effective_enabled());
+        assert_eq!(isolated.effective_base(), "main");
+        assert_eq!(isolated.setup.as_deref(), Some("npm install"));
+        assert!(cfg.agents[1].worktree.is_none());
+
+        let defaults = WorktreeConfig::default();
+        assert!(!defaults.effective_enabled());
+        assert_eq!(defaults.effective_base(), "HEAD");
     }
 
     #[test]

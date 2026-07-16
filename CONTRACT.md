@@ -269,3 +269,64 @@ type GitCommitInfo = {
   直接ブロックしない。
 - untracked fileのdiffは、Gitが返した完全一致pathだけを対象にし、canonical pathが
   repository外へ出る場合は拒否する。
+
+---
+
+# Phase 3.3 追加契約（opt-in agent worktree isolation）
+
+Phase 3.3 は定義ごとに明示的に有効化した場合だけlinked worktreeを作成する。
+`worktree` 未指定または `enabled: false` の既定動作は、従来どおり共有cwdを使う。
+
+## mterm.yml拡張
+
+```yaml
+agents:
+  - name: codex
+    cmd: codex
+    cwd: packages/app
+    worktree:
+      enabled: true       # default false
+      base: HEAD          # default HEAD。branch/tag/commitも可
+      setup: npm install  # 任意。worktree作成後、agent cwdで一度実行
+```
+
+```ts
+type WorktreeConfig = {
+  enabled?: boolean;
+  base?: string;
+  setup?: string;
+};
+type WorktreeInfo = {
+  name: string;
+  repoRoot: string;
+  path: string;
+  branch: string;
+  base: string;
+  locked: boolean;
+};
+```
+
+`AgentDef` に `worktree?: WorktreeConfig`、`SessionInfo` に
+`worktree?: WorktreeInfo` を追加する。既存fieldは変更しない。
+
+## 作成セマンティクス
+
+- 定義の解決済みcwdからGit repository rootとgit common-dirを検出する。
+- 元cwdがrepository外、存在しない、またはGit repositoryでない場合はエラー。
+  共有cwdへ暗黙fallbackしない。
+- 保存先はTauri app-data配下の
+  `worktrees/<common-dir hash>/<agent slug>-<unique suffix>`。
+- branch名は `ptygrid/<agent slug>/<unique suffix>`。`base` から新規作成する。
+- `git worktree add --lock --reason "ptygrid active session" -b ...` を使用する。
+- 元cwdがrepository内のサブディレクトリなら、linked worktree内でも同じ相対cwdを使う。
+- `setup` はworktree作成後、agent cwdでshell経由で一度だけ実行し、定義の展開済みenvを渡す。
+- setup失敗、cwd不足、後続のPTY spawn失敗ではworktreeとbranchを削除せず、復旧用pathをエラーに含める。
+- manual restart / autorestartは同じworktreeとbranchを再利用し、追加worktreeを作らない。
+- Phase 3.3では自動削除しない。dirty worktreeを黙って削除しないことを優先し、明示cleanup UIは後続リリースとする。
+
+## Frontend
+
+- worktree sessionのペインヘッダーにbranch名を表示し、ツールチップにpathを表示する。
+- 実行中sessionにworktreeがある場合、Gitパネルにworkspace selectorを表示する。
+- selectorでworktreeを選ぶと、Phase 3.1/3.2のstatus/diff/stage/unstage/commitは
+  そのworktree pathを `dir` として使用する。

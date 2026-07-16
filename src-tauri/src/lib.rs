@@ -5,6 +5,7 @@ mod git_service;
 mod pty;
 mod queen;
 mod session;
+mod worktree;
 
 use config::ConfigManager;
 use queen::QueenStatus;
