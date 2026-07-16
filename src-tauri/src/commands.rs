@@ -8,6 +8,7 @@ use tauri::{AppHandle, State};
 
 use crate::config::{ConfigInfo, ConfigManager};
 use crate::git_service::{self, GitCommitInfo, GitDiffInfo, GitStatusInfo};
+use crate::project_state::{self, LogicalSession, ProjectState};
 use crate::queen::{self, QueenStatus, QueenStatusInfo};
 use crate::session::{PtyManager, SessionInfo};
 
@@ -94,6 +95,40 @@ pub fn restart_session(
 #[tauri::command]
 pub fn list_sessions(manager: State<'_, PtyManager>) -> Result<Vec<SessionInfo>, String> {
     Ok(manager.list_sessions())
+}
+
+/// Persist versioned logical state under the Tauri app-data directory.
+#[tauri::command]
+pub fn save_project_state(app: AppHandle, state: ProjectState) -> Result<(), String> {
+    project_state::save(&app, state)
+}
+
+/// Load one project's state, or the last active project when dir is omitted.
+#[tauri::command]
+pub fn load_project_state(
+    app: AppHandle,
+    dir: Option<String>,
+) -> Result<Option<ProjectState>, String> {
+    project_state::load(&app, dir)
+}
+
+/// Relaunch a saved logical session from the currently loaded definition.
+#[tauri::command]
+pub fn resume_logical_session(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    config: State<'_, ConfigManager>,
+    session: LogicalSession,
+    cols: u16,
+    rows: u16,
+) -> Result<u32, String> {
+    match session {
+        LogicalSession::Definition { name, worktree } => {
+            let (def, dir) = config.resolve_def(&name)?;
+            manager.resume_agent(app, &def, &dir, cols, rows, worktree)
+        }
+        LogicalSession::Shell => manager.spawn_shell(app, cols, rows, None, None),
+    }
 }
 
 fn project_dir(config: &ConfigManager, dir: Option<String>) -> Result<std::path::PathBuf, String> {

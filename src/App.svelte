@@ -15,7 +15,12 @@
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
-  import type { ConfigInfo, WorktreeInfo } from "./lib/types";
+  import type {
+    ConfigInfo,
+    LogicalSession,
+    ProjectState,
+    WorktreeInfo,
+  } from "./lib/types";
 
   const DEFAULT_COLS = 80;
   const DEFAULT_ROWS = 24;
@@ -24,6 +29,8 @@
   let loadingConfig = $state(false);
   let bulkOpening = $state(false);
   let gitPanelOpen = $state(false);
+  let persistenceReady = $state(false);
+  let stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let demoNextId = 1;
 
   const LAYOUT_MODES: { value: LayoutMode; label: string; hint: string }[] = [
@@ -114,6 +121,67 @@
   function addPane(id: number): void {
     if (!ui.panes.includes(id)) ui.panes.push(id);
   }
+
+  function savedLayoutMode(): ProjectState["layoutMode"] {
+    return String(ui.layoutMode) as ProjectState["layoutMode"];
+  }
+
+  function restoreLayoutMode(mode: ProjectState["layoutMode"]): LayoutMode {
+    return mode === "auto" ? "auto" : (Number(mode) as 1 | 2 | 3);
+  }
+
+  function logicalSession(id: number): LogicalSession {
+    const session = ui.sessions[id];
+    if (session?.name) {
+      return {
+        kind: "definition",
+        name: session.name,
+        ...(session.worktree ? { worktree: session.worktree } : {}),
+      };
+    }
+    return { kind: "shell" };
+  }
+
+  function currentProjectState(): ProjectState | null {
+    const info = ui.configInfo;
+    if (!info) return null;
+    const maximizedIndex =
+      ui.maximizedId === null
+        ? undefined
+        : ui.panes.indexOf(ui.maximizedId);
+    return {
+      version: 1,
+      configDir: info.dir,
+      layoutMode: savedLayoutMode(),
+      sessions: ui.panes.map(logicalSession),
+      ...(maximizedIndex !== undefined && maximizedIndex >= 0
+        ? { maximizedIndex }
+        : {}),
+    };
+  }
+
+  // Debounced snapshots keep pane/layout changes durable without putting
+  // commands, terminal output, or expanded environment values on disk.
+  $effect(() => {
+    const state = currentProjectState();
+    if (!persistenceReady || !isTauri() || !state) return;
+    const snapshot = JSON.stringify(state);
+    if (stateSaveTimer !== null) clearTimeout(stateSaveTimer);
+    stateSaveTimer = setTimeout(() => {
+      stateSaveTimer = null;
+      invokeCmd<void>("save_project_state", {
+        state: JSON.parse(snapshot) as ProjectState,
+      }).catch((err) => {
+        ui.errorBanner = `プロジェクト状態の保存に失敗しました: ${err}`;
+      });
+    }, 250);
+    return () => {
+      if (stateSaveTimer !== null) {
+        clearTimeout(stateSaveTimer);
+        stateSaveTimer = null;
+      }
+    };
+  });
 
   async function newShell(): Promise<void> {
     if (!canAddPane) return;
@@ -248,6 +316,50 @@
     ui.maximizedId = ui.maximizedId === id ? null : id;
   }
 
+  async function restoreProjectState(): Promise<boolean> {
+    const saved = await invokeCmd<ProjectState | null>("load_project_state");
+    if (!saved) return false;
+
+    await loadConfig(saved.configDir);
+    ui.layoutMode = restoreLayoutMode(saved.layoutMode);
+    const resumedByIndex: Array<number | undefined> = [];
+    const errors: string[] = [];
+    for (const [index, session] of saved.sessions.entries()) {
+      if (ui.panes.length >= MAX_PANES) break;
+      try {
+        const id = await invokeCmd<number>("resume_logical_session", {
+          session,
+          cols: DEFAULT_COLS,
+          rows: DEFAULT_ROWS,
+        });
+        resumedByIndex[index] = id;
+        if (!ui.sessions[id]) {
+          ui.sessions[id] = {
+            id,
+            ...(session.kind === "definition" ? { name: session.name } : {}),
+            cmd: "",
+            state: "starting",
+            ...(session.kind === "definition" && session.worktree
+              ? { worktree: session.worktree }
+              : {}),
+          };
+        }
+        addPane(id);
+      } catch (err) {
+        const label =
+          session.kind === "definition" ? session.name : `shell ${index + 1}`;
+        errors.push(`${label}: ${err}`);
+      }
+    }
+    if (saved.maximizedIndex !== undefined) {
+      ui.maximizedId = resumedByIndex[saved.maximizedIndex] ?? null;
+    }
+    if (errors.length > 0) {
+      ui.errorBanner = `一部のセッションを復元できませんでした: ${errors.join(" / ")}`;
+    }
+    return true;
+  }
+
   // ---- startup flow per contract ----
   onMount(() => {
     (async () => {
@@ -259,23 +371,33 @@
       }
       await initGlobalListeners();
       void refreshQueenStatus();
+      let restored = false;
       try {
-        const info = await loadConfig();
-        const autostarts = [
-          ...info.config.agents,
-          ...info.config.processes,
-        ].filter((d) => d.autostart);
-        for (const def of autostarts) {
-          if (ui.panes.length >= MAX_PANES) break;
-          await spawnAgent(def.name);
+        restored = await restoreProjectState();
+      } catch (err) {
+        ui.errorBanner = `前回のプロジェクト状態を復元できませんでした: ${err}`;
+      }
+      try {
+        if (!restored) {
+          const info = await loadConfig();
+          const autostarts = [
+            ...info.config.agents,
+            ...info.config.processes,
+          ].filter((d) => d.autostart);
+          for (const def of autostarts) {
+            if (ui.panes.length >= MAX_PANES) break;
+            await spawnAgent(def.name);
+          }
         }
       } catch (err) {
         const msg = String(err);
         if (msg.startsWith("not_found")) {
           await newShell(); // Phase 0-like: one adhoc shell
-        } else {
+        } else if (!ui.errorBanner) {
           ui.errorBanner = msg;
         }
+      } finally {
+        persistenceReady = true;
       }
     })();
   });

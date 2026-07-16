@@ -330,3 +330,62 @@ type WorktreeInfo = {
 - 実行中sessionにworktreeがある場合、Gitパネルにworkspace selectorを表示する。
 - selectorでworktreeを選ぶと、Phase 3.1/3.2のstatus/diff/stage/unstage/commitは
   そのworktree pathを `dir` として使用する。
+
+---
+
+# Phase 3.4 追加契約（versioned project state / logical resume）
+
+Phase 3.4 はアプリ終了後にPTYへ再接続する機能ではない。前回のproject、pane順、
+layoutと論理session参照を復元し、現在の`mterm.yml`から新しいPTY processを起動する。
+
+## mterm.yml拡張
+
+```yaml
+agents:
+  - name: codex
+    cmd: codex
+    resume: codex resume --last  # 任意。logical resume時だけ使用
+```
+
+`AgentDef`へ`resume?: string`を追加する。省略時のlogical resumeは`cmd`を再実行する。
+通常起動、manual restart、autorestartは従来どおり、そのsessionが保持するcommandを使う。
+
+## Tauri Commands
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `save_project_state` | `{ state: ProjectState }` | `()` | 検証後にproject別stateとlast-project pointerをatomic保存 |
+| `load_project_state` | `{ dir?: string }` | `ProjectState \| null` | 指定project、または最後に保存したprojectのstateを読む |
+| `resume_logical_session` | `{ session, cols, rows }` | `number` | 現在のconfig定義を再解決して新規PTYを起動 |
+
+```ts
+type LogicalSession =
+  | { kind: "definition"; name: string; worktree?: WorktreeInfo }
+  | { kind: "shell" };
+
+type ProjectState = {
+  version: 1;
+  configDir: string;
+  layoutMode: "auto" | "1" | "2" | "3";
+  sessions: LogicalSession[];       // pane順、最大9件
+  maximizedIndex?: number;
+};
+```
+
+`ConfigInfo`には解決済みconfig directoryを示す`dir: string`を追加する。
+
+## 保存・復元セマンティクス
+
+- 保存先はTauri app-data配下の`project-state/projects/<canonical-dir hash>.json`。
+  最終projectは`project-state/last-project.json`で参照する。repository内には書かない。
+- JSONは`version: 1`必須。未知version、未知layout、10件以上のsession、不正な
+  `maximizedIndex`は拒否する。
+- 保存対象はconfig directory、layout、pane順、定義名、worktree参照だけ。
+  `cmd`、terminal output、展開前後のenv値、`QUEEN_URL`は保存しない。
+- 起動時はlast-projectを読み、現在の`mterm.yml`をloadしてからpane順に再起動する。
+  stateがない場合だけ従来のautostartを適用する。
+- state破損、project消失、未知versionでは復元エラーを表示し、通常startupへfallbackする。
+- 定義が削除されたなど一部sessionだけ失敗した場合、残りのsession復元を継続する。
+- shell参照はdefault shellを新規起動する。以前のshell processやscrollbackには再接続しない。
+- 保存worktreeが存在し同じgit common-dirに属する場合はsetupを再実行せず再利用する。
+  消失していれば現在のworktree定義から新規作成し、別repositoryを指す既存pathは拒否する。

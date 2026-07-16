@@ -224,6 +224,14 @@ fn command_for_spec(spec: &LaunchSpec, queen_url: Option<&str>) -> CommandBuilde
     cmd
 }
 
+fn command_for_definition(def: &AgentDef, logical_resume: bool) -> &str {
+    if logical_resume {
+        def.resume.as_deref().unwrap_or(&def.cmd)
+    } else {
+        &def.cmd
+    }
+}
+
 // ---------- pure exit/autorestart decision (unit-tested) ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,8 +324,47 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) -> Result<u32, String> {
+        self.launch_agent(app, def, config_dir, (cols, rows), false, None)
+    }
+
+    /// Logical resume: resolve the current definition/env again and use its
+    /// optional resume command. Persisted worktree metadata is validated by
+    /// the worktree service before reuse.
+    pub fn resume_agent<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        def: &AgentDef,
+        config_dir: &Path,
+        cols: u16,
+        rows: u16,
+        saved_worktree: Option<WorktreeInfo>,
+    ) -> Result<u32, String> {
+        self.launch_agent(
+            app,
+            def,
+            config_dir,
+            (cols, rows),
+            true,
+            saved_worktree,
+        )
+    }
+
+    fn launch_agent<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        def: &AgentDef,
+        config_dir: &Path,
+        size: (u16, u16),
+        logical_resume: bool,
+        saved_worktree: Option<WorktreeInfo>,
+    ) -> Result<u32, String> {
+        let (cols, rows) = size;
         let env = config::expanded_env(def);
-        let prepared = worktree::prepare_for_agent(&app, def, config_dir, &env)?;
+        let prepared = if logical_resume {
+            worktree::prepare_for_resume(&app, def, config_dir, &env, saved_worktree)?
+        } else {
+            worktree::prepare_for_agent(&app, def, config_dir, &env)?
+        };
         let (cwd, worktree) = match prepared {
             Some(prepared) => (prepared.cwd, Some(prepared.info)),
             None => (
@@ -327,7 +374,7 @@ impl PtyManager {
         };
         let spec = LaunchSpec {
             name: Some(def.name.clone()),
-            cmd: def.cmd.clone(),
+            cmd: command_for_definition(def, logical_resume).to_string(),
             shell_wrap: true,
             cwd: Some(cwd),
             env,
@@ -895,6 +942,20 @@ fn schedule_autorestart<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_resume_uses_optional_resume_command_only_for_resume() {
+        let cfg = config::parse_config(
+            "agents:\n  - name: codex\n    cmd: codex\n    resume: codex resume --last\n",
+        )
+        .unwrap();
+        let def = &cfg.agents[0];
+        assert_eq!(command_for_definition(def, false), "codex");
+        assert_eq!(command_for_definition(def, true), "codex resume --last");
+
+        let cfg = config::parse_config("agents:\n  - name: web\n    cmd: npm run dev\n").unwrap();
+        assert_eq!(command_for_definition(&cfg.agents[0], true), "npm run dev");
+    }
 
     // ----- ring buffer -----
 

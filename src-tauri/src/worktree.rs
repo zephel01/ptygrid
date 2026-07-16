@@ -6,14 +6,14 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::config::{self, AgentDef};
 
 static NEXT_WORKTREE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeInfo {
     pub name: String,
@@ -199,6 +199,90 @@ pub fn prepare_for_agent<R: Runtime>(
     prepare_at(&app_data, def, config_dir, env)
 }
 
+/// Reuse a persisted linked worktree when it still belongs to this
+/// repository. A missing worktree is recreated from the current definition;
+/// an existing but mismatched path is rejected rather than executed from.
+pub fn prepare_for_resume<R: Runtime>(
+    app: &AppHandle<R>,
+    def: &AgentDef,
+    config_dir: &Path,
+    env: &[(String, String)],
+    saved: Option<WorktreeInfo>,
+) -> Result<Option<PreparedWorktree>, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("cannot determine app data directory: {e}"))?;
+    resume_at(&app_data, def, config_dir, env, saved)
+}
+
+fn resume_at(
+    app_data: &Path,
+    def: &AgentDef,
+    config_dir: &Path,
+    env: &[(String, String)],
+    saved: Option<WorktreeInfo>,
+) -> Result<Option<PreparedWorktree>, String> {
+    let Some(options) = def.worktree.as_ref() else {
+        return Ok(None);
+    };
+    if !options.effective_enabled() {
+        return Ok(None);
+    }
+    let Some(saved) = saved else {
+        return prepare_at(app_data, def, config_dir, env);
+    };
+    let saved_path = PathBuf::from(&saved.path);
+    if !saved_path.exists() {
+        return prepare_at(app_data, def, config_dir, env);
+    }
+
+    let original_cwd = config::resolve_cwd(config_dir, def.cwd.as_deref())
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve agent cwd: {e}"))?;
+    let repo_root = crate::git_service::repository_root(&original_cwd)?
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve repository root: {e}"))?;
+    let relative_cwd = original_cwd.strip_prefix(&repo_root).map_err(|_| {
+        format!(
+            "agent cwd {} is outside repository {}",
+            original_cwd.display(),
+            repo_root.display()
+        )
+    })?;
+    let saved_repo = PathBuf::from(&saved.repo_root)
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve saved repository root: {e}"))?;
+    if saved_repo != repo_root {
+        return Err("saved worktree belongs to a different repository".to_string());
+    }
+
+    let worktree_root = saved_path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve saved worktree path: {e}"))?;
+    let reported_root = crate::git_service::repository_root(&worktree_root)?
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve saved worktree repository: {e}"))?;
+    if reported_root != worktree_root
+        || common_git_dir(&worktree_root)? != common_git_dir(&repo_root)?
+    {
+        return Err("saved worktree path failed repository validation".to_string());
+    }
+    let cwd = worktree_root.join(relative_cwd);
+    if !cwd.is_dir() {
+        return Err(format!(
+            "saved worktree exists at {}, but cwd {} does not exist in it",
+            worktree_root.display(),
+            cwd.display()
+        ));
+    }
+
+    let mut info = saved;
+    info.repo_root = repo_root.display().to_string();
+    info.path = worktree_root.display().to_string();
+    Ok(Some(PreparedWorktree { cwd, info }))
+}
+
 fn prepare_at(
     app_data: &Path,
     def: &AgentDef,
@@ -354,6 +438,23 @@ agents:
         );
         assert!(prepared.info.branch.starts_with("ptygrid/codex-review/"));
         assert!(Path::new(&prepared.info.path).starts_with(app_data.canonicalize().unwrap()));
+
+        std::fs::write(prepared.cwd.join("setup.marker"), "preserved").unwrap();
+        let resumed = resume_at(
+            &app_data,
+            &cfg.agents[0],
+            &repo,
+            &[("MARKER".to_string(), "rerun".to_string())],
+            Some(prepared.info.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.info.path, prepared.info.path);
+        assert_eq!(
+            std::fs::read_to_string(resumed.cwd.join("setup.marker")).unwrap(),
+            "preserved",
+            "setup must not rerun when an existing worktree is resumed"
+        );
 
         let listed = checked_git(&repo, ["worktree", "list", "--porcelain"]).unwrap();
         let listed = String::from_utf8_lossy(&listed.stdout);

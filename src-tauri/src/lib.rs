@@ -2,6 +2,7 @@ mod ansi;
 mod commands;
 mod config;
 mod git_service;
+mod project_state;
 mod pty;
 mod queen;
 mod session;
@@ -31,6 +32,9 @@ pub fn run() {
             commands::spawn_agent,
             commands::restart_session,
             commands::list_sessions,
+            commands::save_project_state,
+            commands::load_project_state,
+            commands::resume_logical_session,
             commands::queen_status,
             commands::git_status,
             commands::git_diff,

@@ -1,6 +1,6 @@
 // TS types per CONTRACT.md (Phase 1 追加契約) — do not change shapes.
 
-export type ConfigInfo = { path: string; config: Config };
+export type ConfigInfo = { path: string; dir: string; config: Config };
 
 export type Config = {
   project?: string;
@@ -16,6 +16,7 @@ export type AgentDef = {
   autostart?: boolean;
   autorestart?: "never" | "on-failure" | "always";
   instructions?: string;
+  resume?: string;
   worktree?: WorktreeConfig;
 };
 
@@ -46,6 +47,18 @@ export type WorktreeInfo = {
 };
 
 export type SessionState = "starting" | "running" | "exited" | "restarting";
+
+export type LogicalSession =
+  | { kind: "definition"; name: string; worktree?: WorktreeInfo }
+  | { kind: "shell" };
+
+export type ProjectState = {
+  version: 1;
+  configDir: string;
+  layoutMode: "auto" | "1" | "2" | "3";
+  sessions: LogicalSession[];
+  maximizedIndex?: number;
+};
 
 export type PtyOutputPayload = { id: number; data: string };
 export type PtyExitPayload = { id: number; code: number | null };

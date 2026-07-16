@@ -58,6 +58,10 @@ pub struct AgentDef {
     pub autorestart: Option<AutoRestart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Optional command used for a Phase 3.4 logical resume. The normal
+    /// `cmd` remains the fallback when this is omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeConfig>,
 }
@@ -97,6 +101,7 @@ pub enum AutoRestart {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigInfo {
     pub path: String,
+    pub dir: String,
     pub config: Config,
 }
 
@@ -214,12 +219,14 @@ impl ConfigManager {
         // Replace any existing watcher (dropping the old one stops it and
         // ends its throttle thread via channel disconnect).
         let watcher = start_watcher(app.clone(), &dir_path, &path)?;
+        let dir = dir_path.display().to_string();
         inner.dir = Some(dir_path);
         inner.config = Some(config.clone());
         inner.watcher = Some(watcher);
 
         Ok(ConfigInfo {
             path: path.display().to_string(),
+            dir,
             config,
         })
     }
@@ -376,6 +383,7 @@ processes:
 agents:
   - name: isolated
     cmd: codex
+    resume: codex resume --last
     worktree:
       enabled: true
       base: main
@@ -388,6 +396,7 @@ agents:
         assert!(isolated.effective_enabled());
         assert_eq!(isolated.effective_base(), "main");
         assert_eq!(isolated.setup.as_deref(), Some("npm install"));
+        assert_eq!(cfg.agents[0].resume.as_deref(), Some("codex resume --last"));
         assert!(cfg.agents[1].worktree.is_none());
 
         let defaults = WorktreeConfig::default();

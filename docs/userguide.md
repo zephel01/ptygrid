@@ -12,10 +12,11 @@ ptygrid のインストールから、`mterm.yml` の書き方、Queen(内蔵 MC
 5. [Git status / diff](#git-status--diff)
 6. [mterm.yml リファレンス](#mtermyml-リファレンス)
 7. [Worktree 分離](#worktree-分離)
-8. [Queen のセットアップ](#queen-のセットアップ)
-9. [Queen ツールリファレンス](#queen-ツールリファレンス)
-10. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
-11. [困ったときは](#困ったときは)
+8. [セッション復元](#セッション復元)
+9. [Queen のセットアップ](#queen-のセットアップ)
+10. [Queen ツールリファレンス](#queen-ツールリファレンス)
+11. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
+12. [困ったときは](#困ったときは)
 
 ---
 
@@ -127,6 +128,7 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.env` | - | - | 環境変数。値の `${VAR}` はホスト環境から展開(未定義は空文字) |
 | `.autostart` | - | `false` | 設定読込時に自動起動 |
 | `.autorestart` | - | `never` | `never` / `on-failure` / `always`。連続5回失敗で打ち切り |
+| `.resume` | - | `.cmd` | アプリ再起動後のlogical resume時に使うcommand |
 | `.worktree.enabled` | - | `false` | 定義の起動ごとにlinked worktreeと専用branchを作る |
 | `.worktree.base` | - | `HEAD` | worktree branchの起点となるbranch/tag/commit |
 | `.worktree.setup` | - | - | worktree作成後、agent cwdで一度だけ実行するsetup command |
@@ -168,6 +170,32 @@ git branch -d <branch>
 
 setupまたはagent起動に失敗してもworktreeは保持され、エラーにpathが表示されます。
 内容を確認せず`--force`で削除しないでください。
+
+## セッション復元
+
+ptygridは最後に開いていたproject、ペイン順、列レイアウト、最大化状態をapp-dataへ
+自動保存します。次回起動時に現在の`mterm.yml`を読み直し、設定定義を新しいPTYとして
+再起動します。AI CLIに会話再開用commandがある場合は`resume`で指定できます。
+
+```yaml
+agents:
+  - name: codex
+    cmd: codex
+    resume: codex resume --last
+  - name: claude
+    cmd: claude
+    resume: claude --continue
+```
+
+`resume`を省略した定義は`cmd`を再実行します。通常の起動やペインの再起動には
+`resume`ではなく、そのsessionを起動したcommandが使われます。
+
+この機能は終了済みprocessへの再接続ではありません。adhoc shellも新しいdefault shellとして
+開き直され、以前のscrollbackは復元されません。worktree sessionは保存pathが同じrepositoryの
+有効なlinked worktreeであることを確認して再利用し、setup commandは再実行しません。
+
+保存JSONにcommand、terminal出力、環境変数は含まれません。状態ファイルが壊れている、
+project directoryが移動した、または定義が削除された場合は画面に復元エラーを表示します。
 
 ## Queen のセットアップ
 

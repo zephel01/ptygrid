@@ -32,6 +32,8 @@ agents:
 
   - name: codex
     cmd: "codex"
+    # Optional command used only after restarting ptygrid. If omitted, cmd is used.
+    # resume: "codex resume --last"
     cwd: "."
     autostart: false
     # Optional linked-worktree isolation (default disabled).
