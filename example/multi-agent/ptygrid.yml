@@ -1,0 +1,36 @@
+# multi-agent — 複数エージェントの協調
+# Claude / Codex / Grok を並行実行し、内蔵MCPサーバー Queen 経由で
+# 「codex の出力を読んで要約して」「#3 にレビューを依頼して」を実現する。
+#
+# 事前登録（各CLIに一度だけ。ツールバーの Queen バッジからコピー可能）:
+#   claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+#   grok mcp add -s user -t http queen http://127.0.0.1:39237/mcp
+#   (Codex は ~/.codex/config.toml の [mcp_servers.queen] に url を追記)
+
+project: multi-agent
+
+queen:
+  enabled: true
+  port: 39237
+
+agents:
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    autostart: true
+
+  - name: codex
+    cmd: "codex"
+    cwd: "."
+    autostart: true
+
+  - name: grok
+    cmd: "grok"
+    cwd: "."
+    autostart: false   # 必要になったら Queen の spawn_agent か UI から起動
+
+  # レビュー専用の2体目のClaude。同名CLIが複数あるときは #id で厳密指定する
+  - name: reviewer
+    cmd: "claude"
+    cwd: "."
+    autostart: false

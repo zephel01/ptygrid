@@ -824,3 +824,30 @@ type SessionInfo = {
   状態ドット active（running）/ stopped（exited）。**restart ボタンなし**・close 可・maximize 可。
 - close は「tail 停止のみ・subagent には影響しない」旨を tooltip で明示する。
 - 9 面上限バナー・toast は既存経路（`ui.errorBanner` / notices）を流用する。
+
+---
+
+# 設定ファイル名の変更（ptygrid.yml / legacy mterm.yml）
+
+config filenameを`mterm.yml`から`ptygrid.yml`へ変更する。migration設計として
+legacy filenameを引き続き受理し、wire formatは変更しない。
+
+## `load_config` の解決順
+
+1. `<dir>/ptygrid.yml` があればそれを読む
+2. 無ければ `<dir>/mterm.yml`（legacy）を読む
+3. 両方無ければ `not_found: <dir>/ptygrid.yml (also tried legacy <dir>/mterm.yml)` エラー
+
+- 両方存在する場合は`ptygrid.yml`が勝つ。file watcherは**実際に読み込んだfile**だけを
+  追跡する（legacyを読み込んだ場合、後から置いた`ptygrid.yml`は次のload_configまで
+  検知しない）。
+- `ConfigInfo.path`は実際に読み込んだfileのpathを返す（既存フィールド、意味の明確化のみ）。
+- スキーマ・`config-changed` event・Reload挙動は不変。
+
+## 影響範囲
+
+- Queen MCP toolのdescription文字列中の`mterm.yml`表記を`ptygrid.yml`へ更新
+  （tool名・引数・返り値は不変）。
+- UI文言・README・userguide・exampleを`ptygrid.yml`表記へ更新。注釈付き全項目
+  サンプルは`ptygrid.example.yml`（旧`mterm.example.yml`）、用途別スターターは
+  `example/{basic,multi-agent,web-dev,worktree,teammates}/ptygrid.yml`に配置。

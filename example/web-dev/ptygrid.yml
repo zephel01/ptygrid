@@ -1,0 +1,33 @@
+# web-dev — Web開発の定番レイアウト
+# エージェント2体 + dev server / テストwatch を常駐プロセスとして並べる。
+# processes は agents と同じフィールドを持つ通常コマンド（instructions なし）。
+
+project: web-dev
+
+agents:
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    autostart: true
+    # ptygrid 再起動後の論理レジューム時だけ使うコマンド（省略時は cmd）
+    resume: "claude --continue"
+
+  - name: codex
+    cmd: "codex"
+    cwd: "."
+    autostart: false
+
+processes:
+  - name: web
+    cmd: "npm run dev"
+    cwd: "."
+    autostart: true
+    autorestart: on-failure   # 異常終了時のみ1秒後に再起動（連続5回で打ち切り）
+
+  - name: test
+    cmd: "npm run test -- --watch"
+    cwd: "."
+    autostart: false
+    autorestart: never

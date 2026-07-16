@@ -1,4 +1,4 @@
-// mterm.yml configuration: parsing (serde_norway), ${VAR} expansion,
+// ptygrid.yml (legacy: mterm.yml) configuration: parsing (serde_norway), ${VAR} expansion,
 // relative-cwd resolution, and the file watcher (notify) that emits
 // `config-changed` events per the Phase 1 contract.
 
@@ -210,7 +210,7 @@ pub struct ConfigInfo {
     pub config: Config,
 }
 
-/// Parse mterm.yml text. Errors are passed through as strings (serde_norway
+/// Parse ptygrid.yml text. Errors are passed through as strings (serde_norway
 /// messages include line/column information).
 pub fn parse_config(text: &str) -> Result<Config, String> {
     serde_norway::from_str(text).map_err(|e| e.to_string())
@@ -240,7 +240,7 @@ pub fn expand_vars(input: &str) -> String {
     out
 }
 
-/// Resolve a definition's cwd against the directory containing mterm.yml.
+/// Resolve a definition's cwd against the directory containing the config file.
 /// Relative paths are joined onto `base`; absolute paths win; None -> base.
 pub fn resolve_cwd(base: &Path, cwd: Option<&str>) -> PathBuf {
     match cwd {
@@ -278,7 +278,7 @@ struct ConfigStateInner {
 }
 
 /// Managed Tauri state holding the loaded config, its directory and the
-/// active mterm.yml watcher.
+/// active config-file watcher.
 pub struct ConfigManager {
     inner: Mutex<ConfigStateInner>,
 }
@@ -297,9 +297,9 @@ impl ConfigManager {
         }
     }
 
-    /// Implements the `load_config` command: read <dir>/mterm.yml
-    /// (dir omitted -> previous dir, first time -> current dir), store the
-    /// config, and (re)start the file watcher.
+    /// Implements the `load_config` command: read <dir>/ptygrid.yml (falling
+    /// back to the legacy <dir>/mterm.yml; dir omitted -> previous dir, first
+    /// time -> current dir), store the config, and (re)start the file watcher.
     pub fn load(&self, app: &AppHandle, dir: Option<String>) -> Result<ConfigInfo, String> {
         let mut inner = self.lock();
 
@@ -312,10 +312,7 @@ impl ConfigManager {
             },
         };
 
-        let path = dir_path.join("mterm.yml");
-        if !path.is_file() {
-            return Err(format!("not_found: {}", path.display()));
-        }
+        let path = resolve_config_path(&dir_path)?;
 
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
@@ -377,8 +374,32 @@ impl ConfigManager {
     }
 }
 
+/// Preferred config filename (since the multi-terminal -> ptygrid rename).
+pub const CONFIG_FILE_NAME: &str = "ptygrid.yml";
+/// Legacy filename, still accepted so existing projects keep loading.
+pub const LEGACY_CONFIG_FILE_NAME: &str = "mterm.yml";
+
+/// Resolve the config file inside `dir`: prefer `ptygrid.yml`, fall back to
+/// the legacy `mterm.yml`. When both exist, `ptygrid.yml` wins (the watcher
+/// then only follows the file that was actually loaded).
+fn resolve_config_path(dir: &Path) -> Result<PathBuf, String> {
+    let preferred = dir.join(CONFIG_FILE_NAME);
+    if preferred.is_file() {
+        return Ok(preferred);
+    }
+    let legacy = dir.join(LEGACY_CONFIG_FILE_NAME);
+    if legacy.is_file() {
+        return Ok(legacy);
+    }
+    Err(format!(
+        "not_found: {} (also tried legacy {})",
+        preferred.display(),
+        legacy.display()
+    ))
+}
+
 /// Watch the config directory (non-recursive) and emit `config-changed`
-/// for events touching mterm.yml. Raw notify events are coalesced by a
+/// for events touching the loaded config file. Raw notify events are coalesced by a
 /// 300ms thread-side throttle so one editor save emits a single event.
 /// Watching the parent dir (not the file) keeps working across editors
 /// that save via rename/replace.
@@ -673,5 +694,31 @@ agents:
             PathBuf::from("/proj/root/sub/dir")
         );
         assert_eq!(resolve_cwd(base, Some("/abs")), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn prefers_ptygrid_yml_and_falls_back_to_legacy_mterm_yml() {
+        let dir = std::env::temp_dir().join(format!(
+            "ptygrid-config-name-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Neither file: clear error naming both candidates.
+        let err = resolve_config_path(&dir).unwrap_err();
+        assert!(err.contains("ptygrid.yml") && err.contains("mterm.yml"));
+
+        // Legacy only: mterm.yml is accepted.
+        std::fs::write(dir.join(LEGACY_CONFIG_FILE_NAME), "agents: []\n").unwrap();
+        assert_eq!(
+            resolve_config_path(&dir).unwrap(),
+            dir.join(LEGACY_CONFIG_FILE_NAME)
+        );
+
+        // Both present: ptygrid.yml wins.
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "agents: []\n").unwrap();
+        assert_eq!(resolve_config_path(&dir).unwrap(), dir.join(CONFIG_FILE_NAME));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

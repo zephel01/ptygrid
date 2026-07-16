@@ -1,0 +1,29 @@
+# worktree — エージェントごとの作業ツリー分離
+# 各エージェントに linked worktree を割り当て、同じリポジトリを汚さず並行作業する。
+# worktree は app-data 配下に ptygrid/<agent>/... ブランチ付きで作成・ロックされ、
+# restart では同じ worktree を再利用。dirty な worktree が自動削除されることはない。
+
+project: worktree-isolation
+
+agents:
+  # メインの作業ツリーで動くエージェント（分離なし）
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    autostart: true
+
+  # 分離された worktree で動くエージェント。初回のみ setup を実行
+  - name: codex
+    cmd: "codex"
+    autostart: false
+    worktree:
+      enabled: true
+      base: HEAD          # 分岐元（ブランチ名やコミットも可）
+      setup: "npm install"
+
+  - name: refactor
+    cmd: "claude"
+    autostart: false
+    worktree:
+      enabled: true
+      base: main

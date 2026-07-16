@@ -2,7 +2,7 @@
 //!
 //! Persist only logical references. Commands and expanded environment values
 //! deliberately never cross this boundary; definitions are resolved again
-//! from the current mterm.yml when a session is resumed.
+//! from the current ptygrid.yml when a session is resumed.
 
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};

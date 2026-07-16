@@ -277,7 +277,7 @@ impl QueenServer {
     fn project_dir(&self) -> Result<std::path::PathBuf, ErrorData> {
         self.config().current().map(|(_, dir)| dir).ok_or_else(|| {
             ErrorData::invalid_params(
-                "no project loaded; load an mterm.yml before using pins or notes",
+                "no project loaded; load a ptygrid.yml before using pins or notes",
                 None,
             )
         })
@@ -328,7 +328,7 @@ pub struct SendMessageRequest {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SpawnAgentRequest {
-    #[schemars(description = "name of an agent/process defined in mterm.yml")]
+    #[schemars(description = "name of an agent/process defined in ptygrid.yml")]
     pub name: String,
 }
 
@@ -473,7 +473,7 @@ fn queen_data_error(error: String) -> ErrorData {
 #[tool_router]
 impl QueenServer {
     #[tool(
-        description = "List running terminal sessions and the agent/process definitions from mterm.yml that can be spawned"
+        description = "List running terminal sessions and the agent/process definitions from ptygrid.yml that can be spawned"
     )]
     fn list_agents(&self) -> Result<CallToolResult, ErrorData> {
         let sessions = self.manager().list_sessions();
@@ -570,13 +570,13 @@ impl QueenServer {
     }
 
     #[tool(
-        description = "Spawn an agent/process by its mterm.yml definition name (only config-defined names are allowed). Returns JSON {id}"
+        description = "Spawn an agent/process by its ptygrid.yml definition name (only config-defined names are allowed). Returns JSON {id}"
     )]
     fn spawn_agent(
         &self,
         Parameters(SpawnAgentRequest { name }): Parameters<SpawnAgentRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Allow-list: only names defined in the loaded mterm.yml.
+        // Allow-list: only names defined in the loaded ptygrid.yml.
         let (def, dir) = self
             .config()
             .resolve_def(&name)

@@ -285,7 +285,7 @@ fn process<R: Runtime>(
 
 // ---------- Phase 4.1: transcript pane orchestration ----------
 
-/// A running lead candidate: a PTY session whose mterm.yml definition has
+/// A running lead candidate: a PTY session whose ptygrid.yml definition has
 /// `teams.enabled: true`, with the pane-limit inputs already resolved.
 struct LeadCandidate {
     id: u32,
@@ -594,7 +594,7 @@ pub fn register<R: Runtime>(app: &AppHandle<R>, scope: &str) -> Result<RegisterR
                 .ok_or_else(|| "config manager unavailable".to_string())?;
             let (_, dir) = cm
                 .current()
-                .ok_or_else(|| "no project loaded; load an mterm.yml first".to_string())?;
+                .ok_or_else(|| "no project loaded; load a ptygrid.yml first".to_string())?;
             dir
         }
         other => {

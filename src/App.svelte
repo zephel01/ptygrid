@@ -107,7 +107,7 @@
     if (!isTauri()) return "Tauri 実行環境なし（デモモード）";
     const q = ui.queenStatus;
     if (!q) return "Queen MCP サーバー（状態未取得）";
-    if (!q.enabled) return "Queen は無効です（mterm.yml の queen.enabled: false）";
+    if (!q.enabled) return "Queen は無効です（ptygrid.yml の queen.enabled: false）";
     const lines: string[] = [];
     if (q.url) lines.push(q.url);
     else if (q.port) lines.push(`http://127.0.0.1:${q.port}/mcp`);
@@ -145,7 +145,7 @@
     if (!t) return "Teammate hooks（状態未取得）";
     return t.enabled
       ? "Teammate hooks 有効（クリックで設定）"
-      : "Teammate hooks 無効（mterm.yml の teammates.enabled: true で有効化）";
+      : "Teammate hooks 無効（ptygrid.yml の teammates.enabled: true で有効化）";
   });
 
   // The hooks JSON snippet (token embedded) users paste into settings.json.
@@ -366,7 +366,7 @@
       );
       ui.configInfo = info;
       ui.configChangedPath = null;
-      // Queen may have been restarted if the port changed in mterm.yml.
+      // Queen may have been restarted if the port changed in ptygrid.yml.
       void refreshQueenStatus();
       // teammates.enabled / hook_notifications may have changed too.
       void refreshTeammateHooks();
@@ -391,7 +391,7 @@
   }
 
   async function onReloadConfig(): Promise<void> {
-    // Reload the watched mterm.yml; running sessions are NOT respawned.
+    // Reload the watched config file; running sessions are NOT respawned.
     try {
       await loadConfig();
     } catch (err) {
@@ -576,7 +576,7 @@
         <input
           class="dir-input"
           type="text"
-          placeholder="mterm.yml のあるディレクトリ"
+          placeholder="ptygrid.yml のあるディレクトリ"
           bind:value={configDirInput}
           onkeydown={(e) => {
             if (e.key === "Enter") onLoadClick();
@@ -874,7 +874,7 @@
 
   {#if ui.configChangedPath}
     <div class="toast" role="status">
-      <span class="toast-text">mterm.yml が変更されました</span>
+      <span class="toast-text">設定ファイル（ptygrid.yml）が変更されました</span>
       <button class="btn btn-small" onclick={onReloadConfig}>再読み込み</button>
       <button
         class="btn btn-small"

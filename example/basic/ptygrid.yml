@@ -1,0 +1,11 @@
+# basic — 最小構成
+# shell 1ペイン（アプリ起動時の既定）に加えて Claude Code を1ペイン。
+# まずはこれをプロジェクトルートに ptygrid.yml としてコピーして読み込む。
+
+project: basic
+
+agents:
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    autostart: true    # 読み込みと同時に起動する。手動起動なら false

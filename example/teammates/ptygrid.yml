@@ -1,0 +1,36 @@
+# teammates — Claude Code の subagent / teammate をペインで観測（Phase 4.0/4.1）
+# lead の Claude Code が subagent を起動すると、read-only の transcript ペインが
+# 自動で追加される（observe モード）。
+#
+# 事前準備（一度だけ）:
+#   1. この設定を読み込むと、ツールバーに Teammates バッジが現れる
+#   2. バッジから hooks 設定を ~/.claude/settings.json へ登録（またはスニペットをコピー）
+#      ※ token はアプリ起動ごとに変わるため、起動のたびに登録が更新される
+#   3. lead ペインで Claude Code を使い、subagent を起動させる
+
+project: teammates-observe
+
+queen:
+  enabled: true
+
+teammates:
+  enabled: true            # マスタースイッチ（既定 false）
+  hook_notifications: true # teammate/task のライフサイクルを toast する
+  global_max_panes: 6      # 全 lead 合計の teammate ペイン上限（<=9）
+
+agents:
+  - name: claude
+    cmd: "claude"
+    cwd: "."
+    autostart: true
+    teams:
+      enabled: true          # この lead の subagent をペイン化する
+      mode: observe          # observe | host（host は Phase 4.2。4.1 では observe と同挙動）
+      max_panes: 3           # この lead が生む teammate ペインの上限
+      transcript_tail: true  # false にするとペインは作らず通知のみ
+
+  # teams ブロックを省略したエージェントは従来どおり（ペイン自動追加なし）
+  - name: codex
+    cmd: "codex"
+    cwd: "."
+    autostart: false
