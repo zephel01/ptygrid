@@ -17,10 +17,12 @@
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
+  import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
   import type {
     ConfigInfo,
     LogicalSession,
     ProjectState,
+    SessionInfo,
     WorktreeInfo,
   } from "./lib/types";
 
@@ -218,6 +220,87 @@
     const who =
       ev.agentType ?? ev.agentId ?? ev.taskName ?? ev.taskId ?? ev.sessionId ?? "teammate";
     return `${who} · ${TEAMMATE_KIND_TEXT[ev.kind] ?? ev.kind}`;
+  }
+
+  // ---- bulk cd (send `cd <dir>` + Enter to several panes at once) ----
+  let cdPopoverOpen = $state(false);
+  // Kept for the whole app session (App is the root, never unmounted).
+  let cdDir = $state("");
+  let cdIncludeNonShell = $state(false);
+  let cdWrapEl = $state<HTMLElement | undefined>(undefined);
+
+  // Ordered SessionInfo for the currently open panes (skips ids with no entry).
+  let cdPaneSessions = $derived(
+    ui.panes
+      .map((id) => ui.sessions[id])
+      .filter((s): s is SessionInfo => Boolean(s)),
+  );
+  // Target selection is a pure function (src/lib/broadcast.ts).
+  let cdTargets = $derived(selectCdTargets(cdPaneSessions, cdIncludeNonShell));
+  let cdCanSend = $derived(cdDir.trim() !== "" && cdTargets.length > 0);
+
+  // list_sessions is the only source of foreground process names (session-state
+  // events omit them); refresh on open so the shell-only default is accurate.
+  async function refreshForegroundInfo(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      const list = await invokeCmd<SessionInfo[]>("list_sessions");
+      for (const s of list) {
+        const existing = ui.sessions[s.id];
+        if (existing) existing.foreground = s.foreground;
+      }
+    } catch {
+      // Best-effort: without foreground info, panes are treated as shells.
+    }
+  }
+
+  function toggleCdPopover(): void {
+    cdPopoverOpen = !cdPopoverOpen;
+    if (cdPopoverOpen) void refreshForegroundInfo();
+  }
+
+  // Close the popover on Escape or an outside click while it is open.
+  $effect(() => {
+    if (!cdPopoverOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") cdPopoverOpen = false;
+    };
+    const onDown = (e: MouseEvent) => {
+      if (cdWrapEl && !cdWrapEl.contains(e.target as Node)) {
+        cdPopoverOpen = false;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown);
+    };
+  });
+
+  async function sendBulkCd(): Promise<void> {
+    const dir = cdDir.trim();
+    const targets = cdTargets;
+    if (dir === "" || targets.length === 0) return;
+    const cmd = buildCdCommand(dir);
+    const data = `${cmd}\r`; // Enter is a carriage return for the PTY
+    let sent = 0;
+    for (const target of targets) {
+      try {
+        if (isTauri()) {
+          await invokeCmd<void>("write_pty", { id: target.id, data });
+        } else {
+          writeToTerm(target.id, data); // demo mode: local echo only
+        }
+        sent += 1;
+      } catch (err) {
+        ui.errorBanner = `cd の一括送信に失敗しました (write_pty #${target.id}): ${err}`;
+      }
+    }
+    if (sent > 0) {
+      addNotice(`${sent}ペインに cd を送信しました`, cmd);
+      cdPopoverOpen = false;
+    }
   }
 
   // ---- actions ----
@@ -623,6 +706,65 @@
     </div>
 
     <span class="spacer"></span>
+    <div class="cd-wrap" bind:this={cdWrapEl}>
+      <button
+        class="queen-badge cd-badge"
+        class:seg-active={cdPopoverOpen}
+        onclick={toggleCdPopover}
+        title="複数ペインへ cd をまとめて送信"
+        aria-label="一括 cd（複数ペインへ cd を送信）"
+      >
+        cd…
+      </button>
+      {#if cdPopoverOpen}
+        <div class="cd-panel" role="dialog" aria-label="一括 cd">
+          <div class="tm-head">
+            <span class="tm-title">一括 cd</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (cdPopoverOpen = false)}
+              title="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+          <p class="tm-note">
+            開いているペインへ <code>cd &lt;dir&gt;</code> + Enter をまとめて送信します。
+          </p>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="cd-input"
+            type="text"
+            placeholder="/path/to/project または ~/works/..."
+            bind:value={cdDir}
+            autofocus
+            onkeydown={(e) => {
+              if (e.key === "Enter" && cdCanSend) sendBulkCd();
+            }}
+          />
+          <label class="cd-check">
+            <input type="checkbox" bind:checked={cdIncludeNonShell} />
+            CLI実行中のペインにも送る
+          </label>
+          {#if cdIncludeNonShell}
+            <p class="cd-warn">⚠ 実行中のCLIへの入力になります。</p>
+          {/if}
+          <div class="cd-foot">
+            <span class="cd-preview">{cdTargets.length}ペインに送信</span>
+            <button
+              class="btn btn-small"
+              onclick={sendBulkCd}
+              disabled={!cdCanSend}
+              title={cdTargets.length === 0
+                ? "対象のペインがありません"
+                : "対象ペインへ cd を送信"}
+            >
+              送信
+            </button>
+          </div>
+        </div>
+      {/if}
+    </div>
     <button
       class="btn"
       class:seg-active={gitPanelOpen}
@@ -1201,6 +1343,89 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* ---- bulk cd (popover under the "cd…" badge) ---- */
+
+  .cd-wrap {
+    position: relative;
+    align-self: center;
+    margin-right: 8px;
+  }
+
+  .cd-wrap .queen-badge {
+    margin-right: 0;
+  }
+
+  .cd-badge.seg-active {
+    background: #3b5b7a;
+    color: #fff;
+    border-color: #3b5b7a;
+  }
+
+  .cd-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 120;
+    width: 300px;
+    background: #2d2d30;
+    border: 1px solid #4a4a4a;
+    border-radius: 6px;
+    padding: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    white-space: normal;
+  }
+
+  .cd-panel code {
+    font-family: Menlo, monospace;
+    font-size: 10px;
+    color: #d0d0d0;
+  }
+
+  .cd-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: #1b1b1b;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+
+  .cd-input::placeholder {
+    color: #777;
+  }
+
+  .cd-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #cfcfcf;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .cd-warn {
+    margin: 6px 0 0;
+    color: #e5c07b;
+    font-size: 10px;
+  }
+
+  .cd-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .cd-preview {
+    color: #b5b5b5;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
   }
 
   /* ---- banners / toast ---- */
