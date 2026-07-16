@@ -1,7 +1,7 @@
 # IPC / Service Contract (backend ⇄ frontend / Queen)
 
 > この文書は段階releaseごとの差分契約を時系列で保持する。前のPhaseと後のPhaseが競合する
-> 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 3.6。
+> 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 3.7。
 > 操作方法と現在仕様の要約は[docs/userguide.md](docs/userguide.md)を参照。
 
 ## Phase 0 (基本PTY)
@@ -508,3 +508,53 @@ type Note = {
 - 同名のCodex/Claude/Grok等が複数ある場合、最新IDを推測してはならない。曖昧errorに
   全候補を`#<id>`形式で含め、callerに厳密指定を求める。
 - session IDは現在のapp実行中の識別子であり、app再起動後は`list_agents`で再取得する。
+
+---
+
+# Phase 3.7 追加契約（durable Queen inbox / reply）
+
+Phase 3.7はQueen MCPを17 toolsへ拡張し、live PTYへ直接入力する`send_message`とは別に、
+project-scopedな永続inboxを提供する。messageは追記専用で、安定ID、acknowledgement、
+reply correlationを持つ。
+
+## Queen MCP tools
+
+| tool | args | returns | 説明 |
+|---|---|---|---|
+| `send_inbox` | `{ sender, recipient, subject, body }` | `{ message }` | mailboxへroot messageを作成 |
+| `list_inbox` | `{ mailbox, afterId?, includeAcknowledged?, limit? }` | `{ messages, nextCursor }` | ID昇順でmailboxを読む |
+| `ack_inbox` | `{ id, recipient }` | `{ message }` | 宛先本人としてmessageをidempotentにacknowledge |
+| `reply_inbox` | `{ id, sender, body }` | `{ message }` | 元宛先から元送信者へcorrelated replyを作り、元messageもacknowledge |
+
+```ts
+type InboxMessage = {
+  id: number;
+  sender: string;
+  recipient: string;
+  subject: string;
+  body: string;
+  inReplyToId?: number;
+  rootMessageId: number;
+  acknowledgedAtMs?: number;
+  createdAtMs: number;
+};
+```
+
+## Inbox semantics
+
+- mailbox名はtrim後1〜128 bytesの安定した論理名とする。app再起動で変わる`#<id>`形式は拒否する。
+  定義には`codex-review`、`claude-impl`等、役割を含む一意な名前を推奨する。
+- sender/recipientは明示引数とする。Phase 3.7ではMCP client identityとの暗黙bindingや認証は行わない。
+- subjectは1〜256 bytes、bodyは最大64 KiB。projectごとに最大50,000 messages。
+- root messageは`inReplyToId`なし、`rootMessageId == id`。replyは
+  `inReplyToId == 元message.id`かつ元messageの`rootMessageId`を継承する。
+- `reply_inbox`のsenderは元messageのrecipientと完全一致しなければ拒否する。新messageのrecipientは
+  元messageのsenderとし、subjectは元messageから継承する。reply作成と元messageのacknowledgeは
+  同じ`BEGIN IMMEDIATE` transactionでcommitする。
+- `ack_inbox`のrecipientは元messageのrecipientと完全一致必須。acknowledgementは単調な
+  `null -> timestamp`遷移で、同じrecipientによる再実行は同じmessageを返すidempotent operationとする。
+- `list_inbox`は`id > afterId`をID昇順で返す。defaultはunacknowledgedだけ、limit 50、最大200。
+  `nextCursor`は返却messageの最大ID、0件なら入力`afterId`を返す。
+- message本文は更新・削除しない。誤送信訂正・retention policyはPhase 3.7の対象外。
+- storageは既存`queen/queen.sqlite3`をschema version 2へtransactional migrationする。
+  project scope、WAL、busy timeout、repositoryへfileを作らない規則はPhase 3.6を継承する。

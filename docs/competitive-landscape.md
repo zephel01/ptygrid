@@ -2,7 +2,7 @@
 
 調査日: 2026-07-16(grok による Web 横断調査、32+ サイト。docs/design.md の記述を起点に更新)
 
-> 外部projectの数値は調査日時点のsnapshot。ptygridの実装状況はPhase 3.6へ更新済み。
+> 外部projectの数値は調査日時点のsnapshot。ptygridの実装状況はPhase 3.7へ更新済み。
 
 ## design.md (2026-07-15) からのアップデート
 
@@ -53,14 +53,14 @@ cmux は端末として最強だが Queen 型ではない。Superset / Conductor
 
 ## ptygrid の勝ち筋 / 次に取る機能
 
-**すでに持っている強み(Phase 3.6)**: マルチペイン + mterm.yml + Queen 13 toolsに加え、
+**すでに持っている強み(Phase 3.7)**: マルチペイン + mterm.yml + Queen 17 toolsに加え、
 Git review/commit、任意worktree分離、logical resume、process-tree resource監視、競合安全な
-Pins/Notesまで一体化している。
+Pins/Notes、永続Inbox/Replyまで一体化している。
 
 | 優先 | 内容 | 競合が強い領域 |
 |---|---|---|
-| 実装済み | Git diff/commit、worktree option、pins/notes | Superset / Parallel Code / Conductor / HiveTerm |
-| 次: Phase 3.7–3.8 | inbox/reply、cancellable await | HiveTerm 本体 |
+| 実装済み | Git diff/commit、worktree option、pins/notes、inbox/reply | Superset / Parallel Code / Conductor / HiveTerm |
+| 次: Phase 3.8 | cancellable await | HiveTerm 本体 |
 | UX | 通知リング / 「要承認」ハイライト | cmux / Architect |
 | 差別化維持 | config-as-code + 許可リスト付き spawn | ほとんど誰も両立していない |
 

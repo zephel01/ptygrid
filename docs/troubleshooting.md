@@ -120,3 +120,16 @@ curl -s -X POST http://127.0.0.1:39237/mcp ... \
   新しい`expectedRevision`でretryする。
 - **注意**: conflict時のmutationはtransactionごとrollbackされる。別agentの新しい内容を
   上書き・削除していないため、errorを無視してblind retryしない。
+
+---
+
+## Inboxにmessageが見つからない
+
+- **`#3`をmailboxにした**: Inboxはapp再起動をまたぐためsession IDを拒否する。
+  `codex-review`などのstable role名で`send_inbox` / `list_inbox`を呼ぶ。
+- **ack済み**: `list_inbox`はdefaultで未ackだけを返す。履歴確認時は
+  `includeAcknowledged: true`を指定する。
+- **別project**: Inboxは読み込まれた`mterm.yml`のcanonical directory単位で分離される。
+  senderとrecipientが同じでも別projectからは見えない。
+- **replyできない**: `reply_inbox.sender`は元messageのrecipientと完全一致する必要がある。
+  messageの`recipient`を確認し、表示名やsession IDへ置き換えない。

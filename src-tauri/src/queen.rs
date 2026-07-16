@@ -393,6 +393,47 @@ pub struct DeleteNoteRequest {
     pub expected_revision: i64,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SendInboxRequest {
+    #[schemars(description = "stable logical sender mailbox (not a session #id)")]
+    pub sender: String,
+    #[schemars(description = "stable logical recipient mailbox (not a session #id)")]
+    pub recipient: String,
+    #[schemars(description = "message subject (max 256 bytes)")]
+    pub subject: String,
+    #[schemars(description = "message body (max 64 KiB)")]
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListInboxRequest {
+    #[schemars(description = "stable recipient mailbox to read")]
+    pub mailbox: String,
+    #[schemars(description = "return only messages with ids greater than this cursor (default 0)")]
+    pub after_id: Option<i64>,
+    #[schemars(description = "include acknowledged messages (default false)")]
+    pub include_acknowledged: Option<bool>,
+    #[schemars(description = "maximum messages to return (default 50, max 200)")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AckInboxRequest {
+    pub id: i64,
+    #[schemars(description = "must exactly match the message recipient")]
+    pub recipient: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReplyInboxRequest {
+    pub id: i64,
+    #[schemars(description = "must exactly match the original message recipient")]
+    pub sender: String,
+    #[schemars(description = "reply body (max 64 KiB)")]
+    pub body: String,
+}
+
 fn queen_data_error(error: String) -> ErrorData {
     if error.starts_with("Queen database error") {
         ErrorData::internal_error(error, None)
@@ -649,6 +690,90 @@ impl QueenServer {
             .map_err(queen_data_error)?;
         ok_json(&serde_json::json!({ "deleted": true, "id": id }))
     }
+
+    #[tool(
+        description = "Send a durable project-scoped inbox message between stable logical mailboxes. This does not type into a live PTY. Mailbox names must not be session #ids. Returns {message} with a stable id and thread root."
+    )]
+    fn send_inbox(
+        &self,
+        Parameters(SendInboxRequest {
+            sender,
+            recipient,
+            subject,
+            body,
+        }): Parameters<SendInboxRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let message = self
+            .store()
+            .send_inbox(&project, sender, recipient, subject, body)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "message": message }))
+    }
+
+    #[tool(
+        description = "Read durable project inbox messages for one stable mailbox in ascending id order. By default only unacknowledged messages are returned. Use afterId as a stable cursor. Returns {messages, nextCursor}."
+    )]
+    fn list_inbox(
+        &self,
+        Parameters(ListInboxRequest {
+            mailbox,
+            after_id,
+            include_acknowledged,
+            limit,
+        }): Parameters<ListInboxRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let after_id = after_id.unwrap_or(0);
+        let messages = self
+            .store()
+            .list_inbox(
+                &project,
+                mailbox,
+                after_id,
+                include_acknowledged.unwrap_or(false),
+                limit.unwrap_or(50),
+            )
+            .map_err(queen_data_error)?;
+        let next_cursor = messages
+            .last()
+            .map(|message| message.id)
+            .unwrap_or(after_id);
+        ok_json(&serde_json::json!({
+            "messages": messages,
+            "nextCursor": next_cursor,
+        }))
+    }
+
+    #[tool(
+        description = "Idempotently acknowledge a durable inbox message. recipient must exactly match the stored recipient; repeated calls return the already-acknowledged message. Returns {message}."
+    )]
+    fn ack_inbox(
+        &self,
+        Parameters(AckInboxRequest { id, recipient }): Parameters<AckInboxRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let message = self
+            .store()
+            .ack_inbox(&project, id, recipient)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "message": message }))
+    }
+
+    #[tool(
+        description = "Create a durable correlated reply. sender must exactly match the original recipient; the reply is addressed to the original sender, inherits the thread root and subject, and atomically acknowledges the original. Returns {message}."
+    )]
+    fn reply_inbox(
+        &self,
+        Parameters(ReplyInboxRequest { id, sender, body }): Parameters<ReplyInboxRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = self.project_dir()?;
+        let message = self
+            .store()
+            .reply_inbox(&project, id, sender, body)
+            .map_err(queen_data_error)?;
+        ok_json(&serde_json::json!({ "message": message }))
+    }
 }
 
 #[tool_handler]
@@ -659,7 +784,8 @@ impl ServerHandler for QueenServer {
                  sessions and definitions, read_output to inspect a pane, \
                  send_message to type into a pane, spawn_agent to start a \
                  config-defined agent, notify to toast the user, and durable \
-                 pins/notes to coordinate project knowledge. When multiple \
+                 pins/notes and durable inbox/reply to coordinate project \
+                 knowledge. When multiple \
                  sessions share a name, address the exact session as #<id>.",
         )
     }
@@ -684,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_3_6_exposes_all_thirteen_tools() {
+    fn phase_3_7_exposes_all_seventeen_tools() {
         let mut names: Vec<_> = QueenServer::tool_router()
             .list_all()
             .into_iter()
@@ -694,15 +820,19 @@ mod tests {
         assert_eq!(
             names,
             [
+                "ack_inbox",
                 "create_note",
                 "delete_note",
                 "delete_pin",
                 "get_note",
                 "list_agents",
+                "list_inbox",
                 "list_notes",
                 "list_pins",
                 "notify",
                 "read_output",
+                "reply_inbox",
+                "send_inbox",
                 "send_message",
                 "set_pin",
                 "spawn_agent",

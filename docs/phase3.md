@@ -1,6 +1,6 @@
 # Phase 3 staged delivery plan
 
-Last updated: 2026-07-16. Releases 3.0 through 3.6 are complete; 3.7 is next.
+Last updated: 2026-07-16. Releases 3.0 through 3.7 are complete; 3.8 is next.
 
 Phase 3 is delivered as a sequence of independently releasable changes. Each
 release must preserve the Phase 0–2.1 IPC contract unless its own contract
@@ -17,7 +17,7 @@ section explicitly extends it, and must pass both Rust and frontend checks.
 | 3.4 ✅ | Versioned project state and logical session resume | No expanded environment values or secrets are persisted |
 | 3.5 ✅ | Per-session process-tree CPU/memory monitoring | One shared sampler; batched frontend updates |
 | 3.6 ✅ | Durable Queen pins and notes | Project-scoped transactional storage and CRUD tools |
-| 3.7 | Durable Queen inbox and reply | Stable message IDs, acknowledgement, and reply correlation |
+| 3.7 ✅ | Durable Queen inbox and reply | Stable message IDs, acknowledgement, and reply correlation |
 | 3.8 | Cancellable Queen `await` | Cursor-based wait, bounded timeout, MCP cancellation support |
 
 ## Fixed design decisions

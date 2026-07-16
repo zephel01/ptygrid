@@ -1,4 +1,4 @@
-//! Durable, project-scoped Queen data (Phase 3.6).
+//! Durable, project-scoped Queen data (Phase 3.6–3.7).
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -15,6 +15,10 @@ const MAX_NOTE_TITLE_BYTES: usize = 256;
 const MAX_NOTE_BODY_BYTES: usize = 64 * 1024;
 const MAX_TAGS: usize = 32;
 const MAX_TAG_BYTES: usize = 64;
+const MAX_MESSAGES_PER_PROJECT: i64 = 50_000;
+const MAX_MAILBOX_BYTES: usize = 128;
+const MAX_MESSAGE_SUBJECT_BYTES: usize = 256;
+const MAX_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +40,22 @@ pub struct Note {
     pub revision: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxMessage {
+    pub id: i64,
+    pub sender: String,
+    pub recipient: String,
+    pub subject: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_id: Option<i64>,
+    pub root_message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at_ms: Option<i64>,
+    pub created_at_ms: i64,
 }
 
 pub struct QueenStore {
@@ -79,9 +99,9 @@ impl QueenStore {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("cannot read Queen database version: {e}"))?;
-        if version > 1 {
+        if version > 2 {
             return Err(format!(
-                "unsupported Queen database version {version} (expected 1)"
+                "unsupported Queen database version {version} (expected 2)"
             ));
         }
         if version == 0 {
@@ -108,12 +128,60 @@ impl QueenStore {
                  );
                  CREATE INDEX IF NOT EXISTS notes_project_updated
                    ON notes(project_dir, updated_at_ms DESC, id DESC);
-                 PRAGMA user_version = 1;
+                 CREATE TABLE IF NOT EXISTS inbox_messages (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project_dir TEXT NOT NULL,
+                   sender TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   subject TEXT NOT NULL,
+                   body TEXT NOT NULL,
+                   in_reply_to_id INTEGER,
+                   root_message_id INTEGER,
+                   acknowledged_at_ms INTEGER,
+                   created_at_ms INTEGER NOT NULL,
+                   FOREIGN KEY (in_reply_to_id) REFERENCES inbox_messages(id),
+                   FOREIGN KEY (root_message_id) REFERENCES inbox_messages(id)
+                 );
+                 CREATE INDEX IF NOT EXISTS inbox_recipient_id
+                   ON inbox_messages(project_dir, recipient, id ASC);
+                 CREATE INDEX IF NOT EXISTS inbox_root_id
+                   ON inbox_messages(project_dir, root_message_id, id ASC);
+                 PRAGMA user_version = 2;
                  COMMIT;",
             );
             if let Err(error) = schema_result {
                 let _ = connection.execute_batch("ROLLBACK;");
                 return Err(format!("cannot initialize Queen database: {error}"));
+            }
+        } else if version == 1 {
+            let migration_result = connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE inbox_messages (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project_dir TEXT NOT NULL,
+                   sender TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   subject TEXT NOT NULL,
+                   body TEXT NOT NULL,
+                   in_reply_to_id INTEGER,
+                   root_message_id INTEGER,
+                   acknowledged_at_ms INTEGER,
+                   created_at_ms INTEGER NOT NULL,
+                   FOREIGN KEY (in_reply_to_id) REFERENCES inbox_messages(id),
+                   FOREIGN KEY (root_message_id) REFERENCES inbox_messages(id)
+                 );
+                 CREATE INDEX inbox_recipient_id
+                   ON inbox_messages(project_dir, recipient, id ASC);
+                 CREATE INDEX inbox_root_id
+                   ON inbox_messages(project_dir, root_message_id, id ASC);
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            );
+            if let Err(error) = migration_result {
+                let _ = connection.execute_batch("ROLLBACK;");
+                return Err(format!(
+                    "cannot migrate Queen database to version 2: {error}"
+                ));
             }
         }
         Ok(Self {
@@ -430,6 +498,192 @@ impl QueenStore {
         transaction.commit().map_err(db_error)?;
         Ok(())
     }
+
+    pub fn send_inbox(
+        &self,
+        project: &Path,
+        sender: String,
+        recipient: String,
+        subject: String,
+        body: String,
+    ) -> Result<InboxMessage, String> {
+        let project = project_id(project)?;
+        let sender = validated_mailbox("sender", sender)?;
+        let recipient = validated_mailbox("recipient", recipient)?;
+        let subject = validated_required("message subject", subject, MAX_MESSAGE_SUBJECT_BYTES)?;
+        let body = validated_required("message body", body, MAX_MESSAGE_BODY_BYTES)?;
+        let now = now_ms();
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        enforce_limit(
+            &transaction,
+            "inbox_messages",
+            &project,
+            MAX_MESSAGES_PER_PROJECT,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO inbox_messages(
+                   project_dir, sender, recipient, subject, body,
+                   in_reply_to_id, root_message_id, acknowledged_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6)",
+                params![project, sender, recipient, subject, body, now],
+            )
+            .map_err(db_error)?;
+        let id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE inbox_messages SET root_message_id = id
+                 WHERE project_dir = ?1 AND id = ?2",
+                params![project, id],
+            )
+            .map_err(db_error)?;
+        let message = get_inbox_from(&transaction, &project, id)?
+            .ok_or_else(|| "inbox message was inserted but could not be read back".to_string())?;
+        transaction.commit().map_err(db_error)?;
+        Ok(message)
+    }
+
+    pub fn list_inbox(
+        &self,
+        project: &Path,
+        mailbox: String,
+        after_id: i64,
+        include_acknowledged: bool,
+        limit: u32,
+    ) -> Result<Vec<InboxMessage>, String> {
+        if after_id < 0 {
+            return Err("afterId must be zero or a positive integer".to_string());
+        }
+        let project = project_id(project)?;
+        let mailbox = validated_mailbox("mailbox", mailbox)?;
+        let limit = limit.clamp(1, 200) as i64;
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, sender, recipient, subject, body, in_reply_to_id,
+                        root_message_id, acknowledged_at_ms, created_at_ms
+                 FROM inbox_messages
+                 WHERE project_dir = ?1 AND recipient = ?2 AND id > ?3
+                   AND (?4 = 1 OR acknowledged_at_ms IS NULL)
+                 ORDER BY id ASC LIMIT ?5",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    project,
+                    mailbox,
+                    after_id,
+                    include_acknowledged as i64,
+                    limit
+                ],
+                inbox_from_row,
+            )
+            .map_err(db_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)
+    }
+
+    pub fn ack_inbox(
+        &self,
+        project: &Path,
+        id: i64,
+        recipient: String,
+    ) -> Result<InboxMessage, String> {
+        validate_message_id(id)?;
+        let project = project_id(project)?;
+        let recipient = validated_mailbox("recipient", recipient)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let current = get_inbox_from(&transaction, &project, id)?
+            .ok_or_else(|| format!("inbox message {id} not found"))?;
+        if current.recipient != recipient {
+            return Err(format!(
+                "inbox message {id} belongs to recipient '{}', not '{recipient}'",
+                current.recipient
+            ));
+        }
+        if current.acknowledged_at_ms.is_none() {
+            transaction
+                .execute(
+                    "UPDATE inbox_messages SET acknowledged_at_ms = ?3
+                     WHERE project_dir = ?1 AND id = ?2 AND acknowledged_at_ms IS NULL",
+                    params![project, id, now_ms()],
+                )
+                .map_err(db_error)?;
+        }
+        let message = get_inbox_from(&transaction, &project, id)?
+            .ok_or_else(|| format!("inbox message {id} not found"))?;
+        transaction.commit().map_err(db_error)?;
+        Ok(message)
+    }
+
+    pub fn reply_inbox(
+        &self,
+        project: &Path,
+        id: i64,
+        sender: String,
+        body: String,
+    ) -> Result<InboxMessage, String> {
+        validate_message_id(id)?;
+        let project = project_id(project)?;
+        let sender = validated_mailbox("sender", sender)?;
+        let body = validated_required("message body", body, MAX_MESSAGE_BODY_BYTES)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let original = get_inbox_from(&transaction, &project, id)?
+            .ok_or_else(|| format!("inbox message {id} not found"))?;
+        if original.recipient != sender {
+            return Err(format!(
+                "only recipient '{}' can reply to inbox message {id}",
+                original.recipient
+            ));
+        }
+        enforce_limit(
+            &transaction,
+            "inbox_messages",
+            &project,
+            MAX_MESSAGES_PER_PROJECT,
+        )?;
+        let now = now_ms();
+        transaction
+            .execute(
+                "INSERT INTO inbox_messages(
+                   project_dir, sender, recipient, subject, body,
+                   in_reply_to_id, root_message_id, acknowledged_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+                params![
+                    project,
+                    sender,
+                    original.sender,
+                    original.subject,
+                    body,
+                    original.id,
+                    original.root_message_id,
+                    now
+                ],
+            )
+            .map_err(db_error)?;
+        let reply_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE inbox_messages
+                 SET acknowledged_at_ms = COALESCE(acknowledged_at_ms, ?3)
+                 WHERE project_dir = ?1 AND id = ?2",
+                params![project, id, now],
+            )
+            .map_err(db_error)?;
+        let reply = get_inbox_from(&transaction, &project, reply_id)?
+            .ok_or_else(|| "inbox reply was inserted but could not be read back".to_string())?;
+        transaction.commit().map_err(db_error)?;
+        Ok(reply)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -472,9 +726,27 @@ fn validated_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn validated_mailbox(label: &str, value: String) -> Result<String, String> {
+    let value = validated_required(label, value, MAX_MAILBOX_BYTES)?;
+    if value.starts_with('#') {
+        return Err(format!(
+            "{label} must be a stable mailbox name, not a session #id"
+        ));
+    }
+    Ok(value)
+}
+
 fn validate_note_id(id: i64) -> Result<(), String> {
     if id <= 0 {
         Err("note id must be a positive integer".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_message_id(id: i64) -> Result<(), String> {
+    if id <= 0 {
+        Err("inbox message id must be a positive integer".to_string())
     } else {
         Ok(())
     }
@@ -530,6 +802,20 @@ fn note_from_row(row: &Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
+fn inbox_from_row(row: &Row<'_>) -> rusqlite::Result<InboxMessage> {
+    Ok(InboxMessage {
+        id: row.get(0)?,
+        sender: row.get(1)?,
+        recipient: row.get(2)?,
+        subject: row.get(3)?,
+        body: row.get(4)?,
+        in_reply_to_id: row.get(5)?,
+        root_message_id: row.get(6)?,
+        acknowledged_at_ms: row.get(7)?,
+        created_at_ms: row.get(8)?,
+    })
+}
+
 fn get_note_from(connection: &Connection, project: &str, id: i64) -> Result<Option<Note>, String> {
     connection
         .query_row(
@@ -537,6 +823,23 @@ fn get_note_from(connection: &Connection, project: &str, id: i64) -> Result<Opti
              FROM notes WHERE project_dir = ?1 AND id = ?2",
             params![project, id],
             note_from_row,
+        )
+        .optional()
+        .map_err(db_error)
+}
+
+fn get_inbox_from(
+    connection: &Connection,
+    project: &str,
+    id: i64,
+) -> Result<Option<InboxMessage>, String> {
+    connection
+        .query_row(
+            "SELECT id, sender, recipient, subject, body, in_reply_to_id,
+                    root_message_id, acknowledged_at_ms, created_at_ms
+             FROM inbox_messages WHERE project_dir = ?1 AND id = ?2",
+            params![project, id],
+            inbox_from_row,
         )
         .optional()
         .map_err(db_error)
@@ -731,6 +1034,118 @@ mod tests {
     }
 
     #[test]
+    fn inbox_is_project_scoped_and_acknowledgement_is_idempotent() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let message = store
+            .send_inbox(
+                &one,
+                "claude-impl".to_string(),
+                "codex-review".to_string(),
+                "Review session storage".to_string(),
+                "Please inspect the migration.".to_string(),
+            )
+            .unwrap();
+        assert_eq!(message.root_message_id, message.id);
+        assert_eq!(message.in_reply_to_id, None);
+        assert_eq!(message.acknowledged_at_ms, None);
+        assert_eq!(
+            store
+                .list_inbox(&one, "codex-review".to_string(), 0, false, 50)
+                .unwrap(),
+            vec![message.clone()]
+        );
+        assert!(store
+            .list_inbox(&two, "codex-review".to_string(), 0, true, 50)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .ack_inbox(&one, message.id, "wrong-mailbox".to_string())
+            .unwrap_err()
+            .contains("belongs to recipient"));
+
+        let acknowledged = store
+            .ack_inbox(&one, message.id, "codex-review".to_string())
+            .unwrap();
+        assert!(acknowledged.acknowledged_at_ms.is_some());
+        let repeated = store
+            .ack_inbox(&one, message.id, "codex-review".to_string())
+            .unwrap();
+        assert_eq!(repeated, acknowledged);
+        assert!(store
+            .list_inbox(&one, "codex-review".to_string(), 0, false, 50)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_inbox(&one, "codex-review".to_string(), 0, true, 50)
+                .unwrap(),
+            vec![acknowledged]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replies_reverse_mailboxes_preserve_thread_and_acknowledge_original() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let root_message = store
+            .send_inbox(
+                &one,
+                "claude-impl".to_string(),
+                "codex-review".to_string(),
+                "Review request".to_string(),
+                "Ready for review".to_string(),
+            )
+            .unwrap();
+        assert!(store
+            .reply_inbox(
+                &one,
+                root_message.id,
+                "claude-impl".to_string(),
+                "spoofed".to_string(),
+            )
+            .unwrap_err()
+            .contains("only recipient"));
+
+        let reply = store
+            .reply_inbox(
+                &one,
+                root_message.id,
+                "codex-review".to_string(),
+                "Looks good".to_string(),
+            )
+            .unwrap();
+        assert_eq!(reply.sender, "codex-review");
+        assert_eq!(reply.recipient, "claude-impl");
+        assert_eq!(reply.subject, root_message.subject);
+        assert_eq!(reply.in_reply_to_id, Some(root_message.id));
+        assert_eq!(reply.root_message_id, root_message.id);
+        assert!(store
+            .list_inbox(&one, "codex-review".to_string(), 0, false, 50)
+            .unwrap()
+            .is_empty());
+
+        let second_reply = store
+            .reply_inbox(
+                &one,
+                reply.id,
+                "claude-impl".to_string(),
+                "Thanks".to_string(),
+            )
+            .unwrap();
+        assert_eq!(second_reply.in_reply_to_id, Some(reply.id));
+        assert_eq!(second_reply.root_message_id, root_message.id);
+        let claude_inbox = store
+            .list_inbox(&one, "claude-impl".to_string(), 0, true, 50)
+            .unwrap();
+        assert_eq!(claude_inbox.len(), 1);
+        assert_eq!(claude_inbox[0].id, reply.id);
+        assert!(claude_inbox[0].acknowledged_at_ms.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_invalid_mutations_without_partial_writes() {
         let (root, one, _) = projects();
         let store = QueenStore::open_in_memory().unwrap();
@@ -745,6 +1160,78 @@ mod tests {
             .update_note(&one, note.id, note.revision, None, None, None)
             .is_err());
         assert_eq!(store.get_note(&one, note.id).unwrap(), Some(note));
+        assert!(store
+            .send_inbox(
+                &one,
+                "#3".to_string(),
+                "codex-review".to_string(),
+                "subject".to_string(),
+                "body".to_string(),
+            )
+            .unwrap_err()
+            .contains("stable mailbox"));
+        assert!(store
+            .list_inbox(&one, "codex-review".to_string(), 0, true, 50)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_version_one_without_losing_existing_data() {
+        let (root, one, _) = projects();
+        let database = root.join("data/queen.sqlite3");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE pins (
+                   project_dir TEXT NOT NULL,
+                   pin_key TEXT NOT NULL,
+                   value TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY (project_dir, pin_key)
+                 );
+                 CREATE TABLE notes (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   project_dir TEXT NOT NULL,
+                   title TEXT NOT NULL,
+                   body TEXT NOT NULL,
+                   tags_json TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        let project = project_id(&one).unwrap();
+        connection
+            .execute(
+                "INSERT INTO pins VALUES (?1, 'existing', 'kept', 1, 1, 1)",
+                params![project],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = QueenStore::open(&database).unwrap();
+        assert_eq!(store.list_pins(&one).unwrap()[0].value, "kept");
+        assert!(store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "migrated".to_string(),
+                "ready".to_string(),
+            )
+            .is_ok());
+        let version: i64 = store
+            .lock()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -754,7 +1241,7 @@ mod tests {
         let database = root.join("data/queen.sqlite3");
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let connection = Connection::open(&database).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
         let error = QueenStore::open(&database).err().unwrap();
         assert!(error.contains("unsupported Queen database version"));
