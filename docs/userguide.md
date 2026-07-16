@@ -419,6 +419,14 @@ agents:
   ペインは作らず日本語バナーで通知します。
 - 安全のため、tail するのは `$HOME/.claude/` 配下の絶対パスのみです。それ以外や path 不明の場合は
   ステータス表示のみになります。transcript セッションはセッション復元(resume)の対象外です。
+- **起動方法**: ▶ チップからの起動が確実(名前付き lead として `teams:` 設定がそのまま効く)ですが、
+  shell ペインで **手打ちした `claude`** でも observe は動きます。`teams.enabled` の名前付き lead が
+  1つも無いとき、フォアグラウンドが `claude`(既定。`teammates.teammate_binaries` で変更可)の
+  running ペインを **暗黙の observe lead** として拾います(グローバル `teammates.enabled: true` が前提。
+  observe 専用で host にはなりません)。名前付き lead があればそちらが優先されます。
+- lead に帰属できずペインを作れなかったときは、`teammates.enabled: true` なら
+  「サブエージェントを検知したが teams 有効な lead が見つからない」旨をバナー通知します
+  (▶ チップからの起動 or `teammates.enabled` の確認を促します)。
 
 ### host: 実 PTY teammate ペイン(Phase 4.2・実験機能・既定オフ)
 

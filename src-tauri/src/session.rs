@@ -853,6 +853,39 @@ impl PtyManager {
             .collect()
     }
 
+    /// Running PTY sessions with their resolved foreground process name and cwd.
+    /// Used by the teammate hook receiver to treat a hand-started `claude` in a
+    /// shell pane (a session with `name == None` whose foreground process is the
+    /// CLI) as an implicit observe lead. Pids are read under the lock (cheap
+    /// ioctl); the pid->name lookup runs after the lock is dropped, exactly like
+    /// `list_sessions`.
+    pub fn running_foreground_sessions(&self) -> Vec<(u32, Option<String>, Option<PathBuf>)> {
+        self.running_foreground_sessions_with(pty::process_name)
+    }
+
+    /// Resolver-injected variant so the fallback is testable on hosts where
+    /// `ps` / `/proc` is unavailable.
+    fn running_foreground_sessions_with<F>(
+        &self,
+        resolve_process: F,
+    ) -> Vec<(u32, Option<String>, Option<PathBuf>)>
+    where
+        F: Fn(i32) -> Option<String>,
+    {
+        let snapshot: Vec<(u32, Option<i32>, Option<PathBuf>)> = {
+            let sessions = self.lock_sessions();
+            sessions
+                .iter()
+                .filter(|(_, s)| s.state == SessionState::Running && s.kind == SessionKind::Pty)
+                .map(|(id, s)| (*id, foreground_pid(s), s.spec.cwd.clone()))
+                .collect()
+        };
+        snapshot
+            .into_iter()
+            .map(|(id, pid, cwd)| (id, pid.and_then(&resolve_process), cwd))
+            .collect()
+    }
+
     /// (total sessions, total transcript sessions, transcript-count-per-lead).
     /// Cheap snapshot under the lock for the pane-limit checks.
     pub fn transcript_stats(&self) -> (usize, usize, HashMap<u32, usize>) {

@@ -667,6 +667,8 @@ teammates:
   hook_notifications: true  # default true。teammate-lifecycle 受信時の toast 可否
   global_max_panes: 6       # default 6、1..9 に clamp（Phase 4.1 で使用）
   hooks_scope: user         # "user" | "project"、default "user"
+  teammate_binaries: [claude]  # default ["claude"]。手打ち起動を暗黙 observe lead 扱いにする
+                               # フォアグラウンドプロセス名の許可リスト（空リストは既定へ縮退）
 ```
 
 - 未知fieldは無視、欠落はデフォルト補完。`agents[].teams` は Phase 4.1 のため今回は未対応。
@@ -795,11 +797,19 @@ type SessionInfo = {
 
 ### lead 帰属
 
-- **lead 候補** = 実行中（running）の PTY セッションのうち、mterm.yml 定義に `teams.enabled: true` を持つもの。
+- **lead 候補（明示）** = 実行中（running）の PTY セッションのうち、mterm.yml 定義に `teams.enabled: true` を持つもの。
+- **lead 候補（暗黙 / フォアグラウンド）** = 明示 lead が **1つも無い**ときのフォールバック。running な PTY セッションの
+  フォアグラウンドプロセス名が teammate 対象バイナリ（`teammates.teammate_binaries`、既定 `["claude"]`）に一致するものを
+  **observe 専用**の暗黙 lead として候補に含める。これにより shell ペインで **手打ち起動した `claude`**（`spec.name = None`）でも
+  observe が動く。暗黙 lead は agent 定義に紐づかないため設定は observe 既定（`max_panes=3`、`transcript_tail=true`、`is_host=false`）で、
+  グローバル `teammates.enabled: true` が前提（`false`／未設定なら候補化しない）。**明示 lead が存在すれば常にそれを優先し、暗黙 lead は使わない**。
+  host 経路には波及しない（host は明示 opt-in の named lead のみ）。
 - hook payload の `cwd` を正規化パス（canonicalize、失敗時は入力パス）で lead 候補の cwd と比較し、
   **一致する候補**へ帰属（複数一致時は最小 id）。
 - cwd 一致が無い場合、lead 候補が **ちょうど1つ**ならそれへ帰属。
-- それも無ければ **ペインを作らずログ（stderr）のみ**。
+- それも無ければ **ペインを作らずログ（stderr）のみ**。加えて `teammates.enabled: true` のときは
+  `teammate-banner` で「サブエージェントを検知したが teams 有効な lead が見つからない」旨をトースト通知する
+  （▶ チップからの起動 or `teammates.enabled` 確認を促す。`teammates.enabled: false` の間は黙る）。
 
 ### 上限（超過時はセッションを作らず日本語バナー通知のみ）
 
@@ -834,7 +844,7 @@ type SessionInfo = {
 | event | payload | 説明 |
 |---|---|---|
 | `transcript-output` | `{ id: number, text: string }` | tail が整形した **追記分のみ**（既存 `pty-output` とは別イベント）。generation で stale 抑止 |
-| `teammate-banner` | `{ message: string }` | ペイン上限超過時のバナー（frontend は `ui.errorBanner` に表示） |
+| `teammate-banner` | `{ message: string }` | ペイン上限超過時、および lead 未マッチ時（`teammates.enabled: true` のみ）のバナー（frontend は `ui.errorBanner` に表示） |
 
 ## ProjectState
 

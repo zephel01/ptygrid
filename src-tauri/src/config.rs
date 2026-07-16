@@ -62,7 +62,7 @@ impl QueenConfig {
 /// Phase 4.0 global `teammates:` block. Governs whether teammate hook events
 /// are emitted/toasted and where `register_teammate_hooks` writes by default.
 /// `agents[].teams` (per-agent teammate config) is Phase 4.1, not parsed here.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TeammatesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -72,6 +72,12 @@ pub struct TeammatesConfig {
     pub global_max_panes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks_scope: Option<HooksScope>,
+    /// argv0 basenames treated as teammate leads when a `claude` (or compatible)
+    /// CLI is started by hand in a shell pane. Used by the Phase 4.1 implicit
+    /// observe fallback (a foreground process match becomes a lead when no
+    /// explicit `teams.enabled` named lead exists). Default `["claude"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate_binaries: Option<Vec<String>>,
 }
 
 impl TeammatesConfig {
@@ -90,6 +96,15 @@ impl TeammatesConfig {
     }
     pub fn effective_hooks_scope(&self) -> HooksScope {
         self.hooks_scope.unwrap_or_default()
+    }
+    /// argv0 basenames that count as an implicit observe lead when started by
+    /// hand. Default `["claude"]`. Empty lists collapse to the default so a
+    /// `teammate_binaries: []` never silently disables the fallback.
+    pub fn effective_teammate_binaries(&self) -> Vec<String> {
+        match &self.teammate_binaries {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec!["claude".to_string()],
+        }
     }
 }
 

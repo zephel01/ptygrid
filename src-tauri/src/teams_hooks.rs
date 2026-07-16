@@ -391,6 +391,84 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether any running named PTY session maps to a `teams.enabled` lead. When
+/// true the implicit foreground fallback is skipped entirely (and the caller
+/// avoids the `ps` cost of resolving foreground names).
+fn has_named_lead(
+    named_sessions: &[(u32, Option<String>, Option<PathBuf>)],
+    cfg: &crate::config::Config,
+) -> bool {
+    named_sessions.iter().any(|(_, name, _)| {
+        name.as_deref()
+            .and_then(|n| cfg.agents.iter().find(|d| d.name == n))
+            .and_then(|d| d.teams.as_ref())
+            .is_some_and(|t| t.effective_enabled())
+    })
+}
+
+/// Build the lead candidates for a `SubagentStart`.
+///
+/// Explicit `teams.enabled` named PTY sessions are always preferred. Only when
+/// none exist do foreground processes whose name is a configured teammate
+/// binary (`teammates.teammate_binaries`, default `["claude"]`) become implicit
+/// **observe** leads — this is what lets a hand-started `claude` drive observe
+/// panes. Implicit leads use the observe defaults (max_panes 3, transcript_tail
+/// true) and never take the host path. The implicit branch additionally
+/// requires `teammates.enabled` (defensive; the hook receiver already gates on
+/// it before calling this).
+fn build_lead_candidates(
+    named_sessions: &[(u32, Option<String>, Option<PathBuf>)],
+    foreground_sessions: &[(u32, Option<String>, Option<PathBuf>)],
+    cfg: &crate::config::Config,
+) -> Vec<LeadCandidate> {
+    let mut leads: Vec<LeadCandidate> = Vec::new();
+    for (id, name, cwd) in named_sessions {
+        let Some(name) = name.as_deref() else { continue };
+        let Some(def) = cfg.agents.iter().find(|d| d.name == name) else {
+            continue;
+        };
+        let teams = match &def.teams {
+            Some(t) if t.effective_enabled() => t,
+            _ => continue,
+        };
+        leads.push(LeadCandidate {
+            id: *id,
+            cwd: cwd.as_deref().map(normalize_path),
+            max_panes: teams.effective_max_panes(),
+            transcript_tail: teams.effective_transcript_tail(),
+            is_host: teams.is_host(),
+            fallback_to_observe: teams.effective_fallback_to_observe(),
+        });
+    }
+    if !leads.is_empty() {
+        return leads;
+    }
+
+    // Fallback: implicit observe leads from foreground teammate binaries.
+    let teammates = cfg.teammates.clone().unwrap_or_default();
+    if !teammates.effective_enabled() {
+        return leads;
+    }
+    let binaries = teammates.effective_teammate_binaries();
+    let defaults = crate::config::AgentTeamsConfig::default();
+    for (id, fg, cwd) in foreground_sessions {
+        let Some(fg) = fg.as_deref() else { continue };
+        if !binaries.iter().any(|b| b == fg) {
+            continue;
+        }
+        leads.push(LeadCandidate {
+            id: *id,
+            cwd: cwd.as_deref().map(normalize_path),
+            max_panes: defaults.effective_max_panes(),
+            transcript_tail: defaults.effective_transcript_tail(),
+            // Implicit leads are observe-only; host is explicit opt-in.
+            is_host: false,
+            fallback_to_observe: false,
+        });
+    }
+    leads
+}
+
 /// `SubagentStart`: attribute to a lead, apply pane limits, and (on Create)
 /// spawn a validated read-only transcript session.
 fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) {
@@ -401,26 +479,17 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
         return;
     };
 
-    // Build lead candidates from running, named PTY sessions with teams.enabled.
-    let mut leads: Vec<LeadCandidate> = Vec::new();
-    for (id, name, cwd) in manager.running_named_sessions() {
-        let Some(name) = name else { continue };
-        let Some(def) = cfg.agents.iter().find(|d| d.name == name) else {
-            continue;
-        };
-        let teams = match &def.teams {
-            Some(t) if t.effective_enabled() => t,
-            _ => continue,
-        };
-        leads.push(LeadCandidate {
-            id,
-            cwd: cwd.as_deref().map(normalize_path),
-            max_panes: teams.effective_max_panes(),
-            transcript_tail: teams.effective_transcript_tail(),
-            is_host: teams.is_host(),
-            fallback_to_observe: teams.effective_fallback_to_observe(),
-        });
-    }
+    // Explicit `teams.enabled` named leads take priority; a hand-started
+    // `claude` in a shell pane is only used as an implicit observe lead when no
+    // explicit lead exists (see `build_lead_candidates`). Resolving foreground
+    // process names may shell out to `ps`, so only do it as a fallback.
+    let named_sessions = manager.running_named_sessions();
+    let foreground_sessions = if has_named_lead(&named_sessions, &cfg) {
+        Vec::new()
+    } else {
+        manager.running_foreground_sessions()
+    };
+    let leads = build_lead_candidates(&named_sessions, &foreground_sessions, &cfg);
 
     let hook_cwd = payload
         .cwd
@@ -486,6 +555,16 @@ fn handle_subagent_start<R: Runtime>(app: &AppHandle<R>, payload: &HookPayload) 
             eprintln!(
                 "teammate hook subagent-start: no teams-enabled lead matched (cwd={:?}); pane not created",
                 payload.cwd
+            );
+            // Surface the miss in the UI (this arm only runs when
+            // `teammates.enabled` is true), so the user knows a subagent was
+            // seen but nothing was attributed. Reuses the `teammate-banner`
+            // path (App.svelte -> ui.errorBanner).
+            let _ = app.emit(
+                "teammate-banner",
+                serde_json::json!({
+                    "message": "サブエージェントを検知しましたが、teams 有効な lead が見つかりませんでした（claude を ▶ チップから起動するか、teammates.enabled を確認してください）。"
+                }),
             );
         }
         PaneDecision::RejectBanner(message) => {
@@ -1030,6 +1109,129 @@ mod tests {
             decide_transcript_pane(Some(&roomy), 0, 0, GRID_MAX_PANES, 99),
             PaneDecision::RejectBanner(_)
         ));
+    }
+
+    // ---------- Phase 4.1: implicit foreground observe leads ----------
+
+    fn parse(yaml: &str) -> crate::config::Config {
+        crate::config::parse_config(yaml).unwrap()
+    }
+
+    fn sess(id: u32, name: Option<&str>, cwd: Option<&str>) -> (u32, Option<String>, Option<PathBuf>) {
+        (id, name.map(String::from), cwd.map(PathBuf::from))
+    }
+
+    #[test]
+    fn named_lead_wins_over_foreground_claude() {
+        let cfg = parse(
+            "agents:\n  - name: lead\n    cmd: claude\n    teams:\n      enabled: true\nteammates:\n  enabled: true",
+        );
+        let named = vec![sess(2, Some("lead"), Some("/proj"))];
+        // A hand-started claude is present too, but the explicit lead wins.
+        let fg = vec![sess(5, Some("claude"), Some("/proj"))];
+        let leads = build_lead_candidates(&named, &fg, &cfg);
+        assert_eq!(leads.len(), 1);
+        assert_eq!(leads[0].id, 2, "explicit named lead is preferred");
+        assert!(has_named_lead(&named, &cfg));
+    }
+
+    #[test]
+    fn foreground_claude_becomes_implicit_observe_lead() {
+        let cfg = parse("agents: []\nteammates:\n  enabled: true");
+        let fg = vec![sess(5, Some("claude"), Some("/proj"))];
+        let leads = build_lead_candidates(&[], &fg, &cfg);
+        assert_eq!(leads.len(), 1);
+        let l = &leads[0];
+        assert_eq!(l.id, 5);
+        assert!(!l.is_host, "implicit leads are observe-only");
+        assert_eq!(l.max_panes, 3, "observe default max_panes");
+        assert!(l.transcript_tail, "observe default transcript_tail");
+        assert!(!has_named_lead(&[], &cfg));
+    }
+
+    #[test]
+    fn foreground_non_binary_is_ignored() {
+        let cfg = parse("agents: []\nteammates:\n  enabled: true");
+        // A plain shell foreground is not a teammate binary.
+        let fg = vec![sess(5, Some("bash"), None), sess(6, None, None)];
+        assert!(build_lead_candidates(&[], &fg, &cfg).is_empty());
+    }
+
+    #[test]
+    fn foreground_lead_requires_teammates_enabled() {
+        // teammates.enabled: false -> no implicit lead even with a fg claude.
+        let disabled = parse("agents: []\nteammates:\n  enabled: false");
+        let fg = vec![sess(5, Some("claude"), None)];
+        assert!(build_lead_candidates(&[], &fg, &disabled).is_empty());
+        // No teammates block at all -> disabled by default -> no implicit lead.
+        let none = parse("agents: []");
+        assert!(build_lead_candidates(&[], &fg, &none).is_empty());
+    }
+
+    #[test]
+    fn foreground_lead_honors_custom_teammate_binaries() {
+        let cfg = parse("agents: []\nteammates:\n  enabled: true\n  teammate_binaries: [claude-next]");
+        let fg = vec![sess(5, Some("claude-next"), None), sess(6, Some("claude"), None)];
+        let leads = build_lead_candidates(&[], &fg, &cfg);
+        assert_eq!(leads.len(), 1);
+        assert_eq!(leads[0].id, 5, "only the configured binary matches");
+    }
+
+    #[test]
+    fn has_named_lead_ignores_non_enabled_definitions() {
+        // Named session mapping to a definition without teams.enabled.
+        let cfg = parse("agents:\n  - name: lead\n    cmd: claude");
+        assert!(!has_named_lead(&[sess(1, Some("lead"), None)], &cfg));
+    }
+
+    // ---------- Phase 4.1: no-lead banner notification ----------
+
+    #[test]
+    fn no_lead_emits_banner_when_enabled() {
+        let app = enabled_app();
+        app.manage(PtyManager::new());
+        let (tx, rx) = mpsc::channel::<String>();
+        app.listen("teammate-banner", move |e| {
+            let _ = tx.send(e.payload().to_string());
+        });
+        // No running sessions -> no lead can be attributed.
+        let payload = HookPayload {
+            session_id: Some("s1".into()),
+            agent_id: Some("a1".into()),
+            cwd: Some("/nowhere".into()),
+            ..Default::default()
+        };
+        handle_subagent_start(&app, &payload);
+        let msg = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no-lead miss must emit a teammate-banner");
+        assert!(msg.contains("lead"), "banner mentions the missing lead: {msg}");
+    }
+
+    #[tokio::test]
+    async fn disabled_no_lead_does_not_emit_banner() {
+        // The whole orchestration path is gated on teammates.enabled, so a
+        // disabled app never emits the no-lead banner.
+        let app = disabled_app();
+        app.manage(PtyManager::new());
+        let (tx, rx) = mpsc::channel::<String>();
+        app.listen("teammate-banner", move |e| {
+            let _ = tx.send(e.payload().to_string());
+        });
+        let addr = serve(app, "secret").await;
+        let code = post(
+            addr,
+            "/hooks/v1/subagent-start",
+            Some("Bearer secret"),
+            Some("application/json"),
+            BODY,
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "disabled app must not emit a no-lead banner"
+        );
     }
 
     // ---------- HTTP receiver ----------
