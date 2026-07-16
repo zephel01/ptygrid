@@ -610,6 +610,27 @@
     ui.maximizedId = ui.maximizedId === id ? null : id;
   }
 
+  // A teammate pane (observe transcript or host PTY) that has finished, i.e.
+  // its subagent/teammate reported Stop and the session is `exited`.
+  function isFinishedTeammatePane(id: number): boolean {
+    const s = ui.sessions[id];
+    if (!s) return false;
+    const isTeammate = s.kind === "transcript" || s.teammate?.mode === "host";
+    return isTeammate && s.state === "exited";
+  }
+
+  // Panes eligible for the bulk "close finished" action.
+  let finishedTeammatePaneIds = $derived(
+    ui.panes.filter((id) => isFinishedTeammatePane(id)),
+  );
+
+  // Close every finished teammate pane at once. read-only transcripts stop
+  // their tail; finished host teammates are already dead, so no process is
+  // killed that wasn't already gone.
+  function closeFinishedTeammatePanes(): void {
+    for (const id of [...finishedTeammatePaneIds]) closePane(id);
+  }
+
   // Phase 4.1 transcript pane header, e.g. `claude·sub #7 ▸reviewer 📖RO`.
   function transcriptTitle(id: number): string {
     const role = ui.sessions[id]?.teammate?.role;
@@ -1012,6 +1033,17 @@
                 {registering ? "登録中…" : "settings.json へ登録 (user)"}
               </button>
             </div>
+            {#if finishedTeammatePaneIds.length > 0}
+              <div class="tm-actions">
+                <button
+                  class="btn btn-small"
+                  onclick={closeFinishedTeammatePanes}
+                  title="終了した teammate / transcript ペインをまとめて閉じます（実体には影響しません）"
+                >
+                  終了したペインを一括で閉じる（{finishedTeammatePaneIds.length}）
+                </button>
+              </div>
+            {/if}
             <div class="tm-events">
               <div class="tm-subhead">host モード（実 PTY teammate）</div>
               {#if (ui.teamsHost?.leads.length ?? 0) === 0 && orphanTeammates.length === 0}
@@ -1163,6 +1195,14 @@
                             ↳#{session.teammate.leadId}
                           </span>
                         {/if}
+                        {#if stopped}
+                          <span
+                            class="finished-tag"
+                            title="subagent は終了しました（閉じても影響なし）"
+                          >
+                            終了
+                          </span>
+                        {/if}
                         <span class="spacer"></span>
                         <button
                           class="pane-btn"
@@ -1198,6 +1238,12 @@
                           ↳#{session.teammate.leadId}
                         </span>
                         {#if session?.state === "exited"}
+                          <span
+                            class="finished-tag"
+                            title="teammate は終了しました"
+                          >
+                            終了
+                          </span>
                           <span class="exit-code">
                             exit {session.code ?? "?"}
                           </span>
@@ -2020,6 +2066,18 @@
     color: #8a9aa8;
     font-family: Menlo, monospace;
     font-size: 10px;
+  }
+
+  /* Explicit "finished" tag so a stopped teammate/transcript pane is legible
+     without relying on the small state dot's color alone. */
+  .finished-tag {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border-radius: 3px;
+    background: #5a2d2d;
+    color: #f0b8b8;
+    font-size: 10px;
+    font-weight: 700;
   }
 
   /* teammate-focus pulse: a short accent ring around the focused pane */
