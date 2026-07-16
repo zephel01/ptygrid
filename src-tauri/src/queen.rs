@@ -296,7 +296,7 @@ pub struct ReadOutputRequest {
     #[schemars(description = "number of trailing lines to return (default 100, 1..1000)")]
     pub lines: Option<u32>,
     #[schemars(
-        description = "if true, return untouched bytes (default false = ANSI stripped + CR overwrites folded)"
+        description = "if true, return untouched bytes (default false = terminal screen reconstructed from ANSI cursor/erase operations and CR overwrites)"
     )]
     pub raw: Option<bool>,
 }
@@ -504,13 +504,13 @@ impl QueenServer {
         let id = manager
             .resolve_agent(&agent)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let text = manager
-            .output_text(id)
+        let (text, rows, cols) = manager
+            .output_snapshot(id)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         let text = if raw.unwrap_or(false) {
             text
         } else {
-            crate::ansi::fold_cr(&crate::ansi::strip_ansi(&text))
+            crate::ansi::render_terminal(&text, rows, cols)
         };
         let n = lines.unwrap_or(100).clamp(1, 1000) as usize;
         let text = tail_lines(&text, n);
@@ -863,8 +863,12 @@ impl ServerHandler for QueenServer {
                  send_message to type into a pane, spawn_agent to start a \
                  config-defined agent, notify to toast the user, and durable \
                  pins/notes and durable inbox/reply/await to coordinate \
-                 project knowledge. When multiple \
-                 sessions share a name, address the exact session as #<id>.",
+                 project knowledge. A user phrase such as \"grok #2\", \
+                 \"codex #3\", or \"#2で作業させて\" identifies an existing \
+                 ptygrid pane, not a request to launch a new CLI process. \
+                 First call list_agents to verify the id, then use \
+                 read_output/send_message for that exact #<id>. When multiple \
+                 sessions share a name, always address the exact session as #<id>.",
         )
     }
 }

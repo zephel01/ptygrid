@@ -570,14 +570,19 @@ impl PtyManager {
             .collect()
     }
 
-    /// Full ring-buffer contents of a session as a lossy string (Queen
-    /// read_output; spans restarts).
-    pub fn output_text(&self, id: u32) -> Result<String, String> {
+    /// Full ring-buffer contents and current terminal dimensions (Queen
+    /// read_output; spans restarts). Dimensions let the text renderer apply
+    /// full-screen TUI cursor movements with the same bounds as the pane.
+    pub fn output_snapshot(&self, id: u32) -> Result<(String, u16, u16), String> {
         let sessions = self.lock_sessions();
         let slot = sessions
             .get(&id)
             .ok_or_else(|| format!("session {id} not found"))?;
-        Ok(String::from_utf8_lossy(&slot.output).to_string())
+        Ok((
+            String::from_utf8_lossy(&slot.output).to_string(),
+            slot.rows,
+            slot.cols,
+        ))
     }
 
     /// Queen resolves `"#<id>"` first, then an exact unique definition/session
@@ -1286,7 +1291,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = String::new();
         while Instant::now() < deadline {
-            seen = manager.output_text(id).unwrap();
+            seen = manager.output_snapshot(id).unwrap().0;
             if seen.contains("ping-42") {
                 break;
             }

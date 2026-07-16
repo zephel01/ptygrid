@@ -134,7 +134,7 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 | tool | 引数 (JSON Schema相当) | 返り値(text content) | 説明 |
 |---|---|---|---|
 | `list_agents` | なし | JSON: `{ sessions: SessionInfo[], definitions: [{name, kind:"agent"\|"process", running:boolean}] }` | 実行中セッションと、mterm.yml定義（起動可能なもの）の一覧 |
-| `read_output` | `{ agent: string, lines?: int (default 100, 1..1000), raw?: bool (default false) }` | `{ agent, id, text }` のJSON | 指定エージェントの直近出力。`agent` は定義名 or `"#<id>"`。raw=false ならANSIエスケープ除去済みテキスト |
+| `read_output` | `{ agent: string, lines?: int (default 100, 1..1000), raw?: bool (default false) }` | `{ agent, id, text }` のJSON | 指定エージェントの直近出力。`agent` は定義名 or `"#<id>"`。raw=false ならペイン寸法を使ってANSIカーソル移動・消去・alternate screenを再構成したテキスト |
 | `send_message` | `{ agent: string, text: string, submit?: bool (default true) }` | `"ok"` | 対象セッションのstdinへ書き込み。submit=true なら末尾に `\r` を付与 |
 | `spawn_agent` | `{ name: string }` | `{ id }` のJSON | **mterm.yml で定義された名前のみ**起動可（許可リスト方式）。未定義名はエラー |
 | `notify` | `{ title: string, message: string }` | `"ok"` | フロントにトースト通知を出す |
@@ -169,7 +169,7 @@ type SessionState = "starting"|"running"|"exited"|"restarting";
 2. **名前解決の拡張(当時)**: `read_output` / `send_message`の`agent`は「定義名 →
    session名 → foreground process名 → `#<id>`」へ拡張した。複数match時に最新IDを選ぶ規則は
    Phase 3.6で廃止され、現在は候補IDを返して曖昧errorにする。
-3. **read_output のCR処理**: ANSI除去後、各行について `\r` で上書きされた部分を畳み込み、最終状態のみ返す（TUIスピナー残骸対策）。`raw: true` では従来通り無加工。
+3. **read_output のterminal再構成**: ペインのrows/colsを境界に、`\r`、CSIカーソル移動、画面/行消去、save/restore cursor、alternate screenを適用して現在の表示とscrollbackをテキスト化する。色など表示専用のsequenceは無視する。`raw: true`では従来通り無加工。
 4. **send_message の説明文強化**: MCPツールのdescriptionに「対話型TUIのcomposerに未送信テキストが残っている場合があるため、送信前に read_output で状態確認を推奨。text を空にして submit=true でEnterのみ送出可能」と明記（挙動自体は不変）。
 
 ---
