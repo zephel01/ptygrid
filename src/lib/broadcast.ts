@@ -101,6 +101,41 @@ export function selectCdTargets(
  *   buildCdCommand("~/works/x")  => cd ~'/works/x'
  *   buildCdCommand("~")          => cd ~
  */
+/**
+ * Resolve a bulk-cd directory input against an optional projects root.
+ *
+ * Rules (applied after trimming leading/trailing whitespace):
+ *  - An **absolute** path (`/...`) or a **home-relative** path (`~` / `~/...`)
+ *    is returned unchanged — the user asked for an explicit location.
+ *  - Any other value is treated as a **bare project name** relative to `root`:
+ *    when `root` is a non-empty string the result is `<root>/<input>`
+ *    (a single trailing `/` on `root` is not doubled); when `root` is null or
+ *    empty the input is returned as-is (best effort — the shell resolves it
+ *    against its own cwd).
+ *  - An empty input returns `""` regardless of `root`.
+ *
+ * The returned string is a path, not a shell command; feed it to
+ * {@link buildCdCommand} (which handles the leading `~` and quoting). So a
+ * `~`-prefixed root flows through untouched: `resolveCdInput("notemake",
+ * "~/works/project")` => `~/works/project/notemake`.
+ *
+ * Examples:
+ *   resolveCdInput("notemake", "~/works/project") => "~/works/project/notemake"
+ *   resolveCdInput("/etc",     "~/works/project") => "/etc"
+ *   resolveCdInput("~/tmp",    "~/works/project") => "~/tmp"
+ *   resolveCdInput("x",        null)              => "x"
+ */
+export function resolveCdInput(input: string, root: string | null): string {
+  const trimmed = input.trim();
+  if (trimmed === "") return "";
+  if (trimmed.startsWith("/") || trimmed === "~" || trimmed.startsWith("~/")) {
+    return trimmed;
+  }
+  const base = (root ?? "").trim();
+  if (base === "") return trimmed;
+  return `${base.replace(/\/+$/, "")}/${trimmed}`;
+}
+
 export function buildCdCommand(dir: string): string {
   const quote = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
   // Split off a leading ~ that is followed by end-of-string or a path separator.

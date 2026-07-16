@@ -6,6 +6,7 @@
 
 use tauri::{AppHandle, State};
 
+use crate::app_settings::{self, ProjectDirs, ProjectsRoot};
 use crate::config::{ConfigInfo, ConfigManager};
 use crate::git_service::{self, GitCommitInfo, GitDiffInfo, GitStatusInfo};
 use crate::project_state::{self, LogicalSession, ProjectState};
@@ -144,6 +145,26 @@ pub fn resume_logical_session(
         }
         LogicalSession::Shell => manager.spawn_shell(app, cols, rows, None, None),
     }
+}
+
+/// Return the persisted projects root (bulk-cd helper), or `null` when unset.
+#[tauri::command]
+pub fn get_projects_root(app: AppHandle) -> Result<ProjectsRoot, String> {
+    app_settings::get_root(&app)
+}
+
+/// Validate (`~` expanded, must be an existing directory) and persist the
+/// projects root. Returns the stored (verbatim) root.
+#[tauri::command]
+pub fn set_projects_root(app: AppHandle, root: String) -> Result<ProjectsRoot, String> {
+    app_settings::set_root(&app, root)
+}
+
+/// List non-hidden directory names directly under the saved projects root,
+/// sorted, capped at 200 (`truncated` flags overflow).
+#[tauri::command]
+pub fn list_project_dirs(app: AppHandle) -> Result<ProjectDirs, String> {
+    app_settings::list_dirs(&app)
 }
 
 fn project_dir(config: &ConfigManager, dir: Option<String>) -> Result<std::path::PathBuf, String> {

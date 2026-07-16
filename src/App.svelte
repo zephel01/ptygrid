@@ -17,7 +17,11 @@
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
-  import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
+  import {
+    buildCdCommand,
+    resolveCdInput,
+    selectCdTargets,
+  } from "./lib/broadcast";
   import type {
     ConfigInfo,
     LogicalSession,
@@ -228,6 +232,17 @@
   let cdDir = $state("");
   let cdIncludeNonShell = $state(false);
   let cdWrapEl = $state<HTMLElement | undefined>(undefined);
+  // ---- projects root (bulk-cd helper) ----
+  // Persisted app setting: a fixed parent dir whose child folders are the
+  // usual cd targets. `null` until fetched / when never configured.
+  let cdProjectsRoot = $state<string | null>(null);
+  let cdRootInput = $state(""); // edit field for changing the root
+  let cdRootError = $state("");
+  let cdProjectDirs = $state<string[]>([]);
+  let cdDirsTruncated = $state(false);
+  let cdDirsError = $state("");
+  // Which listed folder is currently selected (for highlight); "" = none.
+  let cdSelectedDir = $state("");
 
   // Ordered SessionInfo for the currently open panes (skips ids with no entry).
   let cdPaneSessions = $derived(
@@ -256,7 +271,69 @@
 
   function toggleCdPopover(): void {
     cdPopoverOpen = !cdPopoverOpen;
-    if (cdPopoverOpen) void refreshForegroundInfo();
+    if (cdPopoverOpen) {
+      void refreshForegroundInfo();
+      void loadProjectsRoot();
+    }
+  }
+
+  // Fetch the persisted projects root, then (if set) its child folders. Runs
+  // each time the popover opens so external changes are reflected.
+  async function loadProjectsRoot(): Promise<void> {
+    if (!isTauri()) return;
+    cdRootError = "";
+    try {
+      const res = await invokeCmd<{ root: string | null }>("get_projects_root");
+      cdProjectsRoot = res.root;
+      cdRootInput = res.root ?? "";
+      if (res.root) await loadProjectDirs();
+      else {
+        cdProjectDirs = [];
+        cdDirsTruncated = false;
+      }
+    } catch (err) {
+      cdRootError = `プロジェクトルートの取得に失敗しました: ${err}`;
+    }
+  }
+
+  async function loadProjectDirs(): Promise<void> {
+    if (!isTauri()) return;
+    cdDirsError = "";
+    try {
+      const res = await invokeCmd<{
+        root: string;
+        dirs: string[];
+        truncated: boolean;
+      }>("list_project_dirs");
+      cdProjectDirs = res.dirs;
+      cdDirsTruncated = res.truncated;
+    } catch (err) {
+      cdProjectDirs = [];
+      cdDirsTruncated = false;
+      cdDirsError = `フォルダ一覧の取得に失敗しました: ${err}`;
+    }
+  }
+
+  async function saveProjectsRoot(): Promise<void> {
+    if (!isTauri()) return;
+    cdRootError = "";
+    try {
+      const res = await invokeCmd<{ root: string | null }>(
+        "set_projects_root",
+        { root: cdRootInput.trim() },
+      );
+      cdProjectsRoot = res.root;
+      cdSelectedDir = "";
+      await loadProjectDirs();
+    } catch (err) {
+      cdRootError = `${err}`;
+    }
+  }
+
+  // Click a listed folder: select it and drop `<root>/<name>` into the input.
+  function pickProjectDir(name: string): void {
+    cdSelectedDir = name;
+    cdDir = resolveCdInput(name, cdProjectsRoot);
   }
 
   // Close the popover on Escape or an outside click while it is open.
@@ -279,7 +356,9 @@
   });
 
   async function sendBulkCd(): Promise<void> {
-    const dir = cdDir.trim();
+    // A bare relative name is resolved against the projects root; absolute and
+    // `~`-prefixed inputs pass through unchanged (see resolveCdInput).
+    const dir = resolveCdInput(cdDir, cdProjectsRoot);
     const targets = cdTargets;
     if (dir === "" || targets.length === 0) return;
     const cmd = buildCdCommand(dir);
@@ -731,11 +810,78 @@
           <p class="tm-note">
             開いているペインへ <code>cd &lt;dir&gt;</code> + Enter をまとめて送信します。
           </p>
+
+          <!-- projects root: fixed parent whose child folders are cd targets -->
+          <div class="cd-root">
+            <div class="cd-root-head">
+              <span class="cd-root-label">プロジェクトルート</span>
+              {#if cdProjectsRoot}
+                <code class="cd-root-cur" title={cdProjectsRoot}
+                  >{cdProjectsRoot}</code
+                >
+              {/if}
+            </div>
+            {#if !cdProjectsRoot}
+              <p class="tm-note cd-root-hint">
+                置き場所を設定すると、直下のフォルダ一覧から選んで一括cdできます。
+              </p>
+            {/if}
+            <div class="cd-root-edit">
+              <input
+                class="cd-input cd-root-input"
+                type="text"
+                placeholder="~/works/project"
+                bind:value={cdRootInput}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") saveProjectsRoot();
+                }}
+              />
+              <button
+                class="btn btn-small"
+                onclick={saveProjectsRoot}
+                disabled={cdRootInput.trim() === ""}
+                title="プロジェクトルートを保存"
+              >
+                保存
+              </button>
+            </div>
+            {#if cdRootError}
+              <p class="cd-warn cd-root-err">{cdRootError}</p>
+            {/if}
+          </div>
+
+          {#if cdProjectsRoot}
+            {#if cdDirsError}
+              <p class="cd-warn">{cdDirsError}</p>
+            {:else if cdProjectDirs.length === 0}
+              <p class="tm-note">ルート直下にフォルダがありません。</p>
+            {:else}
+              <div class="cd-dirs" role="listbox" aria-label="プロジェクト一覧">
+                {#each cdProjectDirs as name (name)}
+                  <button
+                    type="button"
+                    class="cd-dir"
+                    class:cd-dir-active={cdSelectedDir === name}
+                    role="option"
+                    aria-selected={cdSelectedDir === name}
+                    onclick={() => pickProjectDir(name)}
+                    title={name}
+                  >
+                    {name}
+                  </button>
+                {/each}
+              </div>
+              {#if cdDirsTruncated}
+                <p class="cd-warn">一覧は200件で打ち切られています。</p>
+              {/if}
+            {/if}
+          {/if}
+
           <!-- svelte-ignore a11y_autofocus -->
           <input
             class="cd-input"
             type="text"
-            placeholder="/path/to/project または ~/works/..."
+            placeholder="notemake / /path/to/project / ~/works/..."
             bind:value={cdDir}
             autofocus
             onkeydown={(e) => {
@@ -1397,6 +1543,89 @@
 
   .cd-input::placeholder {
     color: #777;
+  }
+
+  /* ---- projects root row + folder list ---- */
+
+  .cd-root {
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #3a3a3a;
+  }
+
+  .cd-root-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .cd-root-label {
+    color: #cfcfcf;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .cd-root-cur {
+    font-family: Menlo, monospace;
+    font-size: 10px;
+    color: #9cdcfe;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 170px;
+  }
+
+  .cd-root-hint {
+    margin: 2px 0 6px;
+  }
+
+  .cd-root-edit {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .cd-root-input {
+    margin-bottom: 0;
+  }
+
+  .cd-root-err {
+    word-break: break-word;
+  }
+
+  .cd-dirs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-height: 120px;
+    overflow-y: auto;
+    margin-bottom: 8px;
+  }
+
+  .cd-dir {
+    background: #1b1b1b;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cd-dir:hover {
+    border-color: #5a7a9a;
+  }
+
+  .cd-dir-active {
+    background: #3b5b7a;
+    color: #fff;
+    border-color: #3b5b7a;
   }
 
   .cd-check {

@@ -851,3 +851,61 @@ legacy filenameを引き続き受理し、wire formatは変更しない。
 - UI文言・README・userguide・exampleを`ptygrid.yml`表記へ更新。注釈付き全項目
   サンプルは`ptygrid.example.yml`（旧`mterm.example.yml`）、用途別スターターは
   `example/{basic,multi-agent,web-dev,worktree,teammates}/ptygrid.yml`に配置。
+
+---
+
+# app settings と projects root（cd補助）
+
+一括cdポップオーバー向けに、プロジェクトの**置き場所（projects root）**をアプリ全体の
+設定として永続化する。project stateと違いprojectには紐付かない、app-global設定。
+
+## ファイル位置とスキーマ
+
+- 保存先はTauri app-data直下の`app-settings.json`（`project-state/`とは別階層）。
+  repository内には書かない。
+- `version: 1`必須。未知versionは黙って開かず、明確なエラーを返す（`project_state`と
+  同じ流儀）。書き込みはtemp file + renameのatomic。
+
+```jsonc
+{ "version": 1, "projectsRoot": "~/works/project" }
+```
+
+- `projectsRoot`は**ユーザーが入力したままの文字列**（先頭`~`を含む）で保存する。
+  移植性のため`~`はファイル内で展開しない。未設定なら当該キーは省略され、
+  `get_projects_root`は`null`を返す。
+- `~` / `~/...` の展開は**実際にpathへ触れる時だけ**（検証・一覧取得）ホームディレクトリへ
+  展開する。`~name`（named home）は特別扱いせずそのまま扱う。
+
+## Tauri Commands
+
+| command | args | returns | 説明 |
+|---|---|---|---|
+| `get_projects_root` | `()` | `{ root: string \| null }` | 保存済みルート（verbatim）。未設定は`null` |
+| `set_projects_root` | `{ root: string }` | `{ root: string \| null }` | `~`展開後に「存在するディレクトリ」であることを検証してから保存し、保存値を返す |
+| `list_project_dirs` | `()` | `{ root, dirs: string[], truncated: boolean }` | 保存済みルート直下の**非隠しディレクトリ名**をソートして返す |
+
+## 検証とエラー
+
+- `set_projects_root`: trim後に空文字は拒否。`~`展開後のpathが存在しない／
+  ディレクトリでない場合は明確なエラー文字列（例: `... is not a directory`）を返し、
+  保存しない。
+- `list_project_dirs`: ルート未設定は`projects root is not set`、保存済みルートが
+  消失／アクセス不可なら明確なエラー。
+
+## 一覧の上限とフィルタ
+
+- ルート直下のみ（再帰しない）。**dotで始まる名前**（隠しディレクトリ・ファイル）と
+  **通常ファイル**は除外し、ディレクトリ名だけをOSソートで返す。symlinkは実体が
+  ディレクトリなら含める。
+- 返す件数の上限は**200件**。超過分は切り捨て、`truncated: true`を立てる。
+
+## Frontend（一括cdポップオーバー拡張）
+
+- ポップオーバー上部に「プロジェクトルート」行（現在値表示＋変更用入力＋保存ボタン、
+  エラーはポップオーバー内に表示、未設定時は設定を促す一文）。
+- ルート設定済みなら開いた時に`list_project_dirs`でフォルダ一覧を出し、クリックで選択
+  （ハイライト）＋入力欄に`<root>/<name>`を投入。
+- 手入力の解決規則は純関数`resolveCdInput(input, root)`（`src/lib/broadcast.ts`）:
+  `/`または`~`始まりはそのまま、それ以外はrootがあれば`<root>/<input>`、無ければそのまま。
+  解決後の文字列を既存の`buildCdCommand`（`~`先頭とquote処理済み）へ渡す。
+- 対象選択（シェルのみ/全ペイン）・プレビュー・送信の挙動は不変。
