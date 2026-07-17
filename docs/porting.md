@@ -1,3 +1,5 @@
+**日本語** · [English](porting.en.md)
+
 # クロスプラットフォーム移植ガイド (Linux / Windows)
 
 現状は **macOSを主対象**とし、Linuxは**テスト対応（beta）**です。本ドキュメントは

@@ -1,3 +1,5 @@
+**日本語** · [English](troubleshooting.en.md)
+
 # Troubleshooting
 
 ## Queen MCPから別ペインへ接続できない(2026-07-16の事例)

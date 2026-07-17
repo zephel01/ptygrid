@@ -1,3 +1,5 @@
+**日本語** · [English](design.en.md)
+
 # ptygrid 設計・アーキテクチャ
 
 更新日: 2026-07-16 / 実装基準: Phase 3.9

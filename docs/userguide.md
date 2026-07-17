@@ -1,3 +1,5 @@
+**日本語** · [English](userguide.en.md)
+
 # ptygrid ユーザーガイド
 
 ptygrid のインストールから、`ptygrid.yml` の書き方、Queen(内蔵 MCP サーバー)を使った

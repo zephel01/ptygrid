@@ -1,3 +1,5 @@
+**日本語** · [English](competitive-landscape.en.md)
+
 # 競合調査: 類似ツールの比較 (Competitive Landscape)
 
 調査日: 2026-07-16(grok による Web 横断調査、32+ サイト。docs/design.md の記述を起点に更新)

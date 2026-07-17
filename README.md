@@ -2,6 +2,8 @@
 
 # ptygrid
 
+**日本語** · [English](README.en.md)
+
 **複数の AI エージェント CLI を1画面で並行実行・協調させる、軽量ネイティブターミナル**
 
 Claude Code / Codex / Grok をスプリットペインで同時に走らせ、内蔵 MCP サーバー **Queen** で
