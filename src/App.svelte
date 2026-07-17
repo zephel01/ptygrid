@@ -120,12 +120,6 @@
     }
   });
 
-  // Open the dock on the Git tab (toolbar Git button).
-  function openGitTab(): void {
-    dockTab = "git";
-    statusSidebarOpen = true;
-  }
-
   // Dock resize handle: drag adjusts the active tab's width, clamped per tab.
   function startDockResize(e: PointerEvent): void {
     e.preventDefault();
@@ -326,7 +320,7 @@
   // Toolbar element ref: the badge scrolls with the toolbar's overflow-x, so
   // the open panel must re-anchor on toolbar scroll, not just window resize.
   let toolbarEl = $state<HTMLDivElement | null>(null);
-  let teammatesPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
+  let teammatesPanelPos = $state<{ bottom: number; right: number }>({ bottom: 0, right: 0 });
   let registering = $state(false);
   let regenerating = $state(false);
 
@@ -336,7 +330,7 @@
   // register MCP servers differently (claude/grok have CLIs, codex is TOML).
   let queenPanelOpen = $state(false);
   let queenBadgeEl = $state<HTMLButtonElement | null>(null);
-  let queenPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
+  let queenPanelPos = $state<{ bottom: number; right: number }>({ bottom: 0, right: 0 });
 
   // Phase 4.2: any host lead that fell back to observe (host unavailable).
   let hostFallbackActive = $derived.by(
@@ -1096,7 +1090,7 @@
     // Right-align the panel to the badge, but keep a small margin from the
     // viewport edge so it never gets clipped off-screen.
     const right = Math.max(6, window.innerWidth - rect.right);
-    teammatesPanelPos = { top: rect.bottom + 6, right };
+    teammatesPanelPos = { bottom: window.innerHeight - rect.top + 6, right };
   }
 
   async function openTeammatesPanel(): Promise<void> {
@@ -1111,7 +1105,7 @@
     if (!queenBadgeEl) return;
     const rect = queenBadgeEl.getBoundingClientRect();
     const right = Math.max(6, window.innerWidth - rect.right);
-    queenPanelPos = { top: rect.bottom + 6, right };
+    queenPanelPos = { bottom: window.innerHeight - rect.top + 6, right };
   }
 
   function openQueenPanel(): void {
@@ -1355,260 +1349,6 @@
       </span>
     </div>
 
-    <span class="spacer"></span>
-    <!-- The left dock (status + Git tabs) is opened/closed from the footer
-         toggle; the Git button below jumps to the Git tab. -->
-
-    <button
-      class="btn"
-      class:seg-active={statusSidebarOpen && dockTab === "git"}
-      onclick={openGitTab}
-      title="Git status / diff / commit（左ドックの Git タブ）"
-    >
-      Git
-    </button>
-    <div class="teammates-wrap">
-      <button
-        bind:this={queenBadgeEl}
-        class="queen-badge {queenClass}"
-        onclick={openQueenPanel}
-        title={queenTooltip}
-        aria-label="Queen MCP サーバー状態（クリックで登録メニュー）"
-      >
-        <span class="queen-dot"></span>
-        {queenLabel}
-      </button>
-      {#if queenPanelOpen}
-        <div
-          class="teammates-panel"
-          role="dialog"
-          aria-label="Queen MCP 登録"
-          style="top: {queenPanelPos.top}px; right: {queenPanelPos.right}px;"
-        >
-          <div class="tm-head">
-            <span class="tm-title">Queen MCP 登録</span>
-            <button
-              class="btn btn-small"
-              onclick={() => (queenPanelOpen = false)}
-              title="閉じる"
-            >
-              ✕
-            </button>
-          </div>
-          {#if !isTauri()}
-            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
-          {:else if !ui.queenStatus?.enabled}
-            <p class="tm-note">
-              Queen は無効です（ptygrid.yml の queen.enabled: false）。
-            </p>
-          {:else}
-            <p class="tm-note">
-              各エージェント CLI に Queen を登録するコマンド/スニペットをコピーします。トークンは永続化され再起動後も有効です。
-            </p>
-            <div class="tm-actions">
-              <button
-                class="btn btn-small"
-                onclick={copyQueenCommand}
-                title="claude mcp add（remove→add で冪等）"
-              >
-                claude 登録コマンド
-              </button>
-              <button
-                class="btn btn-small"
-                onclick={copyCodexSnippet}
-                title="~/.codex/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
-              >
-                codex スニペット
-              </button>
-              <button
-                class="btn btn-small"
-                onclick={copyGrokSnippet}
-                title="~/.grok/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
-              >
-                grok スニペット
-              </button>
-            </div>
-            <p class="tm-note">
-              codex / grok は QUEEN_TOKEN env 参照なのでトークン再生成後もそのまま有効。claude は再生成時に再コピーしてください。
-            </p>
-          {/if}
-        </div>
-      {/if}
-    </div>
-    <div class="teammates-wrap">
-      <button
-        bind:this={teammatesBadgeEl}
-        class="queen-badge {teammatesClass}"
-        onclick={openTeammatesPanel}
-        title={teammatesTooltip}
-        aria-label="Teammate hooks（クリックで設定パネル）"
-      >
-        <span class="queen-dot"></span>
-        Teammates{hostFallbackActive ? " ⚠" : ""}
-      </button>
-      {#if teammatesPanelOpen}
-        <div
-          class="teammates-panel"
-          role="dialog"
-          aria-label="Teammate hooks 設定"
-          style="top: {teammatesPanelPos.top}px; right: {teammatesPanelPos.right}px;"
-        >
-          <div class="tm-head">
-            <span class="tm-title">Teammate hooks</span>
-            <button
-              class="btn btn-small"
-              onclick={() => (teammatesPanelOpen = false)}
-              title="閉じる"
-            >
-              ✕
-            </button>
-          </div>
-          {#if !isTauri()}
-            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
-          {:else if !ui.teammateHooks}
-            <p class="tm-note">状態を取得中…</p>
-          {:else}
-            <p class="tm-note">
-              状態:
-              {ui.teammateHooks.enabled ? "有効" : "無効"} ·
-              通知: {ui.teammateHooks.hookNotifications ? "オン" : "オフ"} ·
-              ポート :{ui.teammateHooks.port}
-            </p>
-            <div class="tm-actions">
-              <button class="btn btn-small" onclick={copyHooksSnippet}>
-                スニペットをコピー
-              </button>
-              <button
-                class="btn btn-small"
-                onclick={registerHooks}
-                disabled={registering}
-                title="~/.claude/settings.json へ登録"
-              >
-                {registering ? "登録中…" : "settings.json へ登録 (user)"}
-              </button>
-            </div>
-            <p class="tm-note">
-              トークンは保存され、再起動後も有効です。初回のみ登録が必要（再生成したときだけ再登録）。
-            </p>
-            <div class="tm-actions">
-              <button
-                class="btn btn-small"
-                onclick={() => regenerateTokens("hook")}
-                disabled={regenerating}
-                title="hook トークンを再生成（漏洩時のローテーション用。再生成後は settings.json の再登録が必要）"
-              >
-                hook トークン再生成
-              </button>
-              <button
-                class="btn btn-small"
-                onclick={() => regenerateTokens("queen")}
-                disabled={regenerating}
-                title="Queen /mcp トークンを再生成（漏洩時のローテーション用。再生成後は MCP の再登録が必要）"
-              >
-                Queen トークン再生成
-              </button>
-            </div>
-            {#if finishedTeammatePaneIds.length > 0}
-              <div class="tm-actions">
-                <button
-                  class="btn btn-small"
-                  onclick={closeFinishedTeammatePanes}
-                  title="終了した teammate / transcript ペインをまとめて閉じます（実体には影響しません）"
-                >
-                  終了したペインを一括で閉じる（{finishedTeammatePaneIds.length}）
-                </button>
-              </div>
-            {/if}
-            <div class="tm-events">
-              <div class="tm-subhead">host モード（実 PTY teammate）</div>
-              {#if (ui.teamsHost?.leads.length ?? 0) === 0 && orphanTeammates.length === 0}
-                <div class="tm-empty">
-                  稼働中の host lead はありません（ptygrid.yml の teams.mode: host）
-                </div>
-              {:else}
-                {#each ui.teamsHost?.leads ?? [] as lead (lead.id)}
-                  <div class="tm-lead">
-                    <div class="tm-lead-head">
-                      <span class="tm-lead-id">lead #{lead.id}</span>
-                      <span
-                        class="tm-lead-badge {lead.fallback
-                          ? 'tm-badge-warn'
-                          : 'tm-badge-ok'}"
-                      >
-                        {lead.fallback ? "host: フォールバック中" : "host"}
-                      </span>
-                    </div>
-                    {#if lead.teammates.length === 0}
-                      <div class="tm-empty">teammate なし</div>
-                    {:else}
-                      {#each lead.teammates.map(teammateRow) as tm (tm.id)}
-                        <div class="tm-teammate">
-                          <span class="tm-teammate-label">
-                            #{tm.id}{tm.role ? ` ▸${tm.role}` : ""}
-                            {tm.paneless ? "（グリッド外）" : ""}
-                          </span>
-                          {#if tm.paneless}
-                            <button
-                              class="btn btn-small"
-                              onclick={() => showTeammatePane(tm.id)}
-                              disabled={!canAddPane}
-                              title="このteammateをグリッドに表示"
-                            >
-                              グリッドへ表示
-                            </button>
-                          {/if}
-                        </div>
-                      {/each}
-                    {/if}
-                  </div>
-                {/each}
-                {#if orphanTeammates.length > 0}
-                  <div class="tm-lead">
-                    <div class="tm-lead-head">
-                      <span class="tm-lead-id">lead 終了済み（孤立 teammate）</span>
-                    </div>
-                    {#each orphanTeammates as s (s.id)}
-                      <div class="tm-teammate">
-                        <span class="tm-teammate-label">
-                          #{s.id}{s.teammate?.role ? ` ▸${s.teammate.role}` : ""}
-                          ↳#{s.teammate?.leadId}
-                        </span>
-                        <button
-                          class="btn btn-small tm-stop"
-                          onclick={() => stopOrphanTeammate(s.id)}
-                          title="この孤立 teammate プロセスを停止"
-                        >
-                          停止
-                        </button>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              {/if}
-            </div>
-            <div class="tm-events">
-              <div class="tm-subhead">直近のイベント</div>
-              {#if ui.teammateEvents.length === 0}
-                <div class="tm-empty">まだイベントはありません</div>
-              {:else}
-                {#each ui.teammateEvents as ev (ev.key)}
-                  <div class="tm-event">{teammateEventLabel(ev)}</div>
-                {/each}
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {/if}
-    </div>
-    {#if totalResources.sessionCount > 0}
-      <span
-        class="total-resources"
-        title={`${totalResources.sessionCount} sessions · ${totalResources.processCount} processes · ${totalResources.memoryBytes.toLocaleString()} bytes`}
-      >
-        Σ CPU {formatCpu(totalResources.cpuPercent)} · {formatMemory(totalResources.memoryBytes)}
-      </span>
-    {/if}
-    <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
   </div>
 
   {#if ui.errorBanner}
@@ -1927,7 +1667,248 @@
       {/if}
     </button>
     <span class="sb-spacer"></span>
-    <span class="sb-info">{statusRows.length} ペイン</span>
+    <div class="teammates-wrap">
+      <button
+        bind:this={queenBadgeEl}
+        class="queen-badge {queenClass}"
+        onclick={openQueenPanel}
+        title={queenTooltip}
+        aria-label="Queen MCP サーバー状態（クリックで登録メニュー）"
+      >
+        <span class="queen-dot"></span>
+        {queenLabel}
+      </button>
+      {#if queenPanelOpen}
+        <div
+          class="teammates-panel"
+          role="dialog"
+          aria-label="Queen MCP 登録"
+          style="bottom: {queenPanelPos.bottom}px; right: {queenPanelPos.right}px;"
+        >
+          <div class="tm-head">
+            <span class="tm-title">Queen MCP 登録</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (queenPanelOpen = false)}
+              title="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+          {#if !isTauri()}
+            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+          {:else if !ui.queenStatus?.enabled}
+            <p class="tm-note">
+              Queen は無効です（ptygrid.yml の queen.enabled: false）。
+            </p>
+          {:else}
+            <p class="tm-note">
+              各エージェント CLI に Queen を登録するコマンド/スニペットをコピーします。トークンは永続化され再起動後も有効です。
+            </p>
+            <div class="tm-actions">
+              <button
+                class="btn btn-small"
+                onclick={copyQueenCommand}
+                title="claude mcp add（remove→add で冪等）"
+              >
+                claude 登録コマンド
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyCodexSnippet}
+                title="~/.codex/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+              >
+                codex スニペット
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyGrokSnippet}
+                title="~/.grok/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+              >
+                grok スニペット
+              </button>
+            </div>
+            <p class="tm-note">
+              codex / grok は QUEEN_TOKEN env 参照なのでトークン再生成後もそのまま有効。claude は再生成時に再コピーしてください。
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+    <div class="teammates-wrap">
+      <button
+        bind:this={teammatesBadgeEl}
+        class="queen-badge {teammatesClass}"
+        onclick={openTeammatesPanel}
+        title={teammatesTooltip}
+        aria-label="Teammate hooks（クリックで設定パネル）"
+      >
+        <span class="queen-dot"></span>
+        Teammates{hostFallbackActive ? " ⚠" : ""}
+      </button>
+      {#if teammatesPanelOpen}
+        <div
+          class="teammates-panel"
+          role="dialog"
+          aria-label="Teammate hooks 設定"
+          style="bottom: {teammatesPanelPos.bottom}px; right: {teammatesPanelPos.right}px;"
+        >
+          <div class="tm-head">
+            <span class="tm-title">Teammate hooks</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (teammatesPanelOpen = false)}
+              title="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+          {#if !isTauri()}
+            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+          {:else if !ui.teammateHooks}
+            <p class="tm-note">状態を取得中…</p>
+          {:else}
+            <p class="tm-note">
+              状態:
+              {ui.teammateHooks.enabled ? "有効" : "無効"} ·
+              通知: {ui.teammateHooks.hookNotifications ? "オン" : "オフ"} ·
+              ポート :{ui.teammateHooks.port}
+            </p>
+            <div class="tm-actions">
+              <button class="btn btn-small" onclick={copyHooksSnippet}>
+                スニペットをコピー
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={registerHooks}
+                disabled={registering}
+                title="~/.claude/settings.json へ登録"
+              >
+                {registering ? "登録中…" : "settings.json へ登録 (user)"}
+              </button>
+            </div>
+            <p class="tm-note">
+              トークンは保存され、再起動後も有効です。初回のみ登録が必要（再生成したときだけ再登録）。
+            </p>
+            <div class="tm-actions">
+              <button
+                class="btn btn-small"
+                onclick={() => regenerateTokens("hook")}
+                disabled={regenerating}
+                title="hook トークンを再生成（漏洩時のローテーション用。再生成後は settings.json の再登録が必要）"
+              >
+                hook トークン再生成
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={() => regenerateTokens("queen")}
+                disabled={regenerating}
+                title="Queen /mcp トークンを再生成（漏洩時のローテーション用。再生成後は MCP の再登録が必要）"
+              >
+                Queen トークン再生成
+              </button>
+            </div>
+            {#if finishedTeammatePaneIds.length > 0}
+              <div class="tm-actions">
+                <button
+                  class="btn btn-small"
+                  onclick={closeFinishedTeammatePanes}
+                  title="終了した teammate / transcript ペインをまとめて閉じます（実体には影響しません）"
+                >
+                  終了したペインを一括で閉じる（{finishedTeammatePaneIds.length}）
+                </button>
+              </div>
+            {/if}
+            <div class="tm-events">
+              <div class="tm-subhead">host モード（実 PTY teammate）</div>
+              {#if (ui.teamsHost?.leads.length ?? 0) === 0 && orphanTeammates.length === 0}
+                <div class="tm-empty">
+                  稼働中の host lead はありません（ptygrid.yml の teams.mode: host）
+                </div>
+              {:else}
+                {#each ui.teamsHost?.leads ?? [] as lead (lead.id)}
+                  <div class="tm-lead">
+                    <div class="tm-lead-head">
+                      <span class="tm-lead-id">lead #{lead.id}</span>
+                      <span
+                        class="tm-lead-badge {lead.fallback
+                          ? 'tm-badge-warn'
+                          : 'tm-badge-ok'}"
+                      >
+                        {lead.fallback ? "host: フォールバック中" : "host"}
+                      </span>
+                    </div>
+                    {#if lead.teammates.length === 0}
+                      <div class="tm-empty">teammate なし</div>
+                    {:else}
+                      {#each lead.teammates.map(teammateRow) as tm (tm.id)}
+                        <div class="tm-teammate">
+                          <span class="tm-teammate-label">
+                            #{tm.id}{tm.role ? ` ▸${tm.role}` : ""}
+                            {tm.paneless ? "（グリッド外）" : ""}
+                          </span>
+                          {#if tm.paneless}
+                            <button
+                              class="btn btn-small"
+                              onclick={() => showTeammatePane(tm.id)}
+                              disabled={!canAddPane}
+                              title="このteammateをグリッドに表示"
+                            >
+                              グリッドへ表示
+                            </button>
+                          {/if}
+                        </div>
+                      {/each}
+                    {/if}
+                  </div>
+                {/each}
+                {#if orphanTeammates.length > 0}
+                  <div class="tm-lead">
+                    <div class="tm-lead-head">
+                      <span class="tm-lead-id">lead 終了済み（孤立 teammate）</span>
+                    </div>
+                    {#each orphanTeammates as s (s.id)}
+                      <div class="tm-teammate">
+                        <span class="tm-teammate-label">
+                          #{s.id}{s.teammate?.role ? ` ▸${s.teammate.role}` : ""}
+                          ↳#{s.teammate?.leadId}
+                        </span>
+                        <button
+                          class="btn btn-small tm-stop"
+                          onclick={() => stopOrphanTeammate(s.id)}
+                          title="この孤立 teammate プロセスを停止"
+                        >
+                          停止
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              {/if}
+            </div>
+            <div class="tm-events">
+              <div class="tm-subhead">直近のイベント</div>
+              {#if ui.teammateEvents.length === 0}
+                <div class="tm-empty">まだイベントはありません</div>
+              {:else}
+                {#each ui.teammateEvents as ev (ev.key)}
+                  <div class="tm-event">{teammateEventLabel(ev)}</div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+    {#if totalResources.sessionCount > 0}
+      <span
+        class="total-resources"
+        title={`${totalResources.sessionCount} sessions · ${totalResources.processCount} processes · ${totalResources.memoryBytes.toLocaleString()} bytes`}
+      >
+        Σ CPU {formatCpu(totalResources.cpuPercent)} · {formatMemory(totalResources.memoryBytes)}
+      </span>
+    {/if}
+    <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
   </footer>
 
   {#if ui.notices.length > 0}
@@ -2605,7 +2586,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    height: 24px;
+    height: 28px;
     padding: 0 8px;
     background: #252526;
     border-top: 1px solid #333;
@@ -2653,11 +2634,6 @@
 
   .sb-spacer {
     flex: 1 1 auto;
-  }
-
-  .sb-info {
-    color: #808080;
-    font-variant-numeric: tabular-nums;
   }
 
   /* ---- semantic status badge (spec 5.1) + toolbar aggregate ---- */
