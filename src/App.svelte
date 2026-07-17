@@ -40,47 +40,112 @@
   let configDirInput = $state("");
   let loadingConfig = $state(false);
   let bulkOpening = $state(false);
-  let gitPanelOpen = $state(false);
   let persistenceReady = $state(false);
   let stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let demoNextId = 1;
 
-  // ---- status sidebar (Phase 4.4.1) ----
-  // Open state + width are UI-only, project-independent settings. Persisted to
-  // localStorage (Tauri webview) to keep 4.4.1 backend-free (no new command).
+  // ---- left dock: tabbed status list + Git (Phase 4.4.1 + Git 移設) ----
+  // Open state, active tab, and per-tab width are UI-only, project-independent
+  // settings persisted to localStorage (keeps this backend-free, no new command).
+  // Git needs more room (file list + diff) than the status list, so each tab
+  // remembers its own width and the dock resizes when you switch tabs.
   const SIDEBAR_OPEN_KEY = "ptygrid.statusSidebar.open";
   const SIDEBAR_WIDTH_KEY = "ptygrid.statusSidebar.width";
+  const DOCK_TAB_KEY = "ptygrid.dock.tab";
+  const DOCK_GIT_WIDTH_KEY = "ptygrid.dock.gitWidth";
 
-  function loadSidebarOpen(): boolean {
+  const STATUS_MIN_W = 150;
+  const STATUS_MAX_W = 480;
+  const GIT_MIN_W = 320;
+  const GIT_MAX_W = 760;
+
+  function loadDockOpen(): boolean {
     try {
       return localStorage.getItem(SIDEBAR_OPEN_KEY) !== "0";
     } catch {
       return true;
     }
   }
-  function loadSidebarWidth(): number {
+  function loadStatusWidth(): number {
     try {
       const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
-      return Number.isFinite(raw) && raw >= 150 && raw <= 480 ? raw : 200;
+      return Number.isFinite(raw) && raw >= STATUS_MIN_W && raw <= STATUS_MAX_W
+        ? raw
+        : 200;
     } catch {
       return 200;
     }
   }
+  function loadGitWidth(): number {
+    try {
+      const raw = Number(localStorage.getItem(DOCK_GIT_WIDTH_KEY));
+      return Number.isFinite(raw) && raw >= GIT_MIN_W && raw <= GIT_MAX_W
+        ? raw
+        : 380;
+    } catch {
+      return 380;
+    }
+  }
+  function loadDockTab(): "status" | "git" {
+    try {
+      return localStorage.getItem(DOCK_TAB_KEY) === "git" ? "git" : "status";
+    } catch {
+      return "status";
+    }
+  }
 
-  let statusSidebarOpen = $state(loadSidebarOpen());
-  let statusSidebarWidth = $state(loadSidebarWidth());
+  let statusSidebarOpen = $state(loadDockOpen());
+  let statusSidebarWidth = $state(loadStatusWidth());
+  let gitDockWidth = $state(loadGitWidth());
+  let dockTab = $state<"status" | "git">(loadDockTab());
 
-  // Persist open/width whenever they change (best-effort; ignore quota errors).
+  // The dock renders the active tab's remembered width.
+  let activeDockWidth = $derived(
+    dockTab === "git" ? gitDockWidth : statusSidebarWidth,
+  );
+
+  // Persist dock UI state whenever it changes (best-effort; ignore quota errors).
   $effect(() => {
     const open = statusSidebarOpen;
-    const width = statusSidebarWidth;
+    const sw = statusSidebarWidth;
+    const gw = gitDockWidth;
+    const tab = dockTab;
     try {
       localStorage.setItem(SIDEBAR_OPEN_KEY, open ? "1" : "0");
-      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(width)));
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(sw)));
+      localStorage.setItem(DOCK_GIT_WIDTH_KEY, String(Math.round(gw)));
+      localStorage.setItem(DOCK_TAB_KEY, tab);
     } catch {
-      // localStorage unavailable/full: sidebar still works, just not persisted.
+      // localStorage unavailable/full: dock still works, just not persisted.
     }
   });
+
+  // Open the dock on the Git tab (toolbar Git button).
+  function openGitTab(): void {
+    dockTab = "git";
+    statusSidebarOpen = true;
+  }
+
+  // Dock resize handle: drag adjusts the active tab's width, clamped per tab.
+  function startDockResize(e: PointerEvent): void {
+    e.preventDefault();
+    const startX = e.clientX;
+    const isGit = dockTab === "git";
+    const startW = isGit ? gitDockWidth : statusSidebarWidth;
+    const min = isGit ? GIT_MIN_W : STATUS_MIN_W;
+    const max = isGit ? GIT_MAX_W : STATUS_MAX_W;
+    const move = (ev: PointerEvent) => {
+      const next = Math.min(max, Math.max(min, startW + (ev.clientX - startX)));
+      if (isGit) gitDockWidth = next;
+      else statusSidebarWidth = next;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
 
   const LAYOUT_MODES: { value: LayoutMode; label: string; hint: string }[] = [
     { value: "auto", label: "自動", hint: "枚数に応じて格子配置" },
@@ -1291,14 +1356,14 @@
     </div>
 
     <span class="spacer"></span>
-    <!-- The collapsed status sidebar is re-opened from its own left-edge rail
-         (StatusSidebar.svelte), not a toolbar chip. -->
+    <!-- The left dock (status + Git tabs) is opened/closed from the footer
+         toggle; the Git button below jumps to the Git tab. -->
 
     <button
       class="btn"
-      class:seg-active={gitPanelOpen}
-      onclick={() => (gitPanelOpen = !gitPanelOpen)}
-      title="Git status / diff / commit"
+      class:seg-active={statusSidebarOpen && dockTab === "git"}
+      onclick={openGitTab}
+      title="Git status / diff / commit（左ドックの Git タブ）"
     >
       Git
     </button>
@@ -1546,15 +1611,6 @@
     <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
   </div>
 
-  {#if gitPanelOpen}
-    {#key ui.configInfo?.path}
-      <GitPanel
-        worktrees={activeWorktrees}
-        onclose={() => (gitPanelOpen = false)}
-      />
-    {/key}
-  {/if}
-
   {#if ui.errorBanner}
     <div class="banner banner-error" role="alert">
       <span class="banner-text">{ui.errorBanner}</span>
@@ -1569,14 +1625,69 @@
   {/if}
 
   <div class="workspace">
-  <StatusSidebar
-    bind:open={statusSidebarOpen}
-    bind:width={statusSidebarWidth}
-    rows={statusRows}
-    onFocus={sidebarFocus}
-    onToggleMax={toggleMaximize}
-    onClose={sidebarClose}
-  />
+  {#if statusSidebarOpen}
+    <aside
+      class="dock"
+      style="width: {activeDockWidth}px;"
+      aria-label="左ドック（ステータス / Git）"
+    >
+      <div class="dock-head">
+        <button
+          class="dock-collapse"
+          onclick={() => (statusSidebarOpen = false)}
+          title="ドックを畳む"
+          aria-label="ドックを畳む"
+        >
+          ‹
+        </button>
+        <div class="dock-tabs" role="tablist">
+          <button
+            class="dock-tab"
+            class:active={dockTab === "status"}
+            role="tab"
+            aria-selected={dockTab === "status"}
+            onclick={() => (dockTab = "status")}
+          >
+            ステータス
+            {#if statusBlockedCount > 0}
+              <span class="dock-tab-badge">🔴 {statusBlockedCount}</span>
+            {/if}
+          </button>
+          <button
+            class="dock-tab"
+            class:active={dockTab === "git"}
+            role="tab"
+            aria-selected={dockTab === "git"}
+            onclick={() => (dockTab = "git")}
+          >
+            Git
+          </button>
+        </div>
+      </div>
+      <div class="dock-body">
+        {#if dockTab === "status"}
+          <StatusSidebar
+            rows={statusRows}
+            onFocus={sidebarFocus}
+            onToggleMax={toggleMaximize}
+            onClose={sidebarClose}
+          />
+        {:else}
+          {#key ui.configInfo?.path}
+            <GitPanel embedded worktrees={activeWorktrees} />
+          {/key}
+        {/if}
+      </div>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="dock-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="ドックの幅を変更"
+        onpointerdown={startDockResize}
+      ></div>
+    </aside>
+  {/if}
   <div class="grid" class:has-max={ui.maximizedId !== null}>
     {#if paneCount === 0}
       <div class="empty-hint">
@@ -2387,6 +2498,104 @@
     min-height: 0;
     position: relative;
     overflow: hidden;
+  }
+
+  /* ---- left dock (tabbed: status list + Git) ---- */
+
+  .dock {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #232324;
+    border-right: 1px solid #333;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  .dock-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+    background: #252526;
+    border-bottom: 1px solid #333;
+  }
+
+  .dock-collapse {
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #bbb;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 2px 7px;
+  }
+  .dock-collapse:hover {
+    background: #353535;
+    color: #eee;
+  }
+
+  .dock-tabs {
+    display: flex;
+    gap: 3px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .dock-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 10px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: #9a9a9a;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1.6;
+    white-space: nowrap;
+  }
+  .dock-tab:hover {
+    background: #2d2d2e;
+    color: #ddd;
+  }
+  .dock-tab.active {
+    background: #2f3d51;
+    border-color: #3d5573;
+    color: #dbe7f5;
+  }
+  .dock-tab-badge {
+    color: #f0b8b8;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .dock-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .dock-resizer {
+    position: absolute;
+    top: 0;
+    right: -2px;
+    width: 5px;
+    height: 100%;
+    cursor: ew-resize;
+    z-index: 5;
+  }
+  .dock-resizer:hover {
+    background: #3d5573;
   }
 
   /* ---- bottom status bar (footer) ---- */

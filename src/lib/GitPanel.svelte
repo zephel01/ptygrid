@@ -13,10 +13,15 @@
     dir,
     worktrees = [],
     onclose,
+    embedded = false,
   }: {
     dir?: string;
     worktrees?: WorktreeInfo[];
-    onclose: () => void;
+    // Optional: only the standalone (floating) mode shows a close button.
+    onclose?: () => void;
+    // When embedded in the left dock, drop the fixed positioning and the
+    // title/close chrome — the dock owns the frame, tabs and collapse.
+    embedded?: boolean;
   } = $props();
 
   let activeDir = $state<string | undefined>();
@@ -211,10 +216,12 @@
   }
 </script>
 
-<aside class="git-panel" aria-label="Git changes">
+<aside class="git-panel" class:embedded aria-label="Git changes">
   <header class="git-header">
     <div>
-      <div class="git-title">Git</div>
+      {#if !embedded}
+        <div class="git-title">Git</div>
+      {/if}
       {#if status}
         <div class="git-ref">
           {status.branch ?? "detached HEAD"} · {status.head}
@@ -225,7 +232,9 @@
     <button class="icon-btn" onclick={refresh} disabled={loadingStatus || mutating} title="更新">
       ⟳
     </button>
-    <button class="icon-btn" onclick={onclose} title="閉じる">✕</button>
+    {#if !embedded && onclose}
+      <button class="icon-btn" onclick={onclose} title="閉じる">✕</button>
+    {/if}
   </header>
 
   {#if status}
@@ -358,6 +367,19 @@
     box-shadow: -8px 0 24px #0008;
     color: #ccc;
     font-size: 12px;
+  }
+
+  /* Embedded in the left dock: fill the dock body instead of floating. */
+  .git-panel.embedded {
+    position: static;
+    z-index: auto;
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    flex: 1 1 auto;
+    min-height: 0;
+    border-left: none;
+    box-shadow: none;
   }
 
   .git-header,
