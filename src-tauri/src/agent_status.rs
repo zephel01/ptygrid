@@ -521,6 +521,17 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
+/// Map a semantic-status *change* to the out-of-app notification event it should
+/// raise (Phase 4.4.2): `blocked` needs a human, `done` is a completion. Other
+/// statuses (working/idle/unknown) never notify.
+fn notify_event_for(status: AgentStatus) -> Option<crate::notifications::NotifyEvent> {
+    match status {
+        AgentStatus::Blocked => Some(crate::notifications::NotifyEvent::NeedsAttention),
+        AgentStatus::Done => Some(crate::notifications::NotifyEvent::Complete),
+        _ => None,
+    }
+}
+
 fn evaluate_tick<R: Runtime>(
     app: &AppHandle<R>,
     manager: &PtyManager,
@@ -548,6 +559,12 @@ fn evaluate_tick<R: Runtime>(
         let tracker = trackers.entry(id).or_default();
         tracker.rule_set = rule_set.clone();
         if let Some(status) = tracker.observe(raw, done_linger) {
+            // Phase 4.4.2: mirror blocked/done edges to out-of-app notifications
+            // (clone what `emit` is about to consume). A no-op when notifications
+            // are disabled or no channel subscribes to this event.
+            if let Some(event) = notify_event_for(status) {
+                crate::notifications::dispatch(app, event, id, snapshot.name.clone(), matched.clone());
+            }
             emit(app, id, status, matched, rule_set);
         }
     }

@@ -1452,6 +1452,16 @@ fn handle_eof<R: Runtime>(
         EofOutcome::Exited(info, code) => {
             let _ = app.emit("pty-exit", ExitPayload { id, code });
             let _ = app.emit("session-state", &info);
+            // Phase 4.4.2: a terminal exit is a notification edge — clean (0) =>
+            // Complete, anything else => Error. Autorestart transitions
+            // (EofOutcome::Restarting) stay quiet; only the final exit notifies.
+            crate::notifications::dispatch(
+                app,
+                crate::notifications::event_for_exit(code),
+                id,
+                info.name.clone(),
+                Some(crate::notifications::exit_detail(code)),
+            );
         }
         EofOutcome::Restarting(info, code) => {
             let _ = app.emit("pty-exit", ExitPayload { id, code });

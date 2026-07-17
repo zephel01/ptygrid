@@ -47,6 +47,14 @@ teams-backend = { path = "teams-backend" }
 # Tauri's recommended fix for GUI launches not inheriting the user's shell PATH
 # on Linux/macOS (also covers Windows PATH inheritance edge cases).
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", rev = "c4c45d503ea115a839aae718d02f79e7c7f0f673" }
+# Phase 4.4.2: out-of-app notifications.
+# tauri-plugin-notification: cross-platform desktop OS toast (macOS/Linux/Windows),
+# invoked from the backend on session/agent-status edges.
+tauri-plugin-notification = "2"
+# ureq: tiny blocking HTTP client for the chat webhooks (Slack/Mattermost/Discord/
+# Telegram). Each send runs on a detached thread, so blocking I/O never touches
+# the PTY reader or the async runtime. `json` for bodies, `tls` (rustls) for HTTPS.
+ureq = { version = "2", features = ["json", "tls"] }
 
 [dev-dependencies]
 # Enables tauri::test::mock_app() (MockRuntime) for session state-machine tests.

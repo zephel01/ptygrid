@@ -36,6 +36,9 @@ pub struct Config {
     /// Phase 4.4.0 global `agent_status:` block (semantic-status detection).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusConfig>,
+    /// Phase 4.4.2 global `notifications:` block (out-of-app alerting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<NotificationsConfig>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -108,6 +111,110 @@ impl TeammatesConfig {
             Some(list) if !list.is_empty() => list.clone(),
             _ => vec!["claude".to_string()],
         }
+    }
+}
+
+/// Phase 4.4.2 global `notifications:` block. Routes the two edge-triggered
+/// event sources — session lifecycle (`session::handle_eof`) and agent-status
+/// changes (`agent_status::emit`) — to channels OUTSIDE the ptygrid window: the
+/// desktop OS toast and chat webhooks (Slack / Mattermost / Discord / Telegram).
+/// The routing model + dispatch live in [`crate::notifications`]; this struct
+/// only carries the parsed values and the scalar defaults.
+///
+/// Opt-in: omitting the block, or `enabled: false`, sends nothing. Unknown keys
+/// are ignored (forward compat), like the other 4.x blocks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Global default preset for channels that omit their own `level`. Default
+    /// `critical` (errors / abnormal exits only) — the least-noisy useful level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<NotifyLevel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<ChannelConfig>,
+}
+
+impl NotificationsConfig {
+    /// Default false: the feature is opt-in. No block / `enabled: false` sends
+    /// nothing regardless of channels.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+    /// Global default level applied to any channel that omits its own `level`.
+    /// Default `Critical` (errors + abnormal termination only).
+    pub fn effective_level(&self) -> NotifyLevel {
+        self.level.unwrap_or(NotifyLevel::Critical)
+    }
+}
+
+/// Notification preset: a named bundle of event severities (see the design
+/// matrix). Least → most noisy. `needs-attention` is the kebab wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyLevel {
+    /// Nothing is sent.
+    Silent,
+    /// Errors / abnormal termination only. The default.
+    #[default]
+    Critical,
+    /// Critical + "needs attention" (a live agent blocked on approval / input /
+    /// permission).
+    NeedsAttention,
+    /// Everything, including normal completion and progress.
+    All,
+}
+
+/// Notification transport for one `notifications.channels` entry. `os` is the
+/// local desktop toast; the rest are outbound chat webhooks. An unknown/mistyped
+/// kind fails the field parse with a clear serde message (the block itself still
+/// ignores unknown *keys*; only this closed enum is strict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelKind {
+    #[default]
+    Os,
+    Slack,
+    Mattermost,
+    Discord,
+    Telegram,
+}
+
+/// One entry under `notifications.channels`. `type` selects the transport; the
+/// remaining fields are transport-specific and validated at DISPATCH, not parse,
+/// so a half-filled channel (e.g. a `slack` entry missing its `webhook`) never
+/// fails the whole config load — it is skipped with a warning at send time.
+///
+/// `webhook` / `bot_token` / `chat_id` are stored verbatim and `${VAR}`-expanded
+/// only when a message is actually sent (mirrors how `env` values are handled).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelConfig {
+    #[serde(rename = "type")]
+    pub kind: ChannelKind,
+    /// Per-channel override of the global `level`. Omitted -> the channel uses
+    /// `notifications.level` (see [`NotificationsConfig::effective_level`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<NotifyLevel>,
+    /// Slack / Mattermost / Discord incoming-webhook URL. `${VAR}` expanded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+    /// Telegram Bot API token. `${VAR}` expanded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    /// Telegram destination chat id. `${VAR}` expanded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    /// Optional cosmetic label shown in the message prefix (e.g. to tell two
+    /// Slack channels apart).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl ChannelConfig {
+    /// The level in force for this channel: its own override, else the global
+    /// default handed in by the caller.
+    pub fn effective_level(&self, global: NotifyLevel) -> NotifyLevel {
+        self.level.unwrap_or(global)
     }
 }
 
@@ -1154,6 +1261,111 @@ agents:
         )
         .unwrap();
         assert!(cfg.agent_status.unwrap().effective_enabled());
+    }
+
+    // ---- notifications: block (Phase 4.4.2) ----
+
+    #[test]
+    fn notifications_block_defaults_and_overrides() {
+        // No block at all -> None; Default gives the documented effective values.
+        let cfg = parse_config("agents: []").unwrap();
+        assert!(cfg.notifications.is_none());
+        let d = NotificationsConfig::default();
+        assert!(!d.effective_enabled()); // opt-in
+        assert_eq!(d.effective_level(), NotifyLevel::Critical);
+        assert!(d.channels.is_empty());
+
+        // Empty block -> same effective defaults.
+        let cfg = parse_config("notifications: {}").unwrap();
+        let n = cfg.notifications.unwrap();
+        assert_eq!(n.enabled, None);
+        assert!(!n.effective_enabled());
+        assert_eq!(n.effective_level(), NotifyLevel::Critical);
+
+        // Explicit enabled + global level (kebab wire form parses).
+        let cfg =
+            parse_config("notifications:\n  enabled: true\n  level: needs-attention\n").unwrap();
+        let n = cfg.notifications.unwrap();
+        assert!(n.effective_enabled());
+        assert_eq!(n.effective_level(), NotifyLevel::NeedsAttention);
+    }
+
+    #[test]
+    fn notify_level_parses_all_kebab_variants() {
+        for (wire, want) in [
+            ("silent", NotifyLevel::Silent),
+            ("critical", NotifyLevel::Critical),
+            ("needs-attention", NotifyLevel::NeedsAttention),
+            ("all", NotifyLevel::All),
+        ] {
+            let cfg =
+                parse_config(&format!("notifications:\n  level: {wire}\n")).unwrap();
+            assert_eq!(cfg.notifications.unwrap().effective_level(), want, "wire {wire}");
+        }
+        // An unknown level is a hard field error (closed enum).
+        assert!(parse_config("notifications:\n  level: loud\n").is_err());
+    }
+
+    #[test]
+    fn notification_channels_parse_with_per_channel_level_and_type() {
+        let cfg = parse_config(
+            "notifications:\n  enabled: true\n  level: critical\n  channels:\n    - type: os\n      level: all\n    - type: slack\n      webhook: \"${SLACK_WEBHOOK}\"\n    - type: telegram\n      bot_token: \"${TG_TOKEN}\"\n      chat_id: \"12345\"\n      level: needs-attention\n      label: mobile\n",
+        )
+        .unwrap();
+        let n = cfg.notifications.unwrap();
+        assert_eq!(n.channels.len(), 3);
+
+        // os channel: explicit level override wins over the global.
+        assert_eq!(n.channels[0].kind, ChannelKind::Os);
+        assert_eq!(n.channels[0].effective_level(n.effective_level()), NotifyLevel::All);
+
+        // slack channel: no own level -> falls back to the global (critical).
+        assert_eq!(n.channels[1].kind, ChannelKind::Slack);
+        assert_eq!(n.channels[1].level, None);
+        assert_eq!(
+            n.channels[1].effective_level(n.effective_level()),
+            NotifyLevel::Critical
+        );
+        assert_eq!(n.channels[1].webhook.as_deref(), Some("${SLACK_WEBHOOK}")); // verbatim
+
+        // telegram channel: bot_token + chat_id + own level + label.
+        let tg = &n.channels[2];
+        assert_eq!(tg.kind, ChannelKind::Telegram);
+        assert_eq!(tg.bot_token.as_deref(), Some("${TG_TOKEN}"));
+        assert_eq!(tg.chat_id.as_deref(), Some("12345"));
+        assert_eq!(tg.effective_level(n.effective_level()), NotifyLevel::NeedsAttention);
+        assert_eq!(tg.label.as_deref(), Some("mobile"));
+    }
+
+    #[test]
+    fn channel_kind_parses_all_variants_and_rejects_unknown() {
+        for (wire, want) in [
+            ("os", ChannelKind::Os),
+            ("slack", ChannelKind::Slack),
+            ("mattermost", ChannelKind::Mattermost),
+            ("discord", ChannelKind::Discord),
+            ("telegram", ChannelKind::Telegram),
+        ] {
+            let cfg = parse_config(&format!(
+                "notifications:\n  channels:\n    - type: {wire}\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.notifications.unwrap().channels[0].kind, want, "wire {wire}");
+        }
+        // Unknown transport is a field error.
+        assert!(parse_config("notifications:\n  channels:\n    - type: carrier-pigeon\n").is_err());
+    }
+
+    #[test]
+    fn notifications_block_ignores_unknown_fields() {
+        // Forward-compat: future keys (throttling, digest, ...) are ignored.
+        let cfg = parse_config(
+            "notifications:\n  enabled: true\n  throttle_ms: 5000\n  digest: true\n  channels:\n    - type: os\n      renotify: false\n",
+        )
+        .unwrap();
+        let n = cfg.notifications.unwrap();
+        assert!(n.effective_enabled());
+        assert_eq!(n.channels[0].kind, ChannelKind::Os);
     }
 
     #[test]

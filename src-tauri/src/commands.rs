@@ -71,6 +71,8 @@ pub fn load_config(
     // Phase 4.4.0: recompile agent-status rules + refresh enabled/timings from
     // the (possibly reloaded) config so pattern edits take effect immediately.
     crate::agent_status::apply(&app, &info.config);
+    // Phase 4.4.2: swap in the (possibly reloaded) notifications block.
+    crate::notifications::apply(&app, &info.config);
     Ok(info)
 }
 

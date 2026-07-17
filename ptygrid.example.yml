@@ -32,6 +32,44 @@ queen:
 #   hook_notifications: true
 #   global_max_panes: 6     # total teammate panes across all leads (<=9)
 
+# notifications: out-of-app alerts when a session hits a notable edge — an
+# abnormal exit, a live agent that blocked on an approval/input prompt, or a
+# clean finish. Opt-in: omit the block, or set enabled: false, and nothing is
+# sent. Optional; the whole block can be omitted.
+#
+# Two things combine: the EVENT (derived automatically) and the LEVEL preset a
+# channel subscribes to.
+#   events: error (abnormal exit) | needs-attention (blocked) | complete | progress
+#   levels: silent          -> nothing
+#           critical        -> error only                         (default)
+#           needs-attention -> error + needs-attention
+#           all             -> everything (incl. completion)
+# `error` (abnormal termination) is the one you almost always want; that is why
+# the default level is `critical` rather than `silent`.
+#
+# `level:` at the top is the default for every channel; each channel may override
+# it, so you can keep a shared Slack quiet (critical) while your own Telegram
+# gets the finer-grained needs-attention. Secrets support ${VAR} expansion and
+# are read from the host environment at send time.
+# notifications:
+#   enabled: true
+#   level: critical            # global default preset for channels below
+#   channels:
+#     - type: os               # local desktop toast (macOS/Linux/Windows)
+#       level: all             #   in-app, so full detail is fine
+#     - type: slack            # Slack incoming webhook: {"text": ...}
+#       webhook: "${SLACK_WEBHOOK_URL}"
+#     - type: mattermost       # same incoming-webhook shape as Slack
+#       webhook: "${MATTERMOST_WEBHOOK_URL}"
+#     - type: discord          # Discord webhook: {"content": ...}
+#       webhook: "${DISCORD_WEBHOOK_URL}"
+#       level: needs-attention
+#     - type: telegram         # Telegram Bot API sendMessage
+#       bot_token: "${TELEGRAM_BOT_TOKEN}"
+#       chat_id: "123456789"
+#       level: needs-attention
+#       label: mobile          # cosmetic; shown to tell channels apart
+
 agents:
   - name: claude
     cmd: "claude"

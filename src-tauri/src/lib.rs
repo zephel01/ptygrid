@@ -4,6 +4,7 @@ mod app_settings;
 mod commands;
 mod config;
 mod git_service;
+mod notifications;
 mod project_state;
 mod pty;
 mod queen;
@@ -21,6 +22,7 @@ pub use config::capture_launch_dir;
 use agent_status::AgentStatusManager;
 use config::ConfigManager;
 use queen::QueenStatus;
+use notifications::NotificationManager;
 use session::PtyManager;
 use tauri::Manager;
 use teams_hooks::TeamsHooks;
@@ -43,10 +45,12 @@ pub fn run_tmux_compat_if_requested() -> Option<i32> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(PtyManager::new())
         .manage(ConfigManager::new())
         .manage(TeamsHostManager::new())
         .manage(AgentStatusManager::new())
+        .manage(NotificationManager::new())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             // Load (or first-time generate) the persisted auth tokens before the
