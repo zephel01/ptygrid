@@ -723,10 +723,15 @@ team_presets:
 ローカル側は Claude Code CLI のまま claude-code-router(coderouter)経由で
 llama.cpp / ollama に向け(ルーティングは**プロセス単位の env** で決まるので、
 `agents[].env` に `ANTHROPIC_BASE_URL` を書くだけ)、クラウド勢を `standby: true` で
-宣言します。エスカレーションは機構ではなく **instructions の規約**です:
+宣言します。エスカレーションは機構ではなく **instructions の規約**です。ただし
+「難しいと感じたら」のような**自己判断のトリガーは書かない**でください — ローカルモデルは
+難問にも自信を持って普通に答えてしまい、発火しません。**客観条件**で書きます:
 
-> 一次担当への指示例: 「2往復以上詰まったら spawn_agent で "opus" を起動し、inbox で
-> 問題の要約と試したことを送り、await で回答を待って作業に反映する。」
+> 一次担当への指示例: 「次のどれかに当てはまったら必ずエスカレーションする:
+> ①テスト/ビルドが同じ原因で2回連続失敗 ②公開API・保存データ・セキュリティ境界に
+> 触る変更（この場合は完了前に opus のレビュー必須） ③人間に『opusに聞いて』と
+> 言われた。手順: spawn_agent で "opus" を起動 → inbox で要約と試したことを送る →
+> await で回答を待って反映。」
 
 完全なサンプルは [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) を
 参照してください。CLI が同じ `claude` でも ptygrid は定義名でペインを区別し、Queen の

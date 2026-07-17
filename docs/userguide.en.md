@@ -763,10 +763,16 @@ Reproduce "local LLM for everyday work, Claude Opus / Grok only for hard problem
 Keep the Claude Code CLI and point the local member at llama.cpp / ollama through
 claude-code-router (routing is decided by **per-process env**, so `agents[].env` with
 `ANTHROPIC_BASE_URL` is all it takes), and declare the cloud members `standby: true`.
-Escalation is a **convention in the instructions**, not a mechanism:
+Escalation is a **convention in the instructions**, not a mechanism. Do NOT write a
+self-judged trigger like "when you feel stuck" — local models answer hard questions
+confidently and never report being stuck, so it simply won't fire. Use **objective
+conditions** instead:
 
-> Example instruction for the primary: "If you are stuck after two attempts, spawn_agent
-> \"opus\", send it an inbox message with what you tried, and await the reply."
+> Example instruction for the primary: "Escalate whenever any of these holds: (1) tests or
+> the build failed twice for the same cause, (2) the change touches public APIs, stored
+> data, or security boundaries (then an opus review is required before you report done),
+> (3) a human says 'ask opus'. Procedure: spawn_agent \"opus\", send an inbox message with
+> a summary and what you tried, and await the reply."
 
 See [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) for the full sample.
 Even though both panes run the same `claude` binary, ptygrid distinguishes them by definition
