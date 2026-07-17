@@ -210,6 +210,20 @@ CONTRACT.md への追記（実装前に先行追記）:
 
 ## 8. 実装前の偵察（ゲート）
 
+> **偵察ログ（2026-07-17・R2a 訓練モード実機）**: coderouter 構成の local 発で
+> spawn_agent → send_inbox → await →（opus reply_inbox）→ local が差分要約、の
+> **一連が成立**（G4 機構 ✅）。所見:
+> ① 難易度の自己判断はトリガーとして機能しない（7章の客観条件方式に改訂済み）。
+> ② 検証中、人間が ▶ を2回押して opus が二重起動し、同一 mailbox `opus` を
+> 2セッションが読み合う状態を観測（片方が「依頼が来ない」と混乱）。同名複数
+> セッション自体は意図された仕様（`#id` 厳密指定の対象）だが、**mailbox は定義名
+> 共有**のため、エスカレーション先の standby は1体運用が前提。エージェント発の
+> 二重 spawn 予防として instructions に「spawn 前に list_agents で生存確認」を
+> 規約化（example 反映済み）。UI 側のガードは入れない。
+> ③ チーム再活性化で standby instructions が重複配送される（契約どおり）→ opus 側
+> 規約に「読了後 ack」を追加。恒久策「同一内容の未 ack instructions は再配送しない」は
+> v0.4.7 候補（11章）。
+
 実装着手の前に、想定構成での実機確認を行い、結果を本書に追記する:
 
 1. **coderouter + llama.cpp / ollama 経由の Claude Code** が Queen に MCP 接続でき、
@@ -262,6 +276,15 @@ CONTRACT.md への追記（実装前に先行追記）:
 - テスト: config 検証 8 件 + 起動セマンティクス 5 件を追加し、既存 196 → 210 全通過。
 
 ## 11. 未解決事項
+
+（2026-07-17 偵察で追加）
+
+- **instructions の重複配送抑止** — チーム再活性化のたびに standby メンバーへ同一
+  instructions が再送される。運用は「読了後 ack」で回るが、「同一内容の未 ack
+  instructions が既にあれば配送をスキップ」を v0.4.7 で検討。
+- **`spawn_agent` の冪等オプション** — エスカレーション用途では「生きていれば既存 id を
+  返す」方が安全。`spawn_agent {name, reuse: true}` のような additive な引数を検討
+  （既定挙動は不変のまま）。
 
 - **standby の寿命管理** — idle 自動終了の要否。当面は手動 close とし、運用データで判断
 - **`spawn_team` の呼び出し権限** — 当面は全エージェント可。preset の lead のみに

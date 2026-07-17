@@ -60,15 +60,20 @@ team_presets:
           (1) テスト/ビルドが同じ原因で2回連続で失敗した
           (2) 公開API・保存データ形式・セキュリティ境界・並行処理設計に触る変更をする
           (3) 人間に「opusに聞いて」と言われた。
-          手順: spawn_agent で "opus" を起動 → send_inbox で問題の要約・試したこと・
-          自分の暫定案を送る → await で返信を待つ → 回答を作業に反映する。
+          手順: まず list_agents で opus が既に生きているか確認し、いなければ
+          spawn_agent で "opus" を起動する(生きていれば spawn しない。二重起動すると
+          同じ mailbox を2セッションが読み合って混乱する) → send_inbox で問題の要約・
+          試したこと・自分の暫定案を送る → await で返信を待つ → 回答を作業に反映する。
           (2) に該当する変更は、完了報告の前に opus のレビューを受けること。
           終わったら opus のペインは人間が閉じる。
       - agent: opus
         standby: true          # 定義のみ。必要時に spawn_agent / ▶ で起動
         instructions: >-
-          難問のみ担当: アーキテクチャ判断と難しいデバッグ。inbox の依頼を
-          読み、reply_inbox で結論と根拠を返す。
+          難問のみ担当: アーキテクチャ判断と難しいデバッグ。起動したらまず
+          list_inbox で mailbox "opus" を読み、この指示を含む既読メッセージは
+          ack_inbox で処理済みにする(チーム再活性化で同じ指示が複数届くことが
+          ある。内容が同じなら全部 ack してよい)。実依頼には reply_inbox で
+          結論と根拠を返す(reply は自動で元メッセージを ack する)。
       - agent: grok
         standby: true
         instructions: "セカンドオピニオン担当。依頼されたレビューだけ返す。"
