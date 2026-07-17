@@ -861,8 +861,10 @@
       })),
   );
 
-  let blockedRowIds = $derived(
-    statusRows.filter((r) => r.status === "blocked").map((r) => r.id),
+  // Blocked (承認待ち) pane count, shown on the footer toggle so an alert is
+  // visible whether the sidebar is open or collapsed.
+  let statusBlockedCount = $derived(
+    statusRows.filter((r) => r.status === "blocked").length,
   );
 
   // ---- sidebar row actions ----
@@ -878,13 +880,6 @@
     } else {
       closePane(id);
     }
-  }
-
-  // Collapsed toolbar aggregate badge: expand + focus the first blocked pane.
-  function expandSidebarToBlocked(): void {
-    statusSidebarOpen = true;
-    const first = blockedRowIds[0];
-    if (first !== undefined) focusPane(first);
   }
 
   // ---- header semantic-status badge (spec 5.1) ----
@@ -1296,18 +1291,9 @@
     </div>
 
     <span class="spacer"></span>
-    {#if !statusSidebarOpen}
-      <button
-        class="astatus-agg {blockedRowIds.length > 0 ? 'has-blocked' : 'muted'}"
-        onclick={expandSidebarToBlocked}
-        title={blockedRowIds.length > 0
-          ? `${blockedRowIds.length} ペインが承認待ち（クリックでサイドバーを開き最初の blocked へ）`
-          : "ステータスサイドバーを開く"}
-        aria-label="ステータスサイドバーを開く"
-      >
-        🔴 {blockedRowIds.length}
-      </button>
-    {/if}
+    <!-- The collapsed status sidebar is re-opened from its own left-edge rail
+         (StatusSidebar.svelte), not a toolbar chip. -->
+
     <button
       class="btn"
       class:seg-active={gitPanelOpen}
@@ -1801,6 +1787,37 @@
     {/if}
   </div>
   </div>
+
+  <!-- Bottom status bar. The sidebar open/close toggle lives at its left end,
+       aligned under the sidebar column — the conventional (VS Code-style) home
+       for it, always visible whether the sidebar is open or collapsed. -->
+  <footer class="statusbar">
+    <button
+      class="sb-toggle"
+      class:active={statusSidebarOpen}
+      onclick={() => (statusSidebarOpen = !statusSidebarOpen)}
+      title={statusSidebarOpen
+        ? "ステータスサイドバーを畳む"
+        : "ステータスサイドバーを開く"}
+      aria-label={statusSidebarOpen
+        ? "ステータスサイドバーを畳む"
+        : "ステータスサイドバーを開く"}
+      aria-pressed={statusSidebarOpen}
+    >
+      <span class="sb-toggle-icon" aria-hidden="true">◧</span>
+      <span>サイドバー</span>
+      {#if statusBlockedCount > 0}
+        <span
+          class="sb-blocked"
+          title={`${statusBlockedCount} ペインが承認待ち（blocked）`}
+        >
+          🔴 {statusBlockedCount}
+        </span>
+      {/if}
+    </button>
+    <span class="sb-spacer"></span>
+    <span class="sb-info">{statusRows.length} ペイン</span>
+  </footer>
 
   {#if ui.notices.length > 0}
     <div class="notices" aria-live="polite">
@@ -2372,6 +2389,68 @@
     overflow: hidden;
   }
 
+  /* ---- bottom status bar (footer) ---- */
+
+  .statusbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 24px;
+    padding: 0 8px;
+    background: #252526;
+    border-top: 1px solid #333;
+    font-size: 11px;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  .sb-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 18px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #bbb;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1;
+  }
+
+  .sb-toggle:hover {
+    background: #353535;
+    color: #eee;
+  }
+
+  .sb-toggle.active {
+    background: #2f3d51;
+    border-color: #3d5573;
+    color: #dbe7f5;
+  }
+
+  .sb-toggle-icon {
+    font-size: 12px;
+    line-height: 1;
+  }
+
+  .sb-blocked {
+    color: #f0b8b8;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .sb-spacer {
+    flex: 1 1 auto;
+  }
+
+  .sb-info {
+    color: #808080;
+    font-variant-numeric: tabular-nums;
+  }
+
   /* ---- semantic status badge (spec 5.1) + toolbar aggregate ---- */
 
   /* Small colored dot rendered right after the liveness dot; distinct from the
@@ -2395,35 +2474,6 @@
   }
   .astatus-idle {
     background: #4caf50;
-  }
-
-  .astatus-agg {
-    align-self: center;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 10px;
-    padding: 3px 9px;
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    cursor: pointer;
-    margin-right: 8px;
-    color: #ddd;
-  }
-
-  .astatus-agg:hover {
-    background: #353535;
-  }
-
-  .astatus-agg.has-blocked {
-    border-color: #6b2b2b;
-    color: #f0b8b8;
-  }
-
-  .astatus-agg.muted {
-    opacity: 0.6;
   }
 
   .empty-hint {
