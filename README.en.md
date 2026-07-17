@@ -13,7 +13,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 [![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/)
 [![MCP](https://img.shields.io/badge/MCP-built--in%20server-8A2BE2)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-v0.4.5-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.4.6-brightgreen)](#roadmap)
 
 [User Guide](docs/userguide.en.md) · [Design Document](docs/design.en.md) · [Linux / Windows Porting](docs/porting.en.md) · [Competitive Analysis](docs/competitive-landscape.en.md) · [Troubleshooting](docs/troubleshooting.en.md)
 
