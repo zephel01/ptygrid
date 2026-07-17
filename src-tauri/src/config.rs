@@ -33,6 +33,9 @@ pub struct Config {
     pub queen: Option<QueenConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teammates: Option<TeammatesConfig>,
+    /// Phase 4.4.0 global `agent_status:` block (semantic-status detection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatusConfig>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -105,6 +108,69 @@ impl TeammatesConfig {
             Some(list) if !list.is_empty() => list.clone(),
             _ => vec!["claude".to_string()],
         }
+    }
+}
+
+/// Phase 4.4.0 global `agent_status:` block. Governs the semantic-status
+/// detector (working/blocked/done/idle) that runs on top of live `running`
+/// PTY sessions. Everything is optional; omitting the block leaves detection
+/// enabled with built-in defaults. This is a **separate layer** from
+/// `SessionState` (process liveness) and never changes it.
+///
+/// The pattern compilation + built-in-default merge lives in
+/// [`crate::agent_status`]; this struct only carries the parsed user values and
+/// the scalar defaults/clamps.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentStatusConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_lines: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_linger_ms: Option<u64>,
+    /// Ruleset overrides keyed by agent-definition name or foreground process
+    /// name (plus the opt-in `"*"` generic key). Merged onto the built-in
+    /// defaults by [`crate::agent_status`] (merge by default, `replace: true`
+    /// discards the built-in ruleset for that key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patterns: Option<HashMap<String, AgentStatusPatternSet>>,
+}
+
+/// One ruleset override under `agent_status.patterns.<key>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentStatusPatternSet {
+    /// Default false (merge onto the built-in ruleset of the same key). `true`
+    /// discards the built-in ruleset and uses only these patterns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<Vec<String>>,
+}
+
+impl AgentStatusConfig {
+    /// Default true: detection + `agent-status` events run unless disabled.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    /// Default 24, clamped into 4..=200. Reconstructed-tail line count fed to
+    /// the classifier.
+    pub fn effective_tail_lines(&self) -> usize {
+        self.tail_lines.unwrap_or(24).clamp(4, 200) as usize
+    }
+    /// Default 250ms, clamped into 100..=2000. Evaluation debounce interval.
+    pub fn effective_debounce_ms(&self) -> u64 {
+        self.debounce_ms.unwrap_or(250).clamp(100, 2000)
+    }
+    /// Default 6000ms, clamped into 0..=60000. How long `done` is held before
+    /// decaying to `idle`; `0` disables `done` (transitions go straight to idle).
+    pub fn effective_done_linger_ms(&self) -> u64 {
+        self.done_linger_ms.unwrap_or(6000).clamp(0, 60000)
     }
 }
 
@@ -1026,6 +1092,68 @@ agents:
         )
         .unwrap();
         assert!(cfg.agents[0].teams.clone().unwrap().effective_enabled());
+    }
+
+    #[test]
+    fn agent_status_block_defaults_and_clamp() {
+        // No block at all -> None; effective defaults come from Default.
+        let cfg = parse_config("agents: []").unwrap();
+        assert!(cfg.agent_status.is_none());
+        let d = AgentStatusConfig::default();
+        assert!(d.effective_enabled()); // default TRUE (4.1)
+        assert_eq!(d.effective_tail_lines(), 24);
+        assert_eq!(d.effective_debounce_ms(), 250);
+        assert_eq!(d.effective_done_linger_ms(), 6000);
+
+        // Empty block -> same effective defaults.
+        let cfg = parse_config("agents: []\nagent_status: {}").unwrap();
+        let a = cfg.agent_status.unwrap();
+        assert_eq!(a.enabled, None);
+        assert!(a.effective_enabled());
+
+        // Out-of-range values clamp; enabled: false is honored.
+        let cfg = parse_config(
+            "agents: []\nagent_status:\n  enabled: false\n  tail_lines: 9999\n  debounce_ms: 1\n  done_linger_ms: 999999\n",
+        )
+        .unwrap();
+        let a = cfg.agent_status.unwrap();
+        assert!(!a.effective_enabled());
+        assert_eq!(a.effective_tail_lines(), 200);
+        assert_eq!(a.effective_debounce_ms(), 100);
+        assert_eq!(a.effective_done_linger_ms(), 60000);
+
+        // Below-range clamps up.
+        let cfg = parse_config("agents: []\nagent_status:\n  tail_lines: 0\n  debounce_ms: 5").unwrap();
+        let a = cfg.agent_status.unwrap();
+        assert_eq!(a.effective_tail_lines(), 4);
+        assert_eq!(a.effective_debounce_ms(), 100);
+    }
+
+    #[test]
+    fn agent_status_patterns_parse_with_merge_and_replace() {
+        let cfg = parse_config(
+            "agent_status:\n  patterns:\n    claude:\n      blocked:\n        - 'Do you want to proceed\\?'\n      working:\n        - 'esc to interrupt'\n    codex:\n      replace: true\n      blocked:\n        - '\\[y/N\\]'\n    \"*\":\n      blocked:\n        - '\\[y/N\\]\\s*$'\n",
+        )
+        .unwrap();
+        let pats = cfg.agent_status.unwrap().patterns.unwrap();
+        // merge is the default (replace unset -> None).
+        assert_eq!(pats["claude"].replace, None);
+        assert_eq!(pats["claude"].blocked.as_ref().unwrap().len(), 1);
+        assert_eq!(pats["claude"].working.as_ref().unwrap().len(), 1);
+        // replace: true is captured.
+        assert_eq!(pats["codex"].replace, Some(true));
+        // the opt-in generic "*" key parses like any other.
+        assert!(pats.contains_key("*"));
+    }
+
+    #[test]
+    fn agent_status_block_ignores_unknown_fields() {
+        // Forward-compat: 4.4.2 fields (notify, etc.) are ignored today.
+        let cfg = parse_config(
+            "agent_status:\n  enabled: true\n  notify: true\n  notify_sound: false\n  renotify_ms: 5000\n",
+        )
+        .unwrap();
+        assert!(cfg.agent_status.unwrap().effective_enabled());
     }
 
     #[test]

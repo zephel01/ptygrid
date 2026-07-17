@@ -4,6 +4,8 @@
   import Terminal from "./lib/Terminal.svelte";
   import TranscriptPane from "./lib/TranscriptPane.svelte";
   import GitPanel from "./lib/GitPanel.svelte";
+  import StatusSidebar from "./lib/StatusSidebar.svelte";
+  import type { StatusRow } from "./lib/StatusSidebar.svelte";
   import {
     ui,
     MAX_PANES,
@@ -15,12 +17,15 @@
     refreshTeammateHooks,
     refreshTeamsHostStatus,
     markPaneClosed,
+    focusPane,
+    clearAgentStatus,
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
   import { invokeCmd, isTauri } from "./lib/tauri";
   import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
   import type {
+    AgentStatus,
     ConfigInfo,
     HostLeadStatus,
     LogicalSession,
@@ -39,6 +44,43 @@
   let persistenceReady = $state(false);
   let stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let demoNextId = 1;
+
+  // ---- status sidebar (Phase 4.4.1) ----
+  // Open state + width are UI-only, project-independent settings. Persisted to
+  // localStorage (Tauri webview) to keep 4.4.1 backend-free (no new command).
+  const SIDEBAR_OPEN_KEY = "ptygrid.statusSidebar.open";
+  const SIDEBAR_WIDTH_KEY = "ptygrid.statusSidebar.width";
+
+  function loadSidebarOpen(): boolean {
+    try {
+      return localStorage.getItem(SIDEBAR_OPEN_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  }
+  function loadSidebarWidth(): number {
+    try {
+      const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+      return Number.isFinite(raw) && raw >= 150 && raw <= 480 ? raw : 200;
+    } catch {
+      return 200;
+    }
+  }
+
+  let statusSidebarOpen = $state(loadSidebarOpen());
+  let statusSidebarWidth = $state(loadSidebarWidth());
+
+  // Persist open/width whenever they change (best-effort; ignore quota errors).
+  $effect(() => {
+    const open = statusSidebarOpen;
+    const width = statusSidebarWidth;
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, open ? "1" : "0");
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(Math.round(width)));
+    } catch {
+      // localStorage unavailable/full: sidebar still works, just not persisted.
+    }
+  });
 
   const LAYOUT_MODES: { value: LayoutMode; label: string; hint: string }[] = [
     { value: "auto", label: "自動", hint: "枚数に応じて格子配置" },
@@ -709,10 +751,92 @@
     delete ui.resources[id];
     delete ui.sessions[id];
     delete ui.transcripts[id];
+    clearAgentStatus(id);
   }
 
   function toggleMaximize(id: number): void {
     ui.maximizedId = ui.maximizedId === id ? null : id;
+  }
+
+  // ---- status sidebar derived view (Phase 4.4.1, spec 5.3) ----
+  // Display name for a sidebar row: definition name / foreground, with teammate
+  // (role + lead) and read-only transcript markers.
+  function statusRowName(s: SessionInfo): string {
+    if (s.kind === "transcript") {
+      const role = s.teammate?.role;
+      return `${s.name ?? "sub"}${role ? ` ▸${role}` : ""} 📖RO`;
+    }
+    if (s.teammate?.mode === "host") {
+      const role = s.teammate.role;
+      return `${s.name ?? "team"}${role ? ` ▸${role}` : ""} ↳#${s.teammate.leadId}`;
+    }
+    return s.name ?? s.foreground ?? "shell";
+  }
+
+  // Pure derived view over ui.panes / ui.sessions / ui.agentStatus: every
+  // running pane (incl. observe transcript + host teammate). No backend.
+  let statusRows = $derived.by<StatusRow[]>(() =>
+    ui.panes
+      .map((id) => ui.sessions[id])
+      .filter(
+        (s): s is SessionInfo => Boolean(s) && s!.state === "running",
+      )
+      .map((s) => ({
+        id: s.id,
+        status: (ui.agentStatus[s.id] ?? "unknown") as AgentStatus,
+        matchedRule: ui.agentStatusRule[s.id],
+        name: statusRowName(s),
+        alive: s.state === "running",
+      })),
+  );
+
+  let blockedRowIds = $derived(
+    statusRows.filter((r) => r.status === "blocked").map((r) => r.id),
+  );
+
+  // ---- sidebar row actions ----
+  function sidebarFocus(id: number): void {
+    focusPane(id);
+  }
+
+  function sidebarClose(id: number): void {
+    // Closing a host teammate kills a real process → route through the existing
+    // inline confirm shown in that pane's header (spec: 破壊的確認は既存フロー踏襲).
+    if (ui.sessions[id]?.teammate?.mode === "host") {
+      requestCloseHostTeammate(id);
+    } else {
+      closePane(id);
+    }
+  }
+
+  // Collapsed toolbar aggregate badge: expand + focus the first blocked pane.
+  function expandSidebarToBlocked(): void {
+    statusSidebarOpen = true;
+    const first = blockedRowIds[0];
+    if (first !== undefined) focusPane(first);
+  }
+
+  // ---- header semantic-status badge (spec 5.1) ----
+  const ASTATUS_LABEL: Record<AgentStatus, string> = {
+    blocked: "blocked（承認待ち）",
+    working: "working（実行中）",
+    done: "done（完了）",
+    idle: "idle（待機）",
+    unknown: "unknown（判定なし）",
+  };
+
+  function astatusTooltip(id: number): string {
+    const st = ui.agentStatus[id] ?? "unknown";
+    const rule = ui.agentStatusRule[id];
+    return rule ? `${ASTATUS_LABEL[st]} · ${rule}` : ASTATUS_LABEL[st];
+  }
+
+  // Whether to render the semantic badge: running + a known (non-unknown) state.
+  function showAstatus(id: number): boolean {
+    const s = ui.sessions[id];
+    if (!s || s.state !== "running") return false;
+    const st = ui.agentStatus[id];
+    return st !== undefined && st !== "unknown";
   }
 
   // A teammate pane (observe transcript or host PTY) that has finished, i.e.
@@ -973,6 +1097,16 @@
 </script>
 
 <main>
+  {#snippet astatusBadge(id: number)}
+    {#if showAstatus(id)}
+      <span
+        class="astatus astatus-{ui.agentStatus[id]}"
+        title={astatusTooltip(id)}
+        aria-label={astatusTooltip(id)}
+      ></span>
+    {/if}
+  {/snippet}
+
   <div class="toolbar" bind:this={toolbarEl}>
     <span class="title">ptygrid</span>
 
@@ -1078,6 +1212,18 @@
     </div>
 
     <span class="spacer"></span>
+    {#if !statusSidebarOpen}
+      <button
+        class="astatus-agg {blockedRowIds.length > 0 ? 'has-blocked' : 'muted'}"
+        onclick={expandSidebarToBlocked}
+        title={blockedRowIds.length > 0
+          ? `${blockedRowIds.length} ペインが承認待ち（クリックでサイドバーを開き最初の blocked へ）`
+          : "ステータスサイドバーを開く"}
+        aria-label="ステータスサイドバーを開く"
+      >
+        🔴 {blockedRowIds.length}
+      </button>
+    {/if}
     <button
       class="btn"
       class:seg-active={gitPanelOpen}
@@ -1293,6 +1439,15 @@
     </div>
   {/if}
 
+  <div class="workspace">
+  <StatusSidebar
+    bind:open={statusSidebarOpen}
+    bind:width={statusSidebarWidth}
+    rows={statusRows}
+    onFocus={sidebarFocus}
+    onToggleMax={toggleMaximize}
+    onClose={sidebarClose}
+  />
   <div class="grid" class:has-max={ui.maximizedId !== null}>
     {#if paneCount === 0}
       <div class="empty-hint">
@@ -1319,6 +1474,7 @@
                           class="dot tstate-{stopped ? 'stopped' : 'active'}"
                           title={stopped ? "stopped" : "active"}
                         ></span>
+                        {@render astatusBadge(id)}
                         <span
                           class="pane-title"
                           title="read-only transcript（観測のみ・入力不可）"
@@ -1363,6 +1519,7 @@
                           class="dot state-{session?.state ?? 'starting'}"
                           title={session?.state ?? "starting"}
                         ></span>
+                        {@render astatusBadge(id)}
                         <span
                           class="pane-title"
                           title="host teammate（実 PTY・対話可能）"
@@ -1441,6 +1598,7 @@
                           class="dot state-{session?.state ?? 'starting'}"
                           title={session?.state ?? "starting"}
                         ></span>
+                        {@render astatusBadge(id)}
                         <span class="pane-title">{paneTitle(id)}</span>
                         {#if session?.worktree}
                           <span
@@ -1498,6 +1656,7 @@
         {/each}
       </Splitpanes>
     {/if}
+  </div>
   </div>
 
   {#if ui.notices.length > 0}
@@ -2050,13 +2209,78 @@
     color: #e0a94f;
   }
 
+  /* ---- workspace (status sidebar + grid) ---- */
+
+  .workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: stretch;
+    overflow: hidden;
+  }
+
   /* ---- grid ---- */
 
   .grid {
     flex: 1 1 auto;
+    min-width: 0;
     min-height: 0;
     position: relative;
     overflow: hidden;
+  }
+
+  /* ---- semantic status badge (spec 5.1) + toolbar aggregate ---- */
+
+  /* Small colored dot rendered right after the liveness dot; distinct from the
+     existing .dot.state-* (that one shows PTY liveness). */
+  .astatus {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px; /* rounded square to differentiate from the round liveness dot */
+    background: #666;
+  }
+
+  .astatus-blocked {
+    background: #e0574a;
+  }
+  .astatus-working {
+    background: #e5c07b;
+  }
+  .astatus-done {
+    background: #4a9be0;
+  }
+  .astatus-idle {
+    background: #4caf50;
+  }
+
+  .astatus-agg {
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 10px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    margin-right: 8px;
+    color: #ddd;
+  }
+
+  .astatus-agg:hover {
+    background: #353535;
+  }
+
+  .astatus-agg.has-blocked {
+    border-color: #6b2b2b;
+    color: #f0b8b8;
+  }
+
+  .astatus-agg.muted {
+    opacity: 0.6;
   }
 
   .empty-hint {

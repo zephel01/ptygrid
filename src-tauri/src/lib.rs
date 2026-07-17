@@ -1,3 +1,4 @@
+mod agent_status;
 mod ansi;
 mod app_settings;
 mod commands;
@@ -17,6 +18,7 @@ mod trust;
 mod worktree;
 
 pub use config::capture_launch_dir;
+use agent_status::AgentStatusManager;
 use config::ConfigManager;
 use queen::QueenStatus;
 use session::PtyManager;
@@ -44,6 +46,7 @@ pub fn run() {
         .manage(PtyManager::new())
         .manage(ConfigManager::new())
         .manage(TeamsHostManager::new())
+        .manage(AgentStatusManager::new())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             // Load (or first-time generate) the persisted auth tokens before the
@@ -59,6 +62,10 @@ pub fn run() {
             // Queen starts with defaults; load_config may adjust it later.
             queen::start_default(&app.handle().clone());
             resource_monitor::start(&app.handle().clone());
+            // Phase 4.4.0: single debounced agent-status evaluation task. Rules
+            // start from built-in defaults; load_config folds in the user's
+            // `agent_status` block via agent_status::apply.
+            agent_status::start(&app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

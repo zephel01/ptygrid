@@ -264,6 +264,20 @@ fn foreground_pid(slot: &SessionSlot) -> Option<i32> {
     }
 }
 
+/// Read-only snapshot for the Phase 4.4.0 agent-status detector (see
+/// [`PtyManager::agent_status_snapshot`]). Deliberately owns its output copy so
+/// the sessions lock is released before the (heavier) render/regex work runs on
+/// the separate evaluation task.
+pub(crate) struct AgentStatusSnapshot {
+    pub state: SessionState,
+    pub kind: SessionKind,
+    pub name: Option<String>,
+    pub foreground_pid: Option<i32>,
+    pub output: Vec<u8>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 type SharedSessions = Arc<Mutex<HashMap<u32, SessionSlot>>>;
 
 fn lock_map(map: &SharedSessions) -> MutexGuard<'_, HashMap<u32, SessionSlot>> {
@@ -725,6 +739,26 @@ impl PtyManager {
             slot.rows,
             slot.cols,
         ))
+    }
+
+    /// One-lock snapshot of everything the Phase 4.4.0 agent-status detector
+    /// needs for a session: liveness/kind (to gate to `running`), the ruleset
+    /// selection keys (definition name + foreground pid, resolved to a name by
+    /// the caller OUTSIDE the lock exactly like `list_sessions`), and the raw
+    /// output ring + dimensions (fed to `ansi::render_terminal`). Returns None
+    /// when the session no longer exists. Pure read; no regex, no process query.
+    pub(crate) fn agent_status_snapshot(&self, id: u32) -> Option<AgentStatusSnapshot> {
+        let sessions = self.lock_sessions();
+        let slot = sessions.get(&id)?;
+        Some(AgentStatusSnapshot {
+            state: slot.state,
+            kind: slot.kind,
+            name: slot.spec.name.clone(),
+            foreground_pid: foreground_pid(slot),
+            output: slot.output.clone(),
+            rows: slot.rows,
+            cols: slot.cols,
+        })
     }
 
     /// Queen resolves `"#<id>"` first, then an exact unique definition/session
@@ -1283,6 +1317,12 @@ fn spawn_reader_thread<R: Runtime>(
                     if !is_current {
                         return; // stale: no EOF handling either
                     }
+                    // Hot path: only MARK this session dirty (cheap: atomic +
+                    // unbounded channel send, no lock/regex/render). The
+                    // debounced agent-status task does all the heavy work
+                    // off-thread (Phase 4.4.0). A no-op when the manager is
+                    // unmanaged (e.g. session unit tests) or detection is off.
+                    crate::agent_status::mark_dirty(&app, id);
                     let data = decode_stream_chunk(&mut carry, &buf[..n]);
                     if !data.is_empty() {
                         let _ = app.emit("pty-output", OutputPayload { id, data });

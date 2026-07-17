@@ -23,6 +23,8 @@ export type Config = {
   project?: string;
   agents: AgentDef[];
   processes: AgentDef[];
+  /** Phase 4.4.0: セマンティック状態検出の設定（省略で既定・検出は既定 on） */
+  agent_status?: AgentStatusConfig;
 };
 
 export type AgentDef = {
@@ -89,6 +91,41 @@ export type ProjectState = {
   layoutMode: "auto" | "1" | "2" | "3";
   sessions: LogicalSession[];
   maximizedIndex?: number;
+};
+
+// Phase 4.4.0 (agent-status: セマンティック状態検出)
+/** 意味的状態。SessionState（プロセス生死）とは別レイヤの「推定（意見）」。
+ * unknown はルールセット未割当／評価前（UI ではバッジ非表示）。 */
+export type AgentStatus = "working" | "blocked" | "done" | "idle" | "unknown";
+
+/** agent-status: 状態が変化したときだけ emit（agent_status.enabled 時のみ）。
+ * exited 時はイベントを出さず、frontend が session-state:exited で
+ * ui.agentStatus[id] を削除する。 */
+export type AgentStatusPayload = {
+  id: number;
+  status: AgentStatus;
+  /** マッチしたルールの id（＝正規表現ソース。tooltip / デバッグ用、任意） */
+  matchedRule?: string;
+  /** 適用したルールセットキー（claude / codex / "*" 等、任意） */
+  ruleSet?: string;
+};
+
+/** agent_status.patterns.<key>。既定は内蔵ルールへの merge、replace:true で置換。 */
+export type AgentStatusPatternSet = {
+  replace?: boolean;
+  blocked?: string[];
+  working?: string[];
+  done?: string[];
+};
+
+/** グローバル agent_status ブロック（すべて任意）。キーは agent 定義名 or
+ * フォアグラウンドプロセス名（+ opt-in の "*"）。wire は snake_case。 */
+export type AgentStatusConfig = {
+  enabled?: boolean; // default true
+  tail_lines?: number; // default 24, clamp 4..200
+  debounce_ms?: number; // default 250, clamp 100..2000
+  done_linger_ms?: number; // default 6000, clamp 0..60000
+  patterns?: Record<string, AgentStatusPatternSet>;
 };
 
 export type PtyOutputPayload = { id: number; data: string };

@@ -1338,3 +1338,103 @@ Bearer トークンを**起動ごとに再生成**し、ディスクに書かな
   ローテーション可能。
 - DNS リバインディング / cross-origin / env に触れないプロセスへの防御（Phase 2「Queen 認証」の
   Host/Origin allow-list・token 検証）は**不変**。bind は 127.0.0.1 のみ、検証は定数時間のまま。
+
+---
+
+# Phase 4.4.0 追加契約（agent-status: セマンティック状態検出の基盤 + イベント）
+
+Phase 4.4.0 は、生きている（`running`）PTY セッションの端末出力から**意味的状態**
+`working | blocked | done | idle`（+ `unknown`）を推定し、`agent-status` イベントで frontend へ
+運ぶ**検出基盤**を実装する。UI バッジ（ヘッダー）は本 Phase の frontend で、ステータスサイドバー
+（4.4.1）と blocked 通知（4.4.2）は後続。Phase 0〜4.2 はすべて互換維持（本節は additive）。
+
+## AgentStatus は SessionState とは別レイヤ（重要）
+
+- `AgentStatus`（`working|blocked|done|idle|unknown`）は、既存 `SessionState`
+  （`starting|running|exited|restarting`＝**プロセス生死**の事実）とは**別レイヤの推定（意見）**である。
+- **意味的状態は `SessionState == running` のセッションにのみ付与する**。`exited`/`restarting`/`starting`
+  は対象外。`AgentStatus` は `SessionState` を**上書きしない**（`SessionState` enum / `session-state`
+  イベント / `SessionInfo` の既存 field は**一切不変**）。
+- `unknown` はルールセット未割当／評価前（UI ではバッジ非表示）。
+
+## ptygrid.yml 拡張（グローバル `agent_status:` ブロック、すべて任意）
+
+```yaml
+agent_status:
+  enabled: true          # default true。false で検出・イベントを停止
+  tail_lines: 24         # default 24、4..=200 に clamp。検出に使う再構成末尾行数
+  debounce_ms: 250       # default 250、100..=2000 に clamp。評価デバウンス間隔
+  done_linger_ms: 6000   # default 6000、0..=60000 に clamp。done を保持して idle へ減衰（0で done 無効）
+
+  # ルールセット定義。キー = agent 定義名 or フォアグラウンドプロセス名（+ opt-in の "*"）。
+  patterns:
+    claude:                    # 内蔵既定へ merge（既定）: 内蔵 + ユーザーを連結（順序: 内蔵→ユーザー）
+      blocked: ['Do you want to proceed\?']
+      working: ['esc to interrupt']
+    codex:
+      replace: true            # 内蔵既定を破棄し、以下だけを使う
+      blocked: ['\[y/N\]']
+    "*":                       # opt-in の generic フォールバック（既定では存在しない）
+      blocked: ['\[y/N\]\s*$']
+```
+
+- **既定値と clamp**: 上記コメントの通り。`enabled` の既定は **true**（省略で検出 on）。
+- **merge / replace セマンティクス**:
+  - `patterns.<key>` は同名の内蔵既定があれば**既定で merge**（各カテゴリ blocked/working/done ごとに
+    **内蔵配列 + ユーザー配列**を連結、重複除去なし、順序は内蔵→ユーザー）。
+  - `replace: true` でそのキーの内蔵既定を**破棄**し、ユーザー定義だけを使う。
+  - カテゴリ省略時: merge では内蔵配列をそのまま使用／replace では空。
+  - 内蔵に無いキーは常に新規追加。`"*"` は 3.1 でルールセット未割当だった running PTY にのみ
+    **opt-in で**適用する generic ルール（既定では未定義）。
+- **内蔵既定パターン**はバイナリに**コンパイル時同梱**（`src-tauri/src/agent_status_defaults.yml` を
+  `include_str!`）。初期同梱キー: `claude` / `codex` / `grok` / `aider`。**これらは各 CLI の UI 変更で
+  陳腐化しうる**ため、リリースごとの更新 + ユーザー上書きで保守する。
+- **不正な正規表現**はその**1本だけをスキップ**して backend ログに警告を出し、残りは有効化する
+  （設定全体を失敗させない／config reload の非破壊性）。
+- 未知 field は無視、欠落はデフォルト補完（既存 config ブロックと同流儀）。パターンは既定で
+  case-insensitive + multiline の部分一致（`(?-i)` 等のインラインフラグで個別上書き可）。
+
+## 検出方式（backend、hot path 分離）
+
+- 対象は `SessionState == running` の PTY セッション。決定順は **blocked > working > done > idle**、
+  どれもマッチしなければ `idle`（ルールセットあり）/ `unknown`（ルールセット無し）。
+  **blocked は保守的**（既知の承認/権限/選択 UI にマッチした時だけ。未知プロンプト・シェル復帰・空は
+  `idle`）。
+- ルールセット選択は評価のたびに遅延解決: ① agent 定義名 → ② フォアグラウンドプロセス名 →
+  ③ opt-in `"*"` → ④ 無ければ `unknown`。
+- 検出入力は **`output_snapshot` → `ansi::render_terminal`（現在画面再構成）→ 末尾 N 行**。生バイト列には
+  掛けない。`done` は `done_linger_ms` 保持後に `idle` へ減衰（working→プロンプト復帰も done 扱い）。
+- **hot path（reader thread）には regex/重処理を置かない**。reader は当該セッションを dirty マークする
+  だけ。別の**単一デバウンス評価タスク**（既定 250ms）が dirty セッションのみ評価する。regex は起動時／
+  config reload 時に一度コンパイルしてキャッシュ（hot path でコンパイルしない）。
+
+## 新イベント `agent-status`（backend → frontend）
+
+| event | payload | 説明 |
+|---|---|---|
+| `agent-status` | `AgentStatusPayload` | 意味的状態が**変化したときだけ** emit（`agent_status.enabled: true` 時のみ） |
+
+```ts
+type AgentStatus = "working" | "blocked" | "done" | "idle" | "unknown";
+type AgentStatusPayload = {
+  id: number;
+  status: AgentStatus;
+  matchedRule?: string;   // マッチしたルール id（＝正規表現ソース。tooltip/デバッグ、任意）
+  ruleSet?: string;       // 適用したルールセットキー（claude / codex / "*" 等、任意）
+};
+```
+
+- **emit は状態変化時のみ**（`blocked → blocked` は emit しない）。`agent_status.enabled: false` の間は
+  一切 emit しない。
+- **`exited` クリア規約**: セッションが running でなくなった時点で backend は tracker から当該
+  セッションを破棄する（**専用のクリアイベントは出さない**）。frontend は `session-state: exited`
+  で `ui.agentStatus[id]` を削除する。
+- 本 Phase では MCP 面（`list_agents` / `read_output` / `SessionInfo.agentStatus?`）へ意味的状態は
+  **同梱しない**（7.4 の任意項目・将来）。イベントのみで UI は成立する。
+
+## 非回帰（本節はすべて additive）
+
+- 既存 `session-state` / `SessionState` / `SessionInfo`（全 field）/ `pty-output` / `pty-exit` /
+  `read_output` / `list_agents` は**不変**。
+- reader hot path の追加は「dirty マーク（atomic + unbounded channel send）」のみ。`agent_status` 未 manage
+  の経路（session 単体テスト等）では dirty マークは no-op。

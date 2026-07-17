@@ -27,6 +27,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 notify = "8"
+# Phase 4.4.0: compiled regex for agent-status detection (built once, cached;
+# never compiled on the hot path).
+regex = "1"
 rmcp = { version = "1.8", features = [
     "server",
     "macros",

@@ -1,0 +1,75 @@
+# Built-in default agent-status detection patterns (Phase 4.4.0).
+#
+# !!! THESE PATTERNS GO STALE. !!!
+# Each agent CLI changes its terminal-UI wording frequently, so this table is a
+# best-effort snapshot (2026-07) and a per-release maintenance target, NOT a
+# stable contract. ptygrid stays offline / config-as-code, so the two
+# maintenance levers are: (a) updating this file each release, and (b) users
+# overriding it in ptygrid.yml `agent_status.patterns` (merge by default,
+# `replace: true` to discard a built-in ruleset).
+#
+# All built-in pattern literals live HERE, in this single file, on purpose: a
+# wording survey (e.g. a Sonnet CLI-string investigation) can be dropped in by
+# editing only this file, with no code change.
+#
+# Matching semantics (see agent_status.rs::compile_list): every pattern is
+# compiled case-insensitive + multiline by default, matched as a partial match
+# against the reconstructed terminal tail. Use inline flags to override per
+# pattern (e.g. `(?-i)` for case-sensitive). Decision order at match time is
+# blocked > working > done > idle. `blocked` is deliberately narrow (only known,
+# visible approval / permission / choice UIs) to keep false positives rare.
+#
+# Shell-prompt returns (`$ `, `❯ `, `% `) are intentionally NOT in any built-in
+# `done` list: they produce too many false positives. Users who want them can
+# add a generic `"*"` ruleset (opt-in) or a per-CLI `done` entry.
+# Confidence (from the 2026-07 wording survey): Aider is highest (patterns
+# taken from its public source io.py / base_coder.py); Claude Code blocked is
+# high (approval prompts quoted in issues); Grok working is from xAI's official
+# screenshots. Codex and Grok `blocked` wording could NOT be confirmed online
+# and needs real-machine verification — kept narrow/omitted to avoid false
+# positives. `\bWorking\b`/`\bThinking\b` alone are too generic (they appear in
+# ordinary agent prose), so we lean on `esc to interrupt` and CLI-specific
+# markers instead.
+patterns:
+  claude:
+    # blocked: approval / permission / choice UIs (issue-quoted, high confidence)
+    blocked:
+      - 'Do you want to proceed\?'
+      - 'Do you want to make this edit to'
+      - "Yes, and don't ask again"
+      - 'No, and tell Claude what to do differently'
+      - '❯\s*\d+\.\s*Yes'
+    working:
+      - 'esc to interrupt'
+    # No confirmed done-only wording; shell-prompt return is intentionally not
+    # used (false positives). Left empty → returns to idle when working clears.
+    done: []
+  codex:
+    # blocked wording unconfirmed online; `don't ask again` is a fragment seen
+    # in approval prompts. Real-machine verification recommended.
+    blocked:
+      - "don't ask again"
+    working:
+      - 'esc to interrupt'
+      - '\bThinking\b'
+    done: []
+  grok:
+    # xAI official Grok Build CLI working markers (from launch screenshots).
+    blocked: []
+    working:
+      - '◆\s*Thought for [\d.]+s'
+      - '\[turn:\s*\d+s'
+      - '\[running\]'
+    done: []
+  aider:
+    # From Aider's public source (highest confidence).
+    blocked:
+      - '\(Y\)es/\(N\)o'
+      - 'Run shell commands?\?'
+      - 'Add .+ to the chat\?'
+      - 'Allow edits to file that has not been added'
+    working:
+      - 'Waiting for \S+'
+    done:
+      - '^Tokens: .* sent.*received\.'
+      - '^Cost: \$[\d.]+ message'

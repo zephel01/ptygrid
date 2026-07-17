@@ -3,6 +3,8 @@
 // exactly once from App via initGlobalListeners().
 
 import type {
+  AgentStatus,
+  AgentStatusPayload,
   ConfigChangedPayload,
   ConfigInfo,
   PtyExitPayload,
@@ -60,6 +62,12 @@ export const ui = $state({
   teamsHost: null as TeamsHostStatus | null,
   /** Phase 4.2: session ids briefly highlighted by a teammate-focus event. */
   focusedTeammates: {} as Record<number, true>,
+  /** Phase 4.4.0: latest semantic status per session id (agent-status event).
+   * Separate map from ui.sessions (liveness): only meaningful while running.
+   * Cleared when the session leaves `running` (session-state) or on close. */
+  agentStatus: {} as Record<number, AgentStatus>,
+  /** Phase 4.4.0: matched rule id (regex source) per session id, for tooltips. */
+  agentStatusRule: {} as Record<number, string>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
 });
@@ -107,6 +115,29 @@ function isTombstoned(id: number): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Briefly highlight a pane's frame (reuses the teammate-focus pulse ring).
+ * Used by the teammate-focus event and the status sidebar's row click so both
+ * share one timer-per-id lifecycle (BUG-6: a re-focus resets, never clears a
+ * newer highlight).
+ */
+export function focusPane(id: number): void {
+  ui.focusedTeammates[id] = true;
+  const prev = focusTimers.get(id);
+  if (prev !== undefined) clearTimeout(prev);
+  const timer = setTimeout(() => {
+    delete ui.focusedTeammates[id];
+    focusTimers.delete(id);
+  }, FOCUS_PULSE_MS);
+  focusTimers.set(id, timer);
+}
+
+/** Drop the semantic status + matched rule for a session (leave running / close). */
+export function clearAgentStatus(id: number): void {
+  delete ui.agentStatus[id];
+  delete ui.agentStatusRule[id];
 }
 
 const NOTICE_TTL_MS = 5000;
@@ -197,7 +228,12 @@ export async function initGlobalListeners(): Promise<void> {
 
     if (known) {
       ui.sessions[payload.id] = payload;
-      if (payload.state !== "running") delete ui.resources[payload.id];
+      if (payload.state !== "running") {
+        delete ui.resources[payload.id];
+        // Semantic status only applies to a running PTY: drop it on
+        // exited/restarting/starting so stale badges never linger (5.1).
+        clearAgentStatus(payload.id);
+      }
       return;
     }
 
@@ -276,17 +312,17 @@ export async function initGlobalListeners(): Promise<void> {
 
   await listen<TeammateFocusPayload>("teammate-focus", (event) => {
     // tmux select-pane 相当: 該当ペインの枠を短時間ハイライトする。
-    const { id } = event.payload;
-    ui.focusedTeammates[id] = true;
-    // Keep one timer per id and reset it on each focus so a rapid re-focus (or
-    // a reused id after a close) can't clear the wrong/newer highlight (BUG-6).
-    const prev = focusTimers.get(id);
-    if (prev !== undefined) clearTimeout(prev);
-    const timer = setTimeout(() => {
-      delete ui.focusedTeammates[id];
-      focusTimers.delete(id);
-    }, FOCUS_PULSE_MS);
-    focusTimers.set(id, timer);
+    focusPane(event.payload.id);
+  });
+
+  await listen<AgentStatusPayload>("agent-status", (event) => {
+    // Phase 4.4.0: semantic status changed for a running session. Kept in a
+    // map independent of ui.sessions (liveness); the header badge / status
+    // sidebar derive purely from it. Cleared via session-state:exited / close.
+    const { id, status, matchedRule } = event.payload;
+    ui.agentStatus[id] = status;
+    if (matchedRule) ui.agentStatusRule[id] = matchedRule;
+    else delete ui.agentStatusRule[id];
   });
 
   await listen<TeammateFallbackPayload>("teammate-fallback", () => {

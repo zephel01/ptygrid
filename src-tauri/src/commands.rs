@@ -68,6 +68,9 @@ pub fn load_config(
     let info = config.load(&app, dir, allow_default.unwrap_or(false))?;
     let q = info.config.queen.unwrap_or_default();
     queen::apply(&app, q.effective_enabled(), q.effective_port());
+    // Phase 4.4.0: recompile agent-status rules + refresh enabled/timings from
+    // the (possibly reloaded) config so pattern edits take effect immediately.
+    crate::agent_status::apply(&app, &info.config);
     Ok(info)
 }
 
