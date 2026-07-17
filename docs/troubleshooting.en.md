@@ -228,3 +228,29 @@ itself, or per-TUI completion conditions.
   you need them.
 - A cancellation error means the MCP client canceled the request — it doesn't change any
   message or ack state.
+
+## The ptygrid window "randomly dies" (case from 2026-07-17)
+
+- **Symptom**: while running agent verification with ptygrid's own repository as the
+  working folder, the whole ptygrid window disappeared several times, seemingly right
+  after pasting long text into a pane.
+- **Triage**: macOS crash reports (`~/Library/Logs/DiagnosticReports`) contained no
+  `.ips` for ptygrid at all — so this was not a real crash (segfault/abort). Meanwhile
+  the mtime of `src-tauri/target/debug/ptygrid` had been refreshed right after each
+  "crash".
+- **Cause**: the **file watcher of `npm run tauri dev`**. When anything under
+  `src-tauri/` changes (a test file being created, an agent editing sources), tauri dev
+  kills the app, rebuilds, and relaunches it. When you dogfood ptygrid on its own
+  repository, every agent touch of src-tauri makes the window drop (and come back after
+  minutes of Rust build). The paste itself is unrelated — the timing just coincides.
+- **Fix**: disable the watcher for verification sessions:
+
+  ```bash
+  npm run tauri -- dev --no-watch
+  ```
+
+  or verify against a built app (`npm run tauri build` artifact). Restart manually when
+  you actually want source changes picked up.
+- **Lesson**: when "the app crashed", check DiagnosticReports first. A "crash" with no
+  `.ips` means an external kill (dev watcher, or some supervising process) — not a
+  crash.

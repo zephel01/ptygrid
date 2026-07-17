@@ -72,8 +72,13 @@ coderouter なしでも実施できる。
 cd ~/works/project/ptygrid
 git status          # clean / v0.4.6 であること
 npm install
-npm run tauri dev   # 初回は Rust ビルドで数分
+npm run tauri -- dev --no-watch   # 初回は Rust ビルドで数分
 ```
+
+> ⚠️ **`--no-watch` は必須**（ptygrid 自身を作業対象にする検証では）。通常の
+> `npm run tauri dev` は `src-tauri/` 配下の変更を検知すると**アプリを kill して
+> 再ビルド→再起動**する。訓練用テストファイルの作成やエージェントのソース編集の
+> たびにウィンドウごと落ちたように見える（troubleshooting.md の 2026-07-17 事例）。
 
 ### A-2. coderouter（claude-code-router）— 偵察(C)で使用
 

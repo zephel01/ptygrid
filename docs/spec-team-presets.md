@@ -223,6 +223,10 @@ CONTRACT.md への追記（実装前に先行追記）:
 > ③ チーム再活性化で standby instructions が重複配送される（契約どおり）→ opus 側
 > 規約に「読了後 ack」を追加。恒久策「同一内容の未 ack instructions は再配送しない」は
 > v0.4.7 候補（11章）。
+> ④ 「ペースト中に ptygrid ごと落ちる」事象は**クラッシュではなく `tauri dev` の
+> ファイル監視による自動再起動**（DiagnosticReports に .ips 無し + 落ちた直後に
+> debug バイナリ再ビルドの物証）。ptygrid 自身をドッグフーディングする検証は
+> `npm run tauri -- dev --no-watch` で起動する（troubleshooting.md 2026-07-17 事例）。
 
 実装着手の前に、想定構成での実機確認を行い、結果を本書に追記する:
 
