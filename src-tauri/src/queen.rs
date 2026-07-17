@@ -171,6 +171,21 @@ pub fn current_env_url<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> 
     Some(env_url_for_port(port, &status.token()))
 }
 
+/// Raw `/mcp` auth token injected as `QUEEN_TOKEN` into every spawned session's
+/// env (parallel to [`current_env_url`]). This lets agents that authenticate by
+/// reference — codex `bearer_token_env_var = "QUEEN_TOKEN"`, grok
+/// `-h Authorization="Bearer $QUEEN_TOKEN"` — pick up the current, persisted
+/// token from the environment instead of embedding a copy in their own config
+/// that goes stale on regeneration (the 401 cause). Returns None when Queen is
+/// disabled. Generic over the runtime so session.rs can test with MockRuntime.
+pub fn current_env_token<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let status = app.try_state::<QueenStatus>()?;
+    if !status.lock().enabled {
+        return None;
+    }
+    Some(status.token())
+}
+
 // ---------- lifecycle ----------
 
 /// Start with defaults at app setup.

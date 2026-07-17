@@ -200,6 +200,57 @@
     }
   }
 
+  /** Token-free base URL (`.../mcp`, no `?token=`). codex/grok authenticate via
+   *  the injected QUEEN_TOKEN env instead of embedding the token in the URL. */
+  function queenBaseUrl(q: NonNullable<typeof ui.queenStatus>): string {
+    return q.url ?? `http://127.0.0.1:${q.port}/mcp`;
+  }
+
+  /** codex: ~/.codex/config.toml has no first-class `mcp add` for HTTP servers,
+   *  so we copy the TOML table. `bearer_token_env_var = "QUEEN_TOKEN"` reads the
+   *  injected env at runtime → stale-proof across token regeneration (no 401). */
+  async function copyCodexSnippet(): Promise<void> {
+    const q = ui.queenStatus;
+    if (!isTauri() || !q || (!q.url && !q.port)) return;
+    const base = queenBaseUrl(q);
+    const snippet =
+      `[mcp_servers.queen]\n` +
+      `url = "${base}"\n` +
+      `bearer_token_env_var = "QUEEN_TOKEN"\n`;
+    try {
+      await navigator.clipboard.writeText(snippet);
+      addNotice(
+        "codex スニペットをコピーしました（~/.codex/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
+        snippet,
+      );
+    } catch (err) {
+      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+    }
+  }
+
+  /** grok: a Codex-style CLI that reads MCP servers from ~/.grok/config.toml
+   *  with the same table shape as codex (verified on a real machine). We copy
+   *  the TOML block; `bearer_token_env_var = "QUEEN_TOKEN"` reads the injected
+   *  env at runtime → stale-proof across token regeneration (no 401). */
+  async function copyGrokSnippet(): Promise<void> {
+    const q = ui.queenStatus;
+    if (!isTauri() || !q || (!q.url && !q.port)) return;
+    const base = queenBaseUrl(q);
+    const snippet =
+      `[mcp_servers.queen]\n` +
+      `url = "${base}"\n` +
+      `bearer_token_env_var = "QUEEN_TOKEN"\n`;
+    try {
+      await navigator.clipboard.writeText(snippet);
+      addNotice(
+        "grok スニペットをコピーしました（~/.grok/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
+        snippet,
+      );
+    } catch (err) {
+      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+    }
+  }
+
   // ---- Teammates badge (Phase 4.0 hooks) ----
   let teammatesPanelOpen = $state(false);
   // Anchor rect for the Teammates panel. The panel is rendered position:fixed
@@ -213,6 +264,14 @@
   let teammatesPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
   let registering = $state(false);
   let regenerating = $state(false);
+
+  // ---- Queen registration panel (claude / codex / grok) ----
+  // The Queen badge opens a small panel (same fixed-position pattern as the
+  // Teammates panel) offering per-CLI register commands, because the three CLIs
+  // register MCP servers differently (claude/grok have CLIs, codex is TOML).
+  let queenPanelOpen = $state(false);
+  let queenBadgeEl = $state<HTMLButtonElement | null>(null);
+  let queenPanelPos = $state<{ top: number; right: number }>({ top: 0, right: 0 });
 
   // Phase 4.2: any host lead that fell back to observe (host unavailable).
   let hostFallbackActive = $derived.by(
@@ -988,6 +1047,18 @@
     }
   }
 
+  function positionQueenPanel(): void {
+    if (!queenBadgeEl) return;
+    const rect = queenBadgeEl.getBoundingClientRect();
+    const right = Math.max(6, window.innerWidth - rect.right);
+    queenPanelPos = { top: rect.bottom + 6, right };
+  }
+
+  function openQueenPanel(): void {
+    queenPanelOpen = !queenPanelOpen;
+    if (queenPanelOpen) positionQueenPanel();
+  }
+
   function formatCpu(percent: number): string {
     return `${percent.toFixed(1)}%`;
   }
@@ -1059,6 +1130,7 @@
     // window is resized while the panel is open.
     const onReposition = () => {
       if (teammatesPanelOpen) positionTeammatesPanel();
+      if (queenPanelOpen) positionQueenPanel();
     };
     window.addEventListener("resize", onReposition);
     // Toolbar overflow-x:auto scrolls the anchor badge; keep the fixed panel
@@ -1244,15 +1316,74 @@
     >
       Git
     </button>
-    <button
-      class="queen-badge {queenClass}"
-      onclick={copyQueenCommand}
-      title={queenTooltip}
-      aria-label="Queen MCP サーバー状態（クリックで登録コマンドをコピー）"
-    >
-      <span class="queen-dot"></span>
-      {queenLabel}
-    </button>
+    <div class="teammates-wrap">
+      <button
+        bind:this={queenBadgeEl}
+        class="queen-badge {queenClass}"
+        onclick={openQueenPanel}
+        title={queenTooltip}
+        aria-label="Queen MCP サーバー状態（クリックで登録メニュー）"
+      >
+        <span class="queen-dot"></span>
+        {queenLabel}
+      </button>
+      {#if queenPanelOpen}
+        <div
+          class="teammates-panel"
+          role="dialog"
+          aria-label="Queen MCP 登録"
+          style="top: {queenPanelPos.top}px; right: {queenPanelPos.right}px;"
+        >
+          <div class="tm-head">
+            <span class="tm-title">Queen MCP 登録</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (queenPanelOpen = false)}
+              title="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+          {#if !isTauri()}
+            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+          {:else if !ui.queenStatus?.enabled}
+            <p class="tm-note">
+              Queen は無効です（ptygrid.yml の queen.enabled: false）。
+            </p>
+          {:else}
+            <p class="tm-note">
+              各エージェント CLI に Queen を登録するコマンド/スニペットをコピーします。トークンは永続化され再起動後も有効です。
+            </p>
+            <div class="tm-actions">
+              <button
+                class="btn btn-small"
+                onclick={copyQueenCommand}
+                title="claude mcp add（remove→add で冪等）"
+              >
+                claude 登録コマンド
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyCodexSnippet}
+                title="~/.codex/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+              >
+                codex スニペット
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyGrokSnippet}
+                title="~/.grok/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+              >
+                grok スニペット
+              </button>
+            </div>
+            <p class="tm-note">
+              codex / grok は QUEEN_TOKEN env 参照なのでトークン再生成後もそのまま有効。claude は再生成時に再コピーしてください。
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </div>
     <div class="teammates-wrap">
       <button
         bind:this={teammatesBadgeEl}

@@ -297,9 +297,14 @@ fn lock_writer(
 }
 
 /// Build the CommandBuilder for a spec. TERM is always set (a definition's
-/// env may deliberately override it). QUEEN_URL is injected into every
-/// session when the Queen MCP server is enabled.
-fn command_for_spec(spec: &LaunchSpec, queen_url: Option<&str>) -> CommandBuilder {
+/// env may deliberately override it). QUEEN_URL (token-carrying connect URL)
+/// and QUEEN_TOKEN (raw token, for codex/grok header-based auth) are injected
+/// into every session when the Queen MCP server is enabled.
+fn command_for_spec(
+    spec: &LaunchSpec,
+    queen_url: Option<&str>,
+    queen_token: Option<&str>,
+) -> CommandBuilder {
     let mut cmd = if spec.shell_wrap {
         #[cfg(not(windows))]
         {
@@ -325,6 +330,9 @@ fn command_for_spec(spec: &LaunchSpec, queen_url: Option<&str>) -> CommandBuilde
     cmd.env("TERM", "xterm-256color");
     if let Some(url) = queen_url {
         cmd.env("QUEEN_URL", url);
+    }
+    if let Some(token) = queen_token {
+        cmd.env("QUEEN_TOKEN", token);
     }
     for (k, v) in &spec.env {
         cmd.env(k, v);
@@ -1267,7 +1275,8 @@ fn spawn_into_slot<R: Runtime>(
     };
 
     let queen_url = crate::queen::current_env_url(app);
-    let cmd = command_for_spec(&spec, queen_url.as_deref());
+    let queen_token = crate::queen::current_env_token(app);
+    let cmd = command_for_spec(&spec, queen_url.as_deref(), queen_token.as_deref());
     let parts = pty::open_and_spawn(cmd, cols, rows)?;
     let generation = generations.fetch_add(1, Ordering::SeqCst);
 
