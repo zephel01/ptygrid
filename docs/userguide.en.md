@@ -772,6 +772,17 @@ See [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) for th
 Even though both panes run the same `claude` binary, ptygrid distinguishes them by definition
 name, and one `-s user` Queen MCP registration covers every pane.
 
+> [!WARNING]
+> **settings.json interference**: besides the env vars ptygrid passes via `agents[].env`,
+> Claude Code also reads the `env` block of `~/.claude/settings.json` (user) and
+> `.claude/settings.json` (project) — and **on some versions the settings side wins over
+> the process environment**. To make local routing stick reliably, give the local agent a
+> per-agent settings file via `cmd: "claude --settings router.settings.json"` (CLI-argument
+> scope outranks both project and user settings). Do NOT put the base URL in a project-level
+> `.claude/settings.json`: it would also apply to the cloud panes running in the same working
+> folder. See A-2b / R1 in verify-team-preset.md (Japanese) for the sample settings file and
+> the "did it actually hit the router" check.
+
 ## Practical Recipes: Agent Coordination
 
 ### Delegating a task to another agent

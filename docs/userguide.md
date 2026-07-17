@@ -732,6 +732,17 @@ llama.cpp / ollama に向け(ルーティングは**プロセス単位の env** 
 参照してください。CLI が同じ `claude` でも ptygrid は定義名でペインを区別し、Queen の
 MCP 登録(`-s user`)も1回で全ペインに効きます。
 
+> [!WARNING]
+> **settings.json との干渉**: Claude Code は `agents[].env` で渡した環境変数のほかに
+> `~/.claude/settings.json`(user) / `.claude/settings.json`(project) の `env` ブロックも
+> 読み、**バージョンによっては settings 側がプロセス env に勝ちます**。ローカル向けの
+> ルーティングを確実に効かせるには、local エージェントの cmd を
+> `claude --settings router.settings.json` のように **per-agent の `--settings`**
+> (CLI 引数スコープ = project/user settings より上位)にしてください。プロジェクト直下の
+> `.claude/settings.json` に base URL を書く方法は、**同じ作業フォルダで動くクラウド側の
+> ペインにも効いてしまう**ため使わないでください。設定ファイル例と着弾確認の手順は
+> [verify-team-preset.md](verify-team-preset.md) の A-2b / R1 を参照。
+
 ## 実践レシピ: エージェント間協調
 
 ### 別のエージェントにタスクを依頼する

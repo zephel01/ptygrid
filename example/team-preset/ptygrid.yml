@@ -18,9 +18,16 @@ queen:
   port: 39237
 
 agents:
-  # ローカルLLM: coderouter(既定 127.0.0.1:3456)経由で llama.cpp / ollama へ
+  # ローカルLLM: coderouter(既定 127.0.0.1:3456)経由で llama.cpp / ollama へ。
+  #
+  # 重要: env だけに頼らない。Claude Code は ~/.claude/settings.json (user) や
+  # .claude/settings.json (project) の env ブロックも読み、バージョンによっては
+  # settings 側がプロセス env に勝つ(v2.0.1 のリグレッション実績あり)。
+  # プロジェクトに .claude/settings.json を置く手は同じ cwd の opus にも効いて
+  # しまうため不可。per-agent の --settings(CLI引数スコープ = project/user より
+  # 上位)で router.settings.json を渡すのが確実。env は保険として併記する。
   - name: local
-    cmd: "claude"
+    cmd: "claude --settings router.settings.json"
     cwd: "."
     env:
       ANTHROPIC_BASE_URL: "${CODEROUTER_URL}"   # 例: http://127.0.0.1:3456
