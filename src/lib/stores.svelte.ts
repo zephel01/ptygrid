@@ -266,6 +266,14 @@ export async function initGlobalListeners(): Promise<void> {
     }
     // One assignment per sampler tick keeps all pane values consistent.
     ui.resources = next;
+    // Live foreground names ride this same tick (Phase 4.4.2): keep
+    // ui.sessions[id].foreground fresh so a hand-started claude/codex/grok in a
+    // shell pane is labelled by its CLI (header + status sidebar) instead of the
+    // shell name. Self-corrects: when the CLI exits, the shell becomes fg again.
+    for (const fg of event.payload.foreground ?? []) {
+      const session = ui.sessions[fg.id];
+      if (session?.state === "running") session.foreground = fg.name;
+    }
   });
 
   await listen<PtyExitPayload>("pty-exit", (event) => {
@@ -353,6 +361,10 @@ export async function initGlobalListeners(): Promise<void> {
 }
 
 export function paneTitle(id: number): string {
-  const name = ui.sessions[id]?.name;
+  const session = ui.sessions[id];
+  // Prefer the definition name; for a hand-started session (no spec.name) fall
+  // back to the live foreground process name so `claude`/`codex`/`grok` typed
+  // into a shell pane shows as `claude #2` rather than `shell #2` (Phase 4.4.2).
+  const name = session?.name ?? session?.foreground;
   return name ? `${name} #${id}` : `shell #${id}`;
 }

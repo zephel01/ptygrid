@@ -28,11 +28,23 @@ pub struct SessionResourceUsage {
     pub process_count: u32,
 }
 
+/// Foreground process name of one running PTY session (Phase 4.4.2). Rides on
+/// the resource batch so a hand-started CLI in a shell pane gets a live display
+/// name / badge without any extra polling.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionForeground {
+    id: u32,
+    name: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResourceBatch {
     sampled_at_ms: u64,
     sessions: Vec<SessionResourceUsage>,
+    /// Per-session foreground process name (only sessions that resolved one).
+    foreground: Vec<SessionForeground>,
 }
 
 fn aggregate_process_trees(
@@ -109,8 +121,16 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         loop {
             std::thread::sleep(SAMPLE_INTERVAL);
             system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
-            let roots = app.state::<PtyManager>().resource_roots();
+            let manager = app.state::<PtyManager>();
+            let roots = manager.resource_roots();
             let sessions = aggregate_process_trees(&process_samples(&system), &roots);
+            // Resolve foreground names for the same tick so the frontend can
+            // label / badge hand-started CLIs live (rides this existing poll).
+            let foreground = manager
+                .foreground_names()
+                .into_iter()
+                .filter_map(|(id, name)| name.map(|name| SessionForeground { id, name }))
+                .collect();
             let sampled_at_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -121,6 +141,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     ResourceBatch {
                         sampled_at_ms,
                         sessions,
+                        foreground,
                     },
                 )
                 .is_err()

@@ -920,6 +920,38 @@ impl PtyManager {
             .collect()
     }
 
+    /// Foreground process name per running PTY session, for the resource
+    /// sampler's periodic broadcast (Phase 4.4.2). This is what lets a
+    /// hand-started `claude`/`codex`/`grok` in a shell pane get a live display
+    /// name and semantic badge without the user relaunching from a chip: the
+    /// sampler already runs every second, so foreground resolution rides along
+    /// instead of adding its own polling. Pids are read under the lock (cheap
+    /// tcgetpgrp ioctl); the pid->name lookup runs after the lock is dropped,
+    /// exactly like `list_sessions`.
+    pub(crate) fn foreground_names(&self) -> Vec<(u32, Option<String>)> {
+        self.foreground_names_with(pty::process_name)
+    }
+
+    /// Resolver-injected variant so the mapping is testable on hosts where
+    /// `ps` / `/proc` is unavailable.
+    fn foreground_names_with<F>(&self, resolve_process: F) -> Vec<(u32, Option<String>)>
+    where
+        F: Fn(i32) -> Option<String>,
+    {
+        let snapshot: Vec<(u32, Option<i32>)> = {
+            let sessions = self.lock_sessions();
+            sessions
+                .iter()
+                .filter(|(_, s)| s.state == SessionState::Running && s.kind == SessionKind::Pty)
+                .map(|(id, s)| (*id, foreground_pid(s)))
+                .collect()
+        };
+        snapshot
+            .into_iter()
+            .map(|(id, pid)| (id, pid.and_then(&resolve_process)))
+            .collect()
+    }
+
     /// (total sessions, total transcript sessions, transcript-count-per-lead).
     /// Cheap snapshot under the lock for the pane-limit checks.
     pub fn transcript_stats(&self) -> (usize, usize, HashMap<u32, usize>) {
@@ -1792,6 +1824,53 @@ mod tests {
         // verified indirectly: an exited session has no live PTY.)
         manager.kill_pty(id1).unwrap();
         manager.kill_pty(id2).unwrap();
+    }
+
+    /// Phase 4.4.2: the resource-sampler foreground broadcast lists a running
+    /// PTY session's foreground process name (drives live header/sidebar labels
+    /// and fg ruleset selection for hand-started CLIs).
+    #[test]
+    fn foreground_names_lists_running_pty_sessions() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+
+        let id = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+
+        // tcgetpgrp needs the child fully set up; poll briefly. Resolve the pid
+        // deterministically so this passes in sandboxes without macOS `ps`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut fg = None;
+        while Instant::now() < deadline {
+            fg = manager
+                .foreground_names_with(|_| Some("cat".to_string()))
+                .into_iter()
+                .find(|(sid, _)| *sid == id)
+                .and_then(|(_, name)| name);
+            if fg.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(fg.as_deref(), Some("cat"), "foreground name for running PTY");
+
+        // An exited session drops out of the list entirely.
+        manager.kill_pty(id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = manager
+                .foreground_names_with(|_| Some("cat".to_string()))
+                .iter()
+                .any(|(sid, _)| *sid == id);
+            if !present {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("exited session should not appear in foreground_names");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

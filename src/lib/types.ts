@@ -139,9 +139,15 @@ export type SessionResourceUsage = {
   processCount: number;
 };
 
+/** フォアグラウンドプロセス名の実時間更新（session-resources に相乗り、
+ * Phase 4.4.2）。手打ち起動の claude/codex/grok を表示名・状態バッジに反映する。 */
+export type SessionForeground = { id: number; name: string };
+
 export type SessionResourcesPayload = {
   sampledAtMs: number;
   sessions: SessionResourceUsage[];
+  /** 実行中 PTY セッションごとの foreground プロセス名（解決できたものだけ）。 */
+  foreground?: SessionForeground[];
 };
 
 // Phase 2 (Queen: 内蔵MCPサーバー)
