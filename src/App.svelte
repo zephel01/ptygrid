@@ -161,7 +161,7 @@
     if (q.error) lines.push(`エラー: ${q.error}`);
     if (!q.running) lines.push("停止中");
     // トークンは app-data に永続化され再起動後も有効。初回のみ登録が必要。
-    lines.push("クリックで token 込み登録コマンドをコピー（初回のみ登録。再起動後も有効。再生成時のみ再登録）");
+    lines.push("クリックで token 込み登録コマンドをコピー（remove→add で冪等。再起動後も有効。再クリックでも安全に再登録）");
     return lines.join("\n") || "Queen MCP サーバー";
   });
 
@@ -178,11 +178,23 @@
     const url = queenRegisterUrl(q);
     // -s user: デフォルトの local スコープは「実行したディレクトリ限定」のため、
     // ペインの cwd と登録時の cwd が違うと接続できない。user スコープで全体登録する。
-    const cmd = `claude mcp add -s user --transport http queen ${url}`;
+    //
+    // 冪等化: `claude mcp add` は既存登録があると "already exists" で弾き、上書き
+    // しない。そのため古いトークンの登録が残ると 401 になる。先に remove して
+    // から add することで、再クリックしても常に現在のトークンで登録し直せる
+    // (remove は未登録でも無害。存在しない場合の非0終了は `|| true` で無視)。
+    // URL は必ずクォートする: `?token=...` の `?` を zsh が glob して
+    // 「no matches found」になるのを防ぐ。
+    const cmd =
+      `claude mcp remove queen -s user 2>/dev/null || true; ` +
+      `claude mcp add -s user --transport http queen "${url}"`;
     try {
       await navigator.clipboard.writeText(cmd);
-      // 認証トークンは永続化され再起動後も有効。初回のみ登録すればよい。
-      addNotice("登録コマンドをコピーしました（初回のみ登録。再起動後も有効）", cmd);
+      // 認証トークンは永続化され再起動後も有効。再クリックでも安全に再登録できる。
+      addNotice(
+        "登録コマンドをコピーしました（remove→add で冪等。再起動後も有効、再クリックでも安全に再登録）",
+        cmd,
+      );
     } catch (err) {
       ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
     }
