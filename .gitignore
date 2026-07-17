@@ -23,6 +23,8 @@ docs/note
 docs/inside
 docs/research
 
+_OUTPUTS/
+
 # ptygrid session cleanup staging (files the device bridge cannot delete)
 _to_delete/
 
