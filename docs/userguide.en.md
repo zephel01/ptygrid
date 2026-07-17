@@ -18,9 +18,10 @@ to coordinating agents with Queen (the built-in MCP server).
 9. [Setting Up Queen](#setting-up-queen)
 10. [Teammates (receiving hooks)](#teammates-receiving-hooks)
 11. [Queen Tool Reference](#queen-tool-reference)
-12. [Practical Recipes: Agent Coordination](#practical-recipes-agent-coordination)
-13. [Stored Data and Safety](#stored-data-and-safety)
-14. [Getting Help](#getting-help)
+12. [Team Presets (team_presets)](#team-presets-team_presets)
+13. [Practical Recipes: Agent Coordination](#practical-recipes-agent-coordination)
+14. [Stored Data and Safety](#stored-data-and-safety)
+15. [Getting Help](#getting-help)
 
 ---
 
@@ -577,6 +578,7 @@ Enabling and how it works:
 | `read_output` | `agent`, `lines?` (default 100, 1..1000), `raw?` (default false) | The most recent output of the given pane. By default, reconstructs ANSI cursor movement, screen clears, and the alternate screen to match the pane dimensions. Use `raw: true` for raw output |
 | `send_message` | `agent`, `text`, `submit?` (default true) | Writes to the given pane's stdin. `submit: true` appends an Enter at the end |
 | `spawn_agent` | `name` | Can launch **only names defined in ptygrid.yml** (allowlist approach) |
+| `spawn_team` | `preset` | Launch a team declared under `team_presets:` in one call (see [Team Presets](#team-presets-team_presets)). Returns a launch report |
 | `notify` | `title`, `message` | Shows an in-app toast notification |
 | `set_pin` | `key`, `value`, `expectedRevision?` | Creates a short shared value within the project, or updates it safely. Updating an existing value requires the current revision |
 | `list_pins` | none | Lists the project's pins and revisions by key order |
@@ -707,6 +709,68 @@ Instead of repeating `list_inbox` at short intervals, you can wait for a new mes
 
 On the next call, pass the previously returned `nextCursor` as `afterId`. `await` itself does not
 acknowledge a message, so after you finish processing, call `ack_inbox` or `reply_inbox`.
+
+## Team Presets (team_presets)
+
+Declare a **named team composition** in `ptygrid.yml` and launch it in a single action
+(Phase 4.3). Members are **references to `agents:` definitions only**, so a preset can never
+launch anything the `spawn_agent` allowlist would not allow.
+
+```yaml
+team_presets:
+  daily:                        # preset name (shown as a 👥 chip in the toolbar)
+    lead: local                 # optional: kickoff recipient; default = first non-standby member
+    members:
+      - agent: local            # reference to an agents: definition (processes: not allowed)
+        instructions: >-        # optional: role instructions delivered via the inbox at launch
+          Primary worker. When stuck, spawn_agent "opus" and ask it via the inbox.
+      - agent: opus
+        standby: true           # optional (default false): declared only, not launched at team start
+        instructions: "Hard problems only."
+      - agent: grok
+        standby: true
+    kickoff: "Read the pinned task list and get started."   # optional: sent to the lead
+```
+
+### How to launch
+
+- **Toolbar**: when the loaded config has `team_presets:`, 👥 chips appear. Click ▶ to launch;
+  a toast summarizes the result (started / existing / failed / standby counts).
+- **Queen tool**: agents themselves can assemble a team with `spawn_team {preset: "daily"}`.
+  Both paths run the same backend function and return the same JSON report.
+
+### Launch semantics
+
+- Non-standby members launch **sequentially in declaration order**. A member whose session is
+  already alive is **skipped instead of duplicated**, so clicking 👥 repeatedly is safe (idempotent).
+- Members beyond the 9-pane limit are not spawned and are reported as failed ("pane limit") —
+  a partial launch; whatever did start keeps working.
+- `instructions` and `kickoff` are delivered via the **durable Queen inbox** (mailbox =
+  definition name, sender = `queen:preset/<preset name>`). Standby members receive their
+  instructions too, so an agent launched later can read its role with `list_inbox`.
+  Delivery only happens **when the call actually started at least one member**, so re-clicking
+  👥 on a running team re-sends nothing.
+
+### Validation errors
+
+`team_presets:` is validated at config load. These fail the load: referencing a name not under
+`agents:` (`processes:` entries are not allowed), an empty or all-standby member list, a standby
+member as `lead`, and declaring the same agent twice in one preset.
+
+### Intended pattern: local-LLM primary + cloud standby (cost tiering)
+
+Reproduce "local LLM for everyday work, Claude Opus / Grok only for hard problems" in one click.
+Keep the Claude Code CLI and point the local member at llama.cpp / ollama through
+claude-code-router (routing is decided by **per-process env**, so `agents[].env` with
+`ANTHROPIC_BASE_URL` is all it takes), and declare the cloud members `standby: true`.
+Escalation is a **convention in the instructions**, not a mechanism:
+
+> Example instruction for the primary: "If you are stuck after two attempts, spawn_agent
+> \"opus\", send it an inbox message with what you tried, and await the reply."
+
+See [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) for the full sample.
+Even though both panes run the same `claude` binary, ptygrid distinguishes them by definition
+name, and one `-s user` Queen MCP registration covers every pane.
 
 ## Practical Recipes: Agent Coordination
 

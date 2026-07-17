@@ -124,3 +124,36 @@ processes:
     cwd: "."
     autostart: false
     autorestart: on-failure
+
+# team_presets: named team compositions launched in ONE action (toolbar 👥 chip
+# or the Queen tool `spawn_team`). Members reference `agents:` definitions by
+# name only — a preset can never launch anything spawn_agent could not.
+# Validation happens at config load: an unknown member, an empty/all-standby
+# member list, or a standby lead FAILS the load with a clear error.
+#
+# Launch semantics: non-standby members start sequentially in declaration
+# order; members whose session is already alive are skipped (idempotent);
+# members beyond the 9-pane grid fail with "pane limit" (partial launch).
+# `instructions` / `kickoff` are delivered via the durable Queen inbox
+# (mailbox = definition name) — only when the call actually started at least
+# one member, so re-clicking a running team re-sends nothing.
+#
+# The intended pattern below: a local-LLM primary (Claude Code routed through
+# claude-code-router to llama.cpp/ollama via env) with cloud models declared
+# `standby: true` — defined and instructed, but launched only on demand
+# (spawn_agent / toolbar ▶) when the local model hits something hard.
+# team_presets:
+#   daily:
+#     lead: local            # kickoff recipient; default = first non-standby
+#     members:
+#       - agent: local
+#         instructions: >-
+#           You are the primary worker. If you are stuck after two attempts or
+#           the problem needs deep architecture judgement, spawn_agent "opus",
+#           send it an inbox message with what you tried, and await the reply.
+#       - agent: opus
+#         standby: true      # declared only; launched on demand
+#         instructions: "Hard problems only: architecture calls and tricky bugs."
+#       - agent: grok
+#         standby: true
+#     kickoff: "Read the pinned task list and start with the top item."

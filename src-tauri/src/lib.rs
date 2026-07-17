@@ -11,6 +11,7 @@ mod queen;
 mod queen_store;
 mod resource_monitor;
 mod session;
+mod team_presets;
 mod teams_hooks;
 mod teams_host;
 mod token_store;
@@ -81,6 +82,7 @@ pub fn run() {
             commands::trust_working_folder,
             commands::is_working_folder_trusted,
             commands::spawn_agent,
+            commands::spawn_team,
             commands::restart_session,
             commands::list_sessions,
             commands::save_project_state,

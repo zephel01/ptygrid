@@ -2,7 +2,7 @@
 // relative-cwd resolution, and the file watcher (notify) that emits
 // `config-changed` events per the Phase 1 contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -39,6 +39,12 @@ pub struct Config {
     /// Phase 4.4.2 global `notifications:` block (out-of-app alerting).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<NotificationsConfig>,
+    /// Phase 4.3 top-level `team_presets:` block (named one-shot team launch).
+    /// Validated at parse time (see [`validate_team_presets`]); unlike the
+    /// other 4.x blocks a broken preset declaration FAILS the config load,
+    /// because presets are launch declarations tied to the spawn allowlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_presets: Option<BTreeMap<String, TeamPreset>>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -376,6 +382,119 @@ pub enum TeamsMode {
     Host,
 }
 
+/// Phase 4.3: one named team preset under `team_presets:`. Members reference
+/// `agents:` definitions by name only (allowlist integrity — the preset can
+/// never launch anything `spawn_agent` could not). Validation rules live in
+/// [`validate_team_presets`] and run at parse time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TeamPreset {
+    /// Kickoff recipient. Must name a non-standby member. Omitted -> the
+    /// first non-standby member ([`TeamPreset::effective_lead`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead: Option<String>,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+    /// Optional first message, delivered to the effective lead's inbox after
+    /// the non-standby members have been launched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<String>,
+}
+
+impl TeamPreset {
+    /// The kickoff recipient: the explicit `lead`, else the first non-standby
+    /// member. `None` only for invalid presets (validation rejects those).
+    pub fn effective_lead(&self) -> Option<&str> {
+        match self.lead.as_deref() {
+            Some(lead) => Some(lead),
+            None => self
+                .members
+                .iter()
+                .find(|m| !m.effective_standby())
+                .map(|m| m.agent.as_str()),
+        }
+    }
+}
+
+/// One entry under `team_presets.<name>.members`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMember {
+    /// Reference to an `agents:` definition name (never `processes:`).
+    pub agent: String,
+    /// Default false. `true` declares the member without launching it at team
+    /// start; it is spawned later on demand (`spawn_agent` / UI) when needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby: Option<bool>,
+    /// Optional role instructions, delivered to the member's inbox mailbox
+    /// (= definition name) when the team is activated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl TeamMember {
+    pub fn effective_standby(&self) -> bool {
+        self.standby.unwrap_or(false)
+    }
+}
+
+/// Phase 4.3 parse-time validation of the `team_presets:` block. Every error
+/// names the offending preset so multi-preset configs stay debuggable.
+///
+/// Rejected: empty preset name, empty `members`, zero non-standby members, a
+/// member referencing a name not defined under `agents:` (`processes:` names
+/// are deliberately NOT accepted — a team is a set of interactive agents), a
+/// duplicate `agent` within one preset, and a `lead` that is missing from the
+/// members or points at a standby member.
+fn validate_team_presets(config: &Config) -> Result<(), String> {
+    let Some(presets) = &config.team_presets else {
+        return Ok(());
+    };
+    for (name, preset) in presets {
+        let ctx = format!("team_presets.{name}");
+        if name.trim().is_empty() {
+            return Err("team_presets: preset name must not be empty".to_string());
+        }
+        if preset.members.is_empty() {
+            return Err(format!("{ctx}: members must not be empty"));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for member in &preset.members {
+            if seen.contains(&member.agent.as_str()) {
+                return Err(format!(
+                    "{ctx}: member '{}' is declared more than once",
+                    member.agent
+                ));
+            }
+            seen.push(member.agent.as_str());
+            if !config.agents.iter().any(|a| a.name == member.agent) {
+                return Err(format!(
+                    "{ctx}: member '{}' is not defined under agents: \
+                     (processes: entries cannot join a team preset)",
+                    member.agent
+                ));
+            }
+        }
+        if !preset.members.iter().any(|m| !m.effective_standby()) {
+            return Err(format!(
+                "{ctx}: at least one member must not be standby"
+            ));
+        }
+        if let Some(lead) = &preset.lead {
+            match preset.members.iter().find(|m| &m.agent == lead) {
+                None => {
+                    return Err(format!("{ctx}: lead '{lead}' is not a member"));
+                }
+                Some(m) if m.effective_standby() => {
+                    return Err(format!(
+                        "{ctx}: lead '{lead}' must not be a standby member"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One agent or process definition (processes use the same shape, no
 /// `instructions` in practice but the field is simply optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,9 +595,13 @@ pub struct ConfigInfo {
 }
 
 /// Parse ptygrid.yml text. Errors are passed through as strings (serde_norway
-/// messages include line/column information).
+/// messages include line/column information). Phase 4.3: a present
+/// `team_presets:` block is validated here too, so every load path (file,
+/// reload, tests) gets the same guarantees.
 pub fn parse_config(text: &str) -> Result<Config, String> {
-    serde_norway::from_str(text).map_err(|e| e.to_string())
+    let config: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
+    validate_team_presets(&config)?;
+    Ok(config)
 }
 
 /// Expand `${VAR}` occurrences in a value using the host environment.
@@ -1642,5 +1765,113 @@ agents:
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    // ---- team_presets: block (Phase 4.3) ----
+
+    const TEAM_AGENTS: &str = "agents:\n  - name: local\n    cmd: claude\n  - name: opus\n    cmd: claude\n  - name: grok\n    cmd: grok\n";
+
+    #[test]
+    fn team_presets_parse_with_defaults_and_lead() {
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  daily:\n    lead: local\n    members:\n      - agent: local\n        instructions: primary\n      - agent: opus\n        standby: true\n      - agent: grok\n    kickoff: go\n"
+        );
+        let cfg = parse_config(&yaml).unwrap();
+        let presets = cfg.team_presets.as_ref().unwrap();
+        let daily = &presets["daily"];
+        assert_eq!(daily.lead.as_deref(), Some("local"));
+        assert_eq!(daily.effective_lead(), Some("local"));
+        assert_eq!(daily.kickoff.as_deref(), Some("go"));
+        assert_eq!(daily.members.len(), 3);
+        assert!(!daily.members[0].effective_standby());
+        assert!(daily.members[1].effective_standby());
+        assert_eq!(daily.members[0].instructions.as_deref(), Some("primary"));
+        assert_eq!(daily.members[2].instructions, None);
+    }
+
+    #[test]
+    fn team_presets_effective_lead_defaults_to_first_non_standby() {
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    members:\n      - agent: opus\n        standby: true\n      - agent: local\n      - agent: grok\n"
+        );
+        let cfg = parse_config(&yaml).unwrap();
+        let t = &cfg.team_presets.as_ref().unwrap()["t"];
+        assert_eq!(t.effective_lead(), Some("local"));
+    }
+
+    #[test]
+    fn team_presets_block_is_optional_and_absent_by_default() {
+        let cfg = parse_config(TEAM_AGENTS).unwrap();
+        assert!(cfg.team_presets.is_none());
+    }
+
+    #[test]
+    fn team_presets_reject_unknown_member() {
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    members:\n      - agent: nope\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("team_presets.t"), "error was: {err}");
+        assert!(err.contains("'nope'"), "error was: {err}");
+    }
+
+    #[test]
+    fn team_presets_reject_process_member() {
+        // processes: names must not join a team preset.
+        let yaml = format!(
+            "{TEAM_AGENTS}processes:\n  - name: web\n    cmd: npm run dev\nteam_presets:\n  t:\n    members:\n      - agent: web\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("processes"), "error was: {err}");
+    }
+
+    #[test]
+    fn team_presets_reject_empty_members_and_all_standby() {
+        let yaml = format!("{TEAM_AGENTS}team_presets:\n  t:\n    members: []\n");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("must not be empty"), "error was: {err}");
+
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    members:\n      - agent: local\n        standby: true\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("not be standby"), "error was: {err}");
+    }
+
+    #[test]
+    fn team_presets_reject_bad_lead() {
+        // Lead not a member.
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    lead: opus\n    members:\n      - agent: local\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("lead 'opus'"), "error was: {err}");
+
+        // Lead is a standby member.
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    lead: opus\n    members:\n      - agent: local\n      - agent: opus\n        standby: true\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("standby"), "error was: {err}");
+    }
+
+    #[test]
+    fn team_presets_reject_duplicate_member() {
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    members:\n      - agent: local\n      - agent: local\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("more than once"), "error was: {err}");
+    }
+
+    #[test]
+    fn team_presets_ignore_unknown_fields() {
+        // Unknown keys inside preset/member are ignored (forward compat),
+        // matching the other 4.x blocks.
+        let yaml = format!(
+            "{TEAM_AGENTS}team_presets:\n  t:\n    future_flag: 1\n    members:\n      - agent: local\n        future_member_flag: 2\n"
+        );
+        let cfg = parse_config(&yaml).unwrap();
+        assert_eq!(cfg.team_presets.unwrap()["t"].members.len(), 1);
     }
 }

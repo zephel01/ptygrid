@@ -519,6 +519,12 @@ pub struct SpawnAgentRequest {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SpawnTeamRequest {
+    #[schemars(description = "team preset name declared under team_presets: in ptygrid.yml")]
+    pub preset: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct NotifyRequest {
     #[schemars(description = "notification title")]
     pub title: String,
@@ -778,6 +784,28 @@ impl QueenServer {
             )
             .map_err(|e| ErrorData::internal_error(e, None))?;
         ok_json(&serde_json::json!({ "id": id }))
+    }
+
+    #[tool(
+        description = "Launch a named team preset declared under team_presets: in ptygrid.yml. Non-standby members spawn sequentially through the same allowlist as spawn_agent; members with a live session are skipped idempotently; standby members are declared only. When the team activates, member instructions and the kickoff are delivered via the durable inbox (mailbox = definition name). Returns the TeamStartReport JSON with per-member started/skipped/failed/standby outcomes"
+    )]
+    fn spawn_team(
+        &self,
+        Parameters(SpawnTeamRequest { preset }): Parameters<SpawnTeamRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let report = crate::team_presets::start_team(
+            &self.app,
+            &self.manager(),
+            &self.config(),
+            &self.store(),
+            &preset,
+            QUEEN_SPAWN_COLS,
+            QUEEN_SPAWN_ROWS,
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let value = serde_json::to_value(&report)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        ok_json(&value)
     }
 
     #[tool(description = "Show a toast notification in the ptygrid UI")]
@@ -1317,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_3_8_exposes_all_eighteen_tools() {
+    fn phase_4_3_exposes_all_nineteen_tools() {
         let mut names: Vec<_> = QueenServer::tool_router()
             .list_all()
             .into_iter()
@@ -1344,6 +1372,7 @@ mod tests {
                 "send_message",
                 "set_pin",
                 "spawn_agent",
+                "spawn_team",
                 "update_note",
             ]
         );

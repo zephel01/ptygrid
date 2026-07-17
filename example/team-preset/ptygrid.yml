@@ -1,0 +1,59 @@
+# team-preset — ローカルLLM主体 + クラウド待機のコスト階層型チーム(Phase 4.3)
+#
+# 「普段はローカルLLM、難しい問題だけ Claude Opus / Grok」を1クリックで再現する。
+# ツールバーの 👥 チップ、または Queen tool `spawn_team {preset: "daily"}` で一括起動。
+#
+# ローカル側は Claude Code CLI のまま、claude-code-router(coderouter)経由で
+# llama.cpp / ollama にルーティングする(ルーティングはプロセス単位の env で決まる。
+# 複数ローカルモデルの切り替えは router 側の設定で行う)。
+# CLI が同じ claude でも ptygrid は定義名(local / opus)でペインを区別する。
+#
+# 事前登録(Queen)は multi-agent サンプルと同じ。1回の `-s user` 登録が
+# ローカル/クラウド両方のペインに効く。
+
+project: team-preset
+
+queen:
+  enabled: true
+  port: 39237
+
+agents:
+  # ローカルLLM: coderouter(既定 127.0.0.1:3456)経由で llama.cpp / ollama へ
+  - name: local
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_BASE_URL: "${CODEROUTER_URL}"   # 例: http://127.0.0.1:3456
+      ANTHROPIC_AUTH_TOKEN: "${CODEROUTER_TOKEN}"
+    autostart: false     # 起動はチームで(👥 daily)
+
+  # クラウド勢: 素の Claude Code(本物の Opus)と Grok。standby 待機層
+  - name: opus
+    cmd: "claude"
+    cwd: "."
+    autostart: false
+
+  - name: grok
+    cmd: "grok"
+    cwd: "."
+    autostart: false
+
+team_presets:
+  daily:
+    lead: local
+    members:
+      - agent: local
+        instructions: >-
+          あなたは一次担当。実装・調査・レビューをまず自力で進める。
+          2往復以上詰まった/設計判断が必要と感じたら、spawn_agent で "opus" を
+          起動し、inbox で問題の要約と試したことを送り、await で回答を待って
+          作業に反映する。終わったら opus のペインは人間が閉じる。
+      - agent: opus
+        standby: true          # 定義のみ。必要時に spawn_agent / ▶ で起動
+        instructions: >-
+          難問のみ担当: アーキテクチャ判断と難しいデバッグ。inbox の依頼を
+          読み、reply_inbox で結論と根拠を返す。
+      - agent: grok
+        standby: true
+        instructions: "セカンドオピニオン担当。依頼されたレビューだけ返す。"
+    kickoff: "pins のタスク一覧を読んで、一番上から着手して。"

@@ -15,6 +15,7 @@
 | [web-dev/](web-dev/ptygrid.yml) | Web開発。エージェント + dev server / テストwatchを autorestart で常駐 |
 | [worktree/](worktree/ptygrid.yml) | エージェントごとに linked worktree で作業ツリーを分離 |
 | [teammates/](teammates/ptygrid.yml) | Claude Code の subagent/teammate をペインで観測（Phase 4.0/4.1） |
+| [team-preset/](team-preset/ptygrid.yml) | ローカルLLM主体 + クラウド standby のチームを 👥 で一括起動（Phase 4.3） |
 
 各ファイルは省略可能なフィールドをコメントで残しています。既定値は
 [docs/userguide.md](../docs/userguide.md) の設定リファレンスを参照してください。

@@ -31,6 +31,8 @@
     LogicalSession,
     ProjectState,
     SessionInfo,
+    TeamPreset,
+    TeamStartReport,
     WorktreeInfo,
   } from "./lib/types";
 
@@ -174,6 +176,10 @@
   let canAddPane = $derived(paneCount < MAX_PANES);
   let agentDefs = $derived(ui.configInfo?.config.agents ?? []);
   let processDefs = $derived(ui.configInfo?.config.processes ?? []);
+  /** Phase 4.3: [preset名, preset] の一覧（無ければ空）。 */
+  let teamPresets = $derived(
+    Object.entries(ui.configInfo?.config.team_presets ?? {}),
+  );
   let activeWorktrees = $derived.by(() => {
     const byPath = new Map<string, WorktreeInfo>();
     for (const session of Object.values(ui.sessions)) {
@@ -685,6 +691,70 @@
       addPane(id);
     } catch (err) {
       ui.errorBanner = `「${name}」の起動に失敗しました (spawn_agent): ${err}`;
+    }
+  }
+
+  // Phase 4.3: launch a named team preset through the spawn_team command
+  // (same backend function as the Queen tool). Individual member failures
+  // come back inside the report, not as a reject.
+  let launchingTeam = $state(false);
+
+  function teamPresetTitle(name: string, preset: TeamPreset): string {
+    const members = preset.members
+      .map((m) => (m.standby ? `${m.agent} (standby)` : m.agent))
+      .join(", ");
+    return `チーム ${name} を一括起動\nメンバー: ${members}`;
+  }
+
+  async function spawnTeam(name: string): Promise<void> {
+    if (launchingTeam) return;
+    if (!isTauri()) return;
+    launchingTeam = true;
+    try {
+      const report = await invokeCmd<TeamStartReport>("spawn_team", {
+        preset: name,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+      });
+      // Mirror spawnAgent: track + pane the members started by this call
+      // (skipped members already have panes; the session-state fallback
+      // covers races just like Queen spawns).
+      for (const m of report.members) {
+        if (m.status === "started" && m.id !== undefined) {
+          if (!ui.sessions[m.id]) {
+            ui.sessions[m.id] = {
+              id: m.id,
+              name: m.agent,
+              cmd: "",
+              state: "starting",
+            };
+          }
+          addPane(m.id);
+        }
+      }
+      const started = report.members.filter((m) => m.status === "started");
+      const skipped = report.members.filter((m) => m.status === "skipped");
+      const failed = report.members.filter((m) => m.status === "failed");
+      const standby = report.members.filter((m) => m.status === "standby");
+      const counts = [
+        `起動 ${started.length}`,
+        skipped.length > 0 ? `既存 ${skipped.length}` : null,
+        failed.length > 0 ? `失敗 ${failed.length}` : null,
+        standby.length > 0 ? `待機 ${standby.length}` : null,
+      ]
+        .filter((s) => s !== null)
+        .join(" / ");
+      const kickoff = report.kickoffDelivered ? "、kickoff を lead へ送信" : "";
+      addNotice(`チーム ${name}`, `${counts}${kickoff}`);
+      if (failed.length > 0) {
+        ui.errorBanner = `チーム ${name}: ${failed
+          .map((m) => `${m.agent}（${m.error ?? "不明なエラー"}）`)
+          .join("、")} の起動に失敗しました。`;
+      }
+    } catch (err) {
+      ui.errorBanner = `チーム「${name}」の起動に失敗しました (spawn_team): ${err}`;
+    } finally {
+      launchingTeam = false;
     }
   }
 
@@ -1339,6 +1409,19 @@
                   onclick={() => spawnAgent(def.name)}
                   disabled={!canAddPane}
                   title={`プロセス ${def.name} を起動`}
+                >
+                  ▶
+                </button>
+              </span>
+            {/each}
+            {#each teamPresets as [name, preset] (name)}
+              <span class="chip chip-team" title={teamPresetTitle(name, preset)}>
+                👥 {name}
+                <button
+                  class="chip-run"
+                  onclick={() => spawnTeam(name)}
+                  disabled={launchingTeam}
+                  title={teamPresetTitle(name, preset)}
                 >
                   ▶
                 </button>
@@ -2140,6 +2223,9 @@
 
   .chip-process {
     border-color: #4d6b3c;
+  }
+  .chip-team {
+    border-color: #7a5b8f;
   }
 
   .chip-run {

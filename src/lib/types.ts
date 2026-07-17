@@ -25,6 +25,44 @@ export type Config = {
   processes: AgentDef[];
   /** Phase 4.4.0: セマンティック状態検出の設定（省略で既定・検出は既定 on） */
   agent_status?: AgentStatusConfig;
+  /** Phase 4.3: 名前付きチーム構成（一括起動）。検証は backend の parse 時。 */
+  team_presets?: Record<string, TeamPreset>;
+};
+
+// Phase 4.3 (Queen team preset: 一括起動)
+/** team_presets.<name>。members は agents: 定義名の参照のみ（allowlist 整合）。 */
+export type TeamPreset = {
+  /** kickoff の宛先。省略時は最初の非 standby メンバー。 */
+  lead?: string;
+  members: TeamMember[];
+  /** 起動後に lead の inbox へ投函される初回メッセージ。 */
+  kickoff?: string;
+};
+
+export type TeamMember = {
+  agent: string;
+  /** default false。true はチーム起動時に立ち上げない待機層。 */
+  standby?: boolean;
+  /** チーム起動時に inbox（mailbox=定義名）へ配送される役割指示。 */
+  instructions?: string;
+};
+
+/** spawn_team（command / Queen tool 共通）の起動レポート（wire: camelCase）。 */
+export type TeamStartReport = {
+  preset: string;
+  lead?: string;
+  members: TeamMemberOutcome[];
+  /** kickoff あり かつ started>0 かつ inbox 送信成功のときのみ true。 */
+  kickoffDelivered: boolean;
+};
+
+export type TeamMemberOutcome = {
+  agent: string;
+  standby: boolean;
+  /** skipped=既に生存中（id は既存セッション）。failed は error 必須。 */
+  status: "started" | "skipped" | "failed" | "standby";
+  id?: number;
+  error?: string;
 };
 
 export type AgentDef = {

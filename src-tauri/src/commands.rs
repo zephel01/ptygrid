@@ -149,6 +149,22 @@ pub fn spawn_agent(
     manager.spawn_agent(app, &def, &dir, cols, rows)
 }
 
+/// Phase 4.3: launch a named team preset — the same backend function as the
+/// Queen `spawn_team` tool (CONTRACT.md Phase 4.3). Individual member
+/// failures land in the report; only "no config" / "unknown preset" reject.
+#[tauri::command]
+pub fn spawn_team(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
+    preset: String,
+    cols: u16,
+    rows: u16,
+) -> Result<crate::team_presets::TeamStartReport, String> {
+    crate::team_presets::start_team(&app, &manager, &config, &store, &preset, cols, rows)
+}
+
 /// Kill and respawn a session while preserving its id.
 #[tauri::command]
 pub fn restart_session(

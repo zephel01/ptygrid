@@ -93,8 +93,9 @@ impl QueenStore {
         Self::from_connection(connection, true)
     }
 
+    /// Test-support constructor, also used by the team_presets tests.
     #[cfg(test)]
-    fn open_in_memory() -> Result<Self, String> {
+    pub(crate) fn open_in_memory() -> Result<Self, String> {
         let connection = Connection::open_in_memory()
             .map_err(|e| format!("cannot open in-memory Queen database: {e}"))?;
         Self::from_connection(connection, false)

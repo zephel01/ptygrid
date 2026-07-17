@@ -1438,3 +1438,103 @@ type AgentStatusPayload = {
   `read_output` / `list_agents` は**不変**。
 - reader hot path の追加は「dirty マーク（atomic + unbounded channel send）」のみ。`agent_status` 未 manage
   の経路（session 単体テスト等）では dirty マークは no-op。
+
+# Phase 4.3 追加契約（Queen team preset: 一括起動）
+
+複数エージェントの名前付きチーム構成を `ptygrid.yml` に宣言し、1操作で一括起動する。
+実体は**既存 allowlist spawn 経路の薄いラッパー**であり、新しい信頼境界・新しい
+プロトコルを導入しない。設計背景は docs/spec-team-presets.md。
+
+## ptygrid.yml 拡張（トップレベル `team_presets:` ブロック、任意）
+
+```yaml
+team_presets:
+  daily:                       # preset 名（map キー、一意・非空）
+    lead: local                # 任意: kickoff の宛先。省略時は最初の非 standby メンバー
+    members:                   # 必須: 1 件以上
+      - agent: local           # 必須: agents: の定義名への参照のみ（processes: は不可）
+        standby: true          # 任意（default false）: チーム起動時に立ち上げない待機層
+        instructions: "..."    # 任意: inbox で配送される役割指示
+    kickoff: "..."             # 任意: 起動後に lead の inbox へ投函する初回メッセージ
+```
+
+- Rust: `Config.team_presets: Option<BTreeMap<String, TeamPreset>>`。
+  `TeamPreset { lead?, members: Vec<TeamMember>, kickoff? }`、
+  `TeamMember { agent, standby?, instructions? }`（`effective_standby()` default false）。
+- **検証は config ロード時（parse に含む）**。他の 4.x ブロックと異なり、以下は
+  `parse_config` を **エラーで失敗**させる（preset は起動対象の宣言であり、壊れた宣言を
+  黙って読み込むと allowlist の意味が崩れるため）:
+  - `members[].agent` が `agents:` に存在しない（`processes:` の名前は不可）
+  - `members` が空 / 非 standby メンバーが 0 件
+  - `lead` が members に無い、または standby メンバーを指す
+  - 同一 preset 内で同じ `agent` を重複宣言
+  - preset 名が空文字列
+- 未知キーは従来どおり無視（forward compat）。`team_presets:` ブロック自体の省略は常に有効。
+
+## 一括起動セマンティクス（backend `team_presets::start_team`）
+
+1. 非 standby メンバーを**宣言順に逐次起動**する。spawn は既存の
+   `ConfigManager::resolve_def` + `PtyManager::spawn_agent`（= Queen `spawn_agent` と
+   同一経路・同一 allowlist）。
+2. **冪等 skip**: 同じ定義名の**生存セッション**（`starting` / `running` / `restarting`。
+   直前に spawn されたばかりの `starting` も含む）が既にあるメンバーは起動せず
+   `skipped`（既存セッション id を報告）。
+3. **ペイン上限**: 起動前に現在のセッション総数（kind 不問）が 9 以上なら、その
+   メンバー以降は spawn せず `failed`（`error: "pane limit"`）。部分起動を許し、
+   全体を事前拒否しない（frontend の 9 面グリッドの近似。上限は今後の contract 変更なしに
+   frontend と同期して見直しうる）。
+4. **instructions / kickoff の配送は Queen 永続 inbox に統一**（`send_inbox` と同一の
+   検証・上限に従う）。CLI 引数への埋め込みは行わない。
+   - 宛先 mailbox = **定義名**（inbox の mailbox は論理名であり `#id` は使えない、
+     Phase 3.7 契約に従う）。sender mailbox = `queen:preset/<preset名>`。
+   - 配送は **この呼び出しで `started` が 1 件以上あるとき（=チームが実際に起動したとき）
+     のみ**行う: `started` メンバー各自の `instructions` → standby メンバーの
+     `instructions`（durable なので後から起動しても読める）→ 最後に `kickoff` を
+     effective lead へ。全 skip の呼び出しは何も配送しない（冪等な no-op）。
+   - subject は `preset:<preset名> instructions` / `preset:<preset名> kickoff` 固定。
+5. 起動レポート（下記 wire）を戻り値で返す。配送失敗は起動自体を失敗させず、
+   レポートの `kickoffDelivered` / member `error` に反映する。
+
+## Wire: `TeamStartReport`（camelCase）
+
+```jsonc
+{
+  "preset": "daily",
+  "lead": "local",                    // effective lead（lead 省略時は先頭非 standby）
+  "members": [
+    { "agent": "local", "standby": false, "status": "started", "id": 3 },
+    { "agent": "opus",  "standby": true,  "status": "standby" },
+    { "agent": "grok",  "standby": false, "status": "skipped", "id": 2 },
+    { "agent": "gpt",   "standby": false, "status": "failed", "error": "pane limit" }
+  ],
+  "kickoffDelivered": true            // kickoff あり かつ started>0 かつ送信成功
+}
+```
+
+`status`: `started` | `skipped`（既 running、id=既存）| `failed`（error 必須）|
+`standby`（起動対象外）。
+
+## Tauri Command（additive）
+
+- `spawn_team(preset: string, cols: number, rows: number) -> TeamStartReport`
+  - Queen tool と**同一の backend 関数**を呼ぶ。エラー（preset 不明・config 未ロード）は
+    文字列 reject。
+
+## Queen MCP tool（additive・19 本目）
+
+- `spawn_team { preset: string }` → `TeamStartReport` の JSON。
+  spawn サイズは既存 Queen spawn と同じ 120x30。preset 不明は invalid_params。
+
+## Frontend
+
+- ツールバー: `team_presets` があるとき preset チップ（👥）を表示。クリックで
+  `spawn_team` を呼び、レポートをバナー表示（started/skipped/failed の要約）。
+  standby メンバーの個別起動は既存のエージェントチップ（▶）をそのまま使う。
+- `started` セッションのペイン追加は既存の「Queen spawn の未知セッション自動ペイン化」
+  と同じ経路（session-state イベント）に乗る。frontend 側の新規イベントは無い。
+
+## 非回帰（本節はすべて additive）
+
+- `team_presets:` の無い config のパース・挙動は不変。`spawn_agent`（command / Queen tool）
+  ・inbox 系 tool・`SessionInfo` は不変。
+- 検証エラーは `team_presets:` を書いた config にのみ発生しうる。
