@@ -467,8 +467,10 @@ type SessionResourcesPayload = {
 - sample中に消失したroot、取得不能なprocess treeはそのbatchから省略する。
   frontendはbatchにない古い値を削除する。
 - samplerはsession map lock中にPID snapshotだけを取り、OS refreshやtree集約中はlockを保持しない。
-- foreground名は同じtickに同乗して解決する（追加pollingなし。Phase 4.4.2）。detail（ssh接続先）は
-  foreground名が許可リスト（現状 `ssh` のみ）に一致したときだけ argv を追加取得して抽出する
+- foreground名は同じtickに同乗して解決する（追加pollingなし。Phase 4.4.2）。detail（接続先）は
+  foreground名が許可リスト（`ssh` `sftp` `scp` `mosh` `mosh-client` `telnet` `kubectl` `docker`）に
+  一致したときだけ argv を追加取得して抽出する（kubectl/docker は exec 系 subcommand のときのみ
+  `"<subcommand> <target>"`、kubectl は namespace を `ns/target` に畳み込み）
   （Linux: `/proc/<pid>/cmdline`、macOS: `ps -o command=`。Phase 4.4.3、additive・後方互換）。
 
 ## Frontend
