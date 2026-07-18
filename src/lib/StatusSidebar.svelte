@@ -21,6 +21,8 @@
   // 5.3 + Git 移設). A pure derived view: no backend / IPC. The frame (open
   // state, width, tabs, resize) is owned by the dock in App.svelte; this
   // component renders only the scrollable list.
+  import { msg } from "./i18n.svelte";
+
   let {
     rows,
     onFocus,
@@ -49,13 +51,15 @@
     ),
   );
 
-  const STATUS_LABEL: Record<AgentStatus, string> = {
-    blocked: "blocked（承認待ち）",
-    working: "working（実行中）",
-    done: "done（完了）",
-    idle: "idle（待機）",
-    unknown: "unknown（判定なし）",
-  };
+  let m = $derived(msg());
+
+  let STATUS_LABEL = $derived<Record<AgentStatus, string>>({
+    blocked: m.astatusBlocked,
+    working: m.astatusWorking,
+    done: m.astatusDone,
+    idle: m.astatusIdle,
+    unknown: m.astatusUnknown,
+  });
 
   function rowTitle(r: StatusRow): string {
     const base = `${STATUS_LABEL[r.status]} · #${r.id}`;
@@ -63,9 +67,9 @@
   }
 </script>
 
-<div class="ss-list" aria-label="ステータス一覧">
+<div class="ss-list" aria-label={m.ssAria}>
   {#if sorted.length === 0}
-    <div class="ss-empty">実行中のペインはありません</div>
+    <div class="ss-empty">{m.ssEmpty}</div>
   {:else}
     {#each sorted as r (r.id)}
       <div
@@ -93,8 +97,8 @@
         ></span>
         <button
           class="ss-btn"
-          title="最大化トグル"
-          aria-label="最大化トグル"
+          title={m.ssMaxToggle}
+          aria-label={m.ssMaxToggle}
           onclick={(e) => {
             e.stopPropagation();
             onToggleMax(r.id);
@@ -104,8 +108,8 @@
         </button>
         <button
           class="ss-btn ss-btn-close"
-          title="閉じる"
-          aria-label="閉じる"
+          title={m.btnClose}
+          aria-label={m.btnClose}
           onclick={(e) => {
             e.stopPropagation();
             onClose(r.id);

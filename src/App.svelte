@@ -22,6 +22,7 @@
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
+  import { msg, i18n, setLocaleSetting, type LocaleSetting } from "./lib/i18n.svelte";
   import { invokeCmd, isTauri } from "./lib/tauri";
   import { buildCdCommand, selectCdTargets } from "./lib/broadcast";
   import type {
@@ -38,6 +39,9 @@
 
   const DEFAULT_COLS = 80;
   const DEFAULT_ROWS = 24;
+
+  // Current UI dictionary (reactive: re-evaluates when the locale changes).
+  let m = $derived(msg());
 
   let configDirInput = $state("");
   let loadingConfig = $state(false);
@@ -143,18 +147,22 @@
     window.addEventListener("pointerup", up);
   }
 
-  const LAYOUT_MODES: { value: LayoutMode; label: string; hint: string }[] = [
-    { value: "auto", label: "自動", hint: "枚数に応じて格子配置" },
-    { value: 1, label: "1列", hint: "縦に積む" },
-    { value: 2, label: "2列", hint: "2列で折り返し" },
-    { value: 3, label: "3列", hint: "3列で折り返し" },
-  ];
+  let LAYOUT_MODES = $derived<
+    { value: LayoutMode; label: string; hint: string }[]
+  >([
+    { value: "auto", label: m.layoutAuto, hint: m.layoutAutoHint },
+    { value: 1, label: m.layout1, hint: m.layout1Hint },
+    { value: 2, label: m.layout2, hint: m.layout2Hint },
+    { value: 3, label: m.layout3, hint: m.layout3Hint },
+  ]);
 
-  const SHELL_PRESETS: { count: number; label: string; hint: string }[] = [
-    { count: 1, label: "＋1", hint: "シェルを1面追加" },
-    { count: 4, label: "＋4", hint: "シェルを4面まとめて追加" },
-    { count: 9, label: "＋9", hint: "シェルを9面まとめて追加" },
-  ];
+  let SHELL_PRESETS = $derived<
+    { count: number; label: string; hint: string }[]
+  >([
+    { count: 1, label: "＋1", hint: m.shellAddHint(1) },
+    { count: 4, label: "＋4", hint: m.shellAddHint(4) },
+    { count: 9, label: "＋9", hint: m.shellAddHint(9) },
+  ]);
 
   // ---- grid shape ----
   // "auto": 1 / 1x2 / 2x2 / 2x3 / 3x3 heuristic; otherwise fixed column
@@ -216,18 +224,18 @@
     return q?.port ? `Queen :${q.port}` : "Queen —";
   });
   let queenTooltip = $derived.by(() => {
-    if (!isTauri()) return "Tauri 実行環境なし（デモモード）";
+    if (!isTauri()) return m.queenTooltipNoTauri;
     const q = ui.queenStatus;
-    if (!q) return "Queen MCP サーバー（状態未取得）";
-    if (!q.enabled) return "Queen は無効です（ptygrid.yml の queen.enabled: false）";
+    if (!q) return m.queenTooltipUnknown;
+    if (!q.enabled) return m.queenTooltipDisabled;
     const lines: string[] = [];
     if (q.url) lines.push(q.url);
     else if (q.port) lines.push(`http://127.0.0.1:${q.port}/mcp`);
-    if (q.error) lines.push(`エラー: ${q.error}`);
-    if (!q.running) lines.push("停止中");
+    if (q.error) lines.push(m.queenTooltipError(q.error));
+    if (!q.running) lines.push(m.queenTooltipStopped);
     // トークンは app-data に永続化され再起動後も有効。初回のみ登録が必要。
-    lines.push("クリックで token 込み登録コマンドをコピー（remove→add で冪等。再起動後も有効。再クリックでも安全に再登録）");
-    return lines.join("\n") || "Queen MCP サーバー";
+    lines.push(m.queenTooltipClickHint);
+    return lines.join("\n") || m.queenTooltipFallback;
   });
 
   /** Token-carrying register URL (falls back to the token-free URL if the
@@ -256,12 +264,9 @@
     try {
       await navigator.clipboard.writeText(cmd);
       // 認証トークンは永続化され再起動後も有効。再クリックでも安全に再登録できる。
-      addNotice(
-        "登録コマンドをコピーしました（remove→add で冪等。再起動後も有効、再クリックでも安全に再登録）",
-        cmd,
-      );
+      addNotice(m.queenCmdCopied, cmd);
     } catch (err) {
-      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+      ui.errorBanner = m.clipboardCopyFailed(err);
     }
   }
 
@@ -284,12 +289,9 @@
       `bearer_token_env_var = "QUEEN_TOKEN"\n`;
     try {
       await navigator.clipboard.writeText(snippet);
-      addNotice(
-        "codex スニペットをコピーしました（~/.codex/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
-        snippet,
-      );
+      addNotice(m.codexSnippetCopied, snippet);
     } catch (err) {
-      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+      ui.errorBanner = m.clipboardCopyFailed(err);
     }
   }
 
@@ -307,12 +309,9 @@
       `bearer_token_env_var = "QUEEN_TOKEN"\n`;
     try {
       await navigator.clipboard.writeText(snippet);
-      addNotice(
-        "grok スニペットをコピーしました（~/.grok/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
-        snippet,
-      );
+      addNotice(m.grokSnippetCopied, snippet);
     } catch (err) {
-      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+      ui.errorBanner = m.clipboardCopyFailed(err);
     }
   }
 
@@ -349,14 +348,11 @@
     return ui.teammateHooks?.enabled ? "queen-running" : "queen-off";
   });
   let teammatesTooltip = $derived.by(() => {
-    if (!isTauri()) return "Tauri 実行環境なし（デモモード）";
-    if (hostFallbackActive)
-      return "host: フォールバック中（ネイティブペイン化に失敗し observe へ降格）";
+    if (!isTauri()) return m.queenTooltipNoTauri;
+    if (hostFallbackActive) return m.tmTooltipFallback;
     const t = ui.teammateHooks;
-    if (!t) return "Teammate hooks（状態未取得）";
-    return t.enabled
-      ? "Teammate hooks 有効（クリックで設定）"
-      : "Teammate hooks 無効（ptygrid.yml の teammates.enabled: true で有効化）";
+    if (!t) return m.tmTooltipUnknown;
+    return t.enabled ? m.tmTooltipEnabled : m.tmTooltipDisabled;
   });
 
   // The hooks JSON snippet (token embedded) users paste into settings.json.
@@ -391,9 +387,9 @@
     if (!hooksSnippet) return;
     try {
       await navigator.clipboard.writeText(hooksSnippet);
-      addNotice("hooks 設定スニペットをコピーしました");
+      addNotice(m.hooksSnippetCopied);
     } catch (err) {
-      ui.errorBanner = `クリップボードへのコピーに失敗しました: ${err}`;
+      ui.errorBanner = m.clipboardCopyFailed(err);
     }
   }
 
@@ -406,13 +402,11 @@
         { scope: "user" },
       );
       addNotice(
-        result.written
-          ? "settings.json に登録しました"
-          : "settings.json は既に最新です",
+        result.written ? m.hooksRegistered : m.hooksAlreadyCurrent,
         result.path,
       );
     } catch (err) {
-      ui.errorBanner = `hooks の登録に失敗しました (register_teammate_hooks): ${err}`;
+      ui.errorBanner = m.hooksRegisterFailed(err);
     } finally {
       registering = false;
     }
@@ -436,27 +430,18 @@
       const labels = result.regenerated
         .map((r) => (r === "hook" ? "hook" : "Queen"))
         .join(" / ");
-      addNotice(
-        `${labels} トークンを再生成しました。再登録が必要です（hook: settings.json へ登録 / Queen: 登録コマンドをコピー）。`,
-      );
+      addNotice(m.tokensRegenerated(labels));
     } catch (err) {
-      ui.errorBanner = `トークンの再生成に失敗しました (regenerate_auth_tokens): ${err}`;
+      ui.errorBanner = m.tokenRegenFailed(err);
     } finally {
       regenerating = false;
     }
   }
 
-  const TEAMMATE_KIND_TEXT: Record<string, string> = {
-    "subagent-start": "起動",
-    "subagent-stop": "停止",
-    "teammate-idle": "アイドル",
-    "task-created": "タスク作成",
-    "task-completed": "タスク完了",
-  };
   function teammateEventLabel(ev: { kind: string; agentType?: string; agentId?: string; taskName?: string; taskId?: string; sessionId?: string }): string {
     const who =
       ev.agentType ?? ev.agentId ?? ev.taskName ?? ev.taskId ?? ev.sessionId ?? "teammate";
-    return `${who} · ${TEAMMATE_KIND_TEXT[ev.kind] ?? ev.kind}`;
+    return `${who} · ${m.teammateKindText[ev.kind] ?? ev.kind}`;
   }
 
   // ---- projects root suggestions for the working-folder input ----
@@ -619,7 +604,7 @@
       invokeCmd<void>("save_project_state", {
         state: JSON.parse(snapshot) as ProjectState,
       }).catch((err) => {
-        ui.errorBanner = `プロジェクト状態の保存に失敗しました: ${err}`;
+        ui.errorBanner = m.saveStateFailed(err);
       });
     }, 250);
     return () => {
@@ -648,7 +633,7 @@
       }
       addPane(id);
     } catch (err) {
-      ui.errorBanner = `シェルの起動に失敗しました (spawn_shell): ${err}`;
+      ui.errorBanner = m.spawnShellFailed(err);
     }
   }
 
@@ -656,12 +641,12 @@
     if (bulkOpening) return;
     const remaining = MAX_PANES - ui.panes.length;
     if (remaining <= 0) {
-      ui.errorBanner = `ペイン数が上限（${MAX_PANES}）に達しています。`;
+      ui.errorBanner = m.paneLimitReached(MAX_PANES);
       return;
     }
     let n = count;
     if (n > remaining) {
-      ui.errorBanner = `空きが ${remaining} 面のため、${n} 面ではなく ${remaining} 面だけ開きます。`;
+      ui.errorBanner = m.openShellsCapped(remaining, n);
       n = remaining;
     }
     bulkOpening = true;
@@ -690,7 +675,7 @@
       }
       addPane(id);
     } catch (err) {
-      ui.errorBanner = `「${name}」の起動に失敗しました (spawn_agent): ${err}`;
+      ui.errorBanner = m.spawnAgentFailed(name, err);
     }
   }
 
@@ -701,9 +686,9 @@
 
   function teamPresetTitle(name: string, preset: TeamPreset): string {
     const members = preset.members
-      .map((m) => (m.standby ? `${m.agent} (standby)` : m.agent))
+      .map((member) => (member.standby ? `${member.agent} (standby)` : member.agent))
       .join(", ");
-    return `チーム ${name} を一括起動\nメンバー: ${members}`;
+    return m.teamChipTitle(name, members);
   }
 
   async function spawnTeam(name: string): Promise<void> {
@@ -737,22 +722,25 @@
       const failed = report.members.filter((m) => m.status === "failed");
       const standby = report.members.filter((m) => m.status === "standby");
       const counts = [
-        `起動 ${started.length}`,
-        skipped.length > 0 ? `既存 ${skipped.length}` : null,
-        failed.length > 0 ? `失敗 ${failed.length}` : null,
-        standby.length > 0 ? `待機 ${standby.length}` : null,
+        `${m.lblStarted} ${started.length}`,
+        skipped.length > 0 ? `${m.lblSkippedExisting} ${skipped.length}` : null,
+        failed.length > 0 ? `${m.lblFailed} ${failed.length}` : null,
+        standby.length > 0 ? `${m.lblStandby} ${standby.length}` : null,
       ]
         .filter((s) => s !== null)
         .join(" / ");
-      const kickoff = report.kickoffDelivered ? "、kickoff を lead へ送信" : "";
-      addNotice(`チーム ${name}`, `${counts}${kickoff}`);
+      const kickoff = report.kickoffDelivered ? m.kickoffSent : "";
+      addNotice(m.teamNoticeTitle(name), `${counts}${kickoff}`);
       if (failed.length > 0) {
-        ui.errorBanner = `チーム ${name}: ${failed
-          .map((m) => `${m.agent}（${m.error ?? "不明なエラー"}）`)
-          .join("、")} の起動に失敗しました。`;
+        ui.errorBanner = m.teamMembersFailed(
+          name,
+          failed
+            .map((member) => `${member.agent} (${member.error ?? m.unknownError})`)
+            .join(", "),
+        );
       }
     } catch (err) {
-      ui.errorBanner = `チーム「${name}」の起動に失敗しました (spawn_team): ${err}`;
+      ui.errorBanner = m.spawnTeamFailed(name, err);
     } finally {
       launchingTeam = false;
     }
@@ -808,21 +796,21 @@
       }
       await runAutostart(info);
     } catch (err) {
-      ui.errorBanner = `フォルダの信頼設定に失敗しました (trust_working_folder): ${err}`;
+      ui.errorBanner = m.trustFailed(err);
     }
   }
 
-  // 設定ファイルの由来を短い日本語ラベルにする（origin バッジ・成功トースト用）。
+  // 設定ファイルの由来を短いラベルにする（origin バッジ・成功トースト用）。
   function originLabel(origin: ConfigInfo["origin"]): string {
     switch (origin) {
       case "project":
-        return "プロジェクト内";
+        return m.originProject;
       case "launch":
-        return "起動フォルダ";
+        return m.originLaunch;
       case "global":
-        return "~/.ptygrid";
+        return m.originGlobal;
       case "default":
-        return "既定";
+        return m.originDefault;
     }
   }
 
@@ -876,7 +864,7 @@
         }
         sent += 1;
       } catch (err) {
-        ui.errorBanner = `cd の一括送信に失敗しました (write_pty #${target.id}): ${err}`;
+        ui.errorBanner = m.cdBroadcastFailed(target.id, err);
       }
     }
     return sent;
@@ -884,8 +872,7 @@
 
   async function onLoadClick(): Promise<void> {
     if (!isTauri()) {
-      ui.errorBanner =
-        "設定の読み込み (load_config) には Tauri 実行環境が必要です。";
+      ui.errorBanner = m.loadConfigNeedsTauri;
       return;
     }
     const rawInput = configDirInput.trim();
@@ -901,9 +888,9 @@
       // ペインをその作業フォルダへ移動させる。
       const sent = await sendCdToShells(info.dir);
       const shownDir = rawInput || info.dir;
-      const cdPart = sent > 0 ? `${sent}ペインに cd を送信` : "cd 対象のペインなし";
+      const cdPart = sent > 0 ? m.cdSent(sent) : m.cdNoTargets;
       addNotice(
-        `作業フォルダ: ${shownDir}（設定: ${originLabel(info.origin)}） / ${cdPart}`,
+        m.loadedNotice(shownDir, originLabel(info.origin), cdPart),
         info.path,
       );
     } catch (err) {
@@ -930,7 +917,7 @@
       await invokeCmd<void>("restart_session", { id });
       writeToTerm(id, "\r\n\x1b[2m— restarted —\x1b[0m\r\n");
     } catch (err) {
-      ui.errorBanner = `再起動に失敗しました (restart_session): ${err}`;
+      ui.errorBanner = m.restartFailed(err);
     }
   }
 
@@ -942,7 +929,7 @@
       // pane close is authoritative on the frontend, but a real kill failure
       // (orphaned process) must be surfaced, not silently swallowed (BUG-5).
       invokeCmd<void>("kill_pty", { id }).catch((err) => {
-        ui.errorBanner = `ペインの停止に失敗しました (kill_pty #${id}): ${err}`;
+        ui.errorBanner = m.killPaneFailed(id, err);
       });
     }
     ui.panes = ui.panes.filter((p) => p !== id);
@@ -1012,13 +999,13 @@
   }
 
   // ---- header semantic-status badge (spec 5.1) ----
-  const ASTATUS_LABEL: Record<AgentStatus, string> = {
-    blocked: "blocked（承認待ち）",
-    working: "working（実行中）",
-    done: "done（完了）",
-    idle: "idle（待機）",
-    unknown: "unknown（判定なし）",
-  };
+  let ASTATUS_LABEL = $derived<Record<AgentStatus, string>>({
+    blocked: m.astatusBlocked,
+    working: m.astatusWorking,
+    done: m.astatusDone,
+    idle: m.astatusIdle,
+    unknown: m.astatusUnknown,
+  });
 
   function astatusTooltip(id: number): string {
     const st = ui.agentStatus[id] ?? "unknown";
@@ -1090,7 +1077,7 @@
   function showTeammatePane(id: number): void {
     if (ui.panes.includes(id)) return;
     if (ui.panes.length >= MAX_PANES) {
-      ui.errorBanner = `ペイン数が上限（${MAX_PANES}）に達しています。既存のペインを閉じてから表示してください。`;
+      ui.errorBanner = m.paneLimitReachedClose(MAX_PANES);
       return;
     }
     addPane(id);
@@ -1101,7 +1088,7 @@
       try {
         await invokeCmd<void>("kill_pty", { id });
       } catch (err) {
-        ui.errorBanner = `teammate の停止に失敗しました (kill_pty #${id}): ${err}`;
+        ui.errorBanner = m.stopTeammateFailed(id, err);
         return;
       }
     }
@@ -1183,6 +1170,34 @@
     if (queenPanelOpen) positionQueenPanel();
   }
 
+  // ---- settings (⚙) panel: minimal app preferences (UI language only for
+  // now; structured so more per-user, machine-local settings can join later).
+  // Project config stays in ptygrid.yml by design (config-as-code).
+  let settingsPanelOpen = $state(false);
+  let settingsBadgeEl = $state<HTMLButtonElement | null>(null);
+  let settingsPanelPos = $state<{ bottom: number; right: number }>({
+    bottom: 0,
+    right: 0,
+  });
+
+  function positionSettingsPanel(): void {
+    if (!settingsBadgeEl) return;
+    const rect = settingsBadgeEl.getBoundingClientRect();
+    const right = Math.max(6, window.innerWidth - rect.right);
+    settingsPanelPos = { bottom: window.innerHeight - rect.top + 6, right };
+  }
+
+  function openSettingsPanel(): void {
+    settingsPanelOpen = !settingsPanelOpen;
+    if (settingsPanelOpen) positionSettingsPanel();
+  }
+
+  let LOCALE_OPTIONS = $derived<{ value: LocaleSetting; label: string }[]>([
+    { value: "auto", label: m.langAuto },
+    { value: "en", label: m.langEn },
+    { value: "ja", label: m.langJa },
+  ]);
+
   function formatCpu(percent: number): string {
     return `${percent.toFixed(1)}%`;
   }
@@ -1238,12 +1253,10 @@
       ui.maximizedId = resumedByIndex[saved.maximizedIndex] ?? null;
     }
     if (skippedForCap > 0) {
-      errors.push(
-        `ペイン上限(${MAX_PANES})のため${skippedForCap}件を復元しませんでした`,
-      );
+      errors.push(m.restoreSkippedForCap(MAX_PANES, skippedForCap));
     }
     if (errors.length > 0) {
-      ui.errorBanner = `一部のセッションを復元できませんでした: ${errors.join(" / ")}`;
+      ui.errorBanner = m.restoreSomeFailed(errors.join(" / "));
     }
     return true;
   }
@@ -1255,6 +1268,7 @@
     const onReposition = () => {
       if (teammatesPanelOpen) positionTeammatesPanel();
       if (queenPanelOpen) positionQueenPanel();
+      if (settingsPanelOpen) positionSettingsPanel();
     };
     window.addEventListener("resize", onReposition);
     // Toolbar overflow-x:auto scrolls the anchor badge; keep the fixed panel
@@ -1278,7 +1292,7 @@
       try {
         restored = await restoreProjectState();
       } catch (err) {
-        ui.errorBanner = `前回のプロジェクト状態を復元できませんでした: ${err}`;
+        ui.errorBanner = m.restorePrevFailed(err);
       }
       try {
         if (!restored) {
@@ -1319,8 +1333,8 @@
     <span class="title">ptygrid</span>
 
     <div class="tb-group">
-      <span class="tb-caption">ターミナル</span>
-      <span class="tb-controls" role="group" aria-label="シェル追加">
+      <span class="tb-caption">{m.tbTerminal}</span>
+      <span class="tb-controls" role="group" aria-label={m.ariaAddShells}>
         {#each SHELL_PRESETS as preset (preset.count)}
           <button
             class="btn"
@@ -1335,8 +1349,8 @@
     </div>
 
     <div class="tb-group">
-      <span class="tb-caption">レイアウト</span>
-      <span class="tb-controls layout-group" role="group" aria-label="列数">
+      <span class="tb-caption">{m.tbLayout}</span>
+      <span class="tb-controls layout-group" role="group" aria-label={m.ariaColumns}>
         {#each LAYOUT_MODES as mode (mode.value)}
           <button
             class="seg-btn"
@@ -1351,16 +1365,15 @@
     </div>
 
     <div class="tb-group">
-      <span class="tb-caption">作業フォルダ</span>
+      <span class="tb-caption">{m.tbWorkingFolder}</span>
       <span class="tb-controls">
         <input
           class="dir-input"
           type="text"
           list="dir-suggestions"
-          placeholder="作業フォルダ（例: ~/works/hoge。先頭 ~ 可）"
+          placeholder={m.dirPlaceholder}
           bind:value={configDirInput}
-          title={"作業フォルダのパスを入力します（先頭 ~ はホーム展開）。\n" +
-            "設定ファイル ptygrid.yml は 作業フォルダ内 → 起動フォルダ → ~/.ptygrid の順に探します。"}
+          title={m.dirInputTitle}
           onfocus={loadDirSuggestions}
           onkeydown={(e) => {
             if (e.key === "Enter") onLoadClick();
@@ -1372,20 +1385,20 @@
           {/each}
         </datalist>
         <button class="btn" onclick={onLoadClick} disabled={loadingConfig}>
-          {loadingConfig ? "読み込み中…" : "読み込み"}
+          {loadingConfig ? m.btnLoading : m.btnLoad}
         </button>
 
         {#if ui.configInfo}
           <span
             class="origin-badge"
             title={ui.configInfo.origin === "default"
-              ? `設定ファイルなし（組み込みの既定設定）。\n${ui.configInfo.path} を作成すると自動で読み込みます。\n作業フォルダ: ${ui.configInfo.dir}`
-              : `設定ファイル: ${ui.configInfo.path}\n作業フォルダ: ${ui.configInfo.dir}`}
+              ? m.originBadgeTitleDefault(ui.configInfo.path, ui.configInfo.dir)
+              : m.originBadgeTitle(ui.configInfo.path, ui.configInfo.dir)}
           >
-            設定: {originLabel(ui.configInfo.origin)}
+            {m.configBadge(originLabel(ui.configInfo.origin))}
           </span>
           <span class="project-name" title={ui.configInfo.path}>
-            {ui.configInfo.config.project ?? "（名称未設定）"}
+            {ui.configInfo.config.project ?? m.unnamedProject}
           </span>
           <span class="chips">
             {#each agentDefs as def (def.name)}
@@ -1395,7 +1408,7 @@
                   class="chip-run"
                   onclick={() => spawnAgent(def.name)}
                   disabled={!canAddPane}
-                  title={`エージェント ${def.name} を起動`}
+                  title={m.runAgentTitle(def.name)}
                 >
                   ▶
                 </button>
@@ -1408,7 +1421,7 @@
                   class="chip-run"
                   onclick={() => spawnAgent(def.name)}
                   disabled={!canAddPane}
-                  title={`プロセス ${def.name} を起動`}
+                  title={m.runProcessTitle(def.name)}
                 >
                   ▶
                 </button>
@@ -1440,7 +1453,7 @@
       <button
         class="btn btn-small"
         onclick={() => (ui.errorBanner = null)}
-        title="閉じる"
+        title={m.btnClose}
       >
         ✕
       </button>
@@ -1452,14 +1465,14 @@
     <aside
       class="dock"
       style="width: {activeDockWidth}px;"
-      aria-label="左ドック（ステータス / Git）"
+      aria-label={m.dockAria}
     >
       <div class="dock-head">
         <button
           class="dock-collapse"
           onclick={() => (statusSidebarOpen = false)}
-          title="ドックを畳む"
-          aria-label="ドックを畳む"
+          title={m.dockCollapse}
+          aria-label={m.dockCollapse}
         >
           ‹
         </button>
@@ -1471,7 +1484,7 @@
             aria-selected={dockTab === "status"}
             onclick={() => (dockTab = "status")}
           >
-            ステータス
+            {m.tabStatus}
             {#if statusBlockedCount > 0}
               <span class="dock-tab-badge">🔴 {statusBlockedCount}</span>
             {/if}
@@ -1483,7 +1496,7 @@
             aria-selected={dockTab === "git"}
             onclick={() => (dockTab = "git")}
           >
-            Git
+            {m.tabGit}
           </button>
         </div>
       </div>
@@ -1506,7 +1519,7 @@
         class="dock-resizer"
         role="separator"
         aria-orientation="vertical"
-        aria-label="ドックの幅を変更"
+        aria-label={m.dockResizeAria}
         onpointerdown={startDockResize}
       ></div>
     </aside>
@@ -1514,7 +1527,7 @@
   <div class="grid" class:has-max={ui.maximizedId !== null}>
     {#if paneCount === 0}
       <div class="empty-hint">
-        ペインがありません — ツールバーの「＋1」でシェルを開くか、エージェントを起動してください。
+        {m.emptyHint}
       </div>
     {:else}
       <Splitpanes horizontal theme="mterm-theme">
@@ -1540,34 +1553,34 @@
                         {@render astatusBadge(id)}
                         <span
                           class="pane-title"
-                          title="read-only transcript（観測のみ・入力不可）"
+                          title={m.transcriptROTitle}
                         >
                           {transcriptTitle(id)}
                         </span>
                         {#if session.teammate}
-                          <span class="lead-ref" title="親 lead セッション">
+                          <span class="lead-ref" title={m.leadRefTitle}>
                             ↳#{session.teammate.leadId}
                           </span>
                         {/if}
                         {#if stopped}
                           <span
                             class="finished-tag"
-                            title="subagent は終了しました（閉じても影響なし）"
+                            title={m.finishedTagSubTitle}
                           >
-                            終了
+                            {m.finishedTag}
                           </span>
                         {/if}
                         <span class="spacer"></span>
                         <button
                           class="pane-btn"
-                          title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                          title={ui.maximizedId === id ? m.titleUnmaximize : m.titleMaximize}
                           onclick={() => toggleMaximize(id)}
                         >
                           ⤢
                         </button>
                         <button
                           class="pane-btn pane-btn-close"
-                          title="閉じる（tail 停止のみ・subagent には影響しません）"
+                          title={m.titleCloseTranscript}
                           onclick={() => closePane(id)}
                         >
                           ✕
@@ -1585,19 +1598,19 @@
                         {@render astatusBadge(id)}
                         <span
                           class="pane-title"
-                          title="host teammate（実 PTY・対話可能）"
+                          title={m.hostPTYTitle}
                         >
                           {hostTeammateTitle(id)}
                         </span>
-                        <span class="lead-ref" title="親 lead セッション">
+                        <span class="lead-ref" title={m.leadRefTitle}>
                           ↳#{session.teammate.leadId}
                         </span>
                         {#if session?.state === "exited"}
                           <span
                             class="finished-tag"
-                            title="teammate は終了しました"
+                            title={m.finishedTagTeammateTitle}
                           >
-                            終了
+                            {m.finishedTag}
                           </span>
                           <span class="exit-code">
                             exit {session.code ?? "?"}
@@ -1614,38 +1627,38 @@
                         <span class="spacer"></span>
                         {#if killConfirmId === id}
                           <span class="kill-confirm" role="alertdialog">
-                            <span class="kill-confirm-text">teammate を停止しますか？</span>
+                            <span class="kill-confirm-text">{m.killConfirmText}</span>
                             <button
                               class="btn btn-small tm-stop"
                               onclick={() => confirmCloseHostTeammate(id)}
                             >
-                              停止
+                              {m.btnStop}
                             </button>
                             <button
                               class="btn btn-small"
                               onclick={cancelCloseHostTeammate}
                             >
-                              取消
+                              {m.btnCancel}
                             </button>
                           </span>
                         {:else}
                           <button
                             class="pane-btn"
-                            title="再起動"
+                            title={m.titleRestart}
                             onclick={() => restartSession(id)}
                           >
                             ⟳
                           </button>
                           <button
                             class="pane-btn"
-                            title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                            title={ui.maximizedId === id ? m.titleUnmaximize : m.titleMaximize}
                             onclick={() => toggleMaximize(id)}
                           >
                             ⤢
                           </button>
                           <button
                             class="pane-btn pane-btn-close"
-                            title="閉じる（teammate プロセスを停止します）"
+                            title={m.titleCloseTeammate}
                             onclick={() => requestCloseHostTeammate(id)}
                           >
                             ✕
@@ -1687,21 +1700,21 @@
                         <span class="spacer"></span>
                         <button
                           class="pane-btn"
-                          title="再起動"
+                          title={m.titleRestart}
                           onclick={() => restartSession(id)}
                         >
                           ⟳
                         </button>
                         <button
                           class="pane-btn"
-                          title={ui.maximizedId === id ? "最大化解除" : "最大化"}
+                          title={ui.maximizedId === id ? m.titleUnmaximize : m.titleMaximize}
                           onclick={() => toggleMaximize(id)}
                         >
                           ⤢
                         </button>
                         <button
                           class="pane-btn pane-btn-close"
-                          title="閉じる（セッション終了）"
+                          title={m.titleClosePane}
                           onclick={() => closePane(id)}
                         >
                           ✕
@@ -1730,20 +1743,16 @@
       class="sb-toggle"
       class:active={statusSidebarOpen}
       onclick={() => (statusSidebarOpen = !statusSidebarOpen)}
-      title={statusSidebarOpen
-        ? "ステータスサイドバーを畳む"
-        : "ステータスサイドバーを開く"}
-      aria-label={statusSidebarOpen
-        ? "ステータスサイドバーを畳む"
-        : "ステータスサイドバーを開く"}
+      title={statusSidebarOpen ? m.sbCollapse : m.sbOpen}
+      aria-label={statusSidebarOpen ? m.sbCollapse : m.sbOpen}
       aria-pressed={statusSidebarOpen}
     >
       <span class="sb-toggle-icon" aria-hidden="true">◧</span>
-      <span>サイドバー</span>
+      <span>{m.sbLabel}</span>
       {#if statusBlockedCount > 0}
         <span
           class="sb-blocked"
-          title={`${statusBlockedCount} ペインが承認待ち（blocked）`}
+          title={m.sbBlockedTitle(statusBlockedCount)}
         >
           🔴 {statusBlockedCount}
         </span>
@@ -1756,7 +1765,7 @@
         class="queen-badge {queenClass}"
         onclick={openQueenPanel}
         title={queenTooltip}
-        aria-label="Queen MCP サーバー状態（クリックで登録メニュー）"
+        aria-label={m.queenAria}
       >
         <span class="queen-dot"></span>
         {queenLabel}
@@ -1765,54 +1774,54 @@
         <div
           class="teammates-panel"
           role="dialog"
-          aria-label="Queen MCP 登録"
+          aria-label={m.queenPanelTitle}
           style="bottom: {queenPanelPos.bottom}px; right: {queenPanelPos.right}px;"
         >
           <div class="tm-head">
-            <span class="tm-title">Queen MCP 登録</span>
+            <span class="tm-title">{m.queenPanelTitle}</span>
             <button
               class="btn btn-small"
               onclick={() => (queenPanelOpen = false)}
-              title="閉じる"
+              title={m.btnClose}
             >
               ✕
             </button>
           </div>
           {#if !isTauri()}
-            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+            <p class="tm-note">{m.tauriOnly}</p>
           {:else if !ui.queenStatus?.enabled}
             <p class="tm-note">
-              Queen は無効です（ptygrid.yml の queen.enabled: false）。
+              {m.queenTooltipDisabled}
             </p>
           {:else}
             <p class="tm-note">
-              各エージェント CLI に Queen を登録するコマンド/スニペットをコピーします。トークンは永続化され再起動後も有効です。
+              {m.queenPanelIntro}
             </p>
             <div class="tm-actions">
               <button
                 class="btn btn-small"
                 onclick={copyQueenCommand}
-                title="claude mcp add（remove→add で冪等）"
+                title={m.titleClaudeCmd}
               >
-                claude 登録コマンド
+                {m.btnClaudeCmd}
               </button>
               <button
                 class="btn btn-small"
                 onclick={copyCodexSnippet}
-                title="~/.codex/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+                title={m.titleCodexSnippet}
               >
-                codex スニペット
+                {m.btnCodexSnippet}
               </button>
               <button
                 class="btn btn-small"
                 onclick={copyGrokSnippet}
-                title="~/.grok/config.toml 用スニペット（QUEEN_TOKEN env 参照）"
+                title={m.titleGrokSnippet}
               >
-                grok スニペット
+                {m.btnGrokSnippet}
               </button>
             </div>
             <p class="tm-note">
-              codex / grok は QUEEN_TOKEN env 参照なのでトークン再生成後もそのまま有効。claude は再生成時に再コピーしてください。
+              {m.queenPanelFootnote}
             </p>
           {/if}
         </div>
@@ -1824,7 +1833,7 @@
         class="queen-badge {teammatesClass}"
         onclick={openTeammatesPanel}
         title={teammatesTooltip}
-        aria-label="Teammate hooks（クリックで設定パネル）"
+        aria-label={m.teammatesAria}
       >
         <span class="queen-dot"></span>
         Teammates{hostFallbackActive ? " ⚠" : ""}
@@ -1833,62 +1842,63 @@
         <div
           class="teammates-panel"
           role="dialog"
-          aria-label="Teammate hooks 設定"
+          aria-label={m.tmPanelTitle}
           style="bottom: {teammatesPanelPos.bottom}px; right: {teammatesPanelPos.right}px;"
         >
           <div class="tm-head">
-            <span class="tm-title">Teammate hooks</span>
+            <span class="tm-title">{m.tmPanelTitle}</span>
             <button
               class="btn btn-small"
               onclick={() => (teammatesPanelOpen = false)}
-              title="閉じる"
+              title={m.btnClose}
             >
               ✕
             </button>
           </div>
           {#if !isTauri()}
-            <p class="tm-note">Tauri 実行環境でのみ利用できます。</p>
+            <p class="tm-note">{m.tauriOnly}</p>
           {:else if !ui.teammateHooks}
-            <p class="tm-note">状態を取得中…</p>
+            <p class="tm-note">{m.tmFetching}</p>
           {:else}
             <p class="tm-note">
-              状態:
-              {ui.teammateHooks.enabled ? "有効" : "無効"} ·
-              通知: {ui.teammateHooks.hookNotifications ? "オン" : "オフ"} ·
-              ポート :{ui.teammateHooks.port}
+              {m.tmStatusLine(
+                ui.teammateHooks.enabled,
+                ui.teammateHooks.hookNotifications,
+                ui.teammateHooks.port,
+              )}
             </p>
             <div class="tm-actions">
               <button class="btn btn-small" onclick={copyHooksSnippet}>
-                スニペットをコピー
+                {m.btnCopySnippet}
               </button>
               <button
                 class="btn btn-small"
                 onclick={registerHooks}
                 disabled={registering}
-                title="~/.claude/settings.json へ登録"
+                title={m.titleRegisterSettings}
               >
-                {registering ? "登録中…" : "settings.json へ登録 (user)"}
+                {registering ? m.btnRegistering : m.btnRegisterSettings}
               </button>
             </div>
             <p class="tm-note">
-              トークンは保存され、再起動後も有効です。初回のみ登録が必要（再生成したときだけ再登録）。
+              {m.tmTokenNote}
             </p>
             <div class="tm-actions">
               <button
                 class="btn btn-small"
                 onclick={() => regenerateTokens("hook")}
                 disabled={regenerating}
-                title="hook トークンを再生成（漏洩時のローテーション用。再生成後は settings.json の再登録が必要）"
+                title={m.titleRegenHook}
               >
-                hook トークン再生成
+                {m.btnRegenHook}
               </button>
               <button
                 class="btn btn-small"
                 onclick={() => regenerateTokens("queen")}
                 disabled={regenerating}
-                title="Queen /mcp トークンを再生成（漏洩時のローテーション用。再生成後は MCP の再登録が必要）"
+                title={m.titleRegenQueen}
               >
-                Queen トークン再生成
+                {m.btnRegenQueen}
               </button>
             </div>
             {#if finishedTeammatePaneIds.length > 0}
@@ -1896,17 +1906,17 @@
                 <button
                   class="btn btn-small"
                   onclick={closeFinishedTeammatePanes}
-                  title="終了した teammate / transcript ペインをまとめて閉じます（実体には影響しません）"
+                  title={m.titleCloseFinished}
                 >
-                  終了したペインを一括で閉じる（{finishedTeammatePaneIds.length}）
+                  {m.btnCloseFinished(finishedTeammatePaneIds.length)}
                 </button>
               </div>
             {/if}
             <div class="tm-events">
-              <div class="tm-subhead">host モード（実 PTY teammate）</div>
+              <div class="tm-subhead">{m.tmHostHead}</div>
               {#if (ui.teamsHost?.leads.length ?? 0) === 0 && orphanTeammates.length === 0}
                 <div class="tm-empty">
-                  稼働中の host lead はありません（ptygrid.yml の teams.mode: host）
+                  {m.tmNoHostLeads}
                 </div>
               {:else}
                 {#each ui.teamsHost?.leads ?? [] as lead (lead.id)}
@@ -1918,26 +1928,26 @@
                           ? 'tm-badge-warn'
                           : 'tm-badge-ok'}"
                       >
-                        {lead.fallback ? "host: フォールバック中" : "host"}
+                        {lead.fallback ? m.tmLeadBadgeFallback : m.tmLeadBadgeHost}
                       </span>
                     </div>
                     {#if lead.teammates.length === 0}
-                      <div class="tm-empty">teammate なし</div>
+                      <div class="tm-empty">{m.tmNoTeammates}</div>
                     {:else}
                       {#each lead.teammates.map(teammateRow) as tm (tm.id)}
                         <div class="tm-teammate">
                           <span class="tm-teammate-label">
                             #{tm.id}{tm.role ? ` ▸${tm.role}` : ""}
-                            {tm.paneless ? "（グリッド外）" : ""}
+                            {tm.paneless ? m.tmPaneless : ""}
                           </span>
                           {#if tm.paneless}
                             <button
                               class="btn btn-small"
                               onclick={() => showTeammatePane(tm.id)}
                               disabled={!canAddPane}
-                              title="このteammateをグリッドに表示"
+                              title={m.titleShowOnGrid}
                             >
-                              グリッドへ表示
+                              {m.btnShowOnGrid}
                             </button>
                           {/if}
                         </div>
@@ -1948,7 +1958,7 @@
                 {#if orphanTeammates.length > 0}
                   <div class="tm-lead">
                     <div class="tm-lead-head">
-                      <span class="tm-lead-id">lead 終了済み（孤立 teammate）</span>
+                      <span class="tm-lead-id">{m.tmOrphanHead}</span>
                     </div>
                     {#each orphanTeammates as s (s.id)}
                       <div class="tm-teammate">
@@ -1959,9 +1969,9 @@
                         <button
                           class="btn btn-small tm-stop"
                           onclick={() => stopOrphanTeammate(s.id)}
-                          title="この孤立 teammate プロセスを停止"
+                          title={m.titleStopOrphan}
                         >
-                          停止
+                          {m.btnStop}
                         </button>
                       </div>
                     {/each}
@@ -1970,9 +1980,9 @@
               {/if}
             </div>
             <div class="tm-events">
-              <div class="tm-subhead">直近のイベント</div>
+              <div class="tm-subhead">{m.tmEventsHead}</div>
               {#if ui.teammateEvents.length === 0}
-                <div class="tm-empty">まだイベントはありません</div>
+                <div class="tm-empty">{m.tmNoEvents}</div>
               {:else}
                 {#each ui.teammateEvents as ev (ev.key)}
                   <div class="tm-event">{teammateEventLabel(ev)}</div>
@@ -1991,7 +2001,54 @@
         Σ CPU {formatCpu(totalResources.cpuPercent)} · {formatMemory(totalResources.memoryBytes)}
       </span>
     {/if}
-    <span class="pane-count">{paneCount}/{MAX_PANES} ペイン</span>
+    <span class="pane-count">{m.paneCount(paneCount, MAX_PANES)}</span>
+    <div class="teammates-wrap">
+      <button
+        bind:this={settingsBadgeEl}
+        class="settings-badge"
+        onclick={openSettingsPanel}
+        title={m.settingsTitle}
+        aria-label={m.settingsAria}
+      >
+        ⚙
+      </button>
+      {#if settingsPanelOpen}
+        <div
+          class="teammates-panel"
+          role="dialog"
+          aria-label={m.settingsTitle}
+          style="bottom: {settingsPanelPos.bottom}px; right: {settingsPanelPos.right}px;"
+        >
+          <div class="tm-head">
+            <span class="tm-title">{m.settingsTitle}</span>
+            <button
+              class="btn btn-small"
+              onclick={() => (settingsPanelOpen = false)}
+              title={m.btnClose}
+            >
+              ✕
+            </button>
+          </div>
+          <!-- Each setting is a labeled row; add future app-level (per-user,
+               machine-local) settings as additional .settings-row entries.
+               Project-level config intentionally stays in ptygrid.yml. -->
+          <div class="settings-row">
+            <span class="settings-label">{m.settingsLanguage}</span>
+            <span class="tb-controls layout-group" role="group" aria-label={m.settingsLanguage}>
+              {#each LOCALE_OPTIONS as opt (opt.value)}
+                <button
+                  class="seg-btn"
+                  class:seg-active={i18n.setting === opt.value}
+                  onclick={() => setLocaleSetting(opt.value)}
+                >
+                  {opt.label}
+                </button>
+              {/each}
+            </span>
+          </div>
+        </div>
+      {/if}
+    </div>
   </footer>
 
   {#if ui.notices.length > 0}
@@ -2007,7 +2064,7 @@
           <button
             class="btn btn-small"
             onclick={() => dismissNotice(notice.key)}
-            title="閉じる"
+            title={m.btnClose}
           >
             ✕
           </button>
@@ -2018,12 +2075,12 @@
 
   {#if ui.configChangedPath}
     <div class="toast" role="status">
-      <span class="toast-text">設定ファイル（ptygrid.yml）が変更されました</span>
-      <button class="btn btn-small" onclick={onReloadConfig}>再読み込み</button>
+      <span class="toast-text">{m.configChanged}</span>
+      <button class="btn btn-small" onclick={onReloadConfig}>{m.btnReload}</button>
       <button
         class="btn btn-small"
         onclick={() => (ui.configChangedPath = null)}
-        title="閉じる"
+        title={m.btnClose}
       >
         ✕
       </button>
@@ -2031,23 +2088,23 @@
   {/if}
 
   {#if ui.trustPrompt}
-    <div class="toast trust-toast" role="alertdialog" aria-label="フォルダの信頼確認">
+    <div class="toast trust-toast" role="alertdialog" aria-label={m.trustAria}>
       <span class="toast-text">
-        このフォルダ（{ui.trustPrompt.dir}）の設定は未確認です。定義されたコマンドを自動起動しますか？
+        {m.trustText(ui.trustPrompt.dir)}
       </span>
       <button
         class="btn btn-small"
         onclick={onTrustFolder}
-        title="このフォルダを信頼し、autostart 対象を起動します"
+        title={m.titleTrust}
       >
-        信頼して起動
+        {m.btnTrust}
       </button>
       <button
         class="btn btn-small"
         onclick={() => (ui.trustPrompt = null)}
-        title="起動せずに閉じる（エージェントチップから手動起動は可能）"
+        title={m.titleLater}
       >
-        後で
+        {m.btnLater}
       </button>
     </div>
   {/if}
@@ -2315,6 +2372,37 @@
 
   .teammates-wrap .queen-badge {
     margin-right: 0;
+  }
+
+  /* ⚙ app-settings button (footer). Same chrome family as the queen badge. */
+  .settings-badge {
+    align-self: center;
+    background: transparent;
+    color: #bbb;
+    border: none;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .settings-badge:hover {
+    background: #3a3a3a;
+    color: #eee;
+  }
+
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 0;
+  }
+
+  .settings-label {
+    flex: 0 0 auto;
+    color: #bbb;
+    font-size: 11px;
   }
 
   .teammates-panel {

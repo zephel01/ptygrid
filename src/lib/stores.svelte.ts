@@ -22,6 +22,7 @@ import type {
   TeamsHostStatus,
   TranscriptOutputPayload,
 } from "./types";
+import { msg } from "./i18n.svelte";
 import { isTauri } from "./tauri";
 import { writeToTerm } from "./terminals";
 
@@ -186,15 +187,7 @@ export async function refreshTeamsHostStatus(): Promise<void> {
   }
 }
 
-const TEAMMATE_KIND_LABELS: Record<TeammateLifecycleKind, string> = {
-  "subagent-start": "が起動",
-  "subagent-stop": "が停止",
-  "teammate-idle": "がアイドル",
-  "task-created": "のタスクを作成",
-  "task-completed": "のタスクが完了",
-};
-
-/** Short Japanese toast text for a teammate-lifecycle event. */
+/** Short localized toast text for a teammate-lifecycle event. */
 function teammateToast(ev: TeammateLifecyclePayload): string {
   const who =
     ev.agentType ??
@@ -203,7 +196,7 @@ function teammateToast(ev: TeammateLifecyclePayload): string {
     ev.taskId ??
     ev.sessionId ??
     "teammate";
-  return `🤝 teammate ${who} ${TEAMMATE_KIND_LABELS[ev.kind]}`;
+  return msg().teammateLifecycleToast(who, ev.kind satisfies TeammateLifecycleKind);
 }
 
 let listenersInitialized = false;
@@ -251,7 +244,7 @@ export async function initGlobalListeners(): Promise<void> {
     ui.sessions[payload.id] = payload;
     if (ui.panes.length >= MAX_PANES) {
       const label = payload.name ?? `shell #${payload.id}`;
-      ui.errorBanner = `Queen が「${label}」を起動しましたが、ペイン上限(${MAX_PANES})のため表示できません。`;
+      ui.errorBanner = msg().queenSpawnPaneLimit(label, MAX_PANES);
       return; // session keeps running headless
     }
     ui.panes.push(payload.id);
@@ -335,10 +328,7 @@ export async function initGlobalListeners(): Promise<void> {
 
   await listen<TeammateFallbackPayload>("teammate-fallback", () => {
     // host が使われず observe 降格した。toast + host 状態を更新する。
-    addNotice(
-      "teammate を host できませんでした",
-      "ネイティブペインにホストできず、読み取り専用ビューにフォールバックしました。",
-    );
+    addNotice(msg().hostFallbackNoticeTitle, msg().hostFallbackNoticeMsg);
     void refreshTeamsHostStatus();
   });
 

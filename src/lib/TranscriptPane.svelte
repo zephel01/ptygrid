@@ -4,6 +4,7 @@
   // `transcript-output` event (accumulated in ui.transcripts). Auto-scrolls
   // while the user is at the bottom; stops following once they scroll up.
   import { tick } from "svelte";
+  import { msg } from "./i18n.svelte";
   import { ui } from "./stores.svelte";
 
   let { sessionId, stopped }: { sessionId: number; stopped: boolean } =
@@ -34,9 +35,7 @@
 <div class="transcript" bind:this={scrollEl} onscroll={onScroll}>
   {#if text.length === 0}
     <div class="transcript-empty">
-      {stopped
-        ? "この subagent は停止しました（transcript の追記はありません）。"
-        : "transcript を待機中…（read-only・観測のみ）"}
+      {stopped ? msg().trSubStopped : msg().trWaiting}
     </div>
   {:else}
     <pre class="transcript-text">{text}</pre>

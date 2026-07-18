@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { msg } from "./i18n.svelte";
   import { invokeCmd } from "./tauri";
   import type {
     GitCommitInfo,
@@ -25,6 +26,8 @@
   } = $props();
 
   let activeDir = $state<string | undefined>();
+
+  let m = $derived(msg());
 
   let status = $state<GitStatusInfo | null>(null);
   let diff = $state<GitDiffInfo | null>(null);
@@ -162,7 +165,7 @@
         ...dirArgs(),
         paths,
       });
-      operationMessage = `${paths.length}件を${command === "git_stage" ? "stage" : "unstage"}しました。`;
+      operationMessage = m.gitMutated(paths.length, command === "git_stage");
       selectedPaths = [];
       if (
         selectedPath &&
@@ -229,11 +232,11 @@
       {/if}
     </div>
     <span class="spacer"></span>
-    <button class="icon-btn" onclick={refresh} disabled={loadingStatus || mutating} title="更新">
+    <button class="icon-btn" onclick={refresh} disabled={loadingStatus || mutating} title={m.gitRefresh}>
       ⟳
     </button>
     {#if !embedded && onclose}
-      <button class="icon-btn" onclick={onclose} title="閉じる">✕</button>
+      <button class="icon-btn" onclick={onclose} title={m.btnClose}>✕</button>
     {/if}
   </header>
 
@@ -258,12 +261,12 @@
           void loadDiff(null, staged);
         }}
       >
-        すべての変更
+        {m.gitAllChanges}
       </button>
       <span>{status.files.length}</span>
     </div>
     <div class="mutation-bar">
-      <span>{selectedPaths.length}件選択</span>
+      <span>{m.gitSelectedCount(selectedPaths.length)}</span>
       <span class="spacer"></span>
       <button
         onclick={() => mutatePaths("git_stage", selectedForStage())}
@@ -276,7 +279,7 @@
     </div>
     <div class="file-list">
       {#if status.files.length === 0}
-        <div class="empty">変更はありません</div>
+        <div class="empty">{m.gitNoChanges}</div>
       {:else}
         {#each status.files as file (file.path)}
           <div
@@ -290,7 +293,7 @@
               type="checkbox"
               checked={selectedPaths.includes(file.path)}
               onchange={() => toggleSelected(file.path)}
-              aria-label={`${file.path}を操作対象に選択`}
+              aria-label={m.gitSelectAria(file.path)}
             />
             <button class="file-select" onclick={() => selectFile(file)}>
               <span class="status-code">{statusCode(file)}</span>
@@ -300,7 +303,7 @@
         {/each}
       {/if}
       {#if status.truncated}
-        <div class="warning">10,000ファイルで表示を打ち切りました</div>
+        <div class="warning">{m.gitTruncated}</div>
       {/if}
     </div>
   {/if}
@@ -317,10 +320,8 @@
       class="commit-btn"
       onclick={commitChanges}
       disabled={!commitMessage.trim() || !hasStagedChanges || mutating}
-      title={hasStagedChanges
-        ? "現在stageされている変更をcommit"
-        : "stageされた変更がありません"}
-    >{mutating ? "処理中…" : "Commit staged changes"}</button>
+      title={hasStagedChanges ? m.gitCommitTitleReady : m.gitCommitTitleEmpty}
+    >{mutating ? m.gitWorking : "Commit staged changes"}</button>
   </div>
 
   {#if operationMessage}
@@ -343,11 +344,11 @@
   {#if error}
     <div class="git-error" role="alert">{error}</div>
   {:else if loadingDiff || loadingStatus}
-    <div class="empty">読み込み中…</div>
+    <div class="empty">{m.gitLoading}</div>
   {:else if diff?.text}
     <pre class="diff-view">{diff.text}</pre>
   {:else if status}
-    <div class="empty">この範囲にdiffはありません</div>
+    <div class="empty">{m.gitNoDiff}</div>
   {/if}
 </aside>
 
