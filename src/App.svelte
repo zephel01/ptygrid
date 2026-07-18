@@ -957,7 +957,14 @@
       const role = s.teammate.role;
       return `${s.name ?? "team"}${role ? ` ▸${role}` : ""} ↳#${s.teammate.leadId}`;
     }
-    return s.name ?? s.foreground ?? "shell";
+    if (s.name) return s.name;
+    // Phase 4.4.3: append the destination detail (`ssh user@host`) so the
+    // sidebar shows where each ssh pane is connected.
+    if (s.foreground) {
+      const detail = ui.foregroundDetail[s.id];
+      return detail ? `${s.foreground} ${detail}` : s.foreground;
+    }
+    return "shell";
   }
 
   // Pure derived view over ui.panes / ui.sessions / ui.agentStatus: every

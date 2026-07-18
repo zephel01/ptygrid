@@ -141,7 +141,8 @@ wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
 | v0.4.2 | Phase 4.0（hooks 受信基盤）〜 4.1（observe）〜 4.2（host モード実験）+ UXトラック一式（最初のリリースタグ） |
 | **v0.4.3** | 調査対応の安定化リリース: バグ修正 20件（backend 12 / frontend 8）+ セキュリティ 4件（S1 Queen認証 / S2 trust / S4 CSP）+ 手打ち claude の lead 帰属修正 + **認証トークンの永続化**。cargo test 159 / teams-backend 30。**現時点の main** |
 | **v0.4.6** | Phase 4.3（Queen team preset: `team_presets` 宣言 + `spawn_team`（19本目）+ 👥 一括起動 UI + example/team-preset）。cargo test 210 / svelte-check 0 |
-| **v0.4.7** | UI 多言語化（en/ja。型付き辞書 `i18n.svelte.ts`、⚙ 設定メニューで 自動/English/日本語 切替、既定=OS言語に自動追従・英語ベース）。フロントのみ、backend 文言・ログは対象外。svelte-check 0 / build 成功。**現時点の main** |
+| **v0.4.7** | UI 多言語化（en/ja。型付き辞書 `i18n.svelte.ts`、⚙ 設定メニューで 自動/English/日本語 切替、既定=OS言語に自動追従・英語ベース）。フロントのみ、backend 文言・ログは対象外。svelte-check 0 / build 成功 |
+| **v0.4.8** | ssh 接続先表示（Phase 4.4.3: `session-resources` の foreground に `detail?` を追加し argv から宛先抽出。ヘッダー/サイドバーに `ssh user@host`。`.ssh/config` alias・`-l` 畳み込み対応）。cargo test 214 / clippy 0 / svelte-check 0。**現時点の main** |
 | v0.4.7 / v0.5.0 | 残 Defer 消化 or 通知リング系 UX。Phase 5 系の扱いは実機偵察の結果を見て決定 |
 
 > 注: v0.1.0 のまま Phase 4.2 まで進めたため、遡及タグ（v0.4.0/v0.4.1）は付けず、

@@ -442,9 +442,16 @@ type SessionResourceUsage = {
   memoryBytes: number;
   processCount: number;
 };
+/** Phase 4.4.2/4.4.3: running PTY session の foreground プロセス名（解決できた
+ * session のみ）。detail は表示用の補足で、現状は foreground が `ssh` のときの
+ * 接続先（argv の最初の非オプション引数。`user@host` / ssh_config alias /
+ * `ssh://` authority。`-l user` は宛先に `@` が無いとき `user@dest` に畳み込む）。
+ * 無い場合は field ごと省略。 */
+type SessionForeground = { id: number; name: string; detail?: string };
 type SessionResourcesPayload = {
   sampledAtMs: number;
   sessions: SessionResourceUsage[];
+  foreground?: SessionForeground[];
 };
 ```
 
@@ -460,6 +467,9 @@ type SessionResourcesPayload = {
 - sample中に消失したroot、取得不能なprocess treeはそのbatchから省略する。
   frontendはbatchにない古い値を削除する。
 - samplerはsession map lock中にPID snapshotだけを取り、OS refreshやtree集約中はlockを保持しない。
+- foreground名は同じtickに同乗して解決する（追加pollingなし。Phase 4.4.2）。detail（ssh接続先）は
+  foreground名が許可リスト（現状 `ssh` のみ）に一致したときだけ argv を追加取得して抽出する
+  （Linux: `/proc/<pid>/cmdline`、macOS: `ps -o command=`。Phase 4.4.3、additive・後方互換）。
 
 ## Frontend
 
@@ -468,6 +478,9 @@ type SessionResourcesPayload = {
 - toolbar右側に、最新batch内の全sessionを合算した
   `Σ CPU n.n% · n MiB/GiB`を表示する。追加samplingは行わない。
 - batch eventごとにresource mapを1回だけ置換し、exit/restart/close時は対象値を削除する。
+- `foreground[].name` は `ui.sessions[id].foreground` を毎tick更新し、`detail` はサイドバーの行名と
+  paneヘッダーで `ssh user@host` のように name の後ろへ表示する（定義名がある session は定義名優先で
+  detail は付けない）。detail が来ないtickで保持値を消し、exit/close時も削除する（Phase 4.4.3）。
 
 ---
 

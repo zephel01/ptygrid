@@ -121,6 +121,66 @@ fn comm_basename(comm: &str) -> String {
     base.strip_prefix('-').unwrap_or(base).to_string()
 }
 
+/// Foreground commands whose first non-option argument is a connection
+/// destination worth surfacing next to the process name (Phase 4.4.3: pane
+/// header / status sidebar show `ssh user@host` instead of just `ssh`, so a
+/// command typed into the wrong pane is caught before it runs). Allowlist so
+/// the per-second sampler only pays the extra argv lookup for panes actually
+/// running one of these.
+fn has_destination_detail(name: &str) -> bool {
+    matches!(name, "ssh")
+}
+
+/// ssh options that consume a SEPARATE value argument (per `man ssh`). Any
+/// other `-x` token is either a value-less flag (possibly combined, `-4A`) or
+/// bundles its value (`-p22`) and is skipped whole. `-l` is handled specially
+/// so the login can be folded into the shown destination.
+const SSH_VALUE_FLAGS: &[&str] = &[
+    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-m", "-O", "-o", "-P",
+    "-p", "-Q", "-R", "-S", "-W", "-w",
+];
+
+/// Destination shown for an ssh argv: the first non-option argument
+/// (`user@host`, a ssh_config alias, or a `ssh://` authority). A `-l <user>`
+/// login is folded in as `user@dest` when the destination itself has no `@`.
+/// None for an argv with no destination (e.g. `ssh -Q cipher`... still returns
+/// the query token — acceptable: ssh exits immediately and the next 1s tick
+/// clears it).
+fn ssh_destination(args: &[String]) -> Option<String> {
+    let mut login: Option<String> = None;
+    let mut iter = args.iter().skip(1);
+    while let Some(tok) = iter.next() {
+        // URI form: keep the authority (user@host:port), drop scheme and path.
+        if let Some(rest) = tok.strip_prefix("ssh://") {
+            let authority = rest.split('/').next().unwrap_or(rest);
+            return (!authority.is_empty()).then(|| authority.to_string());
+        }
+        if let Some(rest) = tok.strip_prefix("-l") {
+            if rest.is_empty() {
+                login = iter.next().cloned(); // `-l user`
+            } else {
+                login = Some(rest.to_string()); // bundled `-luser`
+            }
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            if SSH_VALUE_FLAGS.contains(&tok.as_str()) {
+                iter.next(); // skip this flag's separate value
+            }
+            // Bundled values (`-p22`) and combined boolean flags (`-4A`) are
+            // single tokens; nothing extra to skip.
+            continue;
+        }
+        // First non-option token = destination (anything after it is the
+        // remote command and must not be consumed).
+        return match login {
+            Some(user) if !tok.contains('@') => Some(format!("{user}@{tok}")),
+            _ => Some(tok.clone()),
+        };
+    }
+    None
+}
+
 /// Resolve a pid to a short process name (used for SessionInfo.foreground).
 /// Linux: /proc/<pid>/comm (+ /proc/<pid>/cmdline for interpreters).
 /// macOS / other unix: `ps -o comm=/command= -p <pid>` — chosen over the
@@ -201,6 +261,42 @@ pub fn process_name(_pid: i32) -> Option<String> {
     None
 }
 
+/// Extra display detail for a resolved foreground process — currently the ssh
+/// destination (Phase 4.4.3). `name` is the value `process_name` returned for
+/// the same pid; the allowlist check runs first so non-matching processes cost
+/// nothing. Linux reads /proc/<pid>/cmdline; macOS runs `ps -o command=`.
+/// Windows / lookup failure: None.
+#[cfg(target_os = "linux")]
+pub fn process_detail(pid: i32, name: &str) -> Option<String> {
+    if !has_destination_detail(name) {
+        return None;
+    }
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    ssh_destination(&args)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn process_detail(pid: i32, name: &str) -> Option<String> {
+    if !has_destination_detail(name) {
+        return None;
+    }
+    // `command=` joins argv with spaces; ssh destinations/flags never contain
+    // spaces themselves, so whitespace-splitting reconstructs argv well enough.
+    let command = ps_field(pid, "command=")?;
+    let args: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    ssh_destination(&args)
+}
+
+#[cfg(not(unix))]
+pub fn process_detail(_pid: i32, _name: &str) -> Option<String> {
+    None
+}
+
 /// User home directory (spawn_shell default working directory).
 pub fn home_dir() -> Option<String> {
     #[cfg(windows)]
@@ -271,6 +367,70 @@ mod tests {
         // First arg after the interpreter that is not script-like → skip; none
         // here → None.
         assert_eq!(script_basename("node --version"), None);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ssh_destination_takes_first_non_option_argument() {
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "user@host"])).as_deref(),
+            Some("user@host")
+        );
+        // Value-taking flags are skipped with their values; the remote command
+        // after the destination is never consumed.
+        assert_eq!(
+            ssh_destination(&argv(&[
+                "ssh", "-p", "2222", "-i", "~/.ssh/id", "-o", "BatchMode=yes", "host", "uptime"
+            ]))
+            .as_deref(),
+            Some("host")
+        );
+        // Bundled value (-p22) and combined boolean flags (-4A) are one token.
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "-4A", "-p2222", "host"])).as_deref(),
+            Some("host")
+        );
+        // Full path argv[0] (macOS `ps -o command=` shows the resolved path).
+        assert_eq!(
+            ssh_destination(&argv(&["/usr/bin/ssh", "alias-from-config"])).as_deref(),
+            Some("alias-from-config")
+        );
+    }
+
+    #[test]
+    fn ssh_destination_folds_login_flag_and_uri_authority() {
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "-l", "root", "web01"])).as_deref(),
+            Some("root@web01")
+        );
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "-lroot", "web01"])).as_deref(),
+            Some("root@web01")
+        );
+        // Destination already has a user part: -l does not override it.
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "-l", "root", "admin@web01"])).as_deref(),
+            Some("admin@web01")
+        );
+        assert_eq!(
+            ssh_destination(&argv(&["ssh", "ssh://user@host:2222/path"])).as_deref(),
+            Some("user@host:2222")
+        );
+        // No destination at all.
+        assert_eq!(ssh_destination(&argv(&["ssh", "-p", "22"])), None);
+        assert_eq!(ssh_destination(&argv(&["ssh"])), None);
+    }
+
+    #[test]
+    fn process_detail_is_allowlisted_by_name() {
+        // Non-allowlisted names return None without any argv lookup, so the
+        // per-second sampler pays nothing for ordinary shell/agent panes.
+        assert_eq!(process_detail(std::process::id() as i32, "zsh"), None);
+        assert_eq!(process_detail(std::process::id() as i32, "claude"), None);
+        assert!(has_destination_detail("ssh"));
     }
 
     #[cfg(target_os = "linux")]

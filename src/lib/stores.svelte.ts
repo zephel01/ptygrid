@@ -69,6 +69,10 @@ export const ui = $state({
   agentStatus: {} as Record<number, AgentStatus>,
   /** Phase 4.4.0: matched rule id (regex source) per session id, for tooltips. */
   agentStatusRule: {} as Record<number, string>,
+  /** Phase 4.4.3: foreground display detail per session id (currently the ssh
+   * destination, e.g. `user@host`). Updated every resource tick; entries are
+   * removed when the tick reports no detail and on exit/close. */
+  foregroundDetail: {} as Record<number, string>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
 });
@@ -139,6 +143,8 @@ export function focusPane(id: number): void {
 export function clearAgentStatus(id: number): void {
   delete ui.agentStatus[id];
   delete ui.agentStatusRule[id];
+  // Foreground detail is only meaningful while running; same lifecycle.
+  delete ui.foregroundDetail[id];
 }
 
 const NOTICE_TTL_MS = 5000;
@@ -265,7 +271,13 @@ export async function initGlobalListeners(): Promise<void> {
     // shell name. Self-corrects: when the CLI exits, the shell becomes fg again.
     for (const fg of event.payload.foreground ?? []) {
       const session = ui.sessions[fg.id];
-      if (session?.state === "running") session.foreground = fg.name;
+      if (session?.state === "running") {
+        session.foreground = fg.name;
+        // Phase 4.4.3: destination detail (ssh) rides the same entry. Absent
+        // detail clears the stored one so `ssh host` → back-to-shell is clean.
+        if (fg.detail) ui.foregroundDetail[fg.id] = fg.detail;
+        else delete ui.foregroundDetail[fg.id];
+      }
     }
   });
 
@@ -355,6 +367,12 @@ export function paneTitle(id: number): string {
   // Prefer the definition name; for a hand-started session (no spec.name) fall
   // back to the live foreground process name so `claude`/`codex`/`grok` typed
   // into a shell pane shows as `claude #2` rather than `shell #2` (Phase 4.4.2).
+  // Phase 4.4.3: when the foreground name is what we show, append its
+  // destination detail (`ssh user@host #2`) so the target host is visible in
+  // the pane you are typing into.
   const name = session?.name ?? session?.foreground;
-  return name ? `${name} #${id}` : `shell #${id}`;
+  if (!name) return `shell #${id}`;
+  const detail =
+    !session?.name && session?.foreground ? ui.foregroundDetail[id] : undefined;
+  return detail ? `${name} ${detail} #${id}` : `${name} #${id}`;
 }

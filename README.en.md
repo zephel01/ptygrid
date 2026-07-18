@@ -13,7 +13,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 [![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/)
 [![MCP](https://img.shields.io/badge/MCP-built--in%20server-8A2BE2)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-v0.4.7-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.4.8-brightgreen)](#roadmap)
 
 [User Guide](docs/userguide.en.md) · [Design Document](docs/design.en.md) · [Linux / Windows Porting](docs/porting.en.md) · [Competitive Analysis](docs/competitive-landscape.en.md) · [Troubleshooting](docs/troubleshooting.en.md)
 
@@ -41,6 +41,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 - 📊 **Resource monitoring** — per-pane process-tree CPU/RSS, plus an all-sessions total in the toolbar
 - 💾 **Logical session restore** — saves the project, pane order, layout, and definitions, and restarts via a `resume` command of your choosing
 - 🧹 **Readable output sharing** — `read_output` returns text reconstructed to match the pane's dimensions, resolving ANSI cursor moves, screen clears, and the alternate screen (handling TUI full-screen redraws and leftover spinner artifacts)
+- 🔭 **ssh destination display** — panes running ssh show `ssh user@host` in the header/sidebar, so you never type into the wrong host
 - 🌐 **English/Japanese UI** — switch via the ⚙ settings menu: Auto/English/日本語 (defaults to the OS language)
 - 🪶 **Native and lightweight** — no Electron. Rust + Tauri v2 + portable-pty
 

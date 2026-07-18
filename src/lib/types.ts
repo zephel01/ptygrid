@@ -179,7 +179,8 @@ export type SessionResourceUsage = {
 
 /** フォアグラウンドプロセス名の実時間更新（session-resources に相乗り、
  * Phase 4.4.2）。手打ち起動の claude/codex/grok を表示名・状態バッジに反映する。 */
-export type SessionForeground = { id: number; name: string };
+/** Phase 4.4.3: detail は表示用の補足（現状 ssh の接続先 `user@host`。無い場合は省略）。 */
+export type SessionForeground = { id: number; name: string; detail?: string };
 
 export type SessionResourcesPayload = {
   sampledAtMs: number;

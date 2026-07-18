@@ -36,6 +36,10 @@ pub struct SessionResourceUsage {
 struct SessionForeground {
     id: u32,
     name: String,
+    /// Phase 4.4.3: optional display detail (currently the ssh destination,
+    /// e.g. `user@host`). Omitted from the wire when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -129,7 +133,9 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             let foreground = manager
                 .foreground_names()
                 .into_iter()
-                .filter_map(|(id, name)| name.map(|name| SessionForeground { id, name }))
+                .filter_map(|(id, name, detail)| {
+                    name.map(|name| SessionForeground { id, name, detail })
+                })
                 .collect();
             let sampled_at_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

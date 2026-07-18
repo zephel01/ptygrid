@@ -936,15 +936,23 @@ impl PtyManager {
     /// instead of adding its own polling. Pids are read under the lock (cheap
     /// tcgetpgrp ioctl); the pid->name lookup runs after the lock is dropped,
     /// exactly like `list_sessions`.
-    pub(crate) fn foreground_names(&self) -> Vec<(u32, Option<String>)> {
-        self.foreground_names_with(pty::process_name)
+    /// Phase 4.4.3: the third tuple element is an optional display detail for
+    /// the resolved foreground process (currently the ssh destination), so the
+    /// pane header / status sidebar can show `ssh user@host` instead of `ssh`.
+    pub(crate) fn foreground_names(&self) -> Vec<(u32, Option<String>, Option<String>)> {
+        self.foreground_names_with(pty::process_name, pty::process_detail)
     }
 
     /// Resolver-injected variant so the mapping is testable on hosts where
     /// `ps` / `/proc` is unavailable.
-    fn foreground_names_with<F>(&self, resolve_process: F) -> Vec<(u32, Option<String>)>
+    fn foreground_names_with<F, G>(
+        &self,
+        resolve_process: F,
+        resolve_detail: G,
+    ) -> Vec<(u32, Option<String>, Option<String>)>
     where
         F: Fn(i32) -> Option<String>,
+        G: Fn(i32, &str) -> Option<String>,
     {
         let snapshot: Vec<(u32, Option<i32>)> = {
             let sessions = self.lock_sessions();
@@ -956,7 +964,14 @@ impl PtyManager {
         };
         snapshot
             .into_iter()
-            .map(|(id, pid)| (id, pid.and_then(&resolve_process)))
+            .map(|(id, pid)| {
+                let name = pid.and_then(&resolve_process);
+                let detail = match (pid, name.as_deref()) {
+                    (Some(pid), Some(name)) => resolve_detail(pid, name),
+                    _ => None,
+                };
+                (id, name, detail)
+            })
             .collect()
     }
 
@@ -1863,10 +1878,10 @@ mod tests {
         let mut fg = None;
         while Instant::now() < deadline {
             fg = manager
-                .foreground_names_with(|_| Some("cat".to_string()))
+                .foreground_names_with(|_| Some("cat".to_string()), |_, _| None)
                 .into_iter()
-                .find(|(sid, _)| *sid == id)
-                .and_then(|(_, name)| name);
+                .find(|(sid, _, _)| *sid == id)
+                .and_then(|(_, name, _)| name);
             if fg.is_some() {
                 break;
             }
@@ -1879,9 +1894,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let present = manager
-                .foreground_names_with(|_| Some("cat".to_string()))
+                .foreground_names_with(|_| Some("cat".to_string()), |_, _| None)
                 .iter()
-                .any(|(sid, _)| *sid == id);
+                .any(|(sid, _, _)| *sid == id);
             if !present {
                 break;
             }
@@ -1890,6 +1905,37 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Phase 4.4.3: the detail resolver receives the resolved name and its
+    /// result rides the same tuple (ssh destination display).
+    #[test]
+    fn foreground_names_pass_resolved_name_to_detail_resolver() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let id = manager
+            .spawn_shell(handle, 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut row = None;
+        while Instant::now() < deadline {
+            row = manager
+                .foreground_names_with(
+                    |_| Some("ssh".to_string()),
+                    |_, name| (name == "ssh").then(|| "user@host".to_string()),
+                )
+                .into_iter()
+                .find(|(sid, name, _)| *sid == id && name.is_some());
+            if row.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (_, name, detail) = row.expect("running PTY should resolve a foreground name");
+        assert_eq!(name.as_deref(), Some("ssh"));
+        assert_eq!(detail.as_deref(), Some("user@host"));
+        manager.kill_pty(id).unwrap();
     }
 
     #[test]
