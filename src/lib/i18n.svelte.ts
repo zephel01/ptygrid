@@ -156,6 +156,12 @@ const en = {
     "codex snippet copied (paste into ~/.codex/config.toml. Uses the QUEEN_TOKEN env, so it survives token regeneration).",
   grokSnippetCopied:
     "grok snippet copied (paste into ~/.grok/config.toml. Uses the QUEEN_TOKEN env, so it survives token regeneration).",
+  universalUrlCopied:
+    "Token-bearing URL copied. Paste it into any MCP client's HTTP server URL field (no headers/env needed). Re-copy after regenerating the token.",
+  universalJsonCopied:
+    "Standard mcpServers JSON copied (type: http, token embedded in the URL). Works with most JSON-config tools (Cursor / Cline / VS Code / Gemini CLI).",
+  rawValuesCopied:
+    "Raw values copied (endpoint URL / token / QUEEN_TOKEN env name / token-bearing URL) for hand-configuring any tool.",
   hooksSnippetCopied: "hooks settings snippet copied",
   hooksRegistered: "Registered in settings.json",
   hooksAlreadyCurrent: "settings.json is already up to date",
@@ -209,6 +215,18 @@ const en = {
   titleGrokSnippet: "Snippet for ~/.grok/config.toml (reads QUEEN_TOKEN env)",
   queenPanelFootnote:
     "codex / grok read the QUEEN_TOKEN env, so they stay valid after token regeneration. Re-copy the claude command after regenerating.",
+  queenPanelUniversalLabel: "Generic (for other / new agent CLIs):",
+  btnUniversalUrl: "copy URL",
+  titleUniversalUrl:
+    "Token-bearing URL — paste into any MCP client that takes an HTTP URL (no headers/env needed)",
+  btnUniversalJson: "copy JSON",
+  titleUniversalJson:
+    "Standard mcpServers JSON (type: http, token in URL) for Cursor / Cline / VS Code / Gemini CLI, etc.",
+  btnRawValues: "copy raw values",
+  titleRawValues:
+    "Endpoint URL / token / QUEEN_TOKEN env / token-bearing URL for hand configuration",
+  queenPanelUniversalNote:
+    "The URL form is the most portable. For a regeneration-proof setup on TOML CLIs, prefer the codex / grok snippets (QUEEN_TOKEN env).",
 
   // ---- Teammates badge / panel ----
   teammatesAria: "Teammate hooks (click for the settings panel)",
@@ -440,6 +458,12 @@ const ja: Messages = {
     "codex スニペットをコピーしました（~/.codex/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
   grokSnippetCopied:
     "grok スニペットをコピーしました（~/.grok/config.toml に貼付。QUEEN_TOKEN env 参照でトークン再生成後も有効）",
+  universalUrlCopied:
+    "token 込み URL をコピーしました（任意の MCP クライアントの HTTP URL 欄に貼付。ヘッダ/env 不要。再生成時は再コピー）",
+  universalJsonCopied:
+    "標準 mcpServers JSON をコピーしました（type: http、URL に token 埋め込み。Cursor / Cline / VS Code / Gemini CLI 等の JSON 設定向け）",
+  rawValuesCopied:
+    "生の値をコピーしました（エンドポイント URL / token / QUEEN_TOKEN env 変数名 / token 込み URL）。未対応形式のツールに手貼り用",
   hooksSnippetCopied: "hooks 設定スニペットをコピーしました",
   hooksRegistered: "settings.json に登録しました",
   hooksAlreadyCurrent: "settings.json は既に最新です",
@@ -494,6 +518,18 @@ const ja: Messages = {
     "~/.grok/config.toml 用スニペット（QUEEN_TOKEN env 参照）",
   queenPanelFootnote:
     "codex / grok は QUEEN_TOKEN env 参照なのでトークン再生成後もそのまま有効。claude は再生成時に再コピーしてください。",
+  queenPanelUniversalLabel: "汎用（他の / 新しいエージェント CLI 向け）:",
+  btnUniversalUrl: "URL をコピー",
+  titleUniversalUrl:
+    "token 込み URL。HTTP URL を受け付ける任意の MCP クライアントに貼れる（ヘッダ/env 不要）",
+  btnUniversalJson: "JSON をコピー",
+  titleUniversalJson:
+    "標準 mcpServers JSON（type: http、URL に token）。Cursor / Cline / VS Code / Gemini CLI 等向け",
+  btnRawValues: "生の値をコピー",
+  titleRawValues:
+    "エンドポイント URL / token / QUEEN_TOKEN env / token 込み URL（手動設定用）",
+  queenPanelUniversalNote:
+    "URL 形式が最も汎用。TOML 系 CLI で再生成にも強くしたい場合は codex / grok スニペット（QUEEN_TOKEN env 参照）を推奨。",
 
   // ---- Teammates badge / panel ----
   teammatesAria: "Teammate hooks（クリックで設定パネル）",

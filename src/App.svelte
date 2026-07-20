@@ -315,6 +315,68 @@
     }
   }
 
+  // ---- 汎用コピー（claude/codex/grok 以外の新しいエージェント CLI 向け） ----
+  // 専用ボタンを持たないツールでも登録できるよう、どこにでも貼れる形を用意する。
+  // 認証の渡し方は結局2つ: (1) URL クエリ `?token=`（ヘッダ/env 不要で最も汎用。
+  // ただし再生成で貼り直しが要る）、(2) env `QUEEN_TOKEN`→Bearer（stale-proof、
+  // codex/grok の TOML が使用）。JSON の headers に `${QUEEN_TOKEN}` を書く env
+  // 展開方式はツール差で壊れる（claude-code で未展開の不具合報告あり）ため採らず、
+  // JSON はトークンを URL に埋める。
+
+  /** 汎用: トークン込み URL。HTTP エンドポイント URL を受け付ける任意の MCP
+   *  クライアントに貼れる、最も互換性の高い原始プリミティブ。ヘッダも env も不要。 */
+  async function copyUniversalUrl(): Promise<void> {
+    const q = ui.queenStatus;
+    if (!isTauri() || !q || (!q.url && !q.port)) return;
+    const url = queenRegisterUrl(q);
+    try {
+      await navigator.clipboard.writeText(url);
+      addNotice(m.universalUrlCopied, url);
+    } catch (err) {
+      ui.errorBanner = m.clipboardCopyFailed(err);
+    }
+  }
+
+  /** 汎用: 標準 mcpServers JSON（type: http）。Cursor / Cline / VS Code /
+   *  Gemini CLI など JSON 設定を読むツール向け。env 展開に依存させず URL に
+   *  トークンを埋める（stale-proof ではないが最も確実）。 */
+  async function copyUniversalJson(): Promise<void> {
+    const q = ui.queenStatus;
+    if (!isTauri() || !q || (!q.url && !q.port)) return;
+    const url = queenRegisterUrl(q);
+    const snippet = JSON.stringify(
+      { mcpServers: { queen: { type: "http", url } } },
+      null,
+      2,
+    );
+    try {
+      await navigator.clipboard.writeText(snippet);
+      addNotice(m.universalJsonCopied, snippet);
+    } catch (err) {
+      ui.errorBanner = m.clipboardCopyFailed(err);
+    }
+  }
+
+  /** 汎用: 手貼り用の生の値。未対応形式の新ツールでも、この素材から手で組める。
+   *  エンドポイント URL / トークン / env 変数名 / トークン込み URL。 */
+  async function copyRawValues(): Promise<void> {
+    const q = ui.queenStatus;
+    if (!isTauri() || !q || (!q.url && !q.port)) return;
+    const base = queenBaseUrl(q);
+    const snippet = [
+      `endpoint_url = ${base}`,
+      `token        = ${q.token ?? "(not available)"}`,
+      `token_env    = QUEEN_TOKEN`,
+      `token_url    = ${queenRegisterUrl(q)}`,
+    ].join("\n");
+    try {
+      await navigator.clipboard.writeText(snippet);
+      addNotice(m.rawValuesCopied, snippet);
+    } catch (err) {
+      ui.errorBanner = m.clipboardCopyFailed(err);
+    }
+  }
+
   // ---- Teammates badge (Phase 4.0 hooks) ----
   let teammatesPanelOpen = $state(false);
   // Anchor rect for the Teammates panel. The panel is rendered position:fixed
@@ -1829,6 +1891,33 @@
             </div>
             <p class="tm-note">
               {m.queenPanelFootnote}
+            </p>
+            <p class="tm-note">{m.queenPanelUniversalLabel}</p>
+            <div class="tm-actions">
+              <button
+                class="btn btn-small"
+                onclick={copyUniversalUrl}
+                title={m.titleUniversalUrl}
+              >
+                {m.btnUniversalUrl}
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyUniversalJson}
+                title={m.titleUniversalJson}
+              >
+                {m.btnUniversalJson}
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={copyRawValues}
+                title={m.titleRawValues}
+              >
+                {m.btnRawValues}
+              </button>
+            </div>
+            <p class="tm-note">
+              {m.queenPanelUniversalNote}
             </p>
           {/if}
         </div>
