@@ -21,6 +21,7 @@ import type {
   TeammateLifecyclePayload,
   TeamsHostStatus,
   TranscriptOutputPayload,
+  WorkflowRun,
 } from "./types";
 import { msg } from "./i18n.svelte";
 import { isTauri } from "./tauri";
@@ -75,6 +76,9 @@ export const ui = $state({
   foregroundDetail: {} as Record<number, string>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
+  /** Phase 5.0.0.f: latest known WorkflowRun per runId (workflow-state event
+   * + the one-shot list_workflow_runs fetch on mount). */
+  workflowRuns: {} as Record<string, WorkflowRun>,
 });
 
 /** How long a teammate-focus highlight stays on a pane (ms). */
@@ -359,6 +363,12 @@ export async function initGlobalListeners(): Promise<void> {
     if (ui.teammateHooks?.hookNotifications) {
       addNotice(teammateToast(event.payload));
     }
+  });
+
+  await listen<WorkflowRun>("workflow-state", (event) => {
+    // Phase 5.0.0.f: the orchestrator driver emits a full run snapshot
+    // whenever any field changes; last-write-wins keyed by runId (no merge).
+    ui.workflowRuns[event.payload.runId] = event.payload;
   });
 }
 

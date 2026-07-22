@@ -166,3 +166,64 @@ wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
   新ロジックを置かない、unit + integration テスト、両プラットフォーム CI 通過、
   該当挙動のみ userguide 更新。
 - 本文書は Phase の完了・計画変更のたびに「現在地サマリ」と「次の作業」を更新する。
+
+---
+
+## 5. Phase 5.0 / 5.5 / 6.0 の予約（未実装・設計のみ）
+
+詳細は [phase5-6.md](phase5-6.md) と 3 spec([spec-phase5-0.md](spec-phase5-0.md) / [spec-phase5-5.md](spec-phase5-5.md) / [spec-phase6-0.md](spec-phase6-0.md)) を参照。**先行実装は Phase 5.0 の MVO(Minimum Viable Orchestrator)**、それ以降は Track A/B/C/D の 4 並列(`ptygrid.yml` の `workflows:` セクション参照)。
+
+### 5.1 SQLite `PRAGMA user_version` 予約表
+
+migration は additive、既存 `queen.sqlite3` を壊さない。version bump は Phase 単位で予約する:
+
+| user_version | Phase | 追加テーブル | patch |
+|---|---|---|---|
+| 1 | Phase 3.6 | pins / notes | 3.6 |
+| 2 | Phase 3.7 | inbox / reply | 3.7 |
+| **3** | **Phase 5.0**(未実装) | `workflow_runs`(5.0.0)、`memory` + `memory_fts` + `memory_vec`(5.0.1-2) | 5.0.0 / 5.0.1 / 5.0.2 |
+| **4** | **Phase 6.0**(未実装) | `replays`、`secrets_audit`、`sandbox_events` | 6.0.0 |
+
+**規律**:
+- 未知の新 version は黙って開かない(明示 error でユーザーに再インストールを促す。Phase 3.6 の規律を継承)。
+- migration は transactional、既存の pins/notes/inbox データを壊さない。
+- Phase 5.0 の `workflow_runs` と `memory` は同じ v3 で導入し、5.0.0 で skeleton、5.0.1 で本格実装(2 patch にまたがる migration は1回のみ)。
+- Phase 6.0 の 3 テーブルは同じ v4 で同時導入(6.0.0 Foundation)。
+
+### 5.2 Track 別 branch 命名規則
+
+MVO(5.0.0)完成後、Track A/B/C/D を並列に走らせる。branch は 1 patch = 1 branch を基本とし、以下の prefix を強制する:
+
+| Track | prefix | 例 | 対応 patch |
+|---|---|---|---|
+| Track A(UI) | `track/a-ui-*` | `track/a-ui-5.5.3-status-rings` | 5.5.3 / 5.5.4 / 5.0.5 / 6.0.5 |
+| Track B(MCP+観測) | `track/b-mcp-*` | `track/b-mcp-5.5.0-rc-router` | 5.5.0 / 5.5.1 / 5.5.2 |
+| Track C(Memory+Provider+Orch完成) | `track/c-memory-*` | `track/c-memory-5.0.1-fts5` | 5.0.1 / 5.0.2 / 5.0.3 / 5.0.4 |
+| Track D(Security) | `track/d-security-*` | `track/d-security-6.0.2-strict-sandbox` | 6.0.0 / 6.0.1 / 6.0.2 / 6.0.3 / 6.0.4 |
+| MVO(先行、Track に属さない) | `mvo/*` | `mvo/5.0.0-orchestrator` | 5.0.0 |
+| その他 | `main`(直マージ不可)、`bug/*` / `docs/*` | | |
+
+**コーディネーション制約**:
+- `CONTRACT.md` の Phase 節は additive のみ。異なる Track が同時に同じ Phase 節を触ると merge 競合が起きるので、各 patch はその patch 用の subsection(§5.0.1 / §5.0.2 のような)を先に予約する(既に本節と CONTRACT.md 側でスケルトンを用意済み)。
+- `queen.rs` は薄いディスパッチャに保ち、各 tool 実装は別 module(`orchestrator.rs` / `memory.rs` / `secrets.rs` / `sandbox.rs` / `replay.rs` / `provider.rs` 等)に閉じる。
+- `session.rs`(PTY hot path)は Track A(UI)/D(sandbox tee tap)の両方が触るので、Track D が先に tee tap を入れて、Track A は tap 済み event を購読するだけにする。
+- GitHub Actions の concurrency group を Track 別に切る。merge queue を利用して直列化。
+- 人手レビューは Track D(Security)を最優先。Sandbox / Secrets は毎日固定 2 時間のレビュー枠を確保、他 Track は Opus adversarial verify で 8 割済ませる。
+
+### 5.3 実装 dev workflow 用の agent と workflow は `ptygrid.yml` に定義済み
+
+`ptygrid.yml` の `agents:` に 4 種(`opus-planner` / `sonnet-coder` / `opus-reviewer` / `sonnet-docs`)、`workflows:` に 4 track(`track-a-ui` / `track-b-mcp-otel` / `track-c-memory` / `track-d-security`)を定義済み。MVO(5.0.0)完成後、`spawn_workflow {name: "track-b-mcp-otel"}` の Queen tool 呼び出しで各 Track の1 patch サイクルが自動で回る(design → implement → verify → docs、Track D は verify → redteam → docs)。
+
+### 5.4 進捗（2026-07-22): Phase 5.0.0 MVO 完了
+
+- **実装完了**: `workflows:` スキーマ + 検証（config.rs）/ orchestrator.rs（spawn + DAG 進行
+  ドライバ、完了判定 2 経路、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本
+  （`spawn_workflow` / `join_workflow` / `cancel_workflow` 追加）/ Tauri commands 3 本 +
+  `workflow-state` イベント / WorkflowPanel.svelte + 🔀 チップ。
+- **検証**: cargo test 246 / clippy 0 / svelte-check 0 / vite build 成功 / 実機で
+  config 読み込み・チップ表示を確認済み（workflow 実走の実機確認は継続）。
+- **注記**: run registry は in-memory（app 再起動で消える）。SQLite `workflow_runs` +
+  user_version 2→3 は 5.0.1 へ。supervisor / handoff / retry / timeout / join_on reply|N
+  は 5.0.4。CONTRACT.md「Phase 5.0 追加契約」に確定契約を追記済み。
+- **バージョン**: v0.5.0 タグは workflow 実走スモークテスト通過後（3 ファイルの
+  version 同期 → 全チェック → annotated tag、§3 の手順どおり）。

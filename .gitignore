@@ -33,3 +33,4 @@ _to_delete/
 
 # personal working config for this repo (kept out of version control)
 /ptygrid.yml
+.aider*

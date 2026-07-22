@@ -27,6 +27,8 @@ export type Config = {
   agent_status?: AgentStatusConfig;
   /** Phase 4.3: 名前付きチーム構成（一括起動）。検証は backend の parse 時。 */
   team_presets?: Record<string, TeamPreset>;
+  /** Phase 5.0: 宣言的DAGオーケストレーション（workflows:）。検証は backend の parse 時。 */
+  workflows?: Record<string, WorkflowDef>;
 };
 
 // Phase 4.3 (Queen team preset: 一括起動)
@@ -63,6 +65,79 @@ export type TeamMemberOutcome = {
   status: "started" | "skipped" | "failed" | "standby";
   id?: number;
   error?: string;
+};
+
+// Phase 5.0 (workflows: 宣言的DAGオーケストレーション, MVO)
+/** pipeline/fan-out は MVO 実装済み。supervisor/handoff は 5.0.4 まで parse のみ
+ * (spawn_workflow が "not implemented in MVO" で reject する)。 */
+export type WorkflowPattern = "pipeline" | "fan-out" | "supervisor" | "handoff";
+
+/** ワークフロー全体の失敗方針。既定は fail-fast。 */
+export type OnFailure = "fail-fast" | "continue";
+
+export type JoinOnName = "all" | "any" | "reply";
+/** untagged: Named(JoinOnName) | Count(u32) — wire は素の "all"/"any"/"reply"
+ * または数値(例: joinOn: 3)。 */
+export type JoinOn = JoinOnName | number;
+
+/** workflows.<name>.steps の1エントリ。agent は agents: 定義名の参照のみ。 */
+export type WorkflowStep = {
+  id: string;
+  agent: string;
+  dependsOn?: string[];
+  fanOut?: number;
+  joinOn?: JoinOn;
+  timeoutMs?: number;
+  kickoff?: string;
+};
+
+/** workflows.<name> の宣言(見た目は camelCase、serde 1:1)。 */
+export type WorkflowDef = {
+  pattern: WorkflowPattern;
+  steps: WorkflowStep[];
+  onFailure?: OnFailure;
+  /** fan-out ワークフロー起動時に Arena drawer を開く(Phase 5.0.5 予定、parse のみ)。 */
+  arena?: boolean;
+};
+
+/** ワークフロー全体のライフサイクル。 */
+export type WorkflowState =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+/** 1ステップのライフサイクル。skipped は fail-fast カスケードでの未実行化。 */
+export type StepState =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+/** WorkflowRun.steps の1エントリ(step 実行結果)。 */
+export type StepOutcome = {
+  stepId: string;
+  agent: string;
+  sessionId?: number;
+  state: StepState;
+  attempts: number;
+  error?: string;
+};
+
+export type WorkflowRunId = string;
+
+/** `workflow-state` イベント/`spawn_workflow`・`cancel_workflow`・
+ * `list_workflow_runs` の戻り値。cols/rows はサーバ内部専用で wire には出ない。 */
+export type WorkflowRun = {
+  runId: WorkflowRunId;
+  name: string;
+  state: WorkflowState;
+  startedAtMs: number;
+  endedAtMs?: number;
+  steps: StepOutcome[];
 };
 
 export type AgentDef = {

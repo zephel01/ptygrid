@@ -1553,3 +1553,124 @@ team_presets:
 - `team_presets:` の無い config のパース・挙動は不変。`spawn_agent`（command / Queen tool）
   ・inbox 系 tool・`SessionInfo` は不変。
 - 検証エラーは `team_presets:` を書いた config にのみ発生しうる。
+
+---
+
+# Phase 5.0 追加契約（Orchestrated & Remembering）
+
+> 状態: **5.0.0 (MVO) 実装済み（2026-07-22）** / 5.0.1 以降は設計のみ。
+> 本仕様は [docs/spec-phase5-0.md](docs/spec-phase5-0.md) を参照。
+> 5.0.0 実装範囲: `workflows:` スキーマ + parse 検証（循環検出・allowlist）、
+> pipeline / fan-out の spawn と DAG 進行ドライバ（300ms ポーリング、完了判定は
+> PTY exit(0) / AgentStatus==done の2経路、fail-fast で下流 Skipped）、
+> Queen MCP tools 3本（19→22: `spawn_workflow` / `join_workflow` /
+> `cancel_workflow`。join は 200ms ポーリング・timeout 既定 600000ms・
+> clamp 1000..=3600000・`{"timedOut": bool, "run": {...}}` 返却）、
+> Tauri commands 3本（`spawn_workflow` / `cancel_workflow` /
+> `list_workflow_runs`）+ `workflow-state` イベント（payload = WorkflowRun,
+> camelCase）、WorkflowPanel + 🔀 チップ UI。
+> fan-out は copies>=2 のとき常に新規 spawn（冪等 reuse は copies==1 のみ）。
+> supervisor / handoff / retry / timeout 実行・join_on: reply|N は 5.0.4 送り
+> （パースは通り、spawn 時に typed error）。
+> 対象 patch: 5.0.0 MVO / 5.0.1 Memory FTS5 / 5.0.2 Memory embedding / 5.0.3 Provider / 5.0.4 Orchestrator supervisor+handoff / 5.0.5 Arena view。
+> SQLite: **5.0.0 は in-memory registry のみ（DB 変更なし・user_version 据え置き）**。
+> `workflow_runs` テーブルと **2 → 3** bump は 5.0.1（memory 系と同時）へ移動。
+
+## 5.0.1 ptygrid.yml スキーマ追加（予約）
+
+- `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
+- `providers:` ブロック — `local:*` / `cloud:*` 宣言、`embedding:` サブブロック（provider + dimension）。
+- `agents[].provider` フィールド — env 自動注入のトリガ。
+- `queen.memory:` サブブロック — `enabled` / `encrypted` / `max_bytes` / `ttl_default_ms`。
+
+## 5.0.2 新 Tauri Command / Event（予約）
+
+- Commands: `spawn_workflow` / `cancel_workflow` / `list_workflow_runs` / `memory_status` / `provider_status` / `arena_open`。
+- Events: `workflow-state` / `provider-status` / `arena-open` / `memory-changed`。
+
+## 5.0.3 新 Queen MCP tools（予約）
+
+- Orchestrator: `spawn_workflow` / `join_workflow` / `cancel_workflow`（**5.0.0 実装済み**）
+- Memory: `memory.remember` / `memory.recall` / `memory.forget` / `memory.list` / `memory.reindex`
+- Arena: `arena.vote` / `arena.list_votes`
+- Provider: `provider.status`
+
+計 **11 tools 追加**。既存の 18〜19 tools は不変。
+
+## 5.0.4 非回帰
+
+- 既存 `session-state` / `agent-status` / `queen-notify` / `session-resources` は不変。
+- 既存 `spawn_agent` / `list_agents` / `send_message` / `read_output` / `notify` / Pins / Notes / Inbox / `await` / `spawn_team` は引数・返り値ともに不変。
+- `queen.sqlite3` v2 → v3 migration は transactional、v2 のままの起動時に `memory*` テーブル + provider ident pragma を追加。
+
+---
+
+# Phase 5.5 追加契約（Observable & Standards-Compliant）
+
+> 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
+> 本仕様は [docs/spec-phase5-5.md](docs/spec-phase5-5.md) を参照。
+> 対象 patch: 5.5.0 MCP RC 両立ルータ / 5.5.1 OTel + SQLite / 5.5.2 Cost + agent-cost / 5.5.3 Status Rings / 5.5.4 Waterfall + Dashboard。
+
+## 5.5.1 Queen（MCP）契約拡張
+
+- **HTTP ヘッダ受理**: `Mcp-Method`（値 = リクエストボディの `method` と一致必須）、`Mcp-Name`（tool 呼び出しなら `params.name`）。不一致は 400。`Mcp-Session-Id` は受理はする（旧経路互換）／発行しない（RC 経路）。
+- **JSON-RPC メタ**: `params._meta.traceparent` / `.tracestate` / `.baggage` を受理、応答の `result._meta` に自サーバ側 traceparent を返す。
+- **`initialize` 系メソッド**: RC 経路は no-op 200。旧経路は従来通り `Mcp-Session-Id` を発行して 200。
+- **Deprecation ヘッダ**: 旧経路応答のみに付与。
+- 既存 18+1 tools の I/O 定義は無変更。`queen.rs` の各 handler は無改修、`queen_compat.rs` がヘッダとメタだけ翻訳する。
+
+## 5.5.2 新 Tauri Command（予約）
+
+- `query_spans({ sessionId?, traceId?, sinceNs?, limit? }) -> Span[]` — Waterfall / cost breakdown 用の read-only SQLite クエリ。
+- `set_capture_content({ enabled }) -> void` — 実行時に prompt 本体キャプチャを toggle（永続化なし）。
+
+## 5.5.3 新 Tauri Event（予約）
+
+- `agent-cost` — `{ id, model, costUmicro, inputTok, outputTok, ttftMs? }`。`gen_ai.chat` span 終了時に1回 emit。
+- `trace-updated` — `{ traceId, sessionId? }`。新しい root span が SQLite に書かれたとき。
+
+## 5.5.4 非回帰
+
+- Phase 3.x〜4.4 の全 CONTRACT 断面は追加のみで維持。
+- 旧 MCP クライアントは `mcp.legacy_2025_06: true` の間は無改修で動く。
+- `observability.enabled: false`（既定）では新規テーブルの作成も event の emit も一切起きない。
+
+---
+
+# Phase 6.0 追加契約（Secure & Auditable）
+
+> 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
+> 本仕様は [docs/spec-phase6-0.md](docs/spec-phase6-0.md) を参照。
+> 対象 patch: 6.0.0 Foundation / 6.0.1 Sandbox filesystem-only / 6.0.2 Sandbox strict / 6.0.3 Secrets keychain / 6.0.4 Secrets derived + proxy / 6.0.5 Replay UI + Export。
+> SQLite `PRAGMA user_version` を **3 → 4** へ bump（6.0.0 で `replays` / `secrets_audit` / `sandbox_events` 追加）。
+
+## 6.0.1 ptygrid.yml スキーマ追加（予約）
+
+- `sandbox:` ブロック — `default_profile` / `warm_pool` / `linux_engine` / `fail_mode` / `strict.{memory_mb, cpu, workspace_mount, kernel}` / `proxy.{enabled, service_rules}`。
+- `secrets:` ブロック — `vault` / backend 固有設定 / `entries[].{name, kind: static|short_lived|derived, ttl, scope}`。
+- `replay:` ブロック — `enabled` / `storage_dir` / `retention_days` / `redact.{patterns, include_secret_names}`。
+- `agents[].{sandbox, secrets, record}` フィールド — agent 単位の profile 上書き。
+- workflow step 単位の `{sandbox, secrets, record}` 上書き（Phase 5.0 の `spawn_workflow` 引数拡張）。
+
+## 6.0.2 新 Queen MCP tools（予約・5本）
+
+- `secrets.get({ name, scope }) -> { value, expires_at, jti }` — 短命 token 発行。error `-32011` SecretNotAllowed / `-32012` SecretVaultUnavailable / `-32013` SecretLeaseExhausted。
+- `secrets.revoke({ jti }) -> void` — 即時破棄。
+- `sandbox.info({}) -> { profile, engine, workspace_mount, network_via_proxy, queen_channel }` — self introspection。
+- `sandbox.exec_side({ cmd, args }) -> { stdout, stderr }` — strict プロファイル内で追加コマンド実行、頭 64KB のみ返す。
+- `replay.mark({ label, kind }) -> void` — asciicast に `m` イベント差込、Phase 5.5 の OTel span からも AddEvent。
+
+## 6.0.3 新 Tauri Command（予約）
+
+- `replay_list(session_id) -> ReplayMeta[]`
+- `replay_open(replay_id) -> { asciicast_url, span_root_id }`
+- `replay_export(replay_id, fmt: "cast"|"mp4"|"json") -> { path }`
+- `sandbox_status(pane_id) -> SandboxStatus`
+- `secrets_audit_tail(limit) -> AuditEntry[]`
+
+## 6.0.4 非回帰
+
+- Phase 5.0 / 5.5 の全契約は不変。
+- 既存 `session-state` / `agent-status` / `pty-output` / `pty-exit` は不変。
+- `sandbox.default_profile: filesystem-only`（既定）で新 pane は起動、`off` は `unsafe: true` 明示時のみ。
+- `queen.sqlite3` v3 → v4 migration は transactional。

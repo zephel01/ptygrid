@@ -6,6 +6,7 @@
   import GitPanel from "./lib/GitPanel.svelte";
   import StatusSidebar from "./lib/StatusSidebar.svelte";
   import type { StatusRow } from "./lib/StatusSidebar.svelte";
+  import WorkflowPanel from "./lib/WorkflowPanel.svelte";
   import {
     ui,
     MAX_PANES,
@@ -34,6 +35,8 @@
     SessionInfo,
     TeamPreset,
     TeamStartReport,
+    WorkflowDef,
+    WorkflowRun,
     WorktreeInfo,
   } from "./lib/types";
 
@@ -92,9 +95,10 @@
       return 380;
     }
   }
-  function loadDockTab(): "status" | "git" {
+  function loadDockTab(): "status" | "git" | "workflow" {
     try {
-      return localStorage.getItem(DOCK_TAB_KEY) === "git" ? "git" : "status";
+      const saved = localStorage.getItem(DOCK_TAB_KEY);
+      return saved === "git" || saved === "workflow" ? saved : "status";
     } catch {
       return "status";
     }
@@ -103,7 +107,7 @@
   let statusSidebarOpen = $state(loadDockOpen());
   let statusSidebarWidth = $state(loadStatusWidth());
   let gitDockWidth = $state(loadGitWidth());
-  let dockTab = $state<"status" | "git">(loadDockTab());
+  let dockTab = $state<"status" | "git" | "workflow">(loadDockTab());
 
   // The dock renders the active tab's remembered width.
   let activeDockWidth = $derived(
@@ -187,6 +191,10 @@
   /** Phase 4.3: [preset名, preset] の一覧（無ければ空）。 */
   let teamPresets = $derived(
     Object.entries(ui.configInfo?.config.team_presets ?? {}),
+  );
+  /** Phase 5.0.0.f: [workflow名, def] の一覧（無ければ空）。 */
+  let workflows = $derived(
+    Object.entries(ui.configInfo?.config.workflows ?? {}),
   );
   let activeWorktrees = $derived.by(() => {
     const byPath = new Map<string, WorktreeInfo>();
@@ -745,6 +753,7 @@
   // (same backend function as the Queen tool). Individual member failures
   // come back inside the report, not as a reject.
   let launchingTeam = $state(false);
+  let launchingWorkflow = $state(false);
 
   function teamPresetTitle(name: string, preset: TeamPreset): string {
     const members = preset.members
@@ -805,6 +814,76 @@
       ui.errorBanner = m.spawnTeamFailed(name, err);
     } finally {
       launchingTeam = false;
+    }
+  }
+
+  function workflowChipTitle(name: string, def: WorkflowDef): string {
+    const n = def.steps.length;
+    return `${name} [${def.pattern}] — ${n} step${n === 1 ? "" : "s"}`;
+  }
+
+  // Phase 5.0.0.f: launch a declared workflow (spawn_workflow). Same idiom as
+  // spawnTeam: invokeCmd, then optimistically track + pane any step that
+  // came back already Running so the grid updates without waiting for the
+  // session-state event round-trip. The workflow-state event (see
+  // stores.svelte.ts) keeps ui.workflowRuns current afterward regardless.
+  async function launchWorkflow(name: string): Promise<void> {
+    if (launchingWorkflow) return;
+    if (!isTauri()) return;
+    launchingWorkflow = true;
+    try {
+      const run = await invokeCmd<WorkflowRun>("spawn_workflow", {
+        name,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+      });
+      ui.workflowRuns[run.runId] = run;
+      for (const step of run.steps) {
+        if (step.state === "running" && step.sessionId !== undefined) {
+          if (!ui.sessions[step.sessionId]) {
+            ui.sessions[step.sessionId] = {
+              id: step.sessionId,
+              name: step.agent,
+              cmd: "",
+              state: "starting",
+            };
+          }
+          addPane(step.sessionId);
+        }
+      }
+      addNotice(`Workflow "${name}" launched`, `run ${run.runId} · ${run.state}`);
+    } catch (err) {
+      ui.errorBanner = `Failed to launch workflow "${name}": ${err}`;
+    } finally {
+      launchingWorkflow = false;
+    }
+  }
+
+  /** Cancel a running workflow run (cancel_workflow). Idempotent on the
+   * backend; a terminal run is simply returned unchanged. */
+  async function cancelWorkflow(runId: string): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      const run = await invokeCmd<WorkflowRun>("cancel_workflow", { runId });
+      ui.workflowRuns[run.runId] = run;
+    } catch (err) {
+      ui.errorBanner = `Failed to cancel workflow run: ${err}`;
+    }
+  }
+
+  /** One-shot fetch of every in-memory workflow run (list_workflow_runs),
+   * called once from onMount to seed ui.workflowRuns before the first
+   * workflow-state event (if any) arrives. */
+  async function refreshWorkflowRuns(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      const runs = await invokeCmd<WorkflowRun[]>("list_workflow_runs");
+      for (const run of runs) {
+        ui.workflowRuns[run.runId] = run;
+      }
+    } catch {
+      // Best-effort: the workflow-state event keeps the store current
+      // regardless of whether this initial fetch succeeds.
     }
   }
 
@@ -1356,6 +1435,7 @@
       void refreshQueenStatus();
       void refreshTeammateHooks();
       void refreshTeamsHostStatus();
+      void refreshWorkflowRuns();
       void loadDirSuggestions();
       let restored = false;
       try {
@@ -1509,6 +1589,19 @@
                 </button>
               </span>
             {/each}
+            {#each workflows as [name, def] (name)}
+              <span class="chip chip-workflow" title={workflowChipTitle(name, def)}>
+                🔀 {name}
+                <button
+                  class="chip-run"
+                  onclick={() => launchWorkflow(name)}
+                  disabled={launchingWorkflow}
+                  title={workflowChipTitle(name, def)}
+                >
+                  ▶
+                </button>
+              </span>
+            {/each}
           </span>
         {/if}
       </span>
@@ -1567,6 +1660,15 @@
           >
             {m.tabGit}
           </button>
+          <button
+            class="dock-tab"
+            class:active={dockTab === "workflow"}
+            role="tab"
+            aria-selected={dockTab === "workflow"}
+            onclick={() => (dockTab = "workflow")}
+          >
+            Workflows
+          </button>
         </div>
       </div>
       <div class="dock-body">
@@ -1577,6 +1679,8 @@
             onToggleMax={toggleMaximize}
             onClose={sidebarClose}
           />
+        {:else if dockTab === "workflow"}
+          <WorkflowPanel />
         {:else}
           {#key ui.configInfo?.path}
             <GitPanel embedded worktrees={activeWorktrees} />
@@ -2379,6 +2483,10 @@
   }
   .chip-team {
     border-color: #7a5b8f;
+  }
+
+  .chip-workflow {
+    border-color: #3c6b6b;
   }
 
   .chip-run {

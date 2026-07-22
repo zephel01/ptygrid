@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod git_service;
 mod notifications;
+mod orchestrator;
 mod project_state;
 mod pty;
 mod queen;
@@ -52,6 +53,7 @@ pub fn run() {
         .manage(TeamsHostManager::new())
         .manage(AgentStatusManager::new())
         .manage(NotificationManager::new())
+        .manage(orchestrator::WorkflowRegistry::new())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             // Load (or first-time generate) the persisted auth tokens before the
@@ -71,6 +73,12 @@ pub fn run() {
             // start from built-in defaults; load_config folds in the user's
             // `agent_status` block via agent_status::apply.
             agent_status::start(&app.handle().clone());
+            // Phase 5.0.0.c: DAG progression driver. Single global thread that
+            // polls Running workflow runs and advances them (spawn downstream
+            // steps on completion, apply fail-fast/continue, finalize). Plus a
+            // lightweight `agent-status` listener feeding semantic-done into
+            // the driver. Started once, after the managed WorkflowRegistry.
+            orchestrator::start_driver(&app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -83,6 +91,9 @@ pub fn run() {
             commands::is_working_folder_trusted,
             commands::spawn_agent,
             commands::spawn_team,
+            commands::spawn_workflow,
+            commands::cancel_workflow,
+            commands::list_workflow_runs,
             commands::restart_session,
             commands::list_sessions,
             commands::save_project_state,

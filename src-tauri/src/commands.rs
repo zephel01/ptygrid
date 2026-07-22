@@ -165,6 +165,47 @@ pub fn spawn_team(
     crate::team_presets::start_team(&app, &manager, &config, &store, &preset, cols, rows)
 }
 
+/// Phase 5.0.0.e/f: launch a named workflow declared under workflows: in
+/// ptygrid.yml — the same backend function as the Queen `spawn_workflow`
+/// tool. MVO supports pipeline/fan-out; supervisor/handoff reject with a
+/// "not implemented in MVO" error until Phase 5.0.4.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn spawn_workflow(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
+    registry: State<'_, crate::orchestrator::WorkflowRegistry>,
+    name: String,
+    cols: u16,
+    rows: u16,
+) -> Result<crate::orchestrator::WorkflowRun, String> {
+    crate::orchestrator::spawn_workflow(
+        &app, &manager, &config, &store, &registry, &name, cols, rows,
+    )
+}
+
+/// Cancel a running workflow: kill every step's live PTY session and mark
+/// the run Cancelled. Idempotent — a no-op on an already-terminal run.
+#[tauri::command]
+pub fn cancel_workflow(
+    manager: State<'_, PtyManager>,
+    registry: State<'_, crate::orchestrator::WorkflowRegistry>,
+    run_id: String,
+) -> Result<crate::orchestrator::WorkflowRun, String> {
+    crate::orchestrator::cancel_workflow(&manager, &registry, &run_id)
+}
+
+/// Return every workflow run currently held in memory (live + recently
+/// terminated), same in-memory registry the Queen workflow tools use.
+#[tauri::command]
+pub fn list_workflow_runs(
+    registry: State<'_, crate::orchestrator::WorkflowRegistry>,
+) -> Result<Vec<crate::orchestrator::WorkflowRun>, String> {
+    Ok(registry.list())
+}
+
 /// Kill and respawn a session while preserving its id.
 #[tauri::command]
 pub fn restart_session(

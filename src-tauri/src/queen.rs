@@ -460,6 +460,12 @@ impl QueenServer {
         self.app.state::<QueenStore>()
     }
 
+    /// Phase 5.0.0.e: workflow runs live here, mirroring `manager()` /
+    /// `config()` / `store()` above.
+    fn registry(&self) -> tauri::State<'_, crate::orchestrator::WorkflowRegistry> {
+        self.app.state::<crate::orchestrator::WorkflowRegistry>()
+    }
+
     fn project_dir(&self) -> Result<std::path::PathBuf, ErrorData> {
         self.config().current().map(|(_, dir)| dir).ok_or_else(|| {
             ErrorData::invalid_params(
@@ -522,6 +528,30 @@ pub struct SpawnAgentRequest {
 pub struct SpawnTeamRequest {
     #[schemars(description = "team preset name declared under team_presets: in ptygrid.yml")]
     pub preset: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SpawnWorkflowRequest {
+    #[schemars(description = "workflow name declared under workflows: in ptygrid.yml")]
+    pub name: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinWorkflowRequest {
+    #[schemars(description = "run id returned by spawn_workflow")]
+    pub run_id: String,
+    #[schemars(
+        description = "bounded wait in milliseconds (default 600000, clamped to 1000..=3600000)"
+    )]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelWorkflowRequest {
+    #[schemars(description = "run id returned by spawn_workflow")]
+    pub run_id: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -804,6 +834,72 @@ impl QueenServer {
         )
         .map_err(|e| ErrorData::invalid_params(e, None))?;
         let value = serde_json::to_value(&report)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        ok_json(&value)
+    }
+
+    #[tool(
+        description = "Launch a named workflow declared under workflows: in ptygrid.yml as a DAG run. Steps spawn only agents/processes from the ptygrid.yml allowlist (the same allow-list spawn_agent uses) — workflows introduce no new spawn path. MVO supports the pipeline and fan-out patterns (a fan-out step's fanOut count expands its root into that many parallel sessions); supervisor and handoff are rejected until Phase 5.0.4. Downstream (non-root) steps start Pending — the DAG-progression driver lands in 5.0.0.c — so poll with join_workflow or list_workflow_runs to observe completion. Returns the initial WorkflowRun JSON snapshot."
+    )]
+    fn spawn_workflow(
+        &self,
+        Parameters(SpawnWorkflowRequest { name }): Parameters<SpawnWorkflowRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = crate::orchestrator::spawn_workflow(
+            &self.app,
+            &self.manager(),
+            &self.config(),
+            &self.store(),
+            &self.registry(),
+            &name,
+            QUEEN_SPAWN_COLS,
+            QUEEN_SPAWN_ROWS,
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let value = serde_json::to_value(&run)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        ok_json(&value)
+    }
+
+    #[tool(
+        description = "Block (polling every 200ms) until a workflow run started by spawn_workflow reaches a terminal state (succeeded, failed, or cancelled), or the bounded timeout elapses. timeoutMs defaults to 600000 and is clamped to 1000..=3600000. Returns {timedOut, run}: timedOut=false with the terminal run once it settles, or timedOut=true with the current snapshot at the deadline — a timeout is NOT an error. An unknown runId is rejected. TODO(5.0.4): integrate MCP request cancellation the way `await` (await_inbox) does, so an aborted join stops polling immediately instead of running to the deadline."
+    )]
+    async fn join_workflow(
+        &self,
+        Parameters(JoinWorkflowRequest { run_id, timeout_ms }): Parameters<JoinWorkflowRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let timeout_ms = timeout_ms.unwrap_or(600_000).clamp(1_000, 3_600_000);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let run = self.registry().get(&run_id).ok_or_else(|| {
+                ErrorData::invalid_params(format!("workflow run '{run_id}' not found"), None)
+            })?;
+            let terminal = matches!(
+                run.state,
+                crate::orchestrator::WorkflowState::Succeeded
+                    | crate::orchestrator::WorkflowState::Failed
+                    | crate::orchestrator::WorkflowState::Cancelled
+            );
+            if terminal || tokio::time::Instant::now() >= deadline {
+                let timed_out = !terminal;
+                let value = serde_json::to_value(&run)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                return ok_json(&serde_json::json!({ "timedOut": timed_out, "run": value }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    #[tool(
+        description = "Cancel a running workflow: kill every step's live PTY session and mark it Cancelled, along with any still-pending downstream steps. Idempotent — calling this on an already-terminal run (succeeded/failed/cancelled) is a no-op that returns the current snapshot. Returns the WorkflowRun JSON."
+    )]
+    fn cancel_workflow(
+        &self,
+        Parameters(CancelWorkflowRequest { run_id }): Parameters<CancelWorkflowRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let run = crate::orchestrator::cancel_workflow(&self.manager(), &self.registry(), &run_id)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let value = serde_json::to_value(&run)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok_json(&value)
     }
@@ -1345,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_4_3_exposes_all_nineteen_tools() {
+    fn phase_5_0_0_e_exposes_all_twenty_two_tools() {
         let mut names: Vec<_> = QueenServer::tool_router()
             .list_all()
             .into_iter()
@@ -1357,10 +1453,12 @@ mod tests {
             [
                 "ack_inbox",
                 "await",
+                "cancel_workflow",
                 "create_note",
                 "delete_note",
                 "delete_pin",
                 "get_note",
+                "join_workflow",
                 "list_agents",
                 "list_inbox",
                 "list_notes",
@@ -1373,6 +1471,7 @@ mod tests {
                 "set_pin",
                 "spawn_agent",
                 "spawn_team",
+                "spawn_workflow",
                 "update_note",
             ]
         );

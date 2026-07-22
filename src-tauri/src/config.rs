@@ -45,6 +45,12 @@ pub struct Config {
     /// because presets are launch declarations tied to the spawn allowlist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_presets: Option<BTreeMap<String, TeamPreset>>,
+    /// Phase 5.0 top-level `workflows:` block (declarative DAG orchestration).
+    /// Validated at parse time (see [`validate_workflows`]); a broken workflow
+    /// declaration FAILS the config load, same as `team_presets:`. Members
+    /// reference `agents:` definition names only (allowlist integrity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<BTreeMap<String, WorkflowDef>>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -436,6 +442,240 @@ impl TeamMember {
     }
 }
 
+/// Phase 5.0: DAG orchestration pattern. `pipeline` and `fan-out` are the
+/// MVO bootstrap (5.0.0); `supervisor` and `handoff` land in 5.0.4 — they
+/// parse today but the state machine rejects execution with an explicit
+/// "not-yet-implemented" error until the completion patch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowPattern {
+    #[default]
+    Pipeline,
+    FanOut,
+    Supervisor,
+    Handoff,
+}
+
+/// Phase 5.0: workflow-level failure policy. `fail-fast` cancels remaining
+/// steps on the first FAILED step; `continue` keeps independent branches
+/// running. Default: fail-fast (documented in spec-phase5-0.md §2.1).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnFailure {
+    #[default]
+    FailFast,
+    Continue,
+}
+
+/// Phase 5.0: fan-out join rule. `all` waits for every parallel step to
+/// SUCCEED; `any` completes on the first success and CANCELs the rest;
+/// numeric `n` completes on the n-th success (MVO ships all/any; `n` and
+/// `reply` land in 5.0.4). Untagged serde so YAML `joinOn: all` and
+/// `joinOn: 3` both work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum JoinOn {
+    Named(JoinOnName),
+    Count(u32),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinOnName {
+    All,
+    Any,
+    /// Complete when an `inbox` reply to the step's kickoff arrives.
+    /// Not implemented in MVO — parses today, rejected at execution.
+    Reply,
+}
+
+/// Phase 5.0: one workflow declaration. See docs/spec-phase5-0.md §2.1.
+/// Field naming is camelCase in YAML (aligned with existing `spawn_agent` and
+/// `spawn_team` conventions) — `depends_on` here maps to `dependsOn` in YAML.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDef {
+    pub pattern: WorkflowPattern,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<OnFailure>,
+    /// Optional: fan-out workflow opens the Arena drawer on launch (Phase
+    /// 5.0.5). Parses today; the frontend hookup lands in 5.0.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arena: Option<bool>,
+}
+
+/// One entry under `workflows.<name>.steps`. Members reference `agents:`
+/// definition names only (allowlist integrity — same as team_presets).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowStep {
+    /// Step identifier — unique within the workflow's `steps` list.
+    pub id: String,
+    /// Reference to an `agents:` definition name (never `processes:`).
+    pub agent: String,
+    /// Predecessor step ids. Empty/None means "root of the DAG".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    /// Parallel spawn count (fan-out pattern only). Must be >= 2 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<u32>,
+    /// Fan-out completion rule. Defaults to `all` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_on: Option<JoinOn>,
+    /// Per-step upper time bound in milliseconds (5.0.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Optional first message delivered to the spawned pane's inbox mailbox
+    /// (= definition name) — the same durable inbox path team_presets uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<String>,
+}
+
+/// Phase 5.0 parse-time validation of the `workflows:` block. Every error
+/// names the offending workflow and step so multi-workflow configs stay
+/// debuggable (same principle as `validate_team_presets`).
+///
+/// Rejected: empty workflow name, empty `steps`, duplicate step id, unknown
+/// step id in `dependsOn`, DAG cycle, unknown `agent` reference (must be in
+/// `agents:`), `fanOut < 2`, `fanOut` on a non-`fan-out` pattern, `fanOut`
+/// missing on a `fan-out` pattern's roots, `pipeline` with a step that has
+/// more than one `dependsOn` (pipelines are linear by construction).
+fn validate_workflows(config: &Config) -> Result<(), String> {
+    let Some(workflows) = &config.workflows else {
+        return Ok(());
+    };
+    for (name, wf) in workflows {
+        let ctx = format!("workflows.{name}");
+        if name.trim().is_empty() {
+            return Err("workflows: workflow name must not be empty".to_string());
+        }
+        if wf.steps.is_empty() {
+            return Err(format!("{ctx}: steps must not be empty"));
+        }
+        // Step id uniqueness + agent allowlist.
+        let mut ids: Vec<&str> = Vec::with_capacity(wf.steps.len());
+        for step in &wf.steps {
+            if step.id.trim().is_empty() {
+                return Err(format!("{ctx}: step id must not be empty"));
+            }
+            if ids.contains(&step.id.as_str()) {
+                return Err(format!(
+                    "{ctx}: step id '{}' is declared more than once",
+                    step.id
+                ));
+            }
+            ids.push(step.id.as_str());
+            if !config.agents.iter().any(|a| a.name == step.agent) {
+                return Err(format!(
+                    "{ctx}: step '{}' references agent '{}' not defined under agents:                      (processes: entries cannot be workflow steps)",
+                    step.id, step.agent
+                ));
+            }
+        }
+        // dependsOn references must be known step ids.
+        for step in &wf.steps {
+            for dep in step.depends_on.as_deref().unwrap_or(&[]) {
+                if !ids.contains(&dep.as_str()) {
+                    return Err(format!(
+                        "{ctx}: step '{}' depends_on '{}' which is not a step id",
+                        step.id, dep
+                    ));
+                }
+                if dep == &step.id {
+                    return Err(format!(
+                        "{ctx}: step '{}' depends on itself",
+                        step.id
+                    ));
+                }
+            }
+        }
+        // DAG cycle detection via DFS from each node.
+        detect_cycle(&ctx, &wf.steps)?;
+        // Pattern-specific rules.
+        match wf.pattern {
+            WorkflowPattern::Pipeline => {
+                for step in &wf.steps {
+                    let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                    if deps.len() > 1 {
+                        return Err(format!(
+                            "{ctx}: pipeline step '{}' has {} dependencies;                              pipeline is linear (max 1 dependsOn per step)",
+                            step.id, deps.len()
+                        ));
+                    }
+                    if step.fan_out.is_some() {
+                        return Err(format!(
+                            "{ctx}: pipeline step '{}' declares fanOut;                              use pattern: fan-out instead",
+                            step.id
+                        ));
+                    }
+                }
+            }
+            WorkflowPattern::FanOut => {
+                let has_any_fan_out = wf.steps.iter().any(|s| s.fan_out.is_some());
+                if !has_any_fan_out {
+                    return Err(format!(
+                        "{ctx}: fan-out pattern requires at least one step with fanOut set"
+                    ));
+                }
+                for step in &wf.steps {
+                    if let Some(count) = step.fan_out {
+                        if count < 2 {
+                            return Err(format!(
+                                "{ctx}: step '{}' fanOut ({}) must be >= 2",
+                                step.id, count
+                            ));
+                        }
+                    }
+                }
+            }
+            WorkflowPattern::Supervisor | WorkflowPattern::Handoff => {
+                // MVO parses these patterns but the state machine returns a
+                // typed "not-yet-implemented" error at spawn time (Phase 5.0.4).
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Kahn/DFS-style cycle detection over the DAG defined by `steps[].depends_on`.
+/// Returns an error naming a member of the first detected cycle.
+fn detect_cycle(ctx: &str, steps: &[WorkflowStep]) -> Result<(), String> {
+    use std::collections::HashMap;
+    #[derive(Copy, Clone, PartialEq)]
+    enum Color { White, Gray, Black }
+    let mut color: HashMap<&str, Color> =
+        steps.iter().map(|s| (s.id.as_str(), Color::White)).collect();
+
+    fn visit<'a>(
+        node: &'a str,
+        steps: &'a [WorkflowStep],
+        color: &mut HashMap<&'a str, Color>,
+    ) -> Result<(), &'a str> {
+        match color.get(node).copied() {
+            Some(Color::Gray) => return Err(node), // back edge -> cycle
+            Some(Color::Black) => return Ok(()),
+            _ => {}
+        }
+        color.insert(node, Color::Gray);
+        if let Some(step) = steps.iter().find(|s| s.id == node) {
+            for dep in step.depends_on.as_deref().unwrap_or(&[]) {
+                visit(dep.as_str(), steps, color)?;
+            }
+        }
+        color.insert(node, Color::Black);
+        Ok(())
+    }
+
+    for step in steps {
+        if visit(step.id.as_str(), steps, &mut color).is_err() {
+            return Err(format!("{ctx}: dependency cycle detected involving step '{}'", step.id));
+        }
+    }
+    Ok(())
+}
+
 /// Phase 4.3 parse-time validation of the `team_presets:` block. Every error
 /// names the offending preset so multi-preset configs stay debuggable.
 ///
@@ -601,6 +841,7 @@ pub struct ConfigInfo {
 pub fn parse_config(text: &str) -> Result<Config, String> {
     let config: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
     validate_team_presets(&config)?;
+    validate_workflows(&config)?;
     Ok(config)
 }
 
