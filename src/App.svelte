@@ -1082,6 +1082,48 @@
     clearAgentStatus(id);
   }
 
+  // Phase 5.0.0 追補: 終了ペイン自動クローズ。workflow 由来セッションは
+  // workflows[].autoClose が優先、それ以外は agents[].close_on_exit。
+  // success は exit 0 のみ・failed は残す。maximized 中は閉じない。3 秒遅延、
+  // 発火時に再判定(手動クローズ・再起動レースに勝たせる)。
+  const autoCloseTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  function autoCloseModeFor(id: number): "success" | "always" | "never" {
+    const cfg = ui.configInfo?.config;
+    if (!cfg) return "never";
+    for (const run of Object.values(ui.workflowRuns)) {
+      if (run.steps.some((s) => s.sessionId === id)) {
+        return cfg.workflows?.[run.name]?.autoClose ?? "never";
+      }
+    }
+    const name = ui.sessions[id]?.name;
+    if (!name) return "never";
+    const def = cfg.agents.find((a) => a.name === name);
+    return def?.close_on_exit ?? "never";
+  }
+
+  $effect(() => {
+    for (const id of ui.panes) {
+      const s = ui.sessions[id];
+      if (!s || s.state !== "exited" || autoCloseTimers.has(id)) continue;
+      const mode = autoCloseModeFor(id);
+      if (mode === "never") continue;
+      if (mode === "success" && s.code !== 0) continue;
+      const timer = setTimeout(() => {
+        autoCloseTimers.delete(id);
+        const cur = ui.sessions[id];
+        if (
+          cur?.state === "exited" &&
+          ui.maximizedId !== id &&
+          ui.panes.includes(id)
+        ) {
+          closePane(id);
+        }
+      }, 3000);
+      autoCloseTimers.set(id, timer);
+    }
+  });
+
   function toggleMaximize(id: number): void {
     ui.maximizedId = ui.maximizedId === id ? null : id;
   }

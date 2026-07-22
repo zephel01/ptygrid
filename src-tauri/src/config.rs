@@ -504,6 +504,14 @@ pub struct WorkflowDef {
     /// 5.0.5). Parses today; the frontend hookup lands in 5.0.5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arena: Option<bool>,
+    /// Phase 5.0.0 追補: auto-close a step's pane a few seconds after that
+    /// step reaches a terminal state — `success` closes only `succeeded`
+    /// steps, `always` also closes `failed`/`cancelled` steps. Default
+    /// `never` (opt-in, existing behavior unchanged). Parsed only; the
+    /// frontend evaluates and performs the close (mirrors `close_on_exit`
+    /// above). Wire: `autoClose` (WorkflowDef is `rename_all = "camelCase"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_close: Option<AutoCloseMode>,
 }
 
 /// One entry under `workflows.<name>.steps`. Members reference `agents:`
@@ -760,6 +768,13 @@ pub struct AgentDef {
     /// Phase 4.1 per-agent teammate/observe config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teams: Option<AgentTeamsConfig>,
+    /// Phase 5.0.0 追補: auto-close this pane a few seconds after the
+    /// session exits — `success` only when the exit code is 0, `always`
+    /// regardless. Default `never` (existing behavior unchanged). Parsed
+    /// only; the close itself is scheduled/performed entirely by the
+    /// frontend (see stores.svelte.ts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_on_exit: Option<AutoCloseMode>,
 }
 
 /// Optional per-definition linked-worktree isolation (Phase 3.3).
@@ -790,6 +805,22 @@ pub enum AutoRestart {
     #[default]
     Never,
     OnFailure,
+    Always,
+}
+
+/// `success | always | never` (default `never`). Phase 5.0.0 追補（終了ペイン
+/// の自動クローズ）: shared by `AgentDef.close_on_exit` (session exit) and
+/// `WorkflowDef.auto_close` (workflow step completion, wire `autoClose`).
+/// Parsed here only — deciding WHEN to close and performing the close is
+/// entirely a frontend concern (stores.svelte.ts `shouldAutoClose` /
+/// `scheduleAutoClose`), mirroring how `autorestart` is parsed here but
+/// enacted in session.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoCloseMode {
+    #[default]
+    Never,
+    Success,
     Always,
 }
 
@@ -2114,5 +2145,38 @@ agents:
         );
         let cfg = parse_config(&yaml).unwrap();
         assert_eq!(cfg.team_presets.unwrap()["t"].members.len(), 1);
+    }
+
+    // ---- Phase 5.0.0 追補: close_on_exit / workflows.<name>.autoClose ----
+
+    #[test]
+    fn close_on_exit_and_workflow_auto_close_parse_with_defaults() {
+        // Agent-level close_on_exit: omitted -> None (never, unchanged).
+        let cfg = parse_config("agents:\n  - name: a\n    cmd: x\n").unwrap();
+        assert_eq!(cfg.agents[0].close_on_exit, None);
+
+        // Explicit values on agents AND processes (shared AgentDef shape).
+        let cfg = parse_config(
+            "agents:\n  - name: a\n    cmd: x\n    close_on_exit: success\n  - name: b\n    cmd: y\n    close_on_exit: always\nprocesses:\n  - name: web\n    cmd: npm run dev\n    close_on_exit: always\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agents[0].close_on_exit, Some(AutoCloseMode::Success));
+        assert_eq!(cfg.agents[1].close_on_exit, Some(AutoCloseMode::Always));
+        assert_eq!(cfg.processes[0].close_on_exit, Some(AutoCloseMode::Always));
+
+        // Workflow-level autoClose (camelCase wire, WorkflowDef convention).
+        let yaml = "agents:\n  - name: a\n    cmd: x\n  - name: b\n    cmd: y\nworkflows:\n  demo:\n    pattern: pipeline\n    autoClose: always\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n        dependsOn: [first]\n  demo2:\n    pattern: pipeline\n    steps:\n      - id: only\n        agent: a\n";
+        let cfg = parse_config(yaml).unwrap();
+        let workflows = cfg.workflows.unwrap();
+        assert_eq!(workflows["demo"].auto_close, Some(AutoCloseMode::Always));
+        // Omitted on demo2 -> None (never, unchanged default).
+        assert_eq!(workflows["demo2"].auto_close, None);
+
+        // Unknown value is a hard field error (closed enum, same posture as
+        // AutoRestart / NotifyLevel / ChannelKind).
+        assert!(parse_config(
+            "agents:\n  - name: a\n    cmd: x\n    close_on_exit: sometimes\n"
+        )
+        .is_err());
     }
 }

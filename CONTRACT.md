@@ -1570,6 +1570,11 @@ team_presets:
 > `list_workflow_runs`）+ `workflow-state` イベント（payload = WorkflowRun,
 > camelCase）、WorkflowPanel + 🔀 チップ UI。
 > fan-out は copies>=2 のとき常に新規 spawn（冪等 reuse は copies==1 のみ）。
+> 追補（同日）: 終了ペイン自動クローズ — `agents[].close_on_exit` /
+> `workflows.<name>.autoClose`（ともに `success | always | never`、既定 never）。
+> workflow 由来セッションは autoClose が優先。success は exit 0 のみ、
+> maximized 中は閉じない、3 秒遅延 + 発火時再判定。判定・実行は frontend、
+> Rust 側はパースのみ。
 > supervisor / handoff / retry / timeout 実行・join_on: reply|N は 5.0.4 送り
 > （パースは通り、spawn 時に typed error）。
 > 対象 patch: 5.0.0 MVO / 5.0.1 Memory FTS5 / 5.0.2 Memory embedding / 5.0.3 Provider / 5.0.4 Orchestrator supervisor+handoff / 5.0.5 Arena view。

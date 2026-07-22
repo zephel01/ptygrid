@@ -98,6 +98,8 @@ export type WorkflowDef = {
   onFailure?: OnFailure;
   /** fan-out ワークフロー起動時に Arena drawer を開く(Phase 5.0.5 予定、parse のみ)。 */
   arena?: boolean;
+  /** step ペインの終了時自動クローズ(agent 定義より優先)。既定 never。 */
+  autoClose?: AutoCloseMode;
 };
 
 /** ワークフロー全体のライフサイクル。 */
@@ -140,9 +142,14 @@ export type WorkflowRun = {
   steps: StepOutcome[];
 };
 
+/** Phase 5.0.0 追補: 終了ペイン自動クローズのポリシー。既定 never。 */
+export type AutoCloseMode = "success" | "always" | "never";
+
 export type AgentDef = {
   name: string;
   cmd: string;
+  /** exited 時のペイン自動クローズ(success=exit 0 のみ / always / never)。 */
+  close_on_exit?: AutoCloseMode;
   cwd?: string;
   env?: Record<string, string>;
   autostart?: boolean;
