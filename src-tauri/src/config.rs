@@ -51,6 +51,9 @@ pub struct Config {
     /// reference `agents:` definition names only (allowlist integrity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflows: Option<BTreeMap<String, WorkflowDef>>,
+    /// Phase 5.5.0 top-level `mcp:` block (the `/mcp` RC-compat router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -75,6 +78,75 @@ impl QueenConfig {
             _ => crate::queen::DEFAULT_PORT,
         }
     }
+}
+
+/// Phase 5.5.0 `mcp:` block — raw ptygrid.yml shape for the MCP RC-compat
+/// router flags (spec-phase5-5.md §4.1). Resolution to plain values lives in
+/// `queen_compat::config::McpCompatConfig` (the `QueenConfig` ->
+/// `effective_*()` split, same pattern).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct McpConfig {
+    /// Accept the 2026-07-28 RC route (`Mcp-Method` / `Mcp-Name` headers,
+    /// no session id issuance). Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rc_2026_07_28: Option<bool>,
+    /// Keep accepting the 2025-06 legacy route during the deprecation
+    /// window. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_2025_06: Option<bool>,
+    /// Per-request body cap for the compat router, bytes. Default 1 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    /// Deprecated-capability no-op policy (sampling/roots/logging). Default:
+    /// sampling/roots off (real `-32601`), logging on (200 no-op).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_capabilities: Option<McpLegacyCapabilitiesConfig>,
+}
+
+impl McpConfig {
+    pub fn effective_rc_2026_07_28(&self) -> bool {
+        self.rc_2026_07_28.unwrap_or(true)
+    }
+    pub fn effective_legacy_2025_06(&self) -> bool {
+        self.legacy_2025_06.unwrap_or(true)
+    }
+    pub fn effective_max_body_bytes(&self) -> usize {
+        // 0 would reject every request; treat it like a missing value
+        // (same posture as QueenConfig::effective_port for port 0).
+        match self.max_body_bytes {
+            Some(n) if n > 0 => n,
+            _ => 1_048_576,
+        }
+    }
+    pub fn effective_legacy_capabilities_sampling(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.sampling)
+            .unwrap_or(false)
+    }
+    pub fn effective_legacy_capabilities_roots(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.roots)
+            .unwrap_or(false)
+    }
+    pub fn effective_legacy_capabilities_logging(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.logging)
+            .unwrap_or(true)
+    }
+}
+
+/// `mcp.legacy_capabilities:` — per-capability opt-in to keep answering
+/// `sampling/*`, `resources/roots`, `logging/setLevel` with a 200 no-op
+/// instead of a real `-32601 method_not_found` during the 12-month
+/// deprecation window (spec-phase5-5.md §3.1, §10 edge cases).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct McpLegacyCapabilitiesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logging: Option<bool>,
 }
 
 /// Phase 4.0 global `teammates:` block. Governs whether teammate hook events
