@@ -74,6 +74,10 @@ pub fn load_config(
     crate::agent_status::apply(&app, &info.config);
     // Phase 4.4.2: swap in the (possibly reloaded) notifications block.
     crate::notifications::apply(&app, &info.config);
+    // Phase 5.5.0: swap in the (possibly reloaded) `mcp:` block for the /mcp
+    // compat middleware — an open TCP connection is unaffected, since
+    // McpCompatHandle::get reads fresh per request.
+    crate::queen_compat::apply(&app, &info.config);
     // Phase 5.0.1: detect workflow runs left "running" in the Queen DB from
     // before a crash/restart (the in-memory WorkflowRegistry is lost on
     // restart, the persisted row is not) and let the frontend prompt Y/N.
