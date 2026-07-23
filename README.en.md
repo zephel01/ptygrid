@@ -191,4 +191,4 @@ For the background on this direction, see the [Competitive Analysis](docs/compet
 
 ## License
 
-Undecided (to be determined at public release)
+MIT License, see [LICENSE](LICENSE).

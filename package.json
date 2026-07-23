@@ -1,6 +1,7 @@
 {
   "name": "ptygrid",
   "private": true,
+  "license": "MIT",
   "version": "0.5.6",
   "type": "module",
   "scripts": {

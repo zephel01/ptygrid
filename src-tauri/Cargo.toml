@@ -11,6 +11,7 @@ version = "0.5.6"
 edition = "2021"
 description = "Multi-agent terminal workspace with PTY grid orchestration"
 authors = ["zephel01"]
+license = "MIT"
 
 [lib]
 name = "ptygrid_lib"

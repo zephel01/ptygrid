@@ -210,4 +210,4 @@ Windowsはportable-pty/ConPTYの分岐を持ちますが、foreground process検
 
 ## License
 
-未定(公開時に決定予定)
+MIT License, see [LICENSE](LICENSE).
