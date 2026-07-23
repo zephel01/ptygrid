@@ -4,6 +4,11 @@
 // shape) — mirrors the `QueenConfig` -> `effective_*()` split already used
 // for the `queen:` block.
 
+// TODO(track-b 5.5.0): remove this allow when the compat middleware is wired
+// into queen.rs (McpCompatHandle gets constructed there); until then every
+// item here is staged-but-unreferenced by design.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

@@ -103,6 +103,9 @@ pub struct McpConfig {
     pub legacy_capabilities: Option<McpLegacyCapabilitiesConfig>,
 }
 
+// TODO(track-b 5.5.0): remove this allow when queen_compat's middleware is
+// wired into queen.rs and these resolvers gain their real call sites.
+#[allow(dead_code)]
 impl McpConfig {
     pub fn effective_rc_2026_07_28(&self) -> bool {
         self.rc_2026_07_28.unwrap_or(true)
