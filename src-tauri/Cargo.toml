@@ -36,6 +36,16 @@ rmcp = { version = "1.8", features = [
     "transport-streamable-http-server",
 ] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Phase 5.5.0: the tower::Layer trait, for queen_compat's axum middleware
+# factory signature (Layer/Service traits are unconditional, no features needed).
+tower = { version = "0.5", default-features = false }
+# Phase 5.5.0: lock-free hot-swappable McpCompatConfig, read per-request by the
+# already-bound `/mcp` middleware (mirrors token_store::TokenHandle's role for
+# the auth token, but via ArcSwap instead of Mutex per the design pin).
+arc-swap = "1"
+# Phase 5.5.0: NaiveDate for per-day dedupe of the legacy-route deprecation
+# warning. Was already a transitive dep (via rmcp/schemars); promoted direct.
+chrono = "0.4"
 tokio-util = "0.7"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

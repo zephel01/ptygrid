@@ -51,6 +51,9 @@ pub struct Config {
     /// reference `agents:` definition names only (allowlist integrity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflows: Option<BTreeMap<String, WorkflowDef>>,
+    /// Phase 5.5.0 top-level `mcp:` block (the `/mcp` RC-compat router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -73,6 +76,42 @@ impl QueenConfig {
         match self.port {
             Some(p) if p != 0 => p,
             _ => crate::queen::DEFAULT_PORT,
+        }
+    }
+}
+
+/// Phase 5.5.0 `mcp:` block — raw ptygrid.yml shape for the MCP RC-compat
+/// router flags (spec-phase5-5.md §4.1). Resolution to plain values lives in
+/// `queen_compat::config::McpCompatConfig` (the `QueenConfig` ->
+/// `effective_*()` split, same pattern).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct McpConfig {
+    /// Accept the 2026-07-28 RC route (`Mcp-Method` / `Mcp-Name` headers,
+    /// no session id issuance). Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rc_2026_07_28: Option<bool>,
+    /// Keep accepting the 2025-06 legacy route during the deprecation
+    /// window. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_2025_06: Option<bool>,
+    /// Per-request body cap for the compat router, bytes. Default 1 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+}
+
+impl McpConfig {
+    pub fn effective_rc_2026_07_28(&self) -> bool {
+        self.rc_2026_07_28.unwrap_or(true)
+    }
+    pub fn effective_legacy_2025_06(&self) -> bool {
+        self.legacy_2025_06.unwrap_or(true)
+    }
+    pub fn effective_max_body_bytes(&self) -> usize {
+        // 0 would reject every request; treat it like a missing value
+        // (same posture as QueenConfig::effective_port for port 0).
+        match self.max_body_bytes {
+            Some(n) if n > 0 => n,
+            _ => 1_048_576,
         }
     }
 }
