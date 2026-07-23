@@ -91,8 +91,15 @@ mod tests {
     #[test]
     fn tools_call_with_mcp_name_is_ok() {
         let h = headers(&[(MCP_METHOD_HEADER, "tools/call"), (MCP_NAME_HEADER, "list_agents")]);
-        let body = json!({"method": "tools/call"});
+        // A real tools/call always carries params.name; "ok" means header AND
+        // body agree on it (the fixture originally omitted params.name, which
+        // correctly yields ToolNameMismatch — that case is asserted below).
+        let body = json!({"method": "tools/call", "params": {"name": "list_agents"}});
         assert_eq!(validate(&h, &body), HeaderValidation::Ok);
+
+        // Header names a tool the body doesn't carry -> mismatch.
+        let body = json!({"method": "tools/call"});
+        assert_eq!(validate(&h, &body), HeaderValidation::ToolNameMismatch);
     }
 
     #[test]
