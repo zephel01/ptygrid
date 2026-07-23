@@ -16,6 +16,9 @@ pub enum HeaderValidation {
     MethodMismatch,
     /// `body.method` is `tools/*` but `Mcp-Name` is absent.
     MissingToolName,
+    /// `body.method` is `tools/*`, `Mcp-Name` is present, but its value
+    /// doesn't match `params.name` (design pin "design-5.5.0" §5.1).
+    ToolNameMismatch,
 }
 
 /// RC-only. `body.method` missing or non-string is folded into
@@ -29,8 +32,14 @@ pub fn validate(headers: &HeaderMap, body: &Value) -> HeaderValidation {
         (Some(h), Some(b)) if h == b => b,
         _ => return HeaderValidation::MethodMismatch,
     };
-    if method.starts_with("tools/") && headers.get(MCP_NAME_HEADER).is_none() {
-        return HeaderValidation::MissingToolName;
+    if method.starts_with("tools/") {
+        let Some(header_name) = headers.get(MCP_NAME_HEADER).and_then(|v| v.to_str().ok()) else {
+            return HeaderValidation::MissingToolName;
+        };
+        let body_name = body.pointer("/params/name").and_then(Value::as_str);
+        if body_name != Some(header_name) {
+            return HeaderValidation::ToolNameMismatch;
+        }
     }
     HeaderValidation::Ok
 }

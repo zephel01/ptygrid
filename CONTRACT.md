@@ -1633,6 +1633,7 @@ team_presets:
   - `rc_2026_07_28`（bool, 既定 `true`）— 2026-07-28 RC 経路の受理可否。
   - `legacy_2025_06`（bool, 既定 `true`）— 2025-06 旧経路の受理可否。
   - `max_body_bytes`（usize, 既定 `1_048_576` = 1 MiB）— compat router のボディ上限。`0` または未指定は既定値へフォールバック（`QueenConfig::effective_port` のポート0フォールバックと同方針）。
+  - `legacy_capabilities`（object, 既定 `{sampling: false, roots: false, logging: true}`）— 廃止予定 capability（`sampling/*` / `resources/roots` / `logging/setLevel`）ごとに no-op 200 で応答し続けるか `-32601 method_not_found` へ倒すかの per-capability トグル（`McpLegacyCapabilitiesConfig` / `queen_compat::config::LegacyCapabilities`）。
   - 生値の `McpConfig`（全フィールド `Option`）は `effective_*()` で解決し、`queen_compat::config::McpCompatConfig`（resolved）へ変換。`McpCompatHandle`（`Arc<ArcSwap<McpCompatConfig>>`）経由でホットリロード可能、`.get()` はロックフリー読み取り。
 - **未実装（本節の上記4箇条が対象、設計のみ）**: HTTP ヘッダ受理 / JSON-RPC メタ(traceparent) / `initialize` の RC no-op / Deprecation ヘッダを行う axum middleware、および `queen.rs::run_server` への組み込み。`mcp:` ブロックは現時点では値を保持するのみで、`/mcp` の実際のリクエスト処理には未接続。
 
@@ -1640,6 +1641,12 @@ team_presets:
 
 - 上記「確定・実装済み」のうち `src-tauri/src/queen_compat/config.rs`（`McpCompatConfig` / `McpCompatHandle` の `ArcSwap` 経由ホットリロード）は、opus-reviewer による commit `8f83a2f` の verify で **差し戻し**（P1 blocker）と判定された。理由: `src-tauri/src/lib.rs` の `mod` 宣言一覧に `queen_compat` が無く、`queen_compat/` 配下（`mod.rs` 自体も未作成）は crate のビルド対象に含まれていない。rustc に解析されないため同ファイル内のユニットテストも実行されておらず、`McpCompatHandle` のホットリロード機構は現時点では**未検証・未稼働**（dead code）。上記「確定・実装済み」からは除外し、`lib.rs` への `mod queen_compat;` 追加と `queen_compat/mod.rs` 新設のうえ再検証が必要。
 - 一方、`src-tauri/src/config.rs`（既存ファイル、`lib.rs` の既存 `mod config;` 経由でビルド対象）が持つトップレベル `Config::mcp: Option<McpConfig>` と `effective_rc_2026_07_28()` / `effective_legacy_2025_06()` / `effective_max_body_bytes()` は実際にコンパイルされる範囲であり、この部分の「確定・実装済み」は維持する。
+
+### 再検証結果（2026-07-23 時点、確定）
+
+- 上記「レビュー差し戻し」が指摘した blocker（`lib.rs` に `mod queen_compat;` が無い）は commit `d7dd01c` で解消済み: `src-tauri/src/lib.rs` に `mod queen_compat;` を追加し、`src-tauri/src/queen_compat/mod.rs` を新設（`pub mod config;` を有効化）。`cargo check --lib` が通り、`cargo test --lib queen_compat` で `queen_compat::config::tests::defaults_match_the_design_pin` / `handle_shares_updates_across_clones` の2件が pass することを再検証済み（2026-07-23）。よって `queen_compat::config`（`McpCompatConfig` / `LegacyCapabilities` / `McpCompatHandle`）は「確定・実装済み」に含める。
+- ただし `queen_compat/mod.rs` は `pub mod header;` / `pub mod route;` をコメントアウトしたままで、`src-tauri/src/queen_compat/header.rs`（`HeaderValidation` / `validate()` と6件のユニットテスト）・`route.rs`（`RouteKind` / `detect()` / `body_too_large()` / `is_batch()` / session-id 系ヘルパ）はファイルとして存在するのみでクレートのビルド対象外（`cargo test --lib header` / `cargo test --lib route` はいずれも 0 tests で確認）。中身は書かれているが未接続のため、この2ファイルは引き続き「未実装」として扱う。
+- `src-tauri/src/config.rs::McpConfig` の `effective_*()` 一式および `src-tauri/src/queen_compat/config.rs` 全体には `#[allow(dead_code)]` が付与されている（`queen.rs` 側に実呼び出し元がまだ無いため）。コンパイル・ユニットテストは通るが実トラフィックからは未参照、という点で上記「未実装」節の実態と整合する。
 
 ## 5.5.2 新 Tauri Command（予約）
 

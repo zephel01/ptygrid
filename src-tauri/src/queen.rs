@@ -64,6 +64,10 @@ pub struct QueenStatus {
     /// stays valid across restarts. Held in a shared [`TokenHandle`] so a
     /// regeneration is seen by the already-bound `/mcp` middleware.
     token: TokenHandle,
+    /// Phase 5.5.0: hot-swappable RC-compat router flags, read per-request by
+    /// the `/mcp` compat middleware. Same lifecycle role as `token`, but
+    /// ArcSwap (lock-free read) per the queen_compat design pin.
+    mcp: crate::queen_compat::McpCompatHandle,
 }
 
 impl QueenStatus {
@@ -75,7 +79,17 @@ impl QueenStatus {
                 ..Default::default()
             }),
             token: TokenHandle::new(token),
+            mcp: crate::queen_compat::McpCompatHandle::new(Default::default()),
         }
+    }
+
+    /// Phase 5.5.0: the shared RC-compat flag handle. Returns a CLONE (clones
+    /// share the same ArcSwap), so callers can bind it from a temporary
+    /// `State<QueenStatus>` without borrowing from the temporary —
+    /// `app.state::<QueenStatus>().mcp_handle()` is safe as written in
+    /// `queen_compat::apply`.
+    pub fn mcp_handle(&self) -> crate::queen_compat::McpCompatHandle {
+        self.mcp.clone()
     }
 
     /// The `/mcp` auth token for this app run (distinct from the hook token).
@@ -284,8 +298,16 @@ fn run_server(app: AppHandle, base_port: u16, epoch: u64, cancel: CancellationTo
             token: app.state::<QueenStatus>().token_handle(),
             port,
         };
+        // Phase 5.5.0: RC/legacy compat router. Added as the inner layer (added
+        // before mcp_auth's `.layer` call below) so mcp_auth stays outermost —
+        // an unauthorized request never reaches queen_compat::middleware.
+        let mcp_compat_state = app.state::<QueenStatus>().mcp_handle();
         let mcp = axum::Router::new()
             .nest_service("/mcp", service)
+            .layer(from_fn_with_state(
+                mcp_compat_state,
+                crate::queen_compat::middleware,
+            ))
             .layer(from_fn_with_state(mcp_auth_state, mcp_auth));
         // Phase 4.0: the teammate hook receiver shares this 127.0.0.1 server,
         // co-located with /mcp. Its own module owns all the hook logic. Both

@@ -421,6 +421,20 @@ mcp:
 > ヘッダ検証・`initialize` no-op・Deprecation ヘッダなどが有効になるのは、これらを実装する
 > 後続リリースからです。
 
+`mcp:` ブロックには上記3項目に加えて、廃止予定 capability(`sampling/*` / `resources/roots` /
+`logging/setLevel`)ごとに no-op 応答を続けるか無効化するかを切り替える `legacy_capabilities`
+サブブロックも用意されています。
+
+```yaml
+mcp:
+  legacy_capabilities:
+    sampling: false   # default false。廃止予定 sampling/* は無効(実装後は -32601 method_not_found)
+    roots: false      # default false。廃止予定 resources/roots は無効(実装後は -32601 method_not_found)
+    logging: true     # default true。廃止予定 logging/setLevel は 200 no-op のまま維持
+```
+
+> ℹ️ こちらも現行リリースでは値を保持するのみで、実際の応答分岐にはまだ接続されていません。
+
 ## Teammates(hooks 受信)
 
 ツールバー右側の **Teammates バッジ**は、Claude Code 等が発火する teammate ライフサイクル
