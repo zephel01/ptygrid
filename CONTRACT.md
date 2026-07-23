@@ -1578,8 +1578,11 @@ team_presets:
 > supervisor / handoff / retry / timeout 実行・join_on: reply|N は 5.0.4 送り
 > （パースは通り、spawn 時に typed error）。
 > 対象 patch: 5.0.0 MVO / 5.0.1 Memory FTS5 / 5.0.2 Memory embedding / 5.0.3 Provider / 5.0.4 Orchestrator supervisor+handoff / 5.0.5 Arena view。
-> SQLite: **5.0.0 は in-memory registry のみ（DB 変更なし・user_version 据え置き）**。
-> `workflow_runs` テーブルと **2 → 3** bump は 5.0.1（memory 系と同時）へ移動。
+> SQLite: 5.0.1（2026-07-23 実装済み）で `workflow_runs` テーブル + **user_version 2 → 3**。
+> `WorkflowRegistry::put` から write-through 永続化。`load_config` 成功時に state='running'
+> の残存 run を検出し `workflow-resume-pending`（WorkflowRun[]）を emit、frontend の
+> Y/N バナーから `resume_workflow`（running step→pending に戻し既存ドライバが続行）/
+> `abandon_workflow`（DB 上 cancelled 化・再プロンプト防止）。memory 系テーブルは 5.0.2+。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 

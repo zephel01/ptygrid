@@ -1124,6 +1124,36 @@
     }
   });
 
+  // Phase 5.0.1: resume/discard a workflow run interrupted by an app restart.
+  async function resumeWorkflowRun(runId: string): Promise<void> {
+    try {
+      const run = await invokeCmd<WorkflowRun>("resume_workflow", {
+        runId,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+      });
+      ui.workflowRuns[run.runId] = run;
+    } catch (err) {
+      ui.errorBanner = `workflow resume failed: ${err}`;
+    } finally {
+      ui.workflowResumePrompts = ui.workflowResumePrompts.filter(
+        (r) => r.runId !== runId,
+      );
+    }
+  }
+
+  async function abandonWorkflowRun(runId: string): Promise<void> {
+    try {
+      await invokeCmd<void>("abandon_workflow", { runId });
+    } catch (err) {
+      ui.errorBanner = `workflow abandon failed: ${err}`;
+    } finally {
+      ui.workflowResumePrompts = ui.workflowResumePrompts.filter(
+        (r) => r.runId !== runId,
+      );
+    }
+  }
+
   function toggleMaximize(id: number): void {
     ui.maximizedId = ui.maximizedId === id ? null : id;
   }
@@ -1650,6 +1680,20 @@
     </div>
 
   </div>
+
+  {#each ui.workflowResumePrompts as run (run.runId)}
+    <div class="banner" role="alert">
+      <span class="banner-text"
+        >前回のワークフロー run「{run.name}」が途中で中断されています。再開しますか?</span
+      >
+      <button class="btn btn-small" onclick={() => resumeWorkflowRun(run.runId)}
+        >再開</button
+      >
+      <button class="btn btn-small" onclick={() => abandonWorkflowRun(run.runId)}
+        >破棄</button
+      >
+    </div>
+  {/each}
 
   {#if ui.errorBanner}
     <div class="banner banner-error" role="alert">

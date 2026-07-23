@@ -227,3 +227,10 @@ MVO(5.0.0)完成後、Track A/B/C/D を並列に走らせる。branch は 1 patc
   は 5.0.4。CONTRACT.md「Phase 5.0 追加契約」に確定契約を追記済み。
 - **バージョン**: v0.5.0 タグは workflow 実走スモークテスト通過後（3 ファイルの
   version 同期 → 全チェック → annotated tag、§3 の手順どおり）。
+
+### 5.5 進捗（2026-07-23): Phase 5.0.1 Workflow Resume 完了
+
+- `workflow_runs` 永続化（user_version 2→3）+ write-through、`workflow-resume-pending`
+  イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` commands。
+- cargo test 251 / clippy 0 / svelte-check 0。実機のクラッシュ→再開テストは継続。
+- バージョン: v0.5.1 タグ候補（3 ファイル version 同期 → 全チェック → annotated tag）。

@@ -22,6 +22,43 @@ const MAX_MAILBOX_BYTES: usize = 128;
 const MAX_MESSAGE_SUBJECT_BYTES: usize = 256;
 const MAX_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
+/// Phase 5.0.1: `workflow_runs` schema, shared verbatim by all three
+/// migration paths below (fresh v0 database, v1->v3, v2->v3) so the
+/// table/index text is defined exactly once. `IF NOT EXISTS` keeps every
+/// path idempotent against a partially-migrated db (same L12a discipline as
+/// the existing tables). `error` is populated only by
+/// `mark_workflow_abandoned` — every other column mirrors
+/// `orchestrator::WorkflowRun` closely enough to round-trip it.
+const WORKFLOW_RUNS_SCHEMA_SQL: &str = "
+                 CREATE TABLE IF NOT EXISTS workflow_runs (
+                   run_id TEXT PRIMARY KEY,
+                   project_dir TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   started_at_ms INTEGER NOT NULL,
+                   ended_at_ms INTEGER,
+                   steps_json TEXT NOT NULL,
+                   error TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS workflow_runs_project_state
+                   ON workflow_runs(project_dir, state, started_at_ms DESC);";
+
+/// One persisted `workflow_runs` row (Phase 5.0.1). A plain,
+/// orchestrator-independent shape — `steps_json` is opaque to this module;
+/// only the orchestrator knows how to decode it back into `Vec<StepOutcome>`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunRow {
+    pub run_id: String,
+    pub name: String,
+    pub state: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub steps_json: String,
+    pub project_dir: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pin {
@@ -119,13 +156,13 @@ impl QueenStore {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("cannot read Queen database version: {e}"))?;
-        if version > 2 {
+        if version > 3 {
             return Err(format!(
-                "unsupported Queen database version {version} (expected 2)"
+                "unsupported Queen database version {version} (expected 3)"
             ));
         }
         if version == 0 {
-            let schema_result = connection.execute_batch(
+            let schema_result = connection.execute_batch(&format!(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE IF NOT EXISTS pins (
                    project_dir TEXT NOT NULL,
@@ -166,9 +203,10 @@ impl QueenStore {
                    ON inbox_messages(project_dir, recipient, id ASC);
                  CREATE INDEX IF NOT EXISTS inbox_root_id
                    ON inbox_messages(project_dir, root_message_id, id ASC);
-                 PRAGMA user_version = 2;
+                 {WORKFLOW_RUNS_SCHEMA_SQL}
+                 PRAGMA user_version = 3;
                  COMMIT;",
-            );
+            ));
             if let Err(error) = schema_result {
                 let _ = connection.execute_batch("ROLLBACK;");
                 return Err(format!("cannot initialize Queen database: {error}"));
@@ -177,7 +215,7 @@ impl QueenStore {
             // `IF NOT EXISTS` so a partially-migrated db (user_version still 1
             // but the table/indexes already present) migrates idempotently
             // instead of hard-failing `open` with "table already exists" (L12a).
-            let migration_result = connection.execute_batch(
+            let migration_result = connection.execute_batch(&format!(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE IF NOT EXISTS inbox_messages (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,13 +235,31 @@ impl QueenStore {
                    ON inbox_messages(project_dir, recipient, id ASC);
                  CREATE INDEX IF NOT EXISTS inbox_root_id
                    ON inbox_messages(project_dir, root_message_id, id ASC);
-                 PRAGMA user_version = 2;
+                 {WORKFLOW_RUNS_SCHEMA_SQL}
+                 PRAGMA user_version = 3;
                  COMMIT;",
-            );
+            ));
             if let Err(error) = migration_result {
                 let _ = connection.execute_batch("ROLLBACK;");
                 return Err(format!(
-                    "cannot migrate Queen database to version 2: {error}"
+                    "cannot migrate Queen database to version 3: {error}"
+                ));
+            }
+        } else if version == 2 {
+            // Phase 5.0.1: pins/notes/inbox_messages already present (v2) —
+            // add just the new `workflow_runs` table + index and bump
+            // straight to v3. `IF NOT EXISTS` keeps this idempotent against a
+            // partially-migrated db, same L12a discipline as the v1 branch.
+            let workflow_migration_result = connection.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 {WORKFLOW_RUNS_SCHEMA_SQL}
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            ));
+            if let Err(error) = workflow_migration_result {
+                let _ = connection.execute_batch("ROLLBACK;");
+                return Err(format!(
+                    "cannot migrate Queen database to version 3: {error}"
                 ));
             }
         }
@@ -762,6 +818,108 @@ impl QueenStore {
         self.inbox_generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
+
+    /// Write-through persistence of one workflow run snapshot (Phase 5.0.1).
+    /// Called by the orchestrator after every driver state transition so a
+    /// crash/restart can detect and offer to resume an in-flight run.
+    /// Replaces the row wholesale on every call — single-writer internal
+    /// bookkeeping, not a user-facing edit, so there is no revision/
+    /// optimistic-concurrency dance here (unlike pins/notes). Resuming a
+    /// previously-abandoned run_id clears its `error` marker back to NULL,
+    /// same as a brand new run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_workflow_run(
+        &self,
+        project: &Path,
+        run_id: &str,
+        name: &str,
+        state: &str,
+        started_at_ms: i64,
+        ended_at_ms: Option<i64>,
+        steps_json: &str,
+    ) -> Result<(), String> {
+        let project = project_id(project)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        transaction
+            .execute(
+                "INSERT INTO workflow_runs(
+                   run_id, project_dir, name, state, started_at_ms, ended_at_ms,
+                   steps_json, error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                   project_dir = excluded.project_dir,
+                   name = excluded.name,
+                   state = excluded.state,
+                   started_at_ms = excluded.started_at_ms,
+                   ended_at_ms = excluded.ended_at_ms,
+                   steps_json = excluded.steps_json,
+                   error = NULL",
+                params![
+                    run_id,
+                    project,
+                    name,
+                    state,
+                    started_at_ms,
+                    ended_at_ms,
+                    steps_json
+                ],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(())
+    }
+
+    /// Every run this project has left `state = 'running'` — a restart loses
+    /// the in-memory `WorkflowRegistry`, so this is how `load_config` finds
+    /// runs to offer resuming (Phase 5.0.1). Most-recently-started first.
+    pub fn list_running_workflow_runs(
+        &self,
+        project: &Path,
+    ) -> Result<Vec<WorkflowRunRow>, String> {
+        let project = project_id(project)?;
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, name, state, started_at_ms, ended_at_ms, steps_json,
+                        project_dir, error
+                 FROM workflow_runs WHERE project_dir = ?1 AND state = 'running'
+                 ORDER BY started_at_ms DESC",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![project], workflow_run_from_row)
+            .map_err(db_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)
+    }
+
+    /// Discard a run left `running` from before a crash/restart instead of
+    /// resuming it (Phase 5.0.1 "破棄"): marks it `cancelled` with an
+    /// explanatory `error`, so `list_running_workflow_runs` — and therefore
+    /// `load_config`'s resume prompt — never surfaces it again.
+    pub fn mark_workflow_abandoned(&self, project: &Path, run_id: &str) -> Result<(), String> {
+        let project = project_id(project)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE workflow_runs SET state = 'cancelled',
+                   error = 'abandoned after restart'
+                 WHERE project_dir = ?1 AND run_id = ?2",
+                params![project, run_id],
+            )
+            .map_err(db_error)?
+            > 0;
+        if !changed {
+            return Err(format!("workflow run '{run_id}' not found"));
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -891,6 +1049,19 @@ fn inbox_from_row(row: &Row<'_>) -> rusqlite::Result<InboxMessage> {
         root_message_id: row.get(6)?,
         acknowledged_at_ms: row.get(7)?,
         created_at_ms: row.get(8)?,
+    })
+}
+
+fn workflow_run_from_row(row: &Row<'_>) -> rusqlite::Result<WorkflowRunRow> {
+    Ok(WorkflowRunRow {
+        run_id: row.get(0)?,
+        name: row.get(1)?,
+        state: row.get(2)?,
+        started_at_ms: row.get(3)?,
+        ended_at_ms: row.get(4)?,
+        steps_json: row.get(5)?,
+        project_dir: row.get(6)?,
+        error: row.get(7)?,
     })
 }
 
@@ -1410,7 +1581,9 @@ mod tests {
             .lock()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        // Phase 5.0.1: v1 now migrates all the way to v3 (workflow_runs
+        // added), not just to v2.
+        assert_eq!(version, 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1477,7 +1650,9 @@ mod tests {
             .lock()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        // Phase 5.0.1: v1 now migrates all the way to v3 (workflow_runs
+        // added), not just to v2.
+        assert_eq!(version, 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1487,10 +1662,138 @@ mod tests {
         let database = root.join("data/queen.sqlite3");
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let connection = Connection::open(&database).unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
         let error = QueenStore::open(&database).err().unwrap();
         assert!(error.contains("unsupported Queen database version"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5.0.1: workflow_runs (migration + CRUD)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn migrates_version_two_to_three_and_workflow_runs_is_idempotent() {
+        let (root, one, _) = projects();
+        let database = root.join("data/queen.sqlite3");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        {
+            // A pre-5.0.1 (v2) database: pins/notes/inbox_messages present,
+            // no workflow_runs table yet.
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE pins (
+                       project_dir TEXT NOT NULL,
+                       pin_key TEXT NOT NULL,
+                       value TEXT NOT NULL,
+                       revision INTEGER NOT NULL,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL,
+                       PRIMARY KEY (project_dir, pin_key)
+                     );
+                     CREATE TABLE notes (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       project_dir TEXT NOT NULL,
+                       title TEXT NOT NULL,
+                       body TEXT NOT NULL,
+                       tags_json TEXT NOT NULL,
+                       revision INTEGER NOT NULL,
+                       created_at_ms INTEGER NOT NULL,
+                       updated_at_ms INTEGER NOT NULL
+                     );
+                     CREATE TABLE inbox_messages (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       project_dir TEXT NOT NULL,
+                       sender TEXT NOT NULL,
+                       recipient TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       body TEXT NOT NULL,
+                       in_reply_to_id INTEGER,
+                       root_message_id INTEGER,
+                       acknowledged_at_ms INTEGER,
+                       created_at_ms INTEGER NOT NULL
+                     );
+                     PRAGMA user_version = 2;",
+                )
+                .unwrap();
+        }
+
+        let store = QueenStore::open(&database).unwrap();
+        let version: i64 = store
+            .lock()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        store
+            .upsert_workflow_run(&one, "run-1", "demo", "running", 1_000, None, "[]")
+            .unwrap();
+        assert_eq!(store.list_running_workflow_runs(&one).unwrap().len(), 1);
+        drop(store);
+
+        // Re-opening an already-migrated (v3) database is idempotent and
+        // keeps the row written above.
+        let reopened = QueenStore::open(&database).unwrap();
+        assert_eq!(reopened.list_running_workflow_runs(&one).unwrap().len(), 1);
+        let version: i64 = reopened
+            .lock()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_runs_upsert_list_running_and_abandon_round_trip() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        store
+            .upsert_workflow_run(&one, "run-a", "demo", "running", 100, None, "[]")
+            .unwrap();
+        store
+            .upsert_workflow_run(&one, "run-b", "other", "succeeded", 50, Some(60), "[]")
+            .unwrap();
+        store
+            .upsert_workflow_run(&two, "run-c", "demo", "running", 10, None, "[]")
+            .unwrap();
+
+        let running_one = store.list_running_workflow_runs(&one).unwrap();
+        assert_eq!(
+            running_one.len(),
+            1,
+            "only the 'running' row for project one, project-scoped"
+        );
+        assert_eq!(running_one[0].run_id, "run-a");
+        assert!(store
+            .list_running_workflow_runs(&two)
+            .unwrap()
+            .iter()
+            .any(|r| r.run_id == "run-c"));
+
+        // Upsert on the same run_id replaces the row in place (write-through
+        // semantics, not append-only).
+        store
+            .upsert_workflow_run(
+                &one,
+                "run-a",
+                "demo",
+                "running",
+                100,
+                None,
+                "[{\"stepId\":\"first\"}]",
+            )
+            .unwrap();
+        let refreshed = store.list_running_workflow_runs(&one).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].steps_json, "[{\"stepId\":\"first\"}]");
+
+        store.mark_workflow_abandoned(&one, "run-a").unwrap();
+        assert!(store.list_running_workflow_runs(&one).unwrap().is_empty());
+        assert!(store
+            .mark_workflow_abandoned(&one, "does-not-exist")
+            .unwrap_err()
+            .contains("not found"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

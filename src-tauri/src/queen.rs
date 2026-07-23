@@ -897,7 +897,13 @@ impl QueenServer {
         &self,
         Parameters(CancelWorkflowRequest { run_id }): Parameters<CancelWorkflowRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let run = crate::orchestrator::cancel_workflow(&self.manager(), &self.registry(), &run_id)
+        let run = crate::orchestrator::cancel_workflow(
+            &self.manager(),
+            &self.config(),
+            &self.store(),
+            &self.registry(),
+            &run_id,
+        )
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         let value = serde_json::to_value(&run)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;

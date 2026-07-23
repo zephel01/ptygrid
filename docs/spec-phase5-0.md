@@ -594,3 +594,21 @@ Phase 5.5 で仕込まれた OpenTelemetry GenAI トレースに、workflow run 
 - **Anthropic Claude Code / Squads / Subagents** — Phase 5.5-4.2 で既に統合済み。workflow の handoff / supervisor は Claude Code の subagent とほぼ同型（[spec-claude-teams-panes.md](spec-claude-teams-panes.md) 参照）。
 - **Reciprocal Rank Fusion** — Cormack, Clarke, Büttcher (2009), "Reciprocal rank fusion outperforms Condorcet and individual rank learning methods."
 - **OpenTelemetry GenAI semantic conventions** — <https://opentelemetry.io/docs/specs/semconv/gen-ai/>（Phase 5.5 で導入、workflow span 属性の受け皿）
+
+---
+
+## 追補: 5.0.1 Workflow Resume(落ちたときの途中再開 + Y/N 確認)
+
+作成: 2026-07-23 / 状態: draft(次実装対象)
+
+### 目的
+アプリ落ち・再起動で in-memory registry が消え、実行中 workflow が失われる。SQLite 永続化(5.0.1 で予約済みの `workflow_runs`、user_version 2→3)を前倒しし、再起動時に中断 run を検出して**ユーザーに Y/N で再開を確認**する。
+
+### 設計
+1. **永続化**: `queen.sqlite3` に `workflow_runs(run_id PK, name, state, started_at_ms, ended_at_ms, steps_json, project_dir)`。`WorkflowRegistry::put` から write-through(driver の状態遷移ごとに UPDATE)。
+2. **検出**: `load_config` 成功時、その project の state='running' の run を SELECT → `workflow-resume-pending` イベントで frontend へ(複数可)。
+3. **Y/N UI**: バナー「前回の run '<name>' が途中で中断されています。再開しますか?」+ [再開] / [破棄] ボタン(既存 trustPrompt バナーと同パターン)。
+4. **再開(Y)** `resume_workflow(runId)`: succeeded/failed/skipped step は保持。**running だった step は pending に戻す**(PTY は死んでいるため再 spawn。エージェントは inbox/pins/memory から文脈を回収できる)。同じ run_id のまま registry に載せ、既存 driver が続きを進める。
+5. **破棄(N)** `abandon_workflow(runId)`: DB 上で state='cancelled' + error="abandoned after restart" に更新(再プロンプト防止)。
+6. **契約追加**: Tauri commands `resume_workflow` / `abandon_workflow`、イベント `workflow-resume-pending`。Queen tool は不要(人間の意思決定なので UI のみ)。
+7. **エッジ**: 同名 agent の live セッションが既にいる場合は pipeline の冪等 reuse 規則をそのまま適用。fan-out の running コピーは全て pending へ。resume 前に config が変わり workflow 定義が消えていたら「定義なし」エラーでバナー表示のみ。

@@ -4,7 +4,7 @@
 //! `config`, `queen`, and Phase 3 additions) stay independent from the
 //! frontend transport layer.
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::app_settings::{self, ProjectDirs, ProjectsRoot};
 use crate::config::{ConfigInfo, ConfigManager};
@@ -62,6 +62,7 @@ pub fn kill_pty(manager: State<'_, PtyManager>, id: u32) -> Result<(), String> {
 pub fn load_config(
     app: AppHandle,
     config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
     dir: Option<String>,
     allow_default: Option<bool>,
 ) -> Result<ConfigInfo, String> {
@@ -73,6 +74,17 @@ pub fn load_config(
     crate::agent_status::apply(&app, &info.config);
     // Phase 4.4.2: swap in the (possibly reloaded) notifications block.
     crate::notifications::apply(&app, &info.config);
+    // Phase 5.0.1: detect workflow runs left "running" in the Queen DB from
+    // before a crash/restart (the in-memory WorkflowRegistry is lost on
+    // restart, the persisted row is not) and let the frontend prompt Y/N.
+    // Best-effort: a lookup failure must not fail config load itself.
+    if let Ok(candidates) =
+        crate::orchestrator::list_resumable_workflow_runs(&store, std::path::Path::new(&info.dir))
+    {
+        if !candidates.is_empty() {
+            let _ = app.emit("workflow-resume-pending", candidates);
+        }
+    }
     Ok(info)
 }
 
@@ -191,10 +203,45 @@ pub fn spawn_workflow(
 #[tauri::command]
 pub fn cancel_workflow(
     manager: State<'_, PtyManager>,
+    config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
     registry: State<'_, crate::orchestrator::WorkflowRegistry>,
     run_id: String,
 ) -> Result<crate::orchestrator::WorkflowRun, String> {
-    crate::orchestrator::cancel_workflow(&manager, &registry, &run_id)
+    crate::orchestrator::cancel_workflow(&manager, &config, &store, &registry, &run_id)
+}
+
+/// Phase 5.0.1: resume a workflow run left `running` in the Queen DB from
+/// before a crash/restart. Steps that were `Running` when the app died are
+/// reset to `Pending` (their PTY is gone) so the existing 5.0.0.c driver
+/// respawns them on its next tick; terminal steps are kept as persisted.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn resume_workflow(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
+    registry: State<'_, crate::orchestrator::WorkflowRegistry>,
+    run_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<crate::orchestrator::WorkflowRun, String> {
+    crate::orchestrator::resume_workflow(
+        &app, &manager, &config, &store, &registry, &run_id, cols, rows,
+    )
+}
+
+/// Phase 5.0.1: discard a run left `running` from before a crash/restart
+/// instead of resuming it — marks it `cancelled` in the Queen DB (with an
+/// "abandoned after restart" note) so `load_config` never re-prompts for it.
+#[tauri::command]
+pub fn abandon_workflow(
+    config: State<'_, ConfigManager>,
+    store: State<'_, crate::queen_store::QueenStore>,
+    run_id: String,
+) -> Result<(), String> {
+    crate::orchestrator::abandon_workflow(&config, &store, &run_id)
 }
 
 /// Return every workflow run currently held in memory (live + recently

@@ -94,6 +94,8 @@ pub fn run() {
             commands::spawn_workflow,
             commands::cancel_workflow,
             commands::list_workflow_runs,
+            commands::resume_workflow,
+            commands::abandon_workflow,
             commands::restart_session,
             commands::list_sessions,
             commands::save_project_state,

@@ -76,6 +76,9 @@ export const ui = $state({
   foregroundDetail: {} as Record<number, string>,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
+  /** Phase 5.0.1: runs left "running" from before a crash/restart, awaiting
+   * the user's resume/discard decision (workflow-resume-pending event). */
+  workflowResumePrompts: [] as WorkflowRun[],
   /** Phase 5.0.0.f: latest known WorkflowRun per runId (workflow-state event
    * + the one-shot list_workflow_runs fetch on mount). */
   workflowRuns: {} as Record<string, WorkflowRun>,
@@ -363,6 +366,10 @@ export async function initGlobalListeners(): Promise<void> {
     if (ui.teammateHooks?.hookNotifications) {
       addNotice(teammateToast(event.payload));
     }
+  });
+
+  await listen<WorkflowRun[]>("workflow-resume-pending", (event) => {
+    ui.workflowResumePrompts = event.payload;
   });
 
   await listen<WorkflowRun>("workflow-state", (event) => {

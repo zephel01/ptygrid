@@ -58,7 +58,11 @@ pub enum WorkflowState {
 /// One step's lifecycle within a run. `Skipped` is used when a step's
 /// predecessor failed and the workflow policy is `fail-fast`; the pane is
 /// never spawned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// Phase 5.0.1: `Deserialize` is derived (in addition to `Serialize`) so a
+/// persisted run's `steps_json` can be decoded back into `Vec<StepOutcome>`
+/// by `resume_workflow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepState {
     Pending,
@@ -70,7 +74,11 @@ pub enum StepState {
 }
 
 /// Per-step outcome inside a `WorkflowRun`.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Phase 5.0.1: `Deserialize` is derived so `resume_workflow` can decode a
+/// persisted run's `steps_json` (see `queen_store::WorkflowRunRow`) back
+/// into `Vec<StepOutcome>`; this struct was `Serialize`-only until now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepOutcome {
     pub step_id: String,
@@ -110,10 +118,25 @@ pub struct WorkflowRun {
     rows: u16,
 }
 
+/// One row of `load_config`'s resume-detection query (Phase 5.0.1), shaped
+/// for the `workflow-resume-pending` event. A thin projection of
+/// `queen_store::WorkflowRunRow` — the frontend only needs enough to render
+/// "run '<name>' is still interrupted, resume?" and to name the run in the
+/// follow-up `resume_workflow` / `abandon_workflow` call.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowResumeCandidate {
+    pub run_id: WorkflowRunId,
+    pub name: String,
+    pub started_at_ms: u64,
+}
+
 /// In-memory registry of live and recently-terminated workflow runs. Held as
 /// `AppHandle::manage`d state (lib.rs), same pattern as `PtyManager`. MVO
-/// keeps the last 100 runs in memory; persistence to the `workflow_runs`
-/// SQLite table lands in 5.0.0.c together with the state-machine driver.
+/// keeps the last 100 runs in memory; Phase 5.0.1 adds write-through
+/// persistence to the `workflow_runs` SQLite table via `persist_run`, called
+/// by every caller of `put` in this module rather than by `put` itself —
+/// every call site already holds the `QueenStore` + project dir it needs.
 #[derive(Default)]
 pub struct WorkflowRegistry {
     inner: Arc<Mutex<HashMap<WorkflowRunId, WorkflowRun>>>,
@@ -419,6 +442,7 @@ pub fn spawn_workflow<R: Runtime>(
         rows,
     };
     registry.put(run.clone());
+    persist_run(store, &project_dir, &run);
     emit_workflow_state(app, &run);
     Ok(run)
 }
@@ -429,6 +453,8 @@ pub fn spawn_workflow<R: Runtime>(
 /// the current snapshot.
 pub fn cancel_workflow(
     manager: &PtyManager,
+    config: &ConfigManager,
+    store: &QueenStore,
     registry: &WorkflowRegistry,
     run_id: &str,
 ) -> Result<WorkflowRun, String> {
@@ -456,7 +482,155 @@ pub fn cancel_workflow(
     run.state = WorkflowState::Cancelled;
     run.ended_at_ms = Some(now_ms());
     registry.put(run.clone());
+    // Phase 5.0.1: write-through so a manual cancel is never mistaken for a
+    // crash-interrupted run and re-offered as "resume?" after a restart.
+    if let Ok(project_dir) = resolve_project_dir(config) {
+        persist_run(store, &project_dir, &run);
+    }
     Ok(run)
+}
+
+/// Every run this project left `state = 'running'` in the Queen DB — a
+/// restart loses the in-memory `WorkflowRegistry`, so this is how
+/// `load_config` (commands.rs) finds runs to offer resuming (Phase 5.0.1).
+/// Read-only; does not touch the registry or spawn anything.
+pub fn list_resumable_workflow_runs(
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+) -> Result<Vec<WorkflowResumeCandidate>, String> {
+    let rows = store.list_running_workflow_runs(project_dir)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkflowResumeCandidate {
+            run_id: row.run_id,
+            name: row.name,
+            started_at_ms: row.started_at_ms as u64,
+        })
+        .collect())
+}
+
+/// Resume a run left `running` in the Queen DB from before a crash/restart
+/// (Phase 5.0.1 "再開"). Succeeded/failed/skipped/cancelled steps are kept
+/// exactly as persisted. Any step with a still-`Running` copy lost its PTY
+/// when the app died, so every copy of THAT step (terminal or not) is
+/// collapsed back to a single fresh `Pending` placeholder — precisely the
+/// shape `spawn_workflow` gives a step that has never been spawned. That
+/// lets the already-running 5.0.0.c driver (`ready_steps` / `spawn_ready`)
+/// pick the run back up on its very next tick with NO changes to that
+/// machinery: `spawn_ready`'s retain-then-replace step only recognizes a
+/// step as "not yet spawned" via its bare (unsuffixed) id, so leaving a
+/// fan-out step's individual suffixed copies (`"<id>#<k>"`) merely flipped
+/// in place would never be removed, and the next tick would push a second,
+/// colliding set of copies under the same ids. The trade-off: a fan-out step
+/// that had already partially joined (e.g. `joinOn: any` with one sibling
+/// succeeded and others still running at crash time) re-runs ALL of its
+/// copies rather than only the interrupted ones — an accepted narrow edge
+/// given the driver does not yet cooperatively cancel in-flight siblings
+/// either (5.0.4).
+#[allow(clippy::too_many_arguments)]
+pub fn resume_workflow<R: Runtime>(
+    app: &AppHandle<R>,
+    _manager: &PtyManager,
+    config: &ConfigManager,
+    store: &QueenStore,
+    registry: &WorkflowRegistry,
+    run_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<WorkflowRun, String> {
+    // Idempotent against a repeat call for a run already resumed this
+    // session: re-deriving from the (by-now-stale) persisted snapshot would
+    // otherwise clobber whatever progress the driver has since made.
+    if let Some(existing) = registry.get(run_id) {
+        return Ok(existing);
+    }
+    let (cfg, project_dir) = config
+        .current()
+        .ok_or_else(|| "no config loaded (call load_config first)".to_string())?;
+    let row = store
+        .list_running_workflow_runs(&project_dir)?
+        .into_iter()
+        .find(|r| r.run_id == run_id)
+        .ok_or_else(|| format!("workflow run '{run_id}' not found or not resumable"))?;
+    let wf = cfg
+        .workflows
+        .as_ref()
+        .and_then(|m| m.get(&row.name))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "workflow '{}' is no longer defined in the loaded config",
+                row.name
+            )
+        })?;
+
+    let mut steps: Vec<StepOutcome> = serde_json::from_str(&row.steps_json)
+        .map_err(|e| format!("cannot decode persisted workflow steps for '{run_id}': {e}"))?;
+
+    let mut needs_restart: Vec<String> = Vec::new();
+    for outcome in &steps {
+        if outcome.state == StepState::Running {
+            let base = base_id(&outcome.step_id).to_string();
+            if !needs_restart.contains(&base) {
+                needs_restart.push(base);
+            }
+        }
+    }
+    for base in &needs_restart {
+        steps.retain(|o| base_id(&o.step_id) != base.as_str());
+        let agent = wf
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == base.as_str())
+            .map(|s| s.agent.clone())
+            .unwrap_or_default();
+        steps.push(StepOutcome {
+            step_id: base.clone(),
+            agent,
+            session_id: None,
+            state: StepState::Pending,
+            attempts: 0,
+            error: None,
+        });
+    }
+    steps.sort_by_key(|o| {
+        wf.steps
+            .iter()
+            .position(|s| s.id == base_id(&o.step_id))
+            .unwrap_or(usize::MAX)
+    });
+
+    let run = WorkflowRun {
+        run_id: row.run_id.clone(),
+        name: row.name.clone(),
+        state: WorkflowState::Running,
+        started_at_ms: row.started_at_ms as u64,
+        ended_at_ms: None,
+        steps,
+        cols,
+        rows,
+    };
+    registry.put(run.clone());
+    persist_run(store, &project_dir, &run);
+    emit_workflow_state(app, &run);
+    Ok(run)
+}
+
+/// Discard a run left `running` from before a crash/restart instead of
+/// resuming it (Phase 5.0.1 "破棄"). Purely a Queen DB update — nothing was
+/// ever re-registered in memory, so there is no live PTY to kill and no
+/// registry entry to touch. `QueenStore::mark_workflow_abandoned` sets
+/// `state = 'cancelled'`, so `load_config`'s resume-detection query never
+/// surfaces this run_id again.
+pub fn abandon_workflow(
+    config: &ConfigManager,
+    store: &QueenStore,
+    run_id: &str,
+) -> Result<(), String> {
+    let (_cfg, project_dir) = config
+        .current()
+        .ok_or_else(|| "no config loaded (call load_config first)".to_string())?;
+    store.mark_workflow_abandoned(&project_dir, run_id)
 }
 
 // -----------------------------------------------------------------------------
@@ -794,6 +968,49 @@ fn emit_workflow_state<R: Runtime>(app: &AppHandle<R>, run: &WorkflowRun) {
     let _ = app.emit("workflow-state", run);
 }
 
+/// Wire string for a `WorkflowState`, used only for the `workflow_runs.state`
+/// DB column. The event/JSON wire shape already gets this for free from
+/// `#[serde(rename_all = "lowercase")]`; this mirrors it for the write path
+/// without deriving `Deserialize` on the enum, which nothing needs to read
+/// back — `resume_workflow` only ever resumes a row `list_running_workflow_runs`
+/// already filtered to `state = 'running'`, so the DB text is never parsed
+/// back into a `WorkflowState`.
+fn workflow_state_wire(state: WorkflowState) -> &'static str {
+    match state {
+        WorkflowState::Pending => "pending",
+        WorkflowState::Running => "running",
+        WorkflowState::Succeeded => "succeeded",
+        WorkflowState::Failed => "failed",
+        WorkflowState::Cancelled => "cancelled",
+    }
+}
+
+/// Best-effort write-through of a run snapshot into the `workflow_runs` table
+/// (Phase 5.0.1), so a crash/restart can detect and offer to resume an
+/// in-flight run. Called immediately after every `registry.put` in this
+/// module (`spawn_workflow`, `cancel_workflow`, `advance_run`) instead of
+/// from inside `WorkflowRegistry::put` itself — every call site already has
+/// the `QueenStore` + project dir it needs, so `put`'s signature (and every
+/// existing caller/test of it) stays untouched. A persistence failure is
+/// swallowed, same "best effort" posture already used for kickoff delivery:
+/// the in-memory registry remains authoritative for the running app either
+/// way, so only a crash before the NEXT successful write would lose
+/// resumability for this one transition.
+fn persist_run(store: &QueenStore, project_dir: &std::path::Path, run: &WorkflowRun) {
+    let Ok(steps_json) = serde_json::to_string(&run.steps) else {
+        return;
+    };
+    let _ = store.upsert_workflow_run(
+        project_dir,
+        &run.run_id,
+        &run.name,
+        workflow_state_wire(run.state),
+        run.started_at_ms as i64,
+        run.ended_at_ms.map(|ms| ms as i64),
+        &steps_json,
+    );
+}
+
 /// Route 1 (PTY exit code) + route 2 (semantic `AgentStatus::Done`)
 /// completion detection. Mutates every currently-`Running` outcome that has
 /// resolved into `Succeeded`/`Failed` in place; returns `true` if anything
@@ -977,6 +1194,7 @@ fn advance_run<R: Runtime>(
 
     if changed {
         registry.put(run.clone());
+        persist_run(store, &project_dir, &run);
         emit_workflow_state(app, &run);
     }
 }
@@ -1223,7 +1441,7 @@ workflows:
             &handle, &manager, &config, &store, &registry, "demo", 80, 24,
         )
         .unwrap();
-        let cancelled = cancel_workflow(&manager, &registry, &run.run_id).unwrap();
+        let cancelled = cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
 
         assert_eq!(cancelled.state, WorkflowState::Cancelled);
         assert_eq!(cancelled.steps[0].state, StepState::Cancelled);
@@ -1231,7 +1449,7 @@ workflows:
         assert!(cancelled.ended_at_ms.is_some());
 
         // Second cancel is idempotent.
-        let again = cancel_workflow(&manager, &registry, &run.run_id).unwrap();
+        let again = cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
         assert_eq!(again.state, WorkflowState::Cancelled);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1869,6 +2087,133 @@ workflows:
             "downstream step should spawn from the route-2 completion"
         );
         assert!(second.session_id.is_some());
+
+        for s in manager.list_sessions() {
+            let _ = manager.kill_pty(s.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 5.0.1: resume_workflow (crash/restart recovery)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resume_workflow_flips_running_steps_to_pending_and_keeps_terminal_ones() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+        assert_eq!(
+            store.list_running_workflow_runs(&dir).unwrap().len(),
+            1,
+            "spawn_workflow should have write-through persisted the new run"
+        );
+
+        // Simulate a crash: the app restarts with a brand new (empty)
+        // in-memory registry, same as `WorkflowRegistry::new()` in lib.rs on
+        // every launch, while the persisted DB row survives untouched.
+        let fresh_registry = WorkflowRegistry::new();
+
+        let resumed = resume_workflow(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &fresh_registry,
+            &run.run_id,
+            80,
+            24,
+        )
+        .unwrap();
+
+        assert_eq!(resumed.run_id, run.run_id);
+        assert_eq!(resumed.state, WorkflowState::Running);
+        // The root step was Running before the "crash" -> resumed as Pending
+        // with no session (its PTY died with the app; the driver respawns it
+        // on its next tick).
+        let first = resumed.steps.iter().find(|o| o.step_id == "first").unwrap();
+        assert_eq!(first.state, StepState::Pending);
+        assert!(first.session_id.is_none());
+        // The downstream step was already Pending before the "crash" ->
+        // stays Pending.
+        let second = resumed
+            .steps
+            .iter()
+            .find(|o| o.step_id == "second")
+            .unwrap();
+        assert_eq!(second.state, StepState::Pending);
+        assert!(fresh_registry.get(&run.run_id).is_some());
+
+        // A repeat resume call is idempotent against the now-live registry
+        // entry rather than re-deriving from the (stale) persisted snapshot.
+        let repeat = resume_workflow(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &fresh_registry,
+            &run.run_id,
+            80,
+            24,
+        )
+        .unwrap();
+        assert_eq!(repeat.steps.len(), resumed.steps.len());
+
+        for s in manager.list_sessions() {
+            let _ = manager.kill_pty(s.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_workflow_errors_when_run_missing_or_definition_gone() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let err = resume_workflow(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            "wfr_does_not_exist",
+            80,
+            24,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "unknown run_id message: {err}");
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+        // Reload a config for the SAME project dir that no longer declares
+        // "demo" (edge case: config changed before the user resumed).
+        let redefined = ConfigManager::new();
+        redefined.set_for_test(dir.clone(), parse_config("agents: []\n").unwrap());
+        let err = resume_workflow(
+            &handle,
+            &manager,
+            &redefined,
+            &store,
+            &WorkflowRegistry::new(),
+            &run.run_id,
+            80,
+            24,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no longer defined"),
+            "stale-definition message: {err}"
+        );
 
         for s in manager.list_sessions() {
             let _ = manager.kill_pty(s.id);
