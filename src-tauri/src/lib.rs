@@ -9,6 +9,7 @@ mod orchestrator;
 mod project_state;
 mod pty;
 mod queen;
+mod queen_compat;
 mod queen_store;
 mod resource_monitor;
 mod session;

@@ -16,6 +16,28 @@ pub struct McpCompatConfig {
     pub rc_2026_07_28: bool,
     pub legacy_2025_06: bool,
     pub max_body_bytes: usize,
+    pub legacy_capabilities: LegacyCapabilities,
+}
+
+/// Resolved `mcp.legacy_capabilities:` — per-capability no-op vs
+/// `-32601 method_not_found` policy for the deprecated `sampling/*`,
+/// `resources/roots`, `logging/setLevel` methods (spec-phase5-5.md §3.1,
+/// design pin "design-5.5.0"). See `capabilities::classify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyCapabilities {
+    pub sampling: bool,
+    pub roots: bool,
+    pub logging: bool,
+}
+
+impl Default for LegacyCapabilities {
+    fn default() -> Self {
+        LegacyCapabilities {
+            sampling: false,
+            roots: false,
+            logging: true,
+        }
+    }
 }
 
 impl Default for McpCompatConfig {
@@ -24,6 +46,7 @@ impl Default for McpCompatConfig {
             rc_2026_07_28: true,
             legacy_2025_06: true,
             max_body_bytes: 1_048_576,
+            legacy_capabilities: LegacyCapabilities::default(),
         }
     }
 }
@@ -34,6 +57,11 @@ impl From<&crate::config::McpConfig> for McpCompatConfig {
             rc_2026_07_28: raw.effective_rc_2026_07_28(),
             legacy_2025_06: raw.effective_legacy_2025_06(),
             max_body_bytes: raw.effective_max_body_bytes(),
+            legacy_capabilities: LegacyCapabilities {
+                sampling: raw.effective_legacy_capabilities_sampling(),
+                roots: raw.effective_legacy_capabilities_roots(),
+                logging: raw.effective_legacy_capabilities_logging(),
+            },
         }
     }
 }

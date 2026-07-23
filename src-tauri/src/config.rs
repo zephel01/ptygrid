@@ -97,6 +97,10 @@ pub struct McpConfig {
     /// Per-request body cap for the compat router, bytes. Default 1 MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<usize>,
+    /// Deprecated-capability no-op policy (sampling/roots/logging). Default:
+    /// sampling/roots off (real `-32601`), logging on (200 no-op).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_capabilities: Option<McpLegacyCapabilitiesConfig>,
 }
 
 impl McpConfig {
@@ -114,6 +118,35 @@ impl McpConfig {
             _ => 1_048_576,
         }
     }
+    pub fn effective_legacy_capabilities_sampling(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.sampling)
+            .unwrap_or(false)
+    }
+    pub fn effective_legacy_capabilities_roots(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.roots)
+            .unwrap_or(false)
+    }
+    pub fn effective_legacy_capabilities_logging(&self) -> bool {
+        self.legacy_capabilities
+            .and_then(|c| c.logging)
+            .unwrap_or(true)
+    }
+}
+
+/// `mcp.legacy_capabilities:` — per-capability opt-in to keep answering
+/// `sampling/*`, `resources/roots`, `logging/setLevel` with a 200 no-op
+/// instead of a real `-32601 method_not_found` during the 12-month
+/// deprecation window (spec-phase5-5.md §3.1, §10 edge cases).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct McpLegacyCapabilitiesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logging: Option<bool>,
 }
 
 /// Phase 4.0 global `teammates:` block. Governs whether teammate hook events
