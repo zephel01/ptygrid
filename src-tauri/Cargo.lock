@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "ptygrid"
-version = "0.4.9"
+version = "0.5.6"
 dependencies = [
  "arc-swap",
  "axum",
