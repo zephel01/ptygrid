@@ -1627,26 +1627,28 @@ team_presets:
 - **Deprecation ヘッダ**: 旧経路応答のみに付与。
 - 既存 18+1 tools の I/O 定義は無変更。`queen.rs` の各 handler は無改修、`queen_compat.rs` がヘッダとメタだけ翻訳する。
 
-### 実装状況（patch 5.5.0, 2026-07-23 時点）
+### 実装状況（patch 5.5.0, 確定 — 2026-07-23）
 
-- **確定・実装済み**（`track/b-mcp-5.5.0` ブランチ、`src-tauri/src/config.rs` + `src-tauri/src/queen_compat/config.rs`）: `ptygrid.yml` 直下の `mcp:` ブロック。
-  - `rc_2026_07_28`（bool, 既定 `true`）— 2026-07-28 RC 経路の受理可否。
-  - `legacy_2025_06`（bool, 既定 `true`）— 2025-06 旧経路の受理可否。
-  - `max_body_bytes`（usize, 既定 `1_048_576` = 1 MiB）— compat router のボディ上限。`0` または未指定は既定値へフォールバック（`QueenConfig::effective_port` のポート0フォールバックと同方針）。
-  - `legacy_capabilities`（object, 既定 `{sampling: false, roots: false, logging: true}`）— 廃止予定 capability（`sampling/*` / `resources/roots` / `logging/setLevel`）ごとに no-op 200 で応答し続けるか `-32601 method_not_found` へ倒すかの per-capability トグル（`McpLegacyCapabilitiesConfig` / `queen_compat::config::LegacyCapabilities`）。
-  - 生値の `McpConfig`（全フィールド `Option`）は `effective_*()` で解決し、`queen_compat::config::McpCompatConfig`（resolved）へ変換。`McpCompatHandle`（`Arc<ArcSwap<McpCompatConfig>>`）経由でホットリロード可能、`.get()` はロックフリー読み取り。
-- **未実装（本節の上記4箇条が対象、設計のみ）**: HTTP ヘッダ受理 / JSON-RPC メタ(traceparent) / `initialize` の RC no-op / Deprecation ヘッダを行う axum middleware、および `queen.rs::run_server` への組み込み。`mcp:` ブロックは現時点では値を保持するのみで、`/mcp` の実際のリクエスト処理には未接続。
+`track/b-mcp-5.5.0` ブランチで確定・実装済み。`cargo test`（`queen_compat` 配下 unit 35件 + `src-tauri/tests/queen_compat_integration.rs` 統合 14件）で検証済み、既存 18 tools の handler 実装（`queen.rs`）は無改修。
 
-### レビュー差し戻し（2026-07-23 時点、要再検証）
+- **ルーティング**: `queen.rs` の `/mcp` に `.nest_service("/mcp", service).layer(compat_middleware).layer(mcp_auth)` として組み込み（auth が最外、compat middleware がその内側 — auth 失敗時は compat 層に body が届かない）。`QueenStatus.mcp: McpCompatHandle` を per-request で読み、`load_config` の reload 時に `queen_compat::apply()` で差し替え（既存 TCP 接続には影響しない）。
+- **`ptygrid.yml` の `mcp:` ブロック**（`src-tauri/src/config.rs::McpConfig` → `queen_compat::config::McpCompatConfig` へ解決、既定値は `ptygrid.example.yml` 参照）:
+  - `rc_2026_07_28`（bool, 既定 `true`）— 2026-07-28 RC 経路の受理可否。`false` で当該経路は 400 `transport_disabled`。
+  - `legacy_2025_06`（bool, 既定 `true`）— 2025-06 旧経路の受理可否。同上。
+  - `max_body_bytes`（usize, 既定 `1_048_576` = 1 MiB）— compat router のボディ上限。超過は 413（`Content-Length` 段階で短絡、downstream 未到達）。
+  - `legacy_capabilities`（object, 既定 `{sampling: false, roots: false, logging: true}`）— `sampling/*` / `resources/roots` / `logging/setLevel` それぞれ、200 no-op を返し続けるか実 `-32601 method_not_found` へ倒すかの per-capability トグル。
+- **HTTP ヘッダ検証（RC のみ）**: `Mcp-Method` は body `method` と大小文字区別ありの完全一致必須。`tools/*` 呼び出しは `Mcp-Name` も body `params.name` と一致必須。不一致は 400 `header_body_mismatch`（`id` は本文から抽出、失敗時は `Null`）。Legacy 経路はこの検証を行わない。
+- **`Mcp-Session-Id`**: 受理はする（forward）。応答は RC のみ strip、Legacy はそのまま（rmcp `LocalSessionManager` 発行値）。
+- **JSON-RPC メタ**: `params._meta.traceparent` > HTTP `traceparent` ヘッダ > 55-byte stub の優先順で解決し、成功応答の `result._meta.traceparent` に echo。エラー応答には付与しない。`tracestate` / `baggage` は 5.5.0 では素通し（受理も加工もしない）。
+- **`initialize`**: RC 経路は `protocolVersion == "2026-07-28"` を 200 no-op（rmcp 到達なし）、不一致は 400 `unsupported_protocol_version`。Legacy 経路・`notifications/initialized` は従来通り rmcp に素通し。
+- **Deprecation trio**: Legacy 経路の全応答、および RC 経路で deprecated capability（上記 `legacy_capabilities` の no-op 応答時）に付与。
+  - `Deprecation: Tue, 28 Jul 2026 00:00:00 GMT`
+  - `Sunset: Wed, 28 Jul 2027 00:00:00 GMT`
+  - `Link: <https://modelcontextprotocol.io/spec/2026-07-28>; rel="deprecation"`
 
-- 上記「確定・実装済み」のうち `src-tauri/src/queen_compat/config.rs`（`McpCompatConfig` / `McpCompatHandle` の `ArcSwap` 経由ホットリロード）は、opus-reviewer による commit `8f83a2f` の verify で **差し戻し**（P1 blocker）と判定された。理由: `src-tauri/src/lib.rs` の `mod` 宣言一覧に `queen_compat` が無く、`queen_compat/` 配下（`mod.rs` 自体も未作成）は crate のビルド対象に含まれていない。rustc に解析されないため同ファイル内のユニットテストも実行されておらず、`McpCompatHandle` のホットリロード機構は現時点では**未検証・未稼働**（dead code）。上記「確定・実装済み」からは除外し、`lib.rs` への `mod queen_compat;` 追加と `queen_compat/mod.rs` 新設のうえ再検証が必要。
-- 一方、`src-tauri/src/config.rs`（既存ファイル、`lib.rs` の既存 `mod config;` 経由でビルド対象）が持つトップレベル `Config::mcp: Option<McpConfig>` と `effective_rc_2026_07_28()` / `effective_legacy_2025_06()` / `effective_max_body_bytes()` は実際にコンパイルされる範囲であり、この部分の「確定・実装済み」は維持する。
-
-### 再検証結果（2026-07-23 時点、確定）
-
-- 上記「レビュー差し戻し」が指摘した blocker（`lib.rs` に `mod queen_compat;` が無い）は commit `d7dd01c` で解消済み: `src-tauri/src/lib.rs` に `mod queen_compat;` を追加し、`src-tauri/src/queen_compat/mod.rs` を新設（`pub mod config;` を有効化）。`cargo check --lib` が通り、`cargo test --lib queen_compat` で `queen_compat::config::tests::defaults_match_the_design_pin` / `handle_shares_updates_across_clones` の2件が pass することを再検証済み（2026-07-23）。よって `queen_compat::config`（`McpCompatConfig` / `LegacyCapabilities` / `McpCompatHandle`）は「確定・実装済み」に含める。
-- ただし `queen_compat/mod.rs` は `pub mod header;` / `pub mod route;` をコメントアウトしたままで、`src-tauri/src/queen_compat/header.rs`（`HeaderValidation` / `validate()` と6件のユニットテスト）・`route.rs`（`RouteKind` / `detect()` / `body_too_large()` / `is_batch()` / session-id 系ヘルパ）はファイルとして存在するのみでクレートのビルド対象外（`cargo test --lib header` / `cargo test --lib route` はいずれも 0 tests で確認）。中身は書かれているが未接続のため、この2ファイルは引き続き「未実装」として扱う。
-- `src-tauri/src/config.rs::McpConfig` の `effective_*()` 一式および `src-tauri/src/queen_compat/config.rs` 全体には `#[allow(dead_code)]` が付与されている（`queen.rs` 側に実呼び出し元がまだ無いため）。コンパイル・ユニットテストは通るが実トラフィックからは未参照、という点で上記「未実装」節の実態と整合する。
+  値は実カレンダーで検証済み（2026-07-28 = 火曜、2027-07-28 = 水曜）。[spec-phase5-5.md](docs/spec-phase5-5.md) §3.6 の例示は曜日表記に誤りがあり（`Deprecation` 行が `Sat, 28 Jul 2027` 表記）、本節の値がその補正版（実装コメント `queen_compat/deprecation.rs` 参照）。ログは `deprecated_route` 警告を per-day dedupe で最大1行/日。
+- **RC top-level array**（batch）は 400 `batch_not_supported`（5.5.0 は single-request only）。
+- 応答 body の buffer 上限は 16 MiB（`echo_into_result` 埋込用。超過時は空応答— 壊れた応答よりは無応答が安全という判断）。`Content-Type: text/event-stream` は buffer せず passthrough。
 
 ## 5.5.2 新 Tauri Command（予約）
 

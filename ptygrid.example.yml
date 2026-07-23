@@ -25,6 +25,24 @@ queen:
   enabled: true   # default true; false stops the server
   port: 39237     # default 39237; if busy, +1 is tried up to 39246
 
+# mcp: `/mcp` RC-compat router flags (Phase 5.5.0, spec-phase5-5.md §3.1/§4.1).
+# Governs the dual-transport router in front of the 18 Queen MCP tools above:
+# the 2026-07-28 RC transport (Mcp-Method/Mcp-Name headers, no
+# Mcp-Session-Id issued) alongside the 2025-06 legacy transport (session id
+# issued, Deprecation/Sunset/Link trio on every response) during the
+# 12-month deprecation window. Optional; the whole block can be omitted —
+# every field defaults to the value shown. Hot-reloadable: editing this
+# block and reloading the config takes effect on the next request without
+# dropping an already-open connection.
+# mcp:
+#   rc_2026_07_28: true      # accept the 2026-07-28 RC route
+#   legacy_2025_06: true     # keep accepting the 2025-06 legacy route
+#   max_body_bytes: 1048576 # 1 MiB per-request body cap for the compat router
+#   legacy_capabilities:     # deprecated-capability no-op policy
+#     sampling: false        # sampling/* -> real -32601 method_not_found
+#     roots: false           # resources/roots -> real -32601 method_not_found
+#     logging: true          # logging/setLevel -> 200 no-op (kept working)
+
 # teammates: global switch for receiving Claude Code teammate/subagent hooks
 # (Phase 4.0) and auto-adding read-only transcript panes (Phase 4.1). Optional.
 # teammates:
