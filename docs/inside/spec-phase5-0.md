@@ -2,29 +2,29 @@
 
 作成日: 2026-07-22 / 状態: draft / 対象 Phase: 4.5（Phase 5.5 通信・観測基盤リリース後）
 
-関連: [spec-agent-status.md](spec-agent-status.md)（意味的状態の下地 / `working|blocked|done|idle` を workflow 状態機械が消費）/
-[spec-notifications.md](spec-notifications.md)（workflow 完了・失敗の外部通知は既存経路にそのまま乗る）/
-[spec-team-presets.md](spec-team-presets.md)（Phase 4.3 の `team_presets` — 本 Phase の workflow はその上位互換）/
+関連: [spec-agent-status.md](../spec-agent-status.md)（意味的状態の下地 / `working|blocked|done|idle` を workflow 状態機械が消費）/
+[spec-notifications.md](../spec-notifications.md)（workflow 完了・失敗の外部通知は既存経路にそのまま乗る）/
+[spec-team-presets.md](../spec-team-presets.md)（Phase 4.3 の `team_presets` — 本 Phase の workflow はその上位互換）/
 [spec-phase5-5.md](spec-phase5-5.md)（MCP RC / OTel / Ring — workflow span と Ring のカラーソースを引き継ぐ）/
-[design.md](design.md)（hot path 分離・config-as-code・推測回避）/
-[plan.md](plan.md)（バージョニング）/ [competitive-landscape.md](competitive-landscape.md)（worktree系 / 協調系の分岐）/
-[../CONTRACT.md](../CONTRACT.md)（IPC/MCP 契約の追記先）/
-[../ptygrid.example.yml](../ptygrid.example.yml)（注釈付き設定例）。
+[design.md](../design.md)（hot path 分離・config-as-code・推測回避）/
+[plan.md](../plan.md)（バージョニング）/ [competitive-landscape.md](../competitive-landscape.md)（worktree系 / 協調系の分岐）/
+[../CONTRACT.md](../../CONTRACT.md)（IPC/MCP 契約の追記先）/
+[../ptygrid.example.yml](../../ptygrid.example.yml)（注釈付き設定例）。
 
 実装（新規モジュール想定）:
-[../src-tauri/src/orchestrator.rs](../src-tauri/src/orchestrator.rs)（M3 DAG / Supervisor 状態機械）/
-[../src-tauri/src/memory.rs](../src-tauri/src/memory.rs)（M4 semantic memory）/
-[../src-tauri/src/memory_embed.rs](../src-tauri/src/memory_embed.rs)（embedding backend 抽象）/
-[../src-tauri/src/provider.rs](../src-tauri/src/provider.rs)（S1 local provider ヘルスチェック・env 注入）/
-[../src-tauri/src/arena.rs](../src-tauri/src/arena.rs)（S7 Arena backend）/
-配線元 [../src-tauri/src/queen.rs](../src-tauri/src/queen.rs)（新規 MCP tools）/
-[../src-tauri/src/queen_store.rs](../src-tauri/src/queen_store.rs)（memory テーブル追加、sqlite-vec ロード）/
-[../src-tauri/src/config.rs](../src-tauri/src/config.rs)（新スキーマ）/
-[../src-tauri/src/session.rs](../src-tauri/src/session.rs)（env 注入フックの再利用のみ）。
-Frontend: [../src/lib/Arena.svelte](../src/lib/Arena.svelte) /
-[../src/lib/WorkflowPanel.svelte](../src/lib/WorkflowPanel.svelte) /
-[../src/lib/MemoryPanel.svelte](../src/lib/MemoryPanel.svelte) /
-[../src/lib/ProviderStatus.svelte](../src/lib/ProviderStatus.svelte)。
+[../src-tauri/src/orchestrator.rs](../../src-tauri/src/orchestrator.rs)（M3 DAG / Supervisor 状態機械）/
+[../src-tauri/src/memory.rs](../../src-tauri/src/memory.rs)（M4 semantic memory）/
+[../src-tauri/src/memory_embed.rs](../../src-tauri/src/memory_embed.rs)（embedding backend 抽象）/
+[../src-tauri/src/provider.rs](../../src-tauri/src/provider.rs)（S1 local provider ヘルスチェック・env 注入）/
+[../src-tauri/src/arena.rs](../../src-tauri/src/arena.rs)（S7 Arena backend）/
+配線元 [../src-tauri/src/queen.rs](../../src-tauri/src/queen.rs)（新規 MCP tools）/
+[../src-tauri/src/queen_store.rs](../../src-tauri/src/queen_store.rs)（memory テーブル追加、sqlite-vec ロード）/
+[../src-tauri/src/config.rs](../../src-tauri/src/config.rs)（新スキーマ）/
+[../src-tauri/src/session.rs](../../src-tauri/src/session.rs)（env 注入フックの再利用のみ）。
+Frontend: [../src/lib/Arena.svelte](../../src/lib/Arena.svelte) /
+[../src/lib/WorkflowPanel.svelte](../../src/lib/WorkflowPanel.svelte) /
+[../src/lib/MemoryPanel.svelte](../../src/lib/MemoryPanel.svelte) /
+[../src/lib/ProviderStatus.svelte](../../src/lib/ProviderStatus.svelte)。
 
 ---
 
@@ -93,7 +93,7 @@ type WorkflowRun = {
 
 - Workflow は **1 run = 複数 pane**。各 step は既存の `spawn_agent` を通して PTY を生む。
 - 状態はイベント駆動で backend が保持し、`workflow-state`（新）で frontend へ配信する。
-- **状態の権威**: step の完了判定は既存の意味的状態 `AgentStatus == done`（[spec-agent-status.md](spec-agent-status.md)）か、PTY 終了 `SessionState == exited && code == 0` のいずれか。**Phase 4.4 の判定を workflow が消費**する構造で、orchestrator 自身は新しい完了検出ロジックを持たない。
+- **状態の権威**: step の完了判定は既存の意味的状態 `AgentStatus == done`（[spec-agent-status.md](../spec-agent-status.md)）か、PTY 終了 `SessionState == exited && code == 0` のいずれか。**Phase 4.4 の判定を workflow が消費**する構造で、orchestrator 自身は新しい完了検出ロジックを持たない。
 
 ### 2.2 Memory モデル（M4）
 
@@ -529,7 +529,7 @@ Phase 5.5 で仕込まれた OpenTelemetry GenAI トレースに、workflow run 
 
 ## 9. 段階分割案（Phase 5.0.0 〜 4.5.5）
 
-[plan.md](plan.md) の y=Phase、z=Phase 内連番規約に従い、4.5 を **6 段階**に分ける。1リリース = 1 patch。
+[plan.md](../plan.md) の y=Phase、z=Phase 内連番規約に従い、4.5 を **6 段階**に分ける。1リリース = 1 patch。
 
 ### Phase 5.0.0 — Provider 統合の基盤
 
@@ -591,7 +591,7 @@ Phase 5.5 で仕込まれた OpenTelemetry GenAI トレースに、workflow run 
 - **LM Studio OpenAI 互換 API** — <https://lmstudio.ai/docs/api/openai-api>（`:1234/v1/embeddings`）
 - **Jan** — <https://jan.ai/docs/api-server>（`:1337/v1/*` の OpenAI 互換）
 - **Parallel Code AI Arena** — <https://parallelcode.app/>（同時 N モデル、side-by-side、diff/vote）
-- **Anthropic Claude Code / Squads / Subagents** — Phase 5.5-4.2 で既に統合済み。workflow の handoff / supervisor は Claude Code の subagent とほぼ同型（[spec-claude-teams-panes.md](spec-claude-teams-panes.md) 参照）。
+- **Anthropic Claude Code / Squads / Subagents** — Phase 5.5-4.2 で既に統合済み。workflow の handoff / supervisor は Claude Code の subagent とほぼ同型（[spec-claude-teams-panes.md](../spec-claude-teams-panes.md) 参照）。
 - **Reciprocal Rank Fusion** — Cormack, Clarke, Büttcher (2009), "Reciprocal rank fusion outperforms Condorcet and individual rank learning methods."
 - **OpenTelemetry GenAI semantic conventions** — <https://opentelemetry.io/docs/specs/semconv/gen-ai/>（Phase 5.5 で導入、workflow span 属性の受け皿）
 

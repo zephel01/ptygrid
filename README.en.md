@@ -160,7 +160,7 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the same change; for release progress, update [docs/phase3.md](docs/phase3.md); and for user-visible behavior, update the [User Guide](docs/userguide.en.md) as well.
+When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the same change; for release progress, update [docs/inside/phase3.md](docs/inside/phase3.md); and for user-visible behavior, update the [User Guide](docs/userguide.en.md) as well.
 
 ## 🗺️ Roadmap
 
@@ -170,7 +170,7 @@ When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the s
 - [x] **Phase 3.0–3.8** — Git diff/commit, worktree isolation, logical resume, resource monitoring, Queen pins/notes/inbox/reply/await (18 tools)
 - [x] **Phase 3.9** — Linux test support (PATH restoration, Ubuntu CI, `.deb` / AppImage packaging)
 
-For the background on this direction, see the [Competitive Analysis](docs/competitive-landscape.en.md) (we chose the "coordinate on one screen" approach rather than a worktree-isolation one). Phase 3 proceeds feature by feature while preserving compatibility, following the [phased release plan](docs/phase3.md).
+For the background on this direction, see the [Competitive Analysis](docs/competitive-landscape.en.md) (we chose the "coordinate on one screen" approach rather than a worktree-isolation one). Phase 3 proceeds feature by feature while preserving compatibility, following the [phased release plan](docs/inside/phase3.md).
 
 ## 📚 Documentation
 
@@ -180,7 +180,7 @@ For the background on this direction, see the [Competitive Analysis](docs/compet
 | [docs/design.en.md](docs/design.en.md) | Design document (OSS research, stack selection, architecture) |
 | [docs/competitive-landscape.en.md](docs/competitive-landscape.en.md) | Competitive analysis of similar tools and positioning |
 | [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | Pitfalls found through real-world dogfooding, and their fixes |
-| [docs/phase3.md](docs/phase3.md) | The independent phased release plan for Phase 3, and its progress |
+| [docs/inside/phase3.md](docs/inside/phase3.md) | The independent phased release plan for Phase 3, and its progress |
 | [docs/plan.md](docs/plan.md) | Work plan (current-status summary, next tasks, versioning conventions) |
 | [docs/porting.en.md](docs/porting.en.md) | Linux test-support status, Linux build/package steps, and the Windows porting plan |
 | [CONTRACT.md](CONTRACT.md) | The backend ⇄ frontend IPC contract (for developers) |

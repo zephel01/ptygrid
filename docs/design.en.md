@@ -135,7 +135,7 @@ CPU treats one core as 100%, so multi-core workloads exceed 100%. Memory is the 
 
 ## 10. Release Status
 
-Phases 0 through 2.1 and Phases 3.0 through 3.9 are implemented. Phase 3.9 added, as Linux test support, native builds, Ubuntu CI, `.deb` / AppImage packaging, and PATH recovery on GUI launch. For the detailed gates, see [phase3.md](phase3.md).
+Phases 0 through 2.1 and Phases 3.0 through 3.9 are implemented. Phase 3.9 added, as Linux test support, native builds, Ubuntu CI, `.deb` / AppImage packaging, and PATH recovery on GUI launch. For the detailed gates, see [inside/phase3.md](inside/phase3.md).
 
 ## 11. Principles for Making Changes
 

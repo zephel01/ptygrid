@@ -2,23 +2,23 @@
 
 作成日: 2026-07-22 / 状態: draft / 対象 Phase: 5.0（Phase 5.0 orchestration・memory リリース後）
 
-関連: [spec-notifications.md](spec-notifications.md)（sandbox 起動失敗の外部通知は既存経路にそのまま乗る）/
-[spec-agent-status.md](spec-agent-status.md)（quarantine 状態は Ring 色で表現）/
+関連: [spec-notifications.md](../spec-notifications.md)（sandbox 起動失敗の外部通知は既存経路にそのまま乗る）/
+[spec-agent-status.md](../spec-agent-status.md)（quarantine 状態は Ring 色で表現）/
 [spec-phase5-5.md](spec-phase5-5.md)（OTel span を replay の tool 呼び出し軸に統合、secrets audit を span 化）/
 [spec-phase5-0.md](spec-phase5-0.md)（workflow step 単位で sandbox プロファイル・record を切替可能に）/
-[design.md](design.md) / [plan.md](plan.md) / [competitive-landscape.md](competitive-landscape.md) /
-[../CONTRACT.md](../CONTRACT.md)（IPC/MCP 契約の追記先）/
-[../ptygrid.example.yml](../ptygrid.example.yml)。
+[design.md](../design.md) / [plan.md](../plan.md) / [competitive-landscape.md](../competitive-landscape.md) /
+[../CONTRACT.md](../../CONTRACT.md)（IPC/MCP 契約の追記先）/
+[../ptygrid.example.yml](../../ptygrid.example.yml)。
 
 実装（新規モジュール想定）:
-[../src-tauri/src/sandbox.rs](../src-tauri/src/sandbox.rs)（S2 sandbox supervisor + プロファイル解決）/
-[../src-tauri/src/secrets.rs](../src-tauri/src/secrets.rs)（S3 credential proxy + lease 管理）/
-[../src-tauri/src/replay.rs](../src-tauri/src/replay.rs)（S4 asciicast v3 writer + redaction stream）/
-[../src-tauri/src/proxy.rs](../src-tauri/src/proxy.rs)（S3 HTTP proxy 経路、strict プロファイル専用）/
-配線元 [../src-tauri/src/session.rs](../src-tauri/src/session.rs)（PtyReader tee tap 追加のみ）/
-[../src-tauri/src/queen.rs](../src-tauri/src/queen.rs)（新規 5 tools）/
-[../src-tauri/src/config.rs](../src-tauri/src/config.rs)（`sandbox:` / `secrets:` / `replay:` スキーマ）。
-Frontend: [../src/lib/ReplayViewer.svelte](../src/lib/ReplayViewer.svelte) / [../src/lib/SandboxBadge.svelte](../src/lib/SandboxBadge.svelte)。
+[../src-tauri/src/sandbox.rs](../../src-tauri/src/sandbox.rs)（S2 sandbox supervisor + プロファイル解決）/
+[../src-tauri/src/secrets.rs](../../src-tauri/src/secrets.rs)（S3 credential proxy + lease 管理）/
+[../src-tauri/src/replay.rs](../../src-tauri/src/replay.rs)（S4 asciicast v3 writer + redaction stream）/
+[../src-tauri/src/proxy.rs](../../src-tauri/src/proxy.rs)（S3 HTTP proxy 経路、strict プロファイル専用）/
+配線元 [../src-tauri/src/session.rs](../../src-tauri/src/session.rs)（PtyReader tee tap 追加のみ）/
+[../src-tauri/src/queen.rs](../../src-tauri/src/queen.rs)（新規 5 tools）/
+[../src-tauri/src/config.rs](../../src-tauri/src/config.rs)（`sandbox:` / `secrets:` / `replay:` スキーマ）。
+Frontend: [../src/lib/ReplayViewer.svelte](../../src/lib/ReplayViewer.svelte) / [../src/lib/SandboxBadge.svelte](../../src/lib/SandboxBadge.svelte)。
 
 ---
 

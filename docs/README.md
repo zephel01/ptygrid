@@ -28,7 +28,7 @@ backend ⇄ frontend / Queen の正確な wire 仕様は [../CONTRACT.md](../CON
 | ドキュメント | 内容 |
 |---|---|
 | [plan.md](plan.md) | 作業計画。「いま何が終わっていて次に何をやるか」の現在地サマリ、バージョニング規約（y = Phase 番号）、リリース手順。**現在地を知りたいときはここ** |
-| [phase3.md](phase3.md) | Phase 3.0–3.9 の段階リリース記録と、以後も踏襲しているリリース規律（CONTRACT 先行追記・テスト・両OS CI） |
+| [inside/phase3.md](inside/phase3.md) | Phase 3.0–3.9 の段階リリース記録と、以後も踏襲しているリリース規律（CONTRACT 先行追記・テスト・両OS CI） |
 | [verify-team-preset.md](verify-team-preset.md) | チームプリセットの手動検証手順書。ゴール定義（G1–G4）、起動順序チェックリスト、機能テスト T1–T6、実機偵察 R1–R3、E2E 受け入れシナリオ |
 | [porting.md](porting.md) | 移植状況。Linux（beta）の build / `.deb` / AppImage と CI、Windows 対応の未着手チェックリスト |
 | [competitive-landscape.md](competitive-landscape.md) | 類似ツールの競合調査（cmux, Claude Squad, Conductor 等）。worktree 隔離系 / 同一画面協調系の分類と ptygrid のポジショニング、やらないことの整理 |

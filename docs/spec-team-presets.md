@@ -254,7 +254,7 @@ CONTRACT.md への追記（実装前に先行追記）:
 ## 9. リリース計画とテスト
 
 - リリースは **v0.4.4（Phase 4.3）** の1本を想定（plan.md のバージョニング規約に従う）
-- [phase3.md](phase3.md) のリリース規律を踏襲: CONTRACT 先行追記、`lib.rs`/hot path に
+- [inside/phase3.md](inside/phase3.md) のリリース規律を踏襲: CONTRACT 先行追記、`lib.rs`/hot path に
   新ロジックを置かない、該当挙動のみ userguide 更新
 
 テスト:

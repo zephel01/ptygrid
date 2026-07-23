@@ -176,7 +176,7 @@ CPUは1 coreを100%とするためmulti-core workloadは100%を超えます。me
 
 Phase 0〜2.1とPhase 3.0〜3.9は実装済みです。3.9でLinuxテスト対応としてnative build、
 Ubuntu CI、`.deb` / AppImage packaging、GUI起動時のPATH復元を追加しました。
-詳細なgateは[phase3.md](phase3.md)を参照してください。
+詳細なgateは[inside/phase3.md](inside/phase3.md)を参照してください。
 
 ## 11. 変更時の原則
 

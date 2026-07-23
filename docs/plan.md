@@ -4,7 +4,7 @@
 
 この文書は「いま何が終わっていて、次に何をやるか」と「バージョンの付け方」を
 1か所にまとめる作業計画である。Phase 3.x の詳細な実績とリリース規律は
-[phase3.md](phase3.md)、teams 機能の設計は
+[inside/phase3.md](inside/phase3.md)、teams 機能の設計は
 [spec-claude-teams-panes.md](spec-claude-teams-panes.md)、方向性の背景は
 [competitive-landscape.md](competitive-landscape.md) を参照。
 
@@ -162,7 +162,7 @@ wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
 
 ## 4. 運用メモ
 
-- 各リリースは phase3.md の規律を踏襲する: CONTRACT 先行追記、`lib.rs`/hot path に
+- 各リリースは inside/phase3.md の規律を踏襲する: CONTRACT 先行追記、`lib.rs`/hot path に
   新ロジックを置かない、unit + integration テスト、両プラットフォーム CI 通過、
   該当挙動のみ userguide 更新。
 - 本文書は Phase の完了・計画変更のたびに「現在地サマリ」と「次の作業」を更新する。
@@ -171,7 +171,7 @@ wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
 
 ## 5. Phase 5.0 / 5.5 / 6.0 の予約（未実装・設計のみ）
 
-詳細は [phase5-6.md](phase5-6.md) と 3 spec([spec-phase5-0.md](spec-phase5-0.md) / [spec-phase5-5.md](spec-phase5-5.md) / [spec-phase6-0.md](spec-phase6-0.md)) を参照。**先行実装は Phase 5.0 の MVO(Minimum Viable Orchestrator)**、それ以降は Track A/B/C/D の 4 並列(`ptygrid.yml` の `workflows:` セクション参照)。
+詳細は [inside/phase5-6.md](inside/phase5-6.md) と 3 spec([inside/spec-phase5-0.md](inside/spec-phase5-0.md) / [inside/spec-phase5-5.md](inside/spec-phase5-5.md) / [inside/spec-phase6-0.md](inside/spec-phase6-0.md)) を参照。**先行実装は Phase 5.0 の MVO(Minimum Viable Orchestrator)**、それ以降は Track A/B/C/D の 4 並列(`ptygrid.yml` の `workflows:` セクション参照)。
 
 ### 5.1 SQLite `PRAGMA user_version` 予約表
 
