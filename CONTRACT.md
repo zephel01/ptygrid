@@ -1608,6 +1608,13 @@ team_presets:
 > されるようになったが、形状が正しい場合でも spawn 時の
 > `"not implemented in MVO"` は変わらず発火し、実行はできない。実行系の
 > 配線が完了し次第、本節を改めて更新する。
+> 追記（2026-07-24、同日）: 上記スキーマ・バリデーション断面は commit
+> `6bad859`（`track/e-orch-5.0.4`）で確定・コミット済み。実行系
+> （`orchestrator.rs`）側の retry / timeout / condition / handoffTo チェイン /
+> `join_on: reply` 完了判定の配線は着手済みだが未完了（pin `design-5.0.4` の
+> 残タスク）であり、承認・commit 済みの断面はまだない。`pattern: supervisor` /
+> `handoff` の spawn 時 `"not implemented in MVO"` も変わらず発火する。実行系の
+> 配線が完了・承認され次第、本節を改めて更新する。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
