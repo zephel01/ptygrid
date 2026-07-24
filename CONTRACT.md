@@ -1625,6 +1625,20 @@ team_presets:
 > これは pin `design-5.0.4` が定める「wire 追加は `started_at_ms` のみ」の方針どおりで、
 > 直前の追記（実行系の retry / timeout / condition / handoffTo / `join_on: reply` 配線は
 > 未完了・未承認）を変更するものではない — スキーマ側の準備が1件、着地した事実のみを記録する。
+> 追記（2026-07-25、続報）: commit `886520b`（`track/e-orch-5.0.4`）で driver 内部の非公開
+> ヘルパー `is_terminal` が `StepState` 単体でなく `&StepOutcome` を受け取るようシグネチャ
+> 変更され、判定セマンティクスも変わった: `Failed` かつ `nextRetryAtMs` が設定済み（retry
+> backoff 待ち）の間は非終端として扱う（後述の `apply_retry_policy` が backoff 経過後に
+> `Running` へ戻し得るため）。`is_terminal` は非公開関数であり、この変更は `all_terminal` /
+> `failfast_targets` という orchestrator.rs 内部の完了判定にのみ影響し、`nextRetryAtMs` は
+> 既報のとおり `#[serde(skip)]` のため wire（`WorkflowRun` JSON・`workflow-state` イベント・
+> `spawn_workflow`/`join_workflow`/`list_workflow_runs` の入出力）には一切現れない。同時に
+> retry の attempts/backoff 純粋関数（`allows_another` / `due_at`）を持つ `mod retry` が
+> 新設されたが、これを呼び出す `apply_retry_policy`（pin `design-5.0.4` の残タスク）はまだ
+> 存在せず、`mod retry` 自体は本追記時点でどこからも呼ばれていない（未配線、ユニットテスト
+> 未追加）。したがって実行系の retry / timeout / condition / handoffTo / `join_on: reply`
+> 配線は直前の追記から変わらず未完了・未承認のままであり、本追記は internal ヘルパーの
+> 進捗記録に留まる。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
