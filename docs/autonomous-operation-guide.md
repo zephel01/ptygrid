@@ -271,6 +271,15 @@ DB integrity / ログ tail / WIP 検出)のようなコマンドがあると、�
 condition 評価・handoffTo チェイン)も未着手のため、本節の結論は変わらない —
 retry/timeout/reply 完了判定に基づく自動リカバリは依然として存在しない。)
 
+(2026-07-24 追記・訂正(docs 同期): 上記フィールド定義とロード時バリデーションは
+commit `6bad859`(`track/e-orch-5.0.4`)でコミット済み — 「作業ツリー上でも未コミット」
+は当時の状態を指す historical な記述であり現在は解消している(`main` へは未マージの
+まま)。ただし実行系(再試行・タイムアウト強制・condition 評価・handoffTo チェイン・
+`join_on: reply` 完了判定)は pin `design-5.0.4` の残タスクとして着手済みだが未完了・
+未承認であり、本節の結論(retry/timeout/reply 完了判定に基づく自動リカバリは存在しない)
+は変わらない。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」および
+[ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1 を参照。)
+
 ---
 
 ## 10. 1日を回すためのチェックリスト

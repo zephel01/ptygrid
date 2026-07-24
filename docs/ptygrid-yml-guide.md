@@ -14,6 +14,13 @@
 `orchestrator.rs` / `queen.rs`)を直接確認して書いている(2026-07-24 追記分は
 `track/e-orch-5.0.4` 作業ツリー・未コミットの `config.rs` を直接確認)。
 
+> 追記(2026-07-24、docs 同期): 上記の 2026-07-24 追記分(`config.rs` の
+> `retry`/`condition`/`handoffTo` スキーマ・ロード時バリデーション)は commit
+> `6bad859`(`track/e-orch-5.0.4`)でコミット済み。「未コミット」は当時の状態を
+> 指す historical な記述であり現在は解消している。ただし `orchestrator.rs` の
+> 実行系配線は未完了のままで、下表 §1 の ❌ 判定は変わらず有効。詳細は
+> [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
+
 ---
 
 ## 1. 最初に: 実装状況マトリクス(最重要)
@@ -34,9 +41,9 @@
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
 | `joinOn: reply` | 各 step | ✅(パースは通る) | ❌ | 「kickoff への reply で完了」は**未実装**。exit 0 でも `AgentStatus::Done` でも完了扱いにならず、**step が永遠に RUNNING のまま止まる可能性がある**。現状は使わないこと |
 | `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ❌ | 超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意 |
-| `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ❌ | `orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット) |
-| `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ❌ | `orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット) |
-| `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ❌ | `orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ |
+| `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ❌ | `orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
+| `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ❌ | `orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
+| `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ❌ | `orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
 | `onFailure: fail-fast` / `continue` | workflow 直下 | ✅ | ✅ | 実装済み。既定 `fail-fast` |
 | `kickoff` | 各 step | ✅ | ✅ | 実装済み。spawn 直後に inbox へ配送 |
 | `arena: true` | workflow 直下 | ✅(パースは通る) | ❌ | Arena UI 自体が未実装(S7 前半、別 Phase)。書いても何も開かない |
