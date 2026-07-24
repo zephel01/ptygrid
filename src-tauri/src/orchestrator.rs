@@ -7,10 +7,12 @@
 // `spawn_agent` could too.
 //
 // Wire contract: CONTRACT.md "Phase 5.0 追加契約". Design: docs/spec-phase5-0.md
-// (§2.1 "Workflow モデル", §3.1 "M3 Orchestrator 状態機械"). MVO scope:
-// pipeline + fan-out, `join_on: all|any`, completion via AgentStatus == done or
-// PTY exit(0). Deferred to 5.0.4: supervisor, handoff, retry, timeout,
-// join_on: reply/N, `condition:` predicates.
+// (§2.1 "Workflow モデル", §3.1 "M3 Orchestrator 状態機械"). Phase 5.0.4 lands
+// the full pattern set: pipeline, fan-out, supervisor, handoff; `join_on:
+// all|any|N|reply`; per-step `retry`/`timeout_ms`; `condition:` predicates.
+// Completion is detected via three independent routes — PTY exit(0),
+// AgentStatus::Done, and a correlated durable inbox reply (see the driver
+// section below).
 //
 // This module is kept OUTSIDE `lib.rs` and outside the session hot path per
 // release discipline (phase3.md).
@@ -763,13 +765,40 @@ fn base_id(step_id: &str) -> &str {
     }
 }
 
-/// Whether a `StepState` is terminal (the step will never transition again
-/// without external intervention like `cancel_workflow`).
-fn is_terminal(state: StepState) -> bool {
-    matches!(
-        state,
-        StepState::Succeeded | StepState::Failed | StepState::Skipped | StepState::Cancelled
-    )
+/// Whether a step's outcome is terminal (the step will never transition
+/// again without external intervention like `cancel_workflow`). A `Failed`
+/// outcome that is still waiting out its `retry` backoff (`next_retry_at_ms`
+/// set) is deliberately NOT terminal — `apply_retry_policy` may yet flip it
+/// back to `Running` once the deadline passes.
+fn is_terminal(outcome: &StepOutcome) -> bool {
+    match outcome.state {
+        StepState::Succeeded | StepState::Skipped | StepState::Cancelled => true,
+        StepState::Failed => outcome.next_retry_at_ms.is_none(),
+        StepState::Pending | StepState::Running => false,
+    }
+}
+
+/// Phase 5.0.4 retry bookkeeping: pure attempts/backoff arithmetic, kept
+/// free of PTY/store I/O so it can be unit-tested directly. `apply_retry_policy`
+/// (driver section below) is the only caller.
+mod retry {
+    use crate::config::RetryPolicy;
+
+    /// Whether another spawn attempt is allowed under `policy`, given how
+    /// many attempts have already been made. Per `RetryPolicy::max`'s own
+    /// doc comment, `max` bounds the number of restart attempts AFTER the
+    /// first (failed) attempt — so with `attempts` spawns already made,
+    /// `attempts - 1` retries have been consumed, and another is allowed
+    /// while that is still `< max`, i.e. `attempts <= max`.
+    pub fn allows_another(attempts: u32, policy: &RetryPolicy) -> bool {
+        attempts <= policy.max
+    }
+
+    /// Wall-clock deadline (ms since UNIX_EPOCH) at which a backoff-waiting
+    /// Failed outcome becomes eligible for its next attempt.
+    pub fn due_at(now_ms: u64, policy: &RetryPolicy) -> u64 {
+        now_ms + policy.backoff_ms.unwrap_or(0)
+    }
 }
 
 /// A step's effective join policy, defaulting to `all` when undeclared.
@@ -898,7 +927,7 @@ fn failfast_targets(wf: &WorkflowDef, run: &WorkflowRun) -> Vec<String> {
             JoinOn::Named(JoinOnName::All) => true,
             JoinOn::Named(JoinOnName::Any) | JoinOn::Count(_) => copies
                 .iter()
-                .all(|o| is_terminal(o.state) && o.state != StepState::Succeeded),
+                .all(|o| is_terminal(o) && o.state != StepState::Succeeded),
             JoinOn::Named(JoinOnName::Reply) => true,
         };
         if unsatisfiable {
@@ -929,7 +958,7 @@ fn all_terminal(wf: &WorkflowDef, run: &WorkflowRun) -> bool {
             .iter()
             .filter(|o| base_id(&o.step_id) == step.id.as_str())
             .collect();
-        !copies.is_empty() && copies.iter().all(|o| is_terminal(o.state))
+        !copies.is_empty() && copies.iter().all(|o| is_terminal(o))
     })
 }
 
@@ -1655,12 +1684,17 @@ workflows:
 
     #[test]
     fn is_terminal_classifies_states() {
-        assert!(!is_terminal(StepState::Pending));
-        assert!(!is_terminal(StepState::Running));
-        assert!(is_terminal(StepState::Succeeded));
-        assert!(is_terminal(StepState::Failed));
-        assert!(is_terminal(StepState::Skipped));
-        assert!(is_terminal(StepState::Cancelled));
+        assert!(!is_terminal(&mk_outcome("s", None, StepState::Pending)));
+        assert!(!is_terminal(&mk_outcome("s", None, StepState::Running)));
+        assert!(is_terminal(&mk_outcome("s", None, StepState::Succeeded)));
+        assert!(is_terminal(&mk_outcome("s", None, StepState::Skipped)));
+        assert!(is_terminal(&mk_outcome("s", None, StepState::Cancelled)));
+        // Failed with no retry scheduled = terminal.
+        assert!(is_terminal(&mk_outcome("s", None, StepState::Failed)));
+        // Failed but a retry deadline is pending = NOT terminal (5.0.4).
+        let mut retrying = mk_outcome("s", None, StepState::Failed);
+        retrying.next_retry_at_ms = Some(1);
+        assert!(!is_terminal(&retrying));
     }
 
     #[test]
