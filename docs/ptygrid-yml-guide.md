@@ -11,7 +11,8 @@
 手順は userguide.md、を使い分けてほしい。
 
 検証時点: 2026-07-23、`v0.5.6` 時点のソース(`src-tauri/src/config.rs` /
-`orchestrator.rs` / `queen.rs`)を直接確認して書いている。
+`orchestrator.rs` / `queen.rs`)を直接確認して書いている(2026-07-24 追記分は
+`track/e-orch-5.0.4` 作業ツリー・未コミットの `config.rs` を直接確認)。
 
 ---
 
@@ -26,21 +27,23 @@
 |---|---|---|---|---|
 | pipeline パターン | `pattern: pipeline` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
 | fan-out パターン | `pattern: fan-out` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
-| supervisor パターン | `pattern: supervisor` | ✅(パースは通る) | ❌ | `spawn_workflow` 実行時に `"pattern Supervisor not implemented in MVO (lands in Phase 5.0.4)"` で **明示エラー**。5.0.4 まで使えない |
-| handoff パターン | `pattern: handoff` | ✅(パースは通る) | ❌ | 同上 |
+| supervisor パターン | `pattern: supervisor` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。ルート(`dependsOn` 無し)がちょうど1件・他の全 step がそのルートを `dependsOn` に含むこと、を要求) | ❌ | `spawn_workflow` 実行時に `"pattern Supervisor not implemented in MVO (lands in Phase 5.0.4)"` で **明示エラー**。形状が正しくても実行不可 |
+| handoff パターン | `pattern: handoff` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。各 step の `dependsOn` は最大1件・ルートがちょうど1件・`handoffTo` を辿った鎖に循環がないこと・鎖上の次段の `dependsOn` が直前 step 1件のみと一致すること・鎖が全 step を過不足なくカバーすること、を要求) | ❌ | `spawn_workflow` 実行時に同上の明示エラー。形状が正しくても実行不可 |
 | `dependsOn` | 各 step | ✅ | ✅ | 実装済み。循環検出・未知 id 参照はロード時エラー |
 | `fanOut` | 各 step | ✅ | ✅ | 実装済み。`>= 2` 必須、fan-out パターン以外では宣言不可 |
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
 | `joinOn: reply` | 各 step | ✅(パースは通る) | ❌ | 「kickoff への reply で完了」は**未実装**。exit 0 でも `AgentStatus::Done` でも完了扱いにならず、**step が永遠に RUNNING のまま止まる可能性がある**。現状は使わないこと |
-| `timeoutMs` | 各 step | ✅(パースは通る) | ❌ | 超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意 |
-| `retry:` | 各 step | — | — | **フィールド自体が存在しない**。`config.rs` の `WorkflowStep` に `retry` は無い。書いても構文エラーにはならず(未知キーは無視)、単に何も効かない |
+| `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ❌ | 超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意 |
+| `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ❌ | `orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット) |
+| `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ❌ | `orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット) |
+| `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ❌ | `orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ |
 | `onFailure: fail-fast` / `continue` | workflow 直下 | ✅ | ✅ | 実装済み。既定 `fail-fast` |
 | `kickoff` | 各 step | ✅ | ✅ | 実装済み。spawn 直後に inbox へ配送 |
 | `arena: true` | workflow 直下 | ✅(パースは通る) | ❌ | Arena UI 自体が未実装(S7 前半、別 Phase)。書いても何も開かない |
 | `autoClose`(workflow 単位) | workflow 直下 | ✅ | ✅ | 実装済み(5.0.0 追補)。詳細は §4 |
 | `close_on_exit`(agent 単位) | agent 定義 | ✅ | ✅ | 実装済み(5.0.0 追補)。詳細は §4 |
 | workflow 再開(アプリ再起動後の Y/N) | (config には書かない) | — | ✅ | 実装済み(5.0.1)。詳細は §5 |
-| escalation(retry 枯渇時の外部通知) | (config には書かない) | — | ❌ | retry 自体が無いので発火しようがない |
+| escalation(retry 枯渇時の外部通知) | (config には書かない) | — | ❌ | `retry:` は 2026-07-24 にスキーマ追加されたが実行系が無いため、枯渇判定自体が発火しようがない |
 
 > [!WARNING]
 > `docs/inside/spec-phase5-0.md` はこの機能セットの**設計ドキュメント**であり、`retry` /
@@ -68,7 +71,12 @@ workflows:
         dependsOn: [<先行 step id>, ...] # 任意。pipeline は最大1件、省略でルート
         fanOut: <N>                      # fan-out パターンのみ、>= 2
         joinOn: all | any | <N>          # fan-out の集約規則。既定 all。reply は§1参照
-        timeoutMs: <ミリ秒>              # パースのみ、実行時未enforced(§1)
+        timeoutMs: <ミリ秒>              # バリデーションのみ、実行時未enforced(§1)
+        retry:                           # 任意。バリデーションのみ、実行時未enforced(§1)
+          max: <1..=10>
+          backoffMs: <0..=60000>         # 任意、既定 0
+        condition: "<正規表現>"          # 任意。バリデーションのみ、実行時未enforced(§1)。dependsOn 1件必須
+        handoffTo: <別 step id>          # 任意。バリデーションのみ、実行時未enforced(§1)
         kickoff: "<inbox に投函する初回メッセージ>"  # 任意だが強く推奨(§3.3)
 ```
 
@@ -95,6 +103,19 @@ workflows:
   (`pattern: fan-out` を使うこと)
 - `pattern: fan-out` なのに、どの step も `fanOut` を宣言していない
 - `fanOut` が 2 未満
+- (2026-07-24 追加) `retry.max` が 1..=10 の範囲外、または `retry.backoffMs` が
+  指定時 60000 を超える
+- (2026-07-24 追加) `timeoutMs` が 100..=86,400,000 の範囲外
+- (2026-07-24 追加) `condition` が有効な正規表現でない・`dependsOn` を厳密に1件持たない・
+  同一 step の `fanOut` と併用されている・その唯一の依存先が `fanOut` step である
+- (2026-07-24 追加) `handoffTo` が同一 workflow 内に存在しない step id を指す、または
+  自分自身を指す(自己参照)
+- (2026-07-24 追加) `pattern: supervisor` なのに、ルート(`dependsOn` 無し)step が
+  1件でない、またはルート以外の step がそのルートを `dependsOn` に含まない
+- (2026-07-24 追加) `pattern: handoff` なのに、いずれかの step が `dependsOn` を
+  2件以上持つ・ルートが1件でない・`handoffTo` を辿った鎖が循環する・鎖上の次段の
+  `dependsOn` が直前 step 1件のみと一致しない・鎖が workflow 内の全 step を
+  過不足なくカバーしない(孤立 step がある)
 
 **未知フィールドは無視される**(forward compat)。ただし `pattern` / `joinOn` の名前付き値
 (`all`/`any`/`reply`)のように**閉じた列挙**は綴り間違いで即エラーになる —
@@ -359,13 +380,16 @@ workflows を選ぶとよい。書き方は userguide.md 「チームプリセ�
 先に疑うこと(pipeline では `fanOut` 宣言自体がバリデーションエラーで弾かれるので、
 この事故は「エラーにならず黙って1本になる」パターンではなく気づきやすいが、念のため)。
 
-### 7.4 `retry:` / `timeoutMs` を書いても保険にならない
+### 7.4 `retry:` / `condition:` / `handoffTo:` / `timeoutMs` を書いても保険にならない
 
-§1 の表のとおり、`retry:` は存在しないフィールド、`timeoutMs` はパースされるだけで
-実行時に効かない。**「timeoutMs: 600000 と書いたから10分でタイムアウトするはず」という
-前提で運用しない**こと。現状、詰まった step を止めたいときは人間または integrator が
-`kill_pty` 相当の操作(ペインを手動で閉じる、または integrator に該当セッションの停止を
-依頼)を行う必要がある。
+§1 の表のとおり、`retry:` / `condition:` / `handoffTo:` は 2026-07-24 にスキーマと
+ロード時バリデーションが追加されたフィールドだが(それ以前は `retry` / `condition` /
+`handoffTo` はフィールド自体が存在しなかった)、`timeoutMs` 含めいずれも
+`orchestrator.rs` の実行ドライバからは一切参照されない。**「timeoutMs: 600000 と書いた
+から10分でタイムアウトするはず」「retry: {max: 3} と書いたから3回までは自動で再試行
+されるはず」という前提で運用しない**こと。現状、詰まった step を止めたいときは人間または
+integrator が `kill_pty` 相当の操作(ペインを手動で閉じる、または integrator に該当
+セッションの停止を依頼)を行う必要がある。
 
 ---
 

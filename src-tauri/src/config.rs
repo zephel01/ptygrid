@@ -2,12 +2,13 @@
 // relative-cwd resolution, and the file watcher (notify) that emits
 // `config-changed` events per the Phase 1 contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -586,6 +587,19 @@ pub struct WorkflowDef {
     pub auto_close: Option<AutoCloseMode>,
 }
 
+/// Phase 5.0.4: per-step retry policy. `max` bounds the number of restart
+/// attempts after the first failed attempt; `backoff_ms` (default 0 when
+/// omitted) is the delay before the next attempt spawns. See
+/// `orchestrator::retry` for the pure attempts/backoff calculation and
+/// `orchestrator::apply_retry_policy` for the driver wiring.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicy {
+    pub max: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+}
+
 /// One entry under `workflows.<name>.steps`. Members reference `agents:`
 /// definition names only (allowlist integrity — same as team_presets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,6 +625,23 @@ pub struct WorkflowStep {
     /// (= definition name) — the same durable inbox path team_presets uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kickoff: Option<String>,
+    /// Phase 5.0.4: restart policy applied when this step's spawn attempt
+    /// fails (route1/route2/timeout). `None` means no retry — a single
+    /// failed attempt is terminal, same as pre-5.0.4 behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+    /// Phase 5.0.4: regex evaluated against the single dependency's
+    /// `reply_body` (or, absent a reply, its tail output) before this step is
+    /// spawned. No match => `StepState::Skipped` (not counted as a failure).
+    /// Requires exactly one `dependsOn` entry; rejected on a `fanOut` step or
+    /// a step depending on one (validated in `validate_workflows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Phase 5.0.4 (handoff pattern): the next step in the chain. When this
+    /// step completes via a durable inbox reply, that reply's body is
+    /// prepended to the target step's `kickoff` (see `orchestrator::handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_to: Option<String>,
 }
 
 /// Phase 5.0 parse-time validation of the `workflows:` block. Every error
@@ -652,6 +683,74 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                     "{ctx}: step '{}' references agent '{}' not defined under agents:                      (processes: entries cannot be workflow steps)",
                     step.id, step.agent
                 ));
+            }
+            // Phase 5.0.4 field-level checks (apply regardless of pattern).
+            if let Some(retry) = step.retry {
+                if retry.max < 1 || retry.max > 10 {
+                    return Err(format!(
+                        "{ctx}: step '{}' retry.max ({}) must be between 1 and 10",
+                        step.id, retry.max
+                    ));
+                }
+                if let Some(backoff) = retry.backoff_ms {
+                    if backoff > 60_000 {
+                        return Err(format!(
+                            "{ctx}: step '{}' retry.backoffMs ({}) must be <= 60000",
+                            step.id, backoff
+                        ));
+                    }
+                }
+            }
+            if let Some(timeout) = step.timeout_ms {
+                if !(100..=86_400_000).contains(&timeout) {
+                    return Err(format!(
+                        "{ctx}: step '{}' timeoutMs ({}) must be between 100 and 86400000",
+                        step.id, timeout
+                    ));
+                }
+            }
+            if let Some(pattern) = &step.condition {
+                if Regex::new(pattern).is_err() {
+                    return Err(format!(
+                        "{ctx}: step '{}' condition is not a valid regex: '{}'",
+                        step.id, pattern
+                    ));
+                }
+                let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                if deps.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: step '{}' condition requires exactly one dependsOn (found {})",
+                        step.id, deps.len()
+                    ));
+                }
+                if step.fan_out.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both fanOut and condition; not supported",
+                        step.id
+                    ));
+                }
+                if let Some(dep_step) = wf.steps.iter().find(|s| s.id == deps[0]) {
+                    if dep_step.fan_out.is_some() {
+                        return Err(format!(
+                            "{ctx}: step '{}' condition depends on fan-out step '{}'; not supported",
+                            step.id, dep_step.id
+                        ));
+                    }
+                }
+            }
+            if let Some(target) = &step.handoff_to {
+                if target == &step.id {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo references itself",
+                        step.id
+                    ));
+                }
+                if !wf.steps.iter().any(|s| &s.id == target) {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo '{}' which is not a step id",
+                        step.id, target
+                    ));
+                }
             }
         }
         // dependsOn references must be known step ids.
@@ -710,9 +809,97 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                     }
                 }
             }
-            WorkflowPattern::Supervisor | WorkflowPattern::Handoff => {
-                // MVO parses these patterns but the state machine returns a
-                // typed "not-yet-implemented" error at spawn time (Phase 5.0.4).
+            WorkflowPattern::Supervisor => {
+                let roots: Vec<&WorkflowStep> = wf
+                    .steps
+                    .iter()
+                    .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                    .collect();
+                if roots.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: supervisor pattern requires exactly one root step (found {})",
+                        roots.len()
+                    ));
+                }
+                let root_id = roots[0].id.clone();
+                for step in &wf.steps {
+                    if step.id == root_id {
+                        continue;
+                    }
+                    if !step
+                        .depends_on
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .contains(&root_id)
+                    {
+                        return Err(format!(
+                            "{ctx}: supervisor step '{}' must dependOn root step '{}'",
+                            step.id, root_id
+                        ));
+                    }
+                }
+            }
+            WorkflowPattern::Handoff => {
+                // Handoff is a strict linear chain: `depends_on` still drives
+                // the generic driver (`ready_steps`/`spawn_ready`), so it must
+                // mirror the `handoff_to` chain 1:1 rather than being a second,
+                // independent graph.
+                for step in &wf.steps {
+                    let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                    if deps.len() > 1 {
+                        return Err(format!(
+                            "{ctx}: handoff step '{}' has {} dependencies;                              handoff is linear (max 1 dependsOn per step)",
+                            step.id, deps.len()
+                        ));
+                    }
+                }
+                let roots: Vec<&WorkflowStep> = wf
+                    .steps
+                    .iter()
+                    .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                    .collect();
+                if roots.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: handoff pattern requires exactly one root step (found {})",
+                        roots.len()
+                    ));
+                }
+                let mut visited: HashSet<&str> = HashSet::new();
+                let mut cur = roots[0].id.as_str();
+                loop {
+                    if !visited.insert(cur) {
+                        return Err(format!(
+                            "{ctx}: handoff chain revisits step '{}' (cycle)",
+                            cur
+                        ));
+                    }
+                    let step = wf.steps.iter().find(|s| s.id == cur).expect(
+                        "handoff chain walk only visits ids already known to be valid step ids",
+                    );
+                    match &step.handoff_to {
+                        Some(next) => {
+                            let next_step = wf.steps.iter().find(|s| &s.id == next).expect(
+                                "handoffTo target existence already validated above",
+                            );
+                            let next_deps = next_step.depends_on.as_deref().unwrap_or(&[]);
+                            if next_deps.len() != 1 || next_deps[0] != cur {
+                                return Err(format!(
+                                    "{ctx}: handoff step '{}' handoffTo '{}' but '{}' does not dependOn '{}'",
+                                    cur, next, next, cur
+                                ));
+                            }
+                            cur = next.as_str();
+                        }
+                        None => break,
+                    }
+                }
+                if visited.len() != wf.steps.len() {
+                    return Err(format!(
+                        "{ctx}: handoff chain covers {} of {} declared steps;                              every step must be part of the single root->terminal chain",
+                        visited.len(),
+                        wf.steps.len()
+                    ));
+                }
             }
         }
     }

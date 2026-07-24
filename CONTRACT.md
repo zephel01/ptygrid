@@ -1583,6 +1583,31 @@ team_presets:
 > の残存 run を検出し `workflow-resume-pending`（WorkflowRun[]）を emit、frontend の
 > Y/N バナーから `resume_workflow`（running step→pending に戻し既存ドライバが続行）/
 > `abandon_workflow`（DB 上 cancelled 化・再プロンプト防止）。memory 系テーブルは 5.0.2+。
+> 追補（2026-07-24、`track/e-orch-5.0.4` 作業ツリー・未コミット）: `WorkflowStep` に
+> `retry`（`RetryPolicy { max: u32, backoffMs: Option<u64> }`）/ `condition`（正規表現
+> 文字列）/ `handoffTo`（同一 workflow 内 step id 参照）の3フィールドをスキーマ追加し、
+> ロード時バリデーションを追加した: `retry.max` は 1..=10、`retry.backoffMs` は指定時
+> <=60000。`condition` は有効な regex であること・`dependsOn` を厳密に1件持つこと・
+> 同一 step で `fanOut` と併用しないこと・その唯一の依存先が `fanOut` step でないこと。
+> `handoffTo` は同一 workflow 内の既知 step id を指すこと・自己参照でないこと。
+> `timeoutMs` にも新たに 100..=86,400,000ms のレンジバリデーションを追加した（既存の
+> パース自体は 5.0.0 から変更なし）。**これらはいずれもパース/バリデーション層のみの
+> 追加である** — `orchestrator.rs` の実行ドライバは無改修のままで、retry 再試行・
+> timeout 強制・condition 評価によるスキップ・handoffTo のチェイン・`join_on: reply`
+> 完了判定のいずれも未実装。`pattern: supervisor` / `handoff` も spawn 時に従来どおり
+> 明示エラー `"pattern {Supervisor|Handoff} not implemented in MVO"` で拒否される
+> ままである。一方、`validate_workflows`（config ロード時、spawn より前）には
+> pattern 別の DAG 形状バリデーションが同時に追加された: supervisor は
+> ルート（`dependsOn` 無し）がちょうど1件であること・他の全 step がその
+> ルートを `dependsOn` に含むことを要求する。handoff は各 step の `dependsOn`
+> が最大1件（線形）であること・ルートがちょうど1件であること・ルートから
+> `handoffTo` を辿った鎖が循環しないこと・鎖上の各 step で次段の
+> `dependsOn` が直前 step 1件のみと一致すること・鎖が workflow 内の全 step
+> を過不足なくカバーすること（鎖から外れた孤立 step を許さない）を要求する。
+> 形状が不正な `ptygrid.yml` は spawn を試みるまでもなく load 時に reject
+> されるようになったが、形状が正しい場合でも spawn 時の
+> `"not implemented in MVO"` は変わらず発火し、実行はできない。実行系の
+> 配線が完了し次第、本節を改めて更新する。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
