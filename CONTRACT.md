@@ -1615,6 +1615,16 @@ team_presets:
 > 残タスク）であり、承認・commit 済みの断面はまだない。`pattern: supervisor` /
 > `handoff` の spawn 時 `"not implemented in MVO"` も変わらず発火する。実行系の
 > 配線が完了・承認され次第、本節を改めて更新する。
+> 追記（2026-07-25）: `StepOutcome`（`WorkflowRun.steps[]` に格納され、`workflow-state`
+> イベント payload および `spawn_workflow` / `join_workflow` / `list_workflow_runs` の
+> 返り値に含まれる）に、commit `1eb7460`（`track/e-orch-5.0.4`）で wire フィールド
+> `startedAtMs`（`u64`、`#[serde(default)]`、0 = 未 spawn）を追加した。5.0.1 で永続化済みの
+> 旧 `steps_json`（本フィールドを持たない）は serde のデフォルト補完で deserialize が壊れず、
+> `resume_workflow` は非破壊。同時に追加された `kickoffRootMsgId` / `replyBody` /
+> `nextRetryAtMs` は driver 内部簿記専用の `#[serde(skip)]` であり **wire には一切現れない**。
+> これは pin `design-5.0.4` が定める「wire 追加は `started_at_ms` のみ」の方針どおりで、
+> 直前の追記（実行系の retry / timeout / condition / handoffTo / `join_on: reply` 配線は
+> 未完了・未承認）を変更するものではない — スキーマ側の準備が1件、着地した事実のみを記録する。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
@@ -1650,6 +1660,11 @@ team_presets:
 > 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
 > 本仕様は [docs/inside/spec-phase5-5.md](docs/inside/spec-phase5-5.md) を参照。
 > 対象 patch: 5.5.0 MCP RC 両立ルータ / 5.5.1 OTel + SQLite / 5.5.2 Cost + agent-cost / 5.5.3 Status Rings / 5.5.4 Waterfall + Dashboard。
+> 追記（2026-07-25）: 上記「状態: 未実装」は Phase 5.5 全体の初期記述であり、現在は patch
+> 5.5.0（Queen MCP RC 両立ルータ）に限り §5.5.1 の「実装状況（patch 5.5.0, 確定 —
+> 2026-07-23）」に記載の通り確定・実装済みで、`v0.5.6` タグとして main に統合済み
+> （`track/b-mcp-5.5.0` 経由、`git tag` で確認可能）。5.5.1（OTel + SQLite）/ 5.5.2（Cost）/
+> 5.5.3（Status Rings）/ 5.5.4（Waterfall + Dashboard）は本追記時点でなお設計のみで未実装。
 
 ## 5.5.1 Queen（MCP）契約拡張
 
