@@ -86,11 +86,33 @@ pub struct StepOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<u32>,
     pub state: StepState,
-    /// Number of times spawn was attempted (increments on retry; MVO always
-    /// leaves this at 1 since retry lands in 5.0.4).
+    /// Number of times spawn was attempted (increments on retry).
     pub attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When this attempt started running (0 if never spawned, e.g. a
+    /// still-Pending step). Phase 5.0.4: drives `check_timeouts`. Old
+    /// (pre-5.0.4) persisted `steps_json` lacks this key entirely, so it
+    /// must default rather than fail `resume_workflow`'s deserialize.
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// `root_message_id` of the kickoff message sent for this attempt, if
+    /// any. Internal only (never serialized) — used by
+    /// `detect_reply_completions` to correlate an inbox reply back to this
+    /// step.
+    #[serde(skip)]
+    pub kickoff_root_msg_id: Option<i64>,
+    /// Body of the reply that completed this step via route 3 (durable
+    /// inbox), if any. Internal only — feeds `condition` evaluation on
+    /// dependents and the `handoff_to` kickoff prefix.
+    #[serde(skip)]
+    pub reply_body: Option<String>,
+    /// Set while a Failed outcome is waiting out its retry backoff; `None`
+    /// once the step is respawned or its retry budget is exhausted.
+    /// Internal only — keeps a mid-backoff Failed outcome from being treated
+    /// as terminal by `all_terminal`/`failfast_targets`.
+    #[serde(skip)]
+    pub next_retry_at_ms: Option<u64>,
 }
 
 /// Public view of a workflow run, emitted verbatim on the `workflow-state`
@@ -251,6 +273,10 @@ fn spawn_step<R: Runtime>(
             state: StepState::Running, // caller will observe completion via AgentStatus/exit
             attempts: 1,
             error: None,
+            started_at_ms: now_ms(),
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         };
     }
     if manager.list_sessions().len() >= WORKFLOW_SESSION_CAP {
@@ -261,6 +287,10 @@ fn spawn_step<R: Runtime>(
             state: StepState::Failed,
             attempts: 1,
             error: Some(format!("pane limit ({WORKFLOW_SESSION_CAP}) reached")),
+            started_at_ms: 0,
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         };
     }
     let spawn = config
@@ -274,6 +304,10 @@ fn spawn_step<R: Runtime>(
             state: StepState::Running,
             attempts: 1,
             error: None,
+            started_at_ms: now_ms(),
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         },
         Err(error) => StepOutcome {
             step_id: step.id.clone(),
@@ -282,6 +316,10 @@ fn spawn_step<R: Runtime>(
             state: StepState::Failed,
             attempts: 1,
             error: Some(error),
+            started_at_ms: 0,
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         },
     }
 }
@@ -372,6 +410,10 @@ pub fn spawn_workflow<R: Runtime>(
                 state: StepState::Pending,
                 attempts: 0,
                 error: None,
+                started_at_ms: 0,
+                kickoff_root_msg_id: None,
+                reply_body: None,
+                next_retry_at_ms: None,
             });
         }
     }
@@ -591,6 +633,10 @@ pub fn resume_workflow<R: Runtime>(
             state: StepState::Pending,
             attempts: 0,
             error: None,
+            started_at_ms: 0,
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         });
     }
     steps.sort_by_key(|o| {
@@ -1336,6 +1382,10 @@ mod tests {
             state,
             attempts: 1,
             error: None,
+            started_at_ms: 0,
+            kickoff_root_msg_id: None,
+            reply_body: None,
+            next_retry_at_ms: None,
         }
     }
 
