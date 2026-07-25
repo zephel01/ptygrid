@@ -568,6 +568,7 @@ pub enum JoinOnName {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowDef {
+    #[serde(default)]
     pub pattern: WorkflowPattern,
     #[serde(default)]
     pub steps: Vec<WorkflowStep>,
@@ -853,6 +854,29 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                         ));
                     }
                 }
+                // A broken `handoffTo` (target missing the matching
+                // `dependsOn` back-edge) leaves that target with an empty
+                // `depends_on`, which would otherwise masquerade as a second
+                // root below and mask the real error behind a generic
+                // "found 2" root-count message. Validate every declared
+                // `handoffTo` edge up front so the specific chain-mismatch
+                // error always wins over the root-count check.
+                for step in &wf.steps {
+                    if let Some(next) = &step.handoff_to {
+                        let next_step = wf
+                            .steps
+                            .iter()
+                            .find(|s| &s.id == next)
+                            .expect("handoffTo target existence already validated above");
+                        let next_deps = next_step.depends_on.as_deref().unwrap_or(&[]);
+                        if next_deps.len() != 1 || next_deps[0] != step.id {
+                            return Err(format!(
+                                "{ctx}: handoff step '{}' handoffTo '{}' but '{}' does not dependOn '{}'",
+                                step.id, next, next, step.id
+                            ));
+                        }
+                    }
+                }
                 let roots: Vec<&WorkflowStep> = wf
                     .steps
                     .iter()
@@ -877,19 +901,7 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                         "handoff chain walk only visits ids already known to be valid step ids",
                     );
                     match &step.handoff_to {
-                        Some(next) => {
-                            let next_step = wf.steps.iter().find(|s| &s.id == next).expect(
-                                "handoffTo target existence already validated above",
-                            );
-                            let next_deps = next_step.depends_on.as_deref().unwrap_or(&[]);
-                            if next_deps.len() != 1 || next_deps[0] != cur {
-                                return Err(format!(
-                                    "{ctx}: handoff step '{}' handoffTo '{}' but '{}' does not dependOn '{}'",
-                                    cur, next, next, cur
-                                ));
-                            }
-                            cur = next.as_str();
-                        }
+                        Some(next) => cur = next.as_str(),
                         None => break,
                     }
                 }
@@ -2437,5 +2449,188 @@ agents:
             "agents:\n  - name: a\n    cmd: x\n    close_on_exit: sometimes\n"
         )
         .is_err());
+    }
+
+    // ---- Phase 5.0.4: retry / timeout / condition / handoffTo / supervisor
+    // field-level and pattern-shape validation (validate_workflows). ----
+
+    const WF_AGENTS: &str =
+        "agents:\n  - name: a\n    cmd: \"a\"\n  - name: b\n    cmd: \"b\"\n  - name: c\n    cmd: \"c\"\n";
+
+    #[test]
+    fn workflow_retry_max_range_is_validated() {
+        let wf = |max: i32| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        retry:\n          max: {max}\n"
+            )
+        };
+        let err = parse_config(&wf(0)).unwrap_err();
+        assert!(err.contains("retry.max"), "error was: {err}");
+        let err = parse_config(&wf(11)).unwrap_err();
+        assert!(err.contains("retry.max"), "error was: {err}");
+        assert!(parse_config(&wf(1)).is_ok());
+        assert!(parse_config(&wf(10)).is_ok());
+    }
+
+    #[test]
+    fn workflow_retry_backoff_ms_range_is_validated() {
+        let wf = |backoff: u64| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        retry:\n          max: 3\n          backoffMs: {backoff}\n"
+            )
+        };
+        assert!(parse_config(&wf(60_000)).is_ok());
+        let err = parse_config(&wf(60_001)).unwrap_err();
+        assert!(err.contains("backoffMs"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_timeout_ms_range_is_validated() {
+        let wf = |timeout: u64| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        timeoutMs: {timeout}\n"
+            )
+        };
+        assert!(parse_config(&wf(100)).is_ok());
+        assert!(parse_config(&wf(86_400_000)).is_ok());
+        let err = parse_config(&wf(99)).unwrap_err();
+        assert!(err.contains("timeoutMs"), "error was: {err}");
+        let err = parse_config(&wf(86_400_001)).unwrap_err();
+        assert!(err.contains("timeoutMs"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_condition_requires_valid_regex() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n        dependsOn: [first]\n        condition: \"(\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("not a valid regex"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_condition_requires_exactly_one_dependency() {
+        let no_deps = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&no_deps).unwrap_err();
+        assert!(err.contains("exactly one dependsOn (found 0)"), "error was: {err}");
+
+        let two_deps = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n      - id: third\n        agent: c\n        dependsOn: [first, second]\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&two_deps).unwrap_err();
+        assert!(err.contains("exactly one dependsOn (found 2)"), "error was: {err}");
+
+        let one_dep = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n        dependsOn: [first]\n        condition: \"^ACCEPT\"\n"
+        );
+        assert!(parse_config(&one_dep).is_ok());
+    }
+
+    #[test]
+    fn workflow_condition_rejects_fan_out_on_conditional_step() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: build\n        agent: a\n        fanOut: 2\n      - id: gate\n        agent: b\n        dependsOn: [build]\n        fanOut: 2\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("declares both fanOut and condition"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_condition_rejects_dependency_with_fan_out() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: build\n        agent: a\n        fanOut: 3\n      - id: gate\n        agent: b\n        dependsOn: [build]\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("condition depends on fan-out step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_to_rejects_self_reference() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        handoffTo: only\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("handoffTo references itself"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_to_rejects_unknown_target() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        handoffTo: nope\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("not a step id"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_requires_exactly_one_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root1\n        agent: a\n      - id: root2\n        agent: b\n      - id: child\n        agent: c\n        dependsOn: [root1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("requires exactly one root step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_children_must_depend_on_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root\n        agent: a\n      - id: mid\n        agent: b\n        dependsOn: [root]\n      - id: stray\n        agent: c\n        dependsOn: [mid]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("must dependOn root step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_valid_shape_is_accepted() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root\n        agent: a\n      - id: child1\n        agent: b\n        dependsOn: [root]\n      - id: child2\n        agent: c\n        dependsOn: [root]\n"
+        );
+        assert!(parse_config(&yaml).is_ok());
+    }
+
+    #[test]
+    fn workflow_handoff_rejects_step_with_multiple_dependencies() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n      - id: b1\n        agent: b\n      - id: c1\n        agent: c\n        dependsOn: [a1, b1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("handoff is linear (max 1 dependsOn per step)"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_requires_exactly_one_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n      - id: b1\n        agent: b\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("requires exactly one root step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_chain_must_match_depends_on() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("does not dependOn"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_chain_must_cover_all_steps() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n      - id: orphan\n        agent: c\n        dependsOn: [a1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("chain covers 2 of 3 declared steps"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_valid_chain_is_accepted() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n        handoffTo: c1\n      - id: c1\n        agent: c\n        dependsOn: [b1]\n"
+        );
+        assert!(parse_config(&yaml).is_ok());
     }
 }
