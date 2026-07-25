@@ -21,6 +21,14 @@
 > 実行系配線は未完了のままで、下表 §1 の ❌ 判定は変わらず有効。詳細は
 > [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
 
+> 追記(2026-07-25、docs 同期): 同ブランチ作業ツリー上(未コミット)で `orchestrator.rs` に
+> `check_timeouts` / `apply_retry_policy` が実装され `advance_run` へ配線された。`timeoutMs`
+> 超過での kill+`Failed` 化、および `retry` policy の backoff 後の再起動(または新規 spawn)
+> が動くようになっているが、未コミット・未マージ・unit test 0 本・実機未検証であり、下表
+> §1 の `timeoutMs` / `retry:` 行の ❌ 判定は変わらず有効。既知の未解決ギャップ(retry 再起動
+> の一部経路で kickoff が再配送されない)を含め詳細は §1 該当行・§7.4、および
+> [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
+
 ---
 
 ## 1. 最初に: 実装状況マトリクス(最重要)
@@ -40,8 +48,8 @@
 | `fanOut` | 各 step | ✅ | ✅ | 実装済み。`>= 2` 必須、fan-out パターン以外では宣言不可 |
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
 | `joinOn: reply` | 各 step | ✅(パースは通る) | ❌ | 「kickoff への reply で完了」は**未実装**。exit 0 でも `AgentStatus::Done` でも完了扱いにならず、**step が永遠に RUNNING のまま止まる可能性がある**。現状は使わないこと |
-| `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ❌ | 超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意 |
-| `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ❌ | `orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
+| `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ❌ | 超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `check_timeouts` が実装され `advance_run` に配線された(超過時に `kill_pty`+`Failed` 化)。ただし未コミット・未マージ・unit test 0 本・実機未検証のため、上記「安全装置にならない」という運用上の結論は変わらない |
+| `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ❌ | `orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `apply_retry_policy` が実装され `advance_run` に配線された(backoff 経過後に同一 step を `restart_session` または新規 `spawn_step` で再起動)。**未解決の既知ギャップ**: `restart_session` 経路は `deliver_kickoff` を呼ばない(新規 spawn 経路のみ再配送)ため、`kickoff` を書いた step が retry で再起動すると空の inbox で起動しうる。未コミット・未マージ・unit test 0 本・実機未検証でもあり、上記 ❌ は変わらず有効 |
 | `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ❌ | `orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
 | `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ❌ | `orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効 |
 | `onFailure: fail-fast` / `continue` | workflow 直下 | ✅ | ✅ | 実装済み。既定 `fail-fast` |
@@ -397,6 +405,15 @@ workflows を選ぶとよい。書き方は userguide.md 「チームプリセ�
 されるはず」という前提で運用しない**こと。現状、詰まった step を止めたいときは人間または
 integrator が `kill_pty` 相当の操作(ペインを手動で閉じる、または integrator に該当
 セッションの停止を依頼)を行う必要がある。
+
+> 追記(2026-07-25、docs 同期、work-tree 未コミット): `timeoutMs` / `retry:` については
+> `track/e-orch-5.0.4` 作業ツリー上(未コミット)で `check_timeouts` / `apply_retry_policy` が
+> 実装され配線されたため、「一切参照されない」は当時点の記述であり厳密には変わりつつある。
+> ただし (a) 未コミット・`main` 未マージ、(b) unit test 0 本・実機未検証、(c) retry の
+> `restart_session` 経路は `kickoff` を再配送しない既知のギャップがあり retry 後に空の
+> inbox で再起動されうる、という3点から、上記の運用結論(保険にならない前提で運用しない
+> こと)は変わらず有効。詳細は §1 表の該当行と [CONTRACT.md](../CONTRACT.md)「Phase 5.0
+> 追加契約」を参照。
 
 ---
 

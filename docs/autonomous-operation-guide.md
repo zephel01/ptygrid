@@ -280,6 +280,18 @@ commit `6bad859`(`track/e-orch-5.0.4`)でコミット済み — 「作業ツリ�
 は変わらない。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」および
 [ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1 を参照。)
 
+(2026-07-25 追記(docs 同期): 同ブランチ作業ツリー上(未コミット)で `check_timeouts` /
+`apply_retry_policy` が実装され、`orchestrator.rs` の tick に配線された — `timeoutMs`
+超過での kill+`Failed` 化、および `retry` policy の backoff 経過後の再起動(または新規
+spawn)が動くようになっている。ただし (a) 同ブランチにも未コミット・`main` 未マージ、
+(b) unit test 0 本・実機未検証、(c) retry 再起動が既存セッションを再利用する経路
+(`restart_session`)では `kickoff` が再配送されない既知のギャップがあり、`kickoff` を
+書いた step が retry で再起動すると空の inbox で起動しうる、という3点により、本節冒頭の
+結論(retry/timeout/reply 完了判定に基づく自動リカバリは存在しない)は変わらない。
+「timeoutMs / retry を書けば安全装置になる」という前提で運用しないことは、特に (c) の
+ため現時点でも重要。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」および
+[ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1・§7.4 を参照。)
+
 ---
 
 ## 10. 1日を回すためのチェックリスト

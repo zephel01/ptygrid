@@ -1639,6 +1639,31 @@ team_presets:
 > 未追加）。したがって実行系の retry / timeout / condition / handoffTo / `join_on: reply`
 > 配線は直前の追記から変わらず未完了・未承認のままであり、本追記は internal ヘルパーの
 > 進捗記録に留まる。
+> 追記（2026-07-25、続報3）: `track/e-orch-5.0.4` 作業ツリー上（未コミット、`orchestrator.rs`
+> +162/-6。`config.rs` の同時点の差分は `validate_workflows` 向けテスト追加のみで契約に
+> 影響なし）で `check_timeouts` と `apply_retry_policy` の2関数が新設され、`advance_run` の
+> tick に `detect_completions` の直後・fail-fast cascade の前として配線された。
+> `check_timeouts` は `Running` 中の step が `timeoutMs` を超過すると `kill_pty` +
+> `StatusView::forget` の上で `Failed`（`error: "timed out after {timeoutMs}ms"`）へ遷移させる
+> （`started_at_ms==0` の未 spawn step は対象外）。`apply_retry_policy` は `retry` を持つ
+> `Failed` step について、初回検出時に `retry::allows_another(attempts, policy)` が真なら
+> `retry::due_at` で `next_retry_at_ms`（backoff 期限）を設定し、期限経過後に同一 `step_id` を
+> in-place で再起動する: `session_id` があれば `restart_session`（成功で `Running` ・
+> `attempts+=1` ・ `started_at_ms` 更新 ・ `error` クリア。失敗時は `error` を上書きし
+> `next_retry_at_ms=None` として予算が残っていても即終端＝再試行しない）、`session_id` が
+> 無ければ `spawn_step` で新規 spawn し `deliver_kickoff` する。`failfast_targets` は
+> `Failed` 判定に `is_terminal` ガードを追加し、backoff 待ち中の `Failed` が fail-fast を
+> 誤発火させないようにした。**pin `design-5.0.4` が指摘し本追記時点でも未修正の既知ギャップ**:
+> `restart_session` 経路は `deliver_kickoff` を呼ばない（新規 spawn 経路のみ再配送）ため、
+> `kickoff` を書いた step が retry で再起動すると空の inbox で起動しうる。加えて
+> `check_timeouts` / `apply_retry_policy` の unit test は本追記時点で 0 本、同ブランチにも
+> 未コミット・`main` 未マージ・実機検証未実施である。`pattern: supervisor` / `handoff` の
+> spawn 時 gate、`dep_satisfied` の `Count(n)` / `Reply` 判定、`finalize_state` の
+> セマンティクス（`Skipped` / `Cancelled` を含む新状態への未対応）、`detect_completions` の
+> route3（reply）、`spawn_ready` の condition/handoff 前置、`mod condition` / `mod handoff` は
+> いずれも直前の追記から変わらず未着手・未配線のままである。したがって「実行系の retry /
+> timeout / condition / handoffTo / `join_on: reply` 配線は未完了・未承認」という結論そのもの
+> は変わらない — 本追記は retry/timeout の2関数が着地した事実のみを記録する。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
