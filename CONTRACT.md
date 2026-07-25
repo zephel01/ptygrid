@@ -1709,6 +1709,145 @@ team_presets:
 > `git status` 上も `orchestrator.rs` / `session.rs` は引き続き変更済み・未コミットのまま
 > である。したがって「実行系の配線は未完了・未承認」という結論は変わらない。詳細は
 > [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1 の該当追記を参照。
+> 追記（2026-07-25、続報7）: **Phase 5.0.4 実行系の配線が着地した。** 続報3〜続報6が
+> 一貫して結論として置いていた「実行系（retry 再試行 / timeout 強制 / condition 評価による
+> スキップ / handoffTo チェイン / `join_on: reply` 完了判定）は未完了・未承認」は、本追記の
+> 時点で**解消**する。断面は `track/e-orch-5.0.4` 作業ツリー上の**未コミット**差分。
+> `git diff HEAD` 実測で `orchestrator.rs` +2404/-188、`config.rs` +250/-22、
+> `commands.rs` +6/-2、`queen.rs` は MCP tool description 1 行のみ。ただしこの数字には
+> 本追記の作業に**先行する**同ツリー上の未コミット分（HEAD から作業開始時点の断面まで
+> `orchestrator.rs` +562/-23、`config.rs` +59/-1）が含まれる。本追記が加えた分だけを取ると
+> `orchestrator.rs` +1840/-163、`config.rs` +191/-21 である（context 行の重複により
+> 単純な加算にはならない）。なお `session.rs` +32/-0 は本作業と無関係の既存差分であり、
+> 一切触っていない。`main` 未マージ・実機検証未実施であり、後述の「検証の限界」を必ず
+> 併せて読むこと。
+>
+> **(1) spawn 時ゲートの撤去。** `pattern: supervisor` / `handoff` の
+> `"pattern {Supervisor|Handoff} not implemented in MVO"` は削除され（同文字列は live source
+> 上 0 箇所。`commands.rs` の doc comment に旧仕様の記述が 2026-07-25 まで残っていたのも本
+> 追記と同時に修正済み。ただし git に commit されたままの `src-tauri/src/orchestrator.rs.bak`
+> は旧コードを保持しており、これは本作業の対象外の既存残骸である）、4 パターン全てが
+> 実行可能になった。ドライバは pattern に対して事実上ほぼ非依存で、
+> `WorkflowPattern` を match するのは `orchestrator::copies_for`（`fan-out` のみ `fanOut` 本数へ
+> 展開、他は 1）だけである。依存充足・join・`condition`・`handoffTo`・retry・timeout はすべて
+> step グラフのみから駆動される。したがって supervisor / handoff の「実装」の実体は、
+> 形状バリデーション（commit `6bad859` で既出）＋ 本追記の unblocking spawn であり、
+> pattern 別の実行経路は増えていない。
+>
+> **(2) `apply_retry_policy` の分割と tick 順序の確定。** 続報3が記録した
+> `apply_retry_policy` は `arm_retry_backoff`（`Failed` かつ retry 予算が残る step に
+> `next_retry_at_ms` を設定するだけ）と `fire_due_retries`（期限到来分を実際に再起動）へ
+> 分割された。`advance_run` の 1 tick（`DRIVER_TICK` = 200ms）の順序は以下 10 段で確定:
+> `detect_reply_completions`（新 route 3）→ `detect_completions` → `check_timeouts` →
+> `fire_due_retries` → `arm_retry_backoff` → `condition_targets` → `failfast_targets` →
+> `spawn_ready` → **`arm_retry_backoff`（2 回目）** → `finalize_state`。順序上の要点は3つ。
+> route 3 を最初に置くのは、既に返信済みの step を `detect_completions` / `check_timeouts` が
+> 生存ペインの failure として再分類するのを防ぐため。fire を arm より前に置くのは、同一 tick で
+> arm した期限がその tick で発火しないようにするため（`backoffMs` 未指定時は 0ms fallback の
+> ため、arm が先だと `due == now` で即発火してしまう）。arm を 2 回呼ぶのは、`spawn_ready` が
+> その tick で新たに作った spawn 失敗 `Failed` に、`finalize_state` が終端判定を下す前に
+> backoff を張らせるため（1 回目の arm はその `Failed` の存在前に走り終えている）。
+>
+> **(3) 続報3の既知ギャップ2件の解消、および「unit test 0 本」の訂正。**
+> 続報3が pin `design-5.0.4` 由来として記録した「`restart_session` 経路は `deliver_kickoff` を
+> 呼ばないため `kickoff` を書いた step が retry で空 inbox 起動しうる」ギャップは解消した
+> — `fire_due_retries` は in-place restart 経路でも `deliver_kickoff` を再実行し、
+> `attach_kickoff_result` が結果を outcome へ反映する（配送失敗時は古い root id を破棄する）。
+> 同じく続報3の「`check_timeouts` / `apply_retry_policy` の unit test は 0 本」も訂正する:
+> 本断面時点で `orchestrator.rs` のテストは 56 本、`config.rs` は 67 本であり、retry / timeout /
+> condition / handoff / reply-join の各断面はテストで覆われている（ただし後述のとおり
+> **本セッションではコンパイル・実行のいずれも行えていない**）。
+>
+> **(4) 代理決定（reversible、要レビュー）。** 実装中に CONTRACT.md が沈黙している論点を
+> 3 点、実装者判断で決めた。**決定A（最終形）**: `condition:` の唯一の依存先が reply を
+> 残さずに完了した場合（`reply_body == None`。`kickoff:` を持たない step か、`kickoff:` は
+> あるが agent が返信せず route 1 = PTY exit / route 2 = semantic `done` で完了した場合の
+> いずれも該当）、その step は `StepState::Failed` とする。作業中の一時案（`Skipped` +
+> 専用理由文字列）は破棄した — 決定B′ 下では `Skipped` は run を green にするため、
+> operator の config が構造的に評価不能（gate 対象に返信経路が無い）であるケースを成功として
+> 報告してしまう。`Pending` で wedge させる案も採らない（終端に到達しないため）。
+> なおこの `Failed` は retry を持つ step の再 spawn を誘発しないよう、`arm_retry_backoff` 側に
+> `attempts == 0`（= 一度も spawn されていない）ガードを置いて除外している。
+> **決定B′（決定B を上書き）**: `finalize_state` の「`Skipped` があれば run は `Failed`」は
+> **変更した** — `Skipped` は run 終了判定に対して**中立**になり、`finalize_state` は
+> `Failed | Cancelled` のみを見る。決定B（「変更しない・スコープ外」）は撤回する。理由は
+> `condition:` が declined ブランチを `Skipped` で表現するため、旧規則のままでは gate が
+> 使い物にならないこと。旧来の fail-fast 報告は失われない: fail-fast の `Skipped` は必ず
+> `Failed`/`Cancelled` の依存先を経由して到達するので、その hard failure 自体が
+> `run.steps` に残り run を red にする。**決定C**: `config.rs` の doc 括弧書き
+> 「(or, absent a reply, its tail output)」は実装せず削除した（返信が無い時にこそ
+> ring buffer が残っていない）。
+>
+> **(5) 挙動変更: 冪等 pane reuse の縮小。** 5.0.0 の
+> 「`fan-out` は copies>=2 のとき常に新規 spawn（冪等 reuse は copies==1 のみ）」に条件が
+> 1つ増えた。reuse は `copies == 1` **かつ** その agent のペインを同一 run の他 step が
+> 保持していない場合のみ行う（`agent_claimed_by_other_step`）。supervisor / handoff では
+> 複数 step が同じ agent を正当に名指すため、旧条件のままだと 2 番目の step が 1 番目の
+> ペインを黙って引き取り、1 つの session を 2 つの outcome が追跡して先行 step の exit が
+> 両方を完了させてしまう。「保持している」判定は `Running` に加え、**backoff を張った
+> `Failed`（`session_id` 付き）** も含む（`fire_due_retries` がそのペインへ復帰するため）。
+>
+> **(6) ロード時バリデーション 3 規則の追加**（`config.rs`、いずれも load 時 reject）:
+> ① `joinOn: reply` は同一 step に非空の `kickoff:` を要求する（返信すべき inbox thread が
+> 無ければ完了不能なため。空白のみの `kickoff:` も拒否）。② 同一 step での `fanOut` と
+> `handoffTo` の併用を拒否する。③ `handoffTo` の「次段が直前 step のみを `dependsOn` する」
+> 逆辺要求を、`handoff` パターン限定から**全パターン**へ引き上げた（従来 supervisor /
+> fan-out / pipeline では `handoffTo` が検証を素通りして実行時に無効化していた）。
+> これに伴い `WorkflowPattern::Handoff` 分岐内の同等チェックは今日の入力に対して到達不能に
+> なったが、線形 1:1 チェイン形状を明文化している唯一の箇所として残置している。
+>
+> **(7) resume ギャップ（`#[serde(skip)]`）。** `StepOutcome` の `reply_body` /
+> `kickoff_root_msg_id` / `next_retry_at_ms` は 3 つとも `#[serde(skip)]` であり、
+> `steps_json` に永続化されず `workflow-state` イベントにも現れない（wire 契約は不変）。
+> 結果として `resume_workflow` 後は: armed 済みの backoff 期限が失われ（次 tick で再 arm
+> される）、`kickoff_root_msg_id` を失った `joinOn: reply` step は再 spawn されるまで
+> 返信を相関できず、`reply_body` を失った upstream に依存する `condition:` step は
+> 「返信なし」＝決定A により `Failed` になりうる。とくに**ペイン上限で下流 step の spawn が
+> 待たされている間に resume が挟まると**、この窓が実際に開く。永続化は本断面では行っていない。
+>
+> **(8) `joinOn: reply` のプロトコルと残存レース。** reply-once-when-done である:
+> 合成 kickoff は「完了したら返信せよ」と依頼し、step は**最初に返信を観測した tick で**
+> 完了する。同一 tick に複数返信が着いた場合は古い順に結合するので「了解 → 回答」の形は
+> 拾えるが、**後続 tick に着いた返信は捨てられる**（step は既に `Succeeded` で走査対象外）。
+> 1 tick 待つ案は締切を 200ms 動かすだけで解にならない — 恒久解は明示的な回答終端マーカーの
+> 導入であり、それが入るまで workflow は「最初の返信＝回答」として書く必要がある。
+> 走査窓の上限も残る: 返信スキャンは生存中の kickoff thread ごとに 1 クエリを、その thread
+> 自身の root 直下から発行する（`list_inbox` が thread 絞り込みより前に SQL 側で `LIMIT` を
+> かけるため、単一 global floor では古い root と新しい root の間に積もった未 ack メッセージが
+> 新しい thread の返信を窓外へ押し出しうる。`joinOn: reply` step には timeout の救済もない）。
+> それでも 1 thread あたり `INBOX_REPLY_SCAN_LIMIT` = 200 件が硬い上限である。
+> **同一 workflow 名の並行 run は 1 つの mailbox（`queen:workflow/<name>`）を共有する**
+> （`workflow_mailbox` に run_id が入らず、`spawn_workflow` に重複名ガードも無い）ため、
+> 孤児メッセージを ack して回す GC は導入できない。MCP tool description にも
+> 「並行起動より join を優先せよ」の注意を明記した。
+>
+> **(9) 既知の限界: kickoff 配送失敗によるペイン孤児化。** `attach_kickoff_result` は
+> store の `send_inbox` 失敗時に outcome を `Failed` へ格上げするが、この関数は
+> `PtyManager` / `StatusView` を持たない 4 箇所から呼ばれるため、直前に開いたペインを
+> 閉じられない。step は既に `Running` でないので後続の route も回収せず、operator が閉じるまで
+> 残る。`retry` を書いた step は同一 session への in-place 復帰で回復する（`attempts` は
+> 常に 1 以上なので上記 `attempts == 0` ガードには掛からない）が、`retry` 無しの step は
+> 孤児のまま終端する。`send_inbox` の失敗が前提のため発生条件は狭いと判断して受容した。
+>
+> **(10) 旧記述の訂正: `any` / `n` join は兄弟をキャンセルしない。** 5.0.4 以前の
+> `JoinOn` doc は `any` が残りを CANCEL すると書いていたが、これは誤りである。join は
+> **下流 step が spawn できる時点**のみを決め、敗れた copy は自然終了まで走り続け、run は
+> 全 copy が終端するまで finalize しない（`all_terminal`）。`StepState::Cancelled` を書くのは
+> 明示的な `cancel_workflow` の 2 箇所だけで、in-flight 兄弟の協調キャンセルは**未実装**である。
+>
+> **(11) 検証の限界（重要）。** 本セッションの作業環境には cargo が無く、**コンパイルも
+> テスト実行も一度も行えていない**。代替として静的検証のみを実施した: 文字列 / raw 文字列 /
+> 文字リテラル / コメントを除去した上での brace・paren・bracket 平衡チェック（3 ファイルとも
+> 最終深さ 0、負値なし、最終 lexer 状態 code）、呼び出し側 arity 監査、`#[test]` 本数
+> （orchestrator 56 / config 67）と重複テスト名 0 件、`assert_eq!(_, true)` 0 件、
+> Rust 1.82 API（`Option::is_none_or`）不使用の確認、および fresh-context の Opus による
+> 敵対的レビュー 2 巡（算術は手計算で突き合わせ）。クレートは `-D warnings` でビルドされる
+> ため `dead_code` / `unused_*` はいずれも致命であり、この静的検証はそれらを狙って組んで
+> あるが、**型検査・借用検査・テストの実際の合否は一切保証されない**。したがって本追記は
+> 「配線が着地した」ことの記録であって、**承認済み・検証済みの断面ではない**。
+> commit・`main` マージ・実機 QA は未実施。ptygrid.yml 側の書き方・新規則・
+> `condition:` の 3 分岐・reply-once プロトコルの詳細は
+> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1・§7.4 の該当追記を参照。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
