@@ -95,6 +95,13 @@ workflows:
         kickoff: "<inbox に投函する初回メッセージ>"  # 任意だが強く推奨(§3.3)
 ```
 
+> 追記(2026-07-25、docs 同期、work-tree 未コミット): `track/e-orch-5.0.4` 作業ツリー上
+> (未コミット)で `WorkflowDef.pattern` に `#[serde(default)]` が追加され、`pattern:` を
+> 省略した workflow は(deserialize エラーにならず)既定の `pipeline` として扱われるように
+> なっている。上のサンプルの「必須」表記はこの行がコミット・マージされた時点で不正確になる
+> 見込み — 未コミット・未マージ・専用テスト無しの段階のため、現状は明示しておくことを推奨。
+> 詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」続報4を参照。
+
 `agent`(step)、`agents:`(定義参照)、`agent:`(team_presets メンバー)と紛らわしい名前が
 並ぶが、**workflow の step から起動できるのは `agents:` に定義された名前だけ**
 (許可リスト方式、`team_presets` と同じ思想)。`processes:` はワークフローの step にはできない。

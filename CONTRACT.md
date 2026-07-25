@@ -1664,6 +1664,16 @@ team_presets:
 > いずれも直前の追記から変わらず未着手・未配線のままである。したがって「実行系の retry /
 > timeout / condition / handoffTo / `join_on: reply` 配線は未完了・未承認」という結論そのもの
 > は変わらない — 本追記は retry/timeout の2関数が着地した事実のみを記録する。
+> 追記（2026-07-25、続報4）: 続報3で「`config.rs` の同時点の差分は `validate_workflows` 向け
+> テスト追加のみで契約に影響なし」とした評価を1点修正する。同じ `track/e-orch-5.0.4` 作業
+> ツリー上（未コミット）で `WorkflowDef.pattern` フィールドに `#[serde(default)]` が追加されて
+> いる。`WorkflowPattern` は元々 `#[default] Pipeline` を持つ enum のため、この1行により
+> `ptygrid.yml` の `workflows.<name>` から `pattern:` を省略しても deserialize エラーになら
+> ず `pipeline` 扱いになる（従来は必須フィールドで省略時エラー）。新設された retry /
+> timeout / condition / handoffTo / supervisor 系 unit test の多くが `pattern:` を書かない
+> YAML 断片を使っており、その通過に付随して必要になった変更で、この挙動自体を検証する専用
+> テストはない。未コミット・`main` 未マージ・実機未検証である点は他の断面と同じ。詳細は
+> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §2.1 の該当追記を参照。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
