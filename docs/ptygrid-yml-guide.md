@@ -29,6 +29,18 @@
 > の一部経路で kickoff が再配送されない)を含め詳細は §1 該当行・§7.4、および
 > [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
 
+> 追記(2026-07-25、docs 同期・続報): 直前2件の「work-tree 未コミット」追記のうち、
+> `WorkflowDef.pattern` の `#[serde(default)]` 追加(§2.1)と `validate_workflows` の
+> handoff チェイン不整合検出の検証順序変更(§1 handoff パターン行)は、commit `5d3c1b5`
+> (`track/e-orch-5.0.4`、`config.rs` のみ)としてコミットされ、「未コミット」は解消した。
+> 同コミットは `retry`/`condition`/`handoffTo`/`timeoutMs`/supervisor/handoff の
+> ロード時バリデーションを検証する unit test 18 本も新設した(このバリデーション自体は
+> 6bad859 で先にコミット済みだったが、専用テストは本コミット以前は0本だった)。一方、
+> `check_timeouts` / `apply_retry_policy`(`orchestrator.rs`)は本コミットの対象外
+> (diffstat 上 `config.rs` のみ)で、直前2件の追記が記す「未コミット・unit test 0 本」は
+> こちらには変わらず該当する。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」
+> 続報6を参照。
+
 ---
 
 ## 1. 最初に: 実装状況マトリクス(最重要)
@@ -43,7 +55,7 @@
 | pipeline パターン | `pattern: pipeline` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
 | fan-out パターン | `pattern: fan-out` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
 | supervisor パターン | `pattern: supervisor` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。ルート(`dependsOn` 無し)がちょうど1件・他の全 step がそのルートを `dependsOn` に含むこと、を要求) | ❌ | `spawn_workflow` 実行時に `"pattern Supervisor not implemented in MVO (lands in Phase 5.0.4)"` で **明示エラー**。形状が正しくても実行不可 |
-| handoff パターン | `pattern: handoff` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。各 step の `dependsOn` は最大1件・ルートがちょうど1件・`handoffTo` を辿った鎖に循環がないこと・鎖上の次段の `dependsOn` が直前 step 1件のみと一致すること・鎖が全 step を過不足なくカバーすること、を要求。2026-07-25 追記(docs 同期、work-tree 未コミット): チェイン不整合の検出を roots 計算より前に先出しするよう検証順序のみ変更 — 複数ルート+チェイン不整合が同時に起きる入力で、以前は汎用的な「ルート1件でない」エラーが先に出て具体的な原因を隠すことがあったが、以後は不整合の具体的エラーが優先される。受理/拒否の判定結果自体・ルール集合は不変) | ❌ | `spawn_workflow` 実行時に同上の明示エラー。形状が正しくても実行不可 |
+| handoff パターン | `pattern: handoff` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。各 step の `dependsOn` は最大1件・ルートがちょうど1件・`handoffTo` を辿った鎖に循環がないこと・鎖上の次段の `dependsOn` が直前 step 1件のみと一致すること・鎖が全 step を過不足なくカバーすること、を要求。2026-07-25 追記(docs 同期、work-tree 未コミット): チェイン不整合の検出を roots 計算より前に先出しするよう検証順序のみ変更 — 複数ルート+チェイン不整合が同時に起きる入力で、以前は汎用的な「ルート1件でない」エラーが先に出て具体的な原因を隠すことがあったが、以後は不整合の具体的エラーが優先される。受理/拒否の判定結果自体・ルール集合は不変。2026-07-25 追記(docs 同期): commit `5d3c1b5`(`track/e-orch-5.0.4`)でコミット済み(work-tree 未コミットは解消)) | ❌ | `spawn_workflow` 実行時に同上の明示エラー。形状が正しくても実行不可 |
 | `dependsOn` | 各 step | ✅ | ✅ | 実装済み。循環検出・未知 id 参照はロード時エラー |
 | `fanOut` | 各 step | ✅ | ✅ | 実装済み。`>= 2` 必須、fan-out パターン以外では宣言不可 |
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
@@ -101,6 +113,13 @@ workflows:
 > なっている。上のサンプルの「必須」表記はこの行がコミット・マージされた時点で不正確になる
 > 見込み — 未コミット・未マージ・専用テスト無しの段階のため、現状は明示しておくことを推奨。
 > 詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」続報4を参照。
+
+> 追記(2026-07-25、docs 同期・続報): 上記の `#[serde(default)]` は commit `5d3c1b5`
+> (`track/e-orch-5.0.4`)でコミット済み(work-tree 未コミットは解消、`main` へは未マージ)。
+> 上のサンプルの「必須」表記は既に不正確 — `pattern:` を省略した workflow は既定
+> `pipeline` として parse される。ただし、この挙動自体を直接検証する専用テストは同コミット
+> にも含まれない(新設された他フィールドの unit test が副次的に `pattern:` 省略 YAML を
+> 使っているのみ)。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」続報6を参照。
 
 `agent`(step)、`agents:`(定義参照)、`agent:`(team_presets メンバー)と紛らわしい名前が
 並ぶが、**workflow の step から起動できるのは `agents:` に定義された名前だけ**

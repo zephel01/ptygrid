@@ -1690,6 +1690,25 @@ team_presets:
 > 目的コードであり approve 済みの変更ではないため、本節では対象外として記録しない。実行系
 > （retry / timeout / condition / handoffTo チェイン / `join_on: reply` 完了判定）が
 > 未完了・未承認という結論は変わらない。
+> 追記（2026-07-25、続報6）: 続報4（`WorkflowDef.pattern` の `#[serde(default)]` 追加）と
+> 続報5（`validate_workflows` の `Handoff` 分岐における `handoffTo` チェイン不整合検出を
+> roots 計算より前に先出しする検証順序変更）が指していた `track/e-orch-5.0.4` 作業ツリー上の
+> 未コミット差分は、commit `5d3c1b5`（`track/e-orch-5.0.4`、`config.rs` のみ、+208/-13）として
+> コミットされ、続報4・続報5の「未コミット」はいずれも解消した。同コミットは同時に、
+> `validate_workflows` の Phase 5.0.4 断面（`retry.max`/`retry.backoffMs`/`timeoutMs` の
+> レンジ、`condition` の regex 妥当性・`dependsOn` 厳密1件・`fanOut` 非併用、`handoffTo` の
+> 自己参照・未知 id 拒否、`pattern: supervisor`/`handoff` の DAG 形状）を対象とする unit test
+> 18 本を新設した。これらの検証ルール自体は先行の commit `6bad859`（2026-07-24）で既に
+> コミット済みだったが、専用のテストは本コミット以前は0本だった。**ただし** 続報4が指摘した
+> 「`pattern:` 省略時にデフォルト `pipeline` が適用される」という挙動自体を直接検証する
+> 専用テストは、本コミットの新設18本にも含まれない（新設テストの多くが `pattern:` を省略した
+> YAML 断片を使っており、その通過に付随して必要だった変更という続報4の位置づけは変わらない）。
+> 実行系（`orchestrator.rs` の retry 再試行 / timeout 強制 / condition 評価によるスキップ /
+> handoffTo チェイン / `join_on: reply` 完了判定、および続報3が記録した `check_timeouts` /
+> `apply_retry_policy`）は本コミットの対象外（diffstat 上 `config.rs` のみ）であり、
+> `git status` 上も `orchestrator.rs` / `session.rs` は引き続き変更済み・未コミットのまま
+> である。したがって「実行系の配線は未完了・未承認」という結論は変わらない。詳細は
+> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1 の該当追記を参照。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
