@@ -83,6 +83,15 @@
 > したがって上の ✅ は「コードが書かれ配線された」ことを意味し、「動作が確認された」ことを
 > **意味しない**。ptygrid.yml を本番の workflow で書き換える前に、必ず `cargo test` と
 > 実機での 1 本流しを通すこと。
+>
+> **2026-07-25 さらに追記(CONTRACT.md 続報8): 上記のうちコンパイル・テストの部分は解除。**
+> commit `3bd9833` / `71d631a` として着地した後、実機で `cargo test`(lib 337 passed /
+> 0 failed、統合 14 passed / 0 failed)と `cargo clippy -- -D warnings`(警告ゼロ)が
+> **通過**した。よって「コンパイルもテスト実行も一度も行えていない」「未コミット」は
+> もはや当てはまらない。**ただし実機での workflow 1 本流し(実際に `spawn_workflow` を
+> 走らせて supervisor / handoff / reply join / condition が進行することの目視確認)は
+> 依然として未実施**であり、`main` 未マージも変わらない。上の ✅ が
+> 「動作が確認された」を意味しないという注意は、この 1 点においてまだ有効である。
 
 > [!WARNING]
 > `docs/inside/spec-phase5-0.md` はこの機能セットの**設計ドキュメント**であり、`retry` /

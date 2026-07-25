@@ -1849,6 +1849,47 @@ team_presets:
 > `condition:` の 3 分岐・reply-once プロトコルの詳細は
 > [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1・§7.4 の該当追記を参照。
 
+> 追記（2026-07-25、続報8）: **続報7 の「検証の限界」を部分的に解除する。**
+> 続報7 は当該断面を「一度もコンパイルされておらず `cargo test` も `cargo clippy` も
+> 実行していない」と記述したが、その後 commit `3bd9833`（実行系）/ `71d631a`（続報7 本体）
+> の断面に対して実機 macOS 上で qa を実施し、以下が確認された。続報7 §11 のうち
+> **コンパイル・テスト・lint に関する記述は本追記により失効する**。それ以外は失効しない。
+>
+> - `cargo test`: `Compiling ptygrid v0.5.6` → `Finished test profile`。
+>   lib unittests **337 passed / 0 failed / 0 ignored**、統合テスト
+>   `queen_compat_integration` **14 passed / 0 failed**、doc-tests 0。失敗ゼロ。
+>   続報3 が「unit test 0 本」とした点を続報7 が 56/67 に訂正したが、その 56/67 が
+>   実際にビルドされ実行されたことも、これで初めて確認された。
+> - `cargo clippy -- -D warnings`: `Finished dev profile`、警告ゼロで通過。したがって
+>   続報7 が明示的に懸念した「`-D warnings` 下で `dead_code` / `unused_*` /
+>   `unfulfilled_lint_expectations` が fatal になる」リスクは現実化しなかった。
+> - 5.0.4 実行系の新規テストが実際に走っていることの確認（いずれも ok）:
+>   `condition_targets_*` 3 本と `condition_matches_is_a_regex_and_fails_closed_on_a_bad_pattern`、
+>   `a_condition_skip_cascades_to_its_own_dependents`、`detect_reply_completions_*` 4 本、
+>   `arm_retry_backoff_*` 3 本、
+>   `fire_due_retries_runs_before_arm_retry_backoff_prevents_same_tick_storm`、
+>   `check_timeouts_kills_and_fails_only_steps_past_their_declared_timeout`、
+>   `supervisor_pattern_now_spawns_its_root`、`handoff_pattern_now_spawns_its_root`、
+>   `compose_kickoff_*` 2 本、`merge_reply_bodies_drops_blanks_and_clips_at_a_char_boundary`、
+>   `clip_never_exceeds_its_cap_even_below_the_marker_length`、
+>   `count_join_partial_success_now_finalizes_failed`、
+>   `agent_claimed_by_other_step_only_trips_on_a_live_sibling`、
+>   `session::tests::kill_pty_removes_slot_so_restart_fails`、および config 側の
+>   `workflow_reply_join_requires_a_kickoff` / `workflow_condition_*` / `workflow_handoff_to_*` /
+>   `workflow_supervisor_*`。
+>
+> **解除されないもの（重要）。** 実機での workflow 1 本流し — GUI もしくは Queen MCP から
+> `spawn_workflow` を実行し、supervisor / handoff / `joinOn: reply` / `condition:` /
+> `timeoutMs` / `retry:` が実際に期待どおり進行することの目視確認 — は**未実施**である。
+> 続報7 §7 の `#[serde(skip)]` による resume ギャップ（`reply_body` /
+> `kickoff_root_msg_id` / `next_retry_at_ms` が `steps_json` に載らない）、§8 の tick を
+> 跨いだ返信取りこぼしと同名 workflow の mailbox 共有、§9 の kickoff 失敗時の孤立 pane は、
+> いずれも unit test では再現しない実行時・再起動時の性質であり、依然として未検証である。
+> `main` 未マージも変わらない。続報7 §4 の代理決定 A′（返信の無い `condition:` は
+> `Failed`）と B′（`Skipped` は中立）は、テストが通ったことによって「正しい仕様である」
+> ことが示されたわけではない — テストは決定どおりに実装されていることを示すだけである。
+>
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
