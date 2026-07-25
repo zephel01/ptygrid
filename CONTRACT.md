@@ -1674,6 +1674,22 @@ team_presets:
 > YAML 断片を使っており、その通過に付随して必要になった変更で、この挙動自体を検証する専用
 > テストはない。未コミット・`main` 未マージ・実機未検証である点は他の断面と同じ。詳細は
 > [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §2.1 の該当追記を参照。
+> 追記（2026-07-25、続報5）: 同じ `track/e-orch-5.0.4` 作業ツリー上（未コミット）で
+> `validate_workflows` の `WorkflowPattern::Handoff` 分岐内の検証順序が変わった。従来は
+> `handoffTo` チェイン不整合（次段の `dependsOn` が直前 step 1件のみと一致しない）の検出が
+> root 集合確定後の chain walk 内でのみ行われていたため、不整合な `handoffTo` を持つ入力の
+> 一部では、その step が見かけ上「ルート無し」の別ルートに見えてしまい、より汎用的な
+> 「requires exactly one root step」エラーが先に発火して具体的な原因を隠すことがあった。
+> 本変更は同じチェックを roots 計算より前に全 `handoffTo` step に対して先出しで実行し、
+> 該当入力ではチェイン不整合の具体的エラーが root-count エラーより優先して返るようにする。
+> **受理/拒否の判定結果自体は変わらない**（対象入力は変更前後どちらも load 時エラーで
+> reject される）— 変わるのはエラーメッセージの選択のみで、`validate_workflows` が検証
+> するルール集合にも wire（JSON/イベント/MCP tools の入出力）にも影響しない。同時点の
+> 作業ツリー差分にはこの他、`orchestrator.rs` / `session.rs` 側に「TEMPORARY REVIEW
+> PROBE」と明記された一時的な調査用テストが含まれるが、これは検証未了・削除前提のデバッグ
+> 目的コードであり approve 済みの変更ではないため、本節では対象外として記録しない。実行系
+> （retry / timeout / condition / handoffTo チェイン / `join_on: reply` 完了判定）が
+> 未完了・未承認という結論は変わらない。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 

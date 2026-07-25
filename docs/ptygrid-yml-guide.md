@@ -43,7 +43,7 @@
 | pipeline パターン | `pattern: pipeline` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
 | fan-out パターン | `pattern: fan-out` | ✅ | ✅ | 実装済み(5.0.0 MVO) |
 | supervisor パターン | `pattern: supervisor` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。ルート(`dependsOn` 無し)がちょうど1件・他の全 step がそのルートを `dependsOn` に含むこと、を要求) | ❌ | `spawn_workflow` 実行時に `"pattern Supervisor not implemented in MVO (lands in Phase 5.0.4)"` で **明示エラー**。形状が正しくても実行不可 |
-| handoff パターン | `pattern: handoff` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。各 step の `dependsOn` は最大1件・ルートがちょうど1件・`handoffTo` を辿った鎖に循環がないこと・鎖上の次段の `dependsOn` が直前 step 1件のみと一致すること・鎖が全 step を過不足なくカバーすること、を要求) | ❌ | `spawn_workflow` 実行時に同上の明示エラー。形状が正しくても実行不可 |
+| handoff パターン | `pattern: handoff` | ✅(2026-07-24 追記: ロード時に DAG 形状バリデーションを追加。各 step の `dependsOn` は最大1件・ルートがちょうど1件・`handoffTo` を辿った鎖に循環がないこと・鎖上の次段の `dependsOn` が直前 step 1件のみと一致すること・鎖が全 step を過不足なくカバーすること、を要求。2026-07-25 追記(docs 同期、work-tree 未コミット): チェイン不整合の検出を roots 計算より前に先出しするよう検証順序のみ変更 — 複数ルート+チェイン不整合が同時に起きる入力で、以前は汎用的な「ルート1件でない」エラーが先に出て具体的な原因を隠すことがあったが、以後は不整合の具体的エラーが優先される。受理/拒否の判定結果自体・ルール集合は不変) | ❌ | `spawn_workflow` 実行時に同上の明示エラー。形状が正しくても実行不可 |
 | `dependsOn` | 各 step | ✅ | ✅ | 実装済み。循環検出・未知 id 参照はロード時エラー |
 | `fanOut` | 各 step | ✅ | ✅ | 実装済み。`>= 2` 必須、fan-out パターン以外では宣言不可 |
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
