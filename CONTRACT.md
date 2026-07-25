@@ -2,7 +2,7 @@
 
 > この文書は段階releaseごとの差分契約を時系列で保持する。前のPhaseと後のPhaseが競合する
 > 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 4.0。
-> 操作方法と現在仕様の要約は[docs/userguide.md](docs/userguide.md)を参照。
+> 操作方法と現在仕様の要約は[docs/guide/userguide.md](docs/guide/userguide.md)を参照。
 
 ## Phase 0 (基本PTY)
 
@@ -189,7 +189,7 @@ stdin 書込 → RCE 含む）を呼べた。これを塞ぐため以下を契�
 
 # Phase 2.1 追補 (ドッグフーディングのフィードバック反映)
 
-実運用（docs/troubleshooting.md）で判明した問題への対応。
+実運用（docs/guide/troubleshooting.md）で判明した問題への対応。
 
 1. **フォアグラウンドプロセスの可視化**: `SessionInfo` に `foreground?: string` を追加（そのPTYのフォアグラウンドプロセス名。取得不能時は省略）。`list_agents` の sessions に含める。ペイン内で手動起動された CLI（zsh の中の codex 等）を発見可能にする。
 2. **名前解決の拡張(当時)**: `read_output` / `send_message`の`agent`は「定義名 →
@@ -202,7 +202,7 @@ stdin 書込 → RCE 含む）を呼べた。これを塞ぐため以下を契�
 
 # Phase 3.0 追加契約（段階リリース基盤）
 
-Phase 3 は一括変更せず、[docs/inside/phase3.md](docs/inside/phase3.md) の順序で独立して
+Phase 3 は一括変更せず、`docs/inside/phase3.md`（git 管理外の内部資料）の順序で独立して
 リリースする。Phase 3.0 は内部構造とテスト基盤のみを変更し、Phase 0–2.1
 の IPC、設定スキーマ、UI挙動を一切変更しない。
 
@@ -1200,7 +1200,7 @@ type ConfigInfo = { path: string; dir: string; origin: ConfigOrigin; config: Con
 
 両エージェントはこの契約に**厳密に**従うこと。既存のコマンド/イベント/`ConfigInfo`は
 互換維持（本節はいずれも additive）。背景は
-[docs/inside/security-review-2026-07-16.md](docs/inside/security-review-2026-07-16.md)
+`docs/inside/security-review-2026-07-16.md`（git 管理外の内部資料）
 Finding 2（S2）/ Finding 4（S4）。
 
 ## config trust 境界（S2）
@@ -1284,7 +1284,7 @@ default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localh
 両エージェントはこの契約に**厳密に**従うこと。既存の `/mcp` 認証・`/hooks/v1/*` Bearer・
 `QUEEN_URL` 形式（`?token=`）・teams-backend は互換維持（本節は「トークンの出所」を
 非永続→永続へ替えるだけで、生成方式・検証ロジック・URL 形式は不変）。背景は
-[docs/inside/evaluation-2026-07-16.md](docs/inside/evaluation-2026-07-16.md) の
+`docs/inside/evaluation-2026-07-16.md`（git 管理外の内部資料）の
 「hook token 固定化」。
 
 ## 動機
@@ -1458,7 +1458,7 @@ type AgentStatusPayload = {
 
 複数エージェントの名前付きチーム構成を `ptygrid.yml` に宣言し、1操作で一括起動する。
 実体は**既存 allowlist spawn 経路の薄いラッパー**であり、新しい信頼境界・新しい
-プロトコルを導入しない。設計背景は docs/spec-team-presets.md。
+プロトコルを導入しない。設計背景は docs/spec/spec-team-presets.md。
 
 ## ptygrid.yml 拡張（トップレベル `team_presets:` ブロック、任意）
 
@@ -1559,7 +1559,7 @@ team_presets:
 # Phase 5.0 追加契約（Orchestrated & Remembering）
 
 > 状態: **5.0.0 (MVO) 実装済み（2026-07-22）** / 5.0.1 以降は設計のみ。
-> 本仕様は [docs/inside/spec-phase5-0.md](docs/inside/spec-phase5-0.md) を参照。
+> 本仕様は [docs/spec/spec-phase5-0.md](docs/spec/spec-phase5-0.md) を参照。
 > 5.0.0 実装範囲: `workflows:` スキーマ + parse 検証（循環検出・allowlist）、
 > pipeline / fan-out の spawn と DAG 進行ドライバ（300ms ポーリング、完了判定は
 > PTY exit(0) / AgentStatus==done の2経路、fail-fast で下流 Skipped）、
@@ -1673,7 +1673,7 @@ team_presets:
 > timeout / condition / handoffTo / supervisor 系 unit test の多くが `pattern:` を書かない
 > YAML 断片を使っており、その通過に付随して必要になった変更で、この挙動自体を検証する専用
 > テストはない。未コミット・`main` 未マージ・実機未検証である点は他の断面と同じ。詳細は
-> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §2.1 の該当追記を参照。
+> [ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) §2.1 の該当追記を参照。
 > 追記（2026-07-25、続報5）: 同じ `track/e-orch-5.0.4` 作業ツリー上（未コミット）で
 > `validate_workflows` の `WorkflowPattern::Handoff` 分岐内の検証順序が変わった。従来は
 > `handoffTo` チェイン不整合（次段の `dependsOn` が直前 step 1件のみと一致しない）の検出が
@@ -1708,7 +1708,7 @@ team_presets:
 > `apply_retry_policy`）は本コミットの対象外（diffstat 上 `config.rs` のみ）であり、
 > `git status` 上も `orchestrator.rs` / `session.rs` は引き続き変更済み・未コミットのまま
 > である。したがって「実行系の配線は未完了・未承認」という結論は変わらない。詳細は
-> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1 の該当追記を参照。
+> [ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) §1・§2.1 の該当追記を参照。
 > 追記（2026-07-25、続報7）: **Phase 5.0.4 実行系の配線が着地した。** 続報3〜続報6が
 > 一貫して結論として置いていた「実行系（retry 再試行 / timeout 強制 / condition 評価による
 > スキップ / handoffTo チェイン / `join_on: reply` 完了判定）は未完了・未承認」は、本追記の
@@ -1847,7 +1847,7 @@ team_presets:
 > 「配線が着地した」ことの記録であって、**承認済み・検証済みの断面ではない**。
 > commit・`main` マージ・実機 QA は未実施。ptygrid.yml 側の書き方・新規則・
 > `condition:` の 3 分岐・reply-once プロトコルの詳細は
-> [ptygrid-yml-guide.md](docs/ptygrid-yml-guide.md) §1・§2.1・§7.4 の該当追記を参照。
+> [ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) §1・§2.1・§7.4 の該当追記を参照。
 
 > 追記（2026-07-25、続報8）: **続報7 の「検証の限界」を部分的に解除する。**
 > 続報7 は当該断面を「一度もコンパイルされておらず `cargo test` も `cargo clippy` も
@@ -1922,7 +1922,7 @@ team_presets:
 # Phase 5.5 追加契約（Observable & Standards-Compliant）
 
 > 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
-> 本仕様は [docs/inside/spec-phase5-5.md](docs/inside/spec-phase5-5.md) を参照。
+> 本仕様は [docs/spec/spec-phase5-5.md](docs/spec/spec-phase5-5.md) を参照。
 > 対象 patch: 5.5.0 MCP RC 両立ルータ / 5.5.1 OTel + SQLite / 5.5.2 Cost + agent-cost / 5.5.3 Status Rings / 5.5.4 Waterfall + Dashboard。
 > 追記（2026-07-25）: 上記「状態: 未実装」は Phase 5.5 全体の初期記述であり、現在は patch
 > 5.5.0（Queen MCP RC 両立ルータ）に限り §5.5.1 の「実装状況（patch 5.5.0, 確定 —
@@ -1957,7 +1957,7 @@ team_presets:
   - `Sunset: Wed, 28 Jul 2027 00:00:00 GMT`
   - `Link: <https://modelcontextprotocol.io/spec/2026-07-28>; rel="deprecation"`
 
-  値は実カレンダーで検証済み（2026-07-28 = 火曜、2027-07-28 = 水曜）。[docs/inside/spec-phase5-5.md](docs/inside/spec-phase5-5.md) §3.6 の例示は曜日表記に誤りがあり（`Deprecation` 行が `Sat, 28 Jul 2027` 表記）、本節の値がその補正版（実装コメント `queen_compat/deprecation.rs` 参照）。ログは `deprecated_route` 警告を per-day dedupe で最大1行/日。
+  値は実カレンダーで検証済み（2026-07-28 = 火曜、2027-07-28 = 水曜）。[docs/spec/spec-phase5-5.md](docs/spec/spec-phase5-5.md) §3.6 の例示は曜日表記に誤りがあり（`Deprecation` 行が `Sat, 28 Jul 2027` 表記）、本節の値がその補正版（実装コメント `queen_compat/deprecation.rs` 参照）。ログは `deprecated_route` 警告を per-day dedupe で最大1行/日。
 - **RC top-level array**（batch）は 400 `batch_not_supported`（5.5.0 は single-request only）。
 - 応答 body の buffer 上限は 16 MiB（`echo_into_result` 埋込用。超過時は空応答— 壊れた応答よりは無応答が安全という判断）。`Content-Type: text/event-stream` は buffer せず passthrough。
 
@@ -1982,7 +1982,7 @@ team_presets:
 # Phase 6.0 追加契約（Secure & Auditable）
 
 > 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
-> 本仕様は [docs/inside/spec-phase6-0.md](docs/inside/spec-phase6-0.md) を参照。
+> 本仕様は [docs/spec/spec-phase6-0.md](docs/spec/spec-phase6-0.md) を参照。
 > 対象 patch: 6.0.0 Foundation / 6.0.1 Sandbox filesystem-only / 6.0.2 Sandbox strict / 6.0.3 Secrets keychain / 6.0.4 Secrets derived + proxy / 6.0.5 Replay UI + Export。
 > SQLite `PRAGMA user_version` を **3 → 4** へ bump（6.0.0 で `replays` / `secrets_audit` / `sandbox_events` 追加）。
 

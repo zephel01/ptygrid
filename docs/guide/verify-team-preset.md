@@ -1,6 +1,6 @@
 # 手動検証手順: Queen team preset（Phase 4.3 / v0.4.6）
 
-対象: [spec-team-presets.md](spec-team-presets.md) の実装（v0.4.6）。
+対象: [spec-team-presets.md](../spec/spec-team-presets.md) の実装（v0.4.6）。
 
 ---
 
@@ -329,11 +329,11 @@ E2E が通らない原因が ptygrid 側（配送されない・skip される�
 ## D. 結果の記録
 
 1. R1〜R3 と E2E（G章）の結果・G1〜G4 の合否を
-   [spec-team-presets.md](spec-team-presets.md) 8章の末尾に追記
+   [spec-team-presets.md](../spec/spec-team-presets.md) 8章の末尾に追記
    （使ったローカルモデル名・router 設定の要点も一行残す）
 2. エスカレーション既定パターンを spec 7章に反映（必要なら
    `example/team-preset/ptygrid.yml` の instructions も追随）
-3. [plan.md](plan.md) の Phase 4.3 残タスクから「実機偵察」を消し込む
+3. [plan.md](../design/plan.md) の Phase 4.3 残タスクから「実機偵察」を消し込む
 4. 挙動修正が必要になった場合は v0.4.7 として通常のリリース規律
    （CONTRACT → 実装 → テスト → タグ）で対応
 

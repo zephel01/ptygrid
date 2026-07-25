@@ -196,7 +196,7 @@ cwd 解決・Git パネル・Queen の project scope・セッション復元の�
 
 読み込んだファイルは監視されており（グローバル設定なら `~/.ptygrid`、起動フォルダ設定ならその
 フォルダを監視）、変更すると「Reload」トーストから再読込できます。
-サンプル: [ptygrid.example.yml](../ptygrid.example.yml)(注釈付き) / [example/](../example/README.md)(用途別)
+サンプル: [ptygrid.example.yml](../../ptygrid.example.yml)(注釈付き) / [example/](../../example/README.md)(用途別)
 
 ```yaml
 project: my-app
@@ -767,7 +767,7 @@ llama.cpp / ollama に向け(ルーティングは**プロセス単位の env** 
 > 言われた。手順: spawn_agent で "opus" を起動 → inbox で要約と試したことを送る →
 > await で回答を待って反映。」
 
-完全なサンプルは [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) を
+完全なサンプルは [example/team-preset/ptygrid.yml](../../example/team-preset/ptygrid.yml) を
 参照してください。CLI が同じ `claude` でも ptygrid は定義名でペインを区別し、Queen の
 MCP 登録(`-s user`)も1回で全ペインに効きます。
 
@@ -807,7 +807,7 @@ TUI のスピナーは経過秒数を更新し続けるため、出力が静止�
 Grokなど画面全体を頻繁に再描画するTUIに対しても、`read_output`はカーソル移動と消去を
 反映するため、過去の再描画を単純連結しません。それでもTUIが表示内容を更新し続ける間は
 完了判定が遅れる場合があります。`sent to #<id>`が出ていれば送信自体は成功しています。
-長時間待つ場合は成果物の更新も確認してください。詳細は`docs/troubleshooting.md`を参照してください。
+長時間待つ場合は成果物の更新も確認してください。詳細は`docs/guide/troubleshooting.md`を参照してください。
 
 ### 外部からスクリプトで操作する
 
@@ -843,4 +843,4 @@ Queenはlocalhost (`127.0.0.1`) のみにbindし、`spawn_agent`は読み込ん�
 
 - 実際のドッグフーディングで判明した罠(登録スコープ、サンドボックスの localhost 制限、
   TUI 出力の読み方、composer 二重入力など)は [troubleshooting.md](troubleshooting.md) にまとまっています。
-- 設計の背景・アーキテクチャは [design.md](design.md) を参照してください。
+- 設計の背景・アーキテクチャは [design.md](../design/design.md) を参照してください。

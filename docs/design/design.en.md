@@ -4,7 +4,7 @@
 
 Last updated: 2026-07-16 / Implementation baseline: Phase 3.9
 
-This document summarizes the current implementation structure and the design decisions to uphold when making changes. For the initial research and competitive positioning, see [competitive-landscape.en.md](competitive-landscape.en.md); for the exact IPC types and constraints, see [CONTRACT.md](../CONTRACT.md); and for how to operate the app, see [userguide.en.md](userguide.en.md).
+This document summarizes the current implementation structure and the design decisions to uphold when making changes. For the initial research and competitive positioning, see [competitive-landscape.en.md](competitive-landscape.en.md); for the exact IPC types and constraints, see [CONTRACT.md](../../CONTRACT.md); and for how to operate the app, see [userguide.en.md](../guide/userguide.en.md).
 
 ## 1. Goals and Boundaries
 
@@ -135,11 +135,11 @@ CPU treats one core as 100%, so multi-core workloads exceed 100%. Memory is the 
 
 ## 10. Release Status
 
-Phases 0 through 2.1 and Phases 3.0 through 3.9 are implemented. Phase 3.9 added, as Linux test support, native builds, Ubuntu CI, `.deb` / AppImage packaging, and PATH recovery on GUI launch. For the detailed gates, see [inside/phase3.md](inside/phase3.md).
+Phases 0 through 2.1 and Phases 3.0 through 3.9 are implemented. Phase 3.9 added, as Linux test support, native builds, Ubuntu CI, `.deb` / AppImage packaging, and PATH recovery on GUI launch. The detailed gates live in `docs/inside/phase3.md` (an internal document, not tracked in git).
 
 ## 11. Principles for Making Changes
 
-- Document IPC or MCP schema changes in [CONTRACT.md](../CONTRACT.md) first.
+- Document IPC or MCP schema changes in [CONTRACT.md](../../CONTRACT.md) first.
 - Do not implicitly create project data in the repository.
 - Do not perform destructive Git/worktree operations on a guess.
 - Do not automatically select or overwrite same-named sessions or stale revisions.

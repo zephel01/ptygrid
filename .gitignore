@@ -28,9 +28,9 @@ _OUTPUTS/
 # ptygrid session cleanup staging (files the device bridge cannot delete)
 _to_delete/
 
-# config
-/ptygrid.yml
-
 # personal working config for this repo (kept out of version control)
+# バックアップ(ptygrid.yml.bak-*)も同じ秘密を持ち回るので必ず一緒に除外する。
+# 公開用の設定例は ptygrid.example.yml / example/**/ptygrid.yml 側に置く。
 /ptygrid.yml
+/ptygrid.yml.bak-*
 .aider*

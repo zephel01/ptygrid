@@ -1,0 +1,358 @@
+# adaptive-orchestration — タスク分類 → worker 事前選抜 → Verifier 反復(Phase 5.7.0)
+#
+# 「難しい課題ほど多くのモデルに解かせる」のではなく、
+# 「課題の種類を先に分類して、その種類に強い1〜2体だけに解かせる」ための構成。
+# 外部の分類・集約 API には一切依存せず、ローカルLLM + 既存の Queen/team_presets
+# だけで同じ振る舞いを再現する(Rust 改修ゼロ、設定のみで成立する)。
+#
+# 3つの部品でできている:
+#
+#   (1) router エージェント — タスク説明を読んで種別を判定し、推奨 worker を
+#       JSON 1行で返すだけの分類係。coderouter 経由のローカルLLMなので
+#       分類コストは実質ゼロ。
+#   (2) routing_hints コメント表 — 「タスク種別 → 推奨 worker 順」の対応表。
+#       router がこの表を読んで選抜する。表の中身は総当たり(cost-opt-bakeoff)
+#       の実測で育てる。現状の順位は仮置きなので、自分の環境で測って上書きする。
+#   (3) plan-build-verify プリセット — Thinker(設計)/ Worker(実装)/
+#       Verifier(合否判定)の3ロール + ドライバ。品質は「worker を増やす」
+#       のではなく「Verifier の合格が出るまで反復する」ことで買う。
+#
+# 前提: Queen MCP の登録が済んでいること(multi-agent サンプルと同じ。
+# 1回の `-s user` 登録が全ペインに効く)。トークンはすべて環境変数参照に
+# してあるので、使う前に自分のシェルまたは systemd/launchd 側で設定すること。
+# 秘密の置き場所の詳細は docs/guide/secrets.md を参照。
+#
+# 関連ドキュメント:
+#   docs/guide/ptygrid-yml-guide.md      — agents / workflows / team_presets の構文
+#   docs/guide/autonomous-operation-guide.md — 反復ループの運用規約
+#   docs/spec/spec-team-presets.md       — team_presets の仕様
+
+project: adaptive-orchestration
+
+queen:
+  enabled: true
+  port: 39237
+
+agents:
+  # ------------------------------------------------------------------
+  # 基本層: ローカルLLM(coderouter 経由)と、判断が要るとき用の Opus
+  # ------------------------------------------------------------------
+  - name: local
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_BASE_URL: "${CODEROUTER_URL}"   # 例: http://127.0.0.1:3456
+      ANTHROPIC_AUTH_TOKEN: "${CODEROUTER_TOKEN}"
+    autostart: false
+
+  - name: opus
+    cmd: "claude"
+    cwd: "."
+    autostart: false
+
+  # ------------------------------------------------------------------
+  # (1) router — タスク分類係。この構成の入口。
+  #
+  # 実装や設計は一切させない。「種別」と「推奨 worker」だけを JSON で返す。
+  # 分類そのものは軽い作業なので、ローカルLLM(coderouter)に寄せてコストを
+  # ゼロにするのが要点。Phase 5.7.4 で `type: router` step としてエンジンに
+  # 入る予定だが、現状は普通のエージェント + inbox でそのまま機能する。
+  # ------------------------------------------------------------------
+  - name: router
+    cmd: >-
+      claude
+      "Queen MCP の inbox ツールで mailbox「router」宛のメッセージを読んで。
+      あなたはルーター(タスク分類係)。届いたタスク説明について、まず
+      ptygrid.yml 内の routing_hints コメント表を読み、タスク種別を
+      rust-implement / ui-svelte / debug-diagnose / algorithm / docs-write /
+      security-review / design / quality-critical のいずれかに分類する。
+      表の推奨順に従い、1行目に
+      {\"task_type\":\"<種別>\",\"workers\":[\"<第一候補>\",\"<第二候補>\"]}
+      の JSON を置いて reply_inbox で返し、2行目以降に分類根拠を1〜2文で
+      書いて作業終了。実装や設計はしない。"
+    cwd: "."
+    env:
+      ANTHROPIC_BASE_URL: "${CODEROUTER_URL}"   # local と同じ coderouter 経由 → 分類コストゼロ
+      ANTHROPIC_AUTH_TOKEN: "${CODEROUTER_TOKEN}"
+    autostart: false
+
+  # ------------------------------------------------------------------
+  # (3) T/W/V の3ロール — plan-build-verify から standby で起動される
+  # ------------------------------------------------------------------
+  - name: opus-planner              # Thinker: 設計のみ
+    cmd: >-
+      claude --model claude-opus-5
+      "Queen MCP の inbox ツールで mailbox「opus-planner」宛のメッセージを読んで。
+      あなたは設計担当。届いた指示に従い、実装方針(モジュール分割・
+      contract 追加・テスト戦略・エッジケース)を pins に短く書き出す。
+      実装コードは書かない。終わったら元メッセージに reply_inbox で
+      要約を返して作業終了。"
+    cwd: "."
+    autostart: false
+
+  - name: sonnet-coder              # Worker: 実装のみ(既定・安い段)
+    cmd: >-
+      claude --model claude-sonnet-5
+      "Queen MCP の inbox ツールで mailbox「sonnet-coder」宛のメッセージを読んで。
+      あなたは実装担当。pins にある設計方針に従ってコードとテストを書く。
+      cargo test / npm run check が通ることを確認したら、変更ファイル一覧を
+      reply_inbox で返して作業終了。"
+    cwd: "."
+    env:
+      # 「書きかけで応答が尽きる」対策。Claude Code は CLI 側で per-model の
+      # 出力上限をかけるため、長い変更では明示的に上げておく。ペインに
+      # 「response exceeded N output token maximum」が出て N が違う場合は
+      # その N に合わせて下げること(上げても無言で無効になる)。
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+    autostart: false
+
+  - name: opus-coder                # Worker: 難所担当(sonnet が2回詰まったら昇格)
+    cmd: >-
+      claude --model claude-opus-5
+      "Queen MCP の inbox ツールで mailbox「opus-coder」宛のメッセージを読んで。
+      あなたは難所担当の実装者。sonnet-coder が完遂できなかったタスクを
+      引き継ぐ。pins の設計方針と直前の書きかけ状態(git diff)を必ず確認して
+      から着手する。1関数=1commit で刻み、struct や enum を変更したら同一
+      応答内で全呼び出し側を更新し切る。ビルドが通らない状態で中断・終了
+      しない。完了したら reply_inbox で変更ファイル一覧を返して作業終了。"
+    cwd: "."
+    env:
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+    autostart: false
+
+  - name: opus-reviewer             # Verifier: 合否判定のみ
+    cmd: >-
+      claude --model claude-opus-5
+      "Queen MCP の inbox ツールで mailbox「opus-reviewer」宛のメッセージを読んで。
+      あなたは検証担当。変更を敵対的に検証し、reply_inbox の1行目を必ず
+      {\"verdict\":\"ACCEPT\"} または
+      {\"verdict\":\"REVISE\",\"diagnosis\":\"<要約>\"} で始めて返す。
+      マージはしない。"
+    cwd: "."
+    autostart: false
+
+  # ------------------------------------------------------------------
+  # (2) 総当たり用の worker 群 — routing_hints 表を実測で育てるための4体。
+  #
+  # worktree: enabled は同じ課題を4体に同時実装させてもブランチが衝突しない
+  # ようにするため(ptygrid が ptygrid/<name>/... のロック済みブランチを
+  # 自動生成する)。
+  #
+  # 重要: トークンは必ず環境変数参照にすること。ここに直書きすると
+  # リポジトリに秘密が入る。詳細は docs/guide/secrets.md。
+  # ------------------------------------------------------------------
+  - name: grok-worker
+    cmd: "grok"
+    cwd: "."
+    autostart: false
+    worktree:
+      enabled: true
+      base: HEAD
+
+  - name: glm-worker
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic"
+      ANTHROPIC_AUTH_TOKEN: "${GLM_TOKEN}"
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "glm-4.7"
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2"
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2"
+      API_TIMEOUT_MS: "3000000"
+    autostart: false
+    worktree:
+      enabled: true
+      base: HEAD
+
+  - name: qwen-worker
+    cmd: "claude"
+    cwd: "."
+    env:
+      ANTHROPIC_BASE_URL: "${QWEN_BASE_URL}"
+      ANTHROPIC_AUTH_TOKEN: "${QWEN_TOKEN}"
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "qwen3.6-flash"
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "qwen3.8-max-preview"
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "qwen3.8-max-preview"
+      API_TIMEOUT_MS: "3000000"
+    autostart: false
+    worktree:
+      enabled: true
+      base: HEAD
+
+  - name: codex-worker
+    cmd: "codex"
+    cwd: "."
+    autostart: false
+    worktree:
+      enabled: true
+      base: HEAD
+
+  # ------------------------------------------------------------------
+  # qa — 自動テストゲート(LLM ではなく素のシェルプロセス)
+  #
+  # 「テストが通った」という LLM の自己申告を機械的事実に置き換えるペイン。
+  # workflow の step 完了判定は「PTY exit 0」なので、この agent を挟むだけで
+  # 緑でなければ後続 step が走らない fail-fast ゲートになる。
+  # コマンドは自分のプロジェクトのものに置き換えて使うこと。
+  # ------------------------------------------------------------------
+  - name: qa
+    cmd: >-
+      sh -c 'set -x;
+      cargo test --manifest-path src-tauri/Cargo.toml &&
+      cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings &&
+      npm run check'
+    cwd: "."
+    autostart: false
+
+# === routing_hints(Phase 5.7.0: 人間可読コメント表)===
+#
+# 「タスク種別 → 推奨worker順」の表。router がこの表を読んで worker を
+# 事前選抜する。Phase 5.7.4 で機械可読スキーマ化して `type: router` step の
+# 分類プロンプトに注入する予定だが、現状は人間(またはドライバ役のペイン)と
+# router が参照するコメントとして運用する。
+#
+# 作り方: 下の cost-opt-bakeoff で同じ課題を4体に並列実装させ、
+# 成否・品質・コスト・速度を比較して表を更新する。総当たりは実測データの
+# 収集、選抜が本番運用 — という役割分担。
+#
+# 注意: 下表の順位は「仮置き」を含む。自分の環境・自分のコードベースで
+# 測った結果で上書きしてから使うこと。そのまま信用する表ではない。
+#
+#   タスク種別          | 推奨worker順(左が第一候補)      | 備考
+#   -------------------|--------------------------------|------------------------------
+#   rust-implement     | codex-worker > glm-worker      | 型システム相性は実測で要更新
+#   rust-driver(状態機械)| opus-coder(固定)              | 長い状態機械は安い段だと
+#                                                       | 書きかけ停止しやすい
+#   ui-svelte          | glm-worker > qwen-worker       | CSS 込みの一発生成力を比較
+#   debug-diagnose     | opus > grok-worker             | 原因究明は精度優先
+#   algorithm          | qwen-worker > codex-worker     | 数理系。実測サンプル不足
+#   docs-write         | glm-worker > qwen-worker       | 和文の自然さで比較
+#   security-review    | opus(固定)                     | レビューは安くしない(設計判断)
+#   design/architecture| opus(固定)                     | 同上
+#   quality-critical   | bake-off + Verifier反復        | 外部APIに頼らず、多数決 +
+#                                                       | 反復で品質を買う(下記参照)
+#
+# quality-critical の考え方: 「品質モード」を外部の高価な集約 API で買うのでは
+# なく、cost-opt-bakeoff の fan-out(独立解を複数作る)+ plan-build-verify の
+# Verifier 反復(合格まで差し戻す)で代替する。品質は worker 数ではなく
+# 反復回数で買う、が設計判断。
+
+team_presets:
+  # === plan-build-verify(Thinker / Worker / Verifier の3ロール)===
+  #
+  # 既存の team_presets だけで T/W/V 反復を表現したもの(Rust 改修ゼロ)。
+  # Verifier 合格までの反復ループはまだエンジン側に無いので、lead の opus を
+  # 「ドライバ」にして send_inbox / await / reply_inbox の手動ループで回す。
+  # 運用手順は docs/guide/autonomous-operation-guide.md を参照。
+  #
+  # verdict 契約(文字列規約。将来 condition 正規表現の対象になる前提の書式):
+  #   Verifier の reply_inbox 本文は必ず1行目を次のどちらかで始める
+  #     {"verdict":"ACCEPT"}
+  #     {"verdict":"REVISE","diagnosis":"<差し戻し理由の要約>"}
+  #
+  # 使い方: 事前に Queen の set_pin で pins キー「pbv-task」に課題を書き、
+  # ツールバーの 👥 または `spawn_team {preset: "plan-build-verify"}` で起動。
+  plan-build-verify:
+    lead: opus
+    members:
+      - agent: opus            # ドライバ(司令塔): ループ制御と予算管理のみ
+        instructions: >-
+          あなたはドライバ(司令塔)。実装・設計・レビューは自分でやらない。
+          pins キー「pbv-task」の課題を読み、次のループを回す:
+          (1) opus-planner に inbox で設計を依頼し await で待つ。
+          (2) 設計を添えて sonnet-coder に実装を依頼し await で待つ。
+          (2.5) spawn_agent で「qa」を起動し、read_output で exit 0 で
+          終了したことを確認する(自動テストゲート)。失敗していれば
+          エラー出力の要点を添えて sonnet-coder に差し戻し (2) へ戻る
+          (この差し戻しも反復1回と数える)。同じタスクで sonnet-coder が
+          2回詰まったら opus-coder に同じ依頼をそのまま送って昇格させる。
+          (3) opus-reviewer に検証を依頼し await で待つ。reply の1行目が
+          {"verdict":"ACCEPT"} なら完了、{"verdict":"REVISE",...} なら
+          diagnosis を添えて実装担当に差し戻し (2) へ戻る。
+          予算: 反復は最大3回。3回で ACCEPT に達しない場合は打ち切り、
+          notify で人間に要点を通知し pins キー「pbv-escalation」に
+          状況を書いて停止する。各段階の結果は pins に短く記録すること。
+      - agent: opus-planner    # Thinker: 設計のみ、コードは書かない
+        standby: true
+      - agent: sonnet-coder    # Worker: 実装のみ
+        standby: true
+      - agent: opus-coder      # Worker: 難所担当(昇格先)
+        standby: true
+      - agent: opus-reviewer   # Verifier: 合否判定のみ
+        standby: true
+        instructions: >-
+          あなたは Verifier。実装担当の変更を敵対的に検証し
+          (cargo test / clippy / npm run check を自分で実行して確認)、
+          reply_inbox の1行目を必ず {"verdict":"ACCEPT"} または
+          {"verdict":"REVISE","diagnosis":"<要約>"} で始めること。
+          2行目以降に根拠を書く。ACCEPT の基準: ビルド緑・テスト緑・
+          既存仕様の非回帰・課題要件を満たす。マージはしない。
+    kickoff: >-
+      pins キー「pbv-task」を読んでください。無ければ notify で人間に
+      「pbv-task が未設定」と伝えて停止。あれば standby の
+      opus-planner / sonnet-coder / opus-reviewer を spawn_agent で起動し、
+      instructions に書いたドライバループを開始してください。
+
+workflows:
+  # ------------------------------------------------------------------
+  # cost-opt-bakeoff — routing_hints 表を実測で育てるための総当たり。
+  #
+  # 同じ課題を4つの worker に独立実装させ、コスト・速度・品質を人間が
+  # 比較する。設計とレビューは Opus に固定(判断が要る箇所は高くても
+  # 正確な方を残す)。
+  #
+  # 使い方:
+  #   1. 事前に set_pin で pins キー「cost-opt-task」にお題を書く
+  #      (小さく閉じたタスクほど比較しやすい)。
+  #   2. spawn_workflow {name: "cost-opt-bakeoff"} で起動。
+  #   3. design が終わったら4本の implement-* が並列で走る。それぞれ
+  #      ptygrid/<name>-worker/... の専用ブランチで独立に commit する。
+  #   4. 4つのブランチを見比べ、結果を routing_hints 表に書き戻す。
+  #      本 workflow 自体は verify/docs を持たない(比較が先、採用は別工程)。
+  # ------------------------------------------------------------------
+  cost-opt-bakeoff:
+    pattern: pipeline
+    onFailure: continue
+    steps:
+      - id: design
+        agent: opus-planner
+        kickoff: >-
+          pins キー「cost-opt-task」に書かれた課題を読んでください。
+          実装方針(変更対象ファイル・関数/コンポーネント単位の分割・
+          テスト観点)を pins キー「design-cost-opt」に短く書き出すこと。
+          実装コードは書かない。この方針は4体がそれぞれ独立に実装する
+          ための共通の設計図になる。
+      - id: implement-grok
+        agent: grok-worker
+        dependsOn: [design]
+        kickoff: >-
+          pins キー「design-cost-opt」の設計方針に従って実装してください。
+          テストが通ることを確認してから commit すること。ビルドが通らない
+          状態で中断・終了しない。完了したら reply_inbox で変更ファイル一覧と、
+          実装で迷った点があれば添えて報告してください。
+      - id: implement-glm
+        agent: glm-worker
+        dependsOn: [design]
+        kickoff: >-
+          pins キー「design-cost-opt」の設計方針に従って実装してください。
+          テストが通ることを確認してから commit すること。ビルドが通らない
+          状態で中断・終了しない。完了したら reply_inbox で変更ファイル一覧と、
+          実装で迷った点があれば添えて報告してください。
+      - id: implement-qwen
+        agent: qwen-worker
+        dependsOn: [design]
+        kickoff: >-
+          pins キー「design-cost-opt」の設計方針に従って実装してください。
+          テストが通ることを確認してから commit すること。ビルドが通らない
+          状態で中断・終了しない。完了したら reply_inbox で変更ファイル一覧と、
+          実装で迷った点があれば添えて報告してください。
+      - id: implement-codex
+        agent: codex-worker
+        dependsOn: [design]
+        kickoff: >-
+          pins キー「design-cost-opt」の設計方針に従って実装してください。
+          テストが通ることを確認してから commit すること。ビルドが通らない
+          状態で中断・終了しない。完了したら reply_inbox で変更ファイル一覧と、
+          実装で迷った点があれば添えて報告してください。

@@ -6,7 +6,7 @@
 
 この文書は現在の実装構造と、変更時に守る設計判断をまとめます。初期調査と競合上の
 位置づけは[competitive-landscape.md](competitive-landscape.md)、IPCの正確な型と制限は
-[CONTRACT.md](../CONTRACT.md)、操作方法は[userguide.md](userguide.md)を参照してください。
+[CONTRACT.md](../../CONTRACT.md)、操作方法は[userguide.md](../guide/userguide.md)を参照してください。
 
 ## 1. 目的と境界
 
@@ -176,11 +176,11 @@ CPUは1 coreを100%とするためmulti-core workloadは100%を超えます。me
 
 Phase 0〜2.1とPhase 3.0〜3.9は実装済みです。3.9でLinuxテスト対応としてnative build、
 Ubuntu CI、`.deb` / AppImage packaging、GUI起動時のPATH復元を追加しました。
-詳細なgateは[inside/phase3.md](inside/phase3.md)を参照してください。
+詳細なgateは `docs/inside/phase3.md`（git 管理外の内部資料）にあります。
 
 ## 11. 変更時の原則
 
-- IPCやMCP schema変更は先に[CONTRACT.md](../CONTRACT.md)へ追記する
+- IPCやMCP schema変更は先に[CONTRACT.md](../../CONTRACT.md)へ追記する
 - project dataをrepositoryへ暗黙作成しない
 - destructive Git/worktree操作を推測で行わない
 - 同名sessionやstale revisionを自動選択・自動上書きしない

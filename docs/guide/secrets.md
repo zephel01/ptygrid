@@ -2,7 +2,7 @@
 
 作成日: 2026-07-20 / 対象: 複数の AI CLI(aider / opencode / claude / pi 等)を1つの ptygrid.yml で束ねるときの、APIキーの置き場所。
 
-関連: [../ptygrid.example.yml](../ptygrid.example.yml)(注釈付き設定例) /
+関連: [../ptygrid.example.yml](../../ptygrid.example.yml)(注釈付き設定例) /
 [userguide.md](userguide.md)(`ptygrid.yml` の全体像) /
 [troubleshooting.md](troubleshooting.md)(GUI 起動で env が空になる件)。
 

@@ -584,7 +584,7 @@ pub enum JoinOnName {
     Reply,
 }
 
-/// Phase 5.0: one workflow declaration. See docs/spec-phase5-0.md §2.1.
+/// Phase 5.0: one workflow declaration. See docs/spec/spec-phase5-0.md §2.1.
 /// Field naming is camelCase in YAML (aligned with existing `spawn_agent` and
 /// `spawn_team` conventions) — `depends_on` here maps to `dependsOn` in YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

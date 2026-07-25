@@ -15,7 +15,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-v0.4.8-brightgreen)](#roadmap)
 
-[User Guide](docs/userguide.en.md) · [Design Document](docs/design.en.md) · [Linux / Windows Porting](docs/porting.en.md) · [Competitive Analysis](docs/competitive-landscape.en.md) · [Troubleshooting](docs/troubleshooting.en.md)
+[User Guide](docs/guide/userguide.en.md) · [Design Document](docs/design/design.en.md) · [Linux / Windows Porting](docs/design/porting.en.md) · [Competitive Analysis](docs/design/competitive-landscape.en.md) · [Troubleshooting](docs/guide/troubleshooting.en.md)
 
 <img src="docs/screenshot-phase0.4.5.png" width="1100" alt="ptygrid v0.4.5 running Claude Code ×2, Codex, and Grok across four panes. The left dock shows a per-pane semantic status list (Status / Git tabs); the bottom footer shows Queen, Teammates, CPU/memory, and pane count." />
 
@@ -74,7 +74,7 @@ Ask the Claude Code in one pane to "**read codex's output and summarize it**," a
 Prerequisites: Rust (rustup), Node.js 20+, Git, and the OS-specific Tauri dependencies.
 
 - macOS: Xcode Command Line Tools
-- Ubuntu / Debian: `libwebkit2gtk-4.1-dev` and others (see [Linux setup](docs/userguide.en.md#linuxubuntu--debian) for details)
+- Ubuntu / Debian: `libwebkit2gtk-4.1-dev` and others (see [Linux setup](docs/guide/userguide.en.md#linuxubuntu--debian) for details)
 
 ```bash
 git clone https://github.com/zephel01/ptygrid.git
@@ -106,7 +106,7 @@ processes:
     autorestart: on-failure
 ```
 
-The first time you load a project (a `ptygrid.yml` from the working folder or the launch folder), a **"Do you trust this folder?" confirmation** appears exactly once, so that autostart commands aren't run without your consent. Choosing "Trust and launch" remembers that folder from then on, and the confirmation no longer appears (the global config in `~/.ptygrid` is always trusted). For details, see "Trust confirmation" in [docs/userguide.en.md](docs/userguide.en.md).
+The first time you load a project (a `ptygrid.yml` from the working folder or the launch folder), a **"Do you trust this folder?" confirmation** appears exactly once, so that autostart commands aren't run without your consent. Choosing "Trust and launch" remembers that folder from then on, and the confirmation no longer appears (the global config in `~/.ptygrid` is always trusted). For details, see "Trust confirmation" in [docs/guide/userguide.en.md](docs/guide/userguide.en.md).
 
 ### Registering Queen with each CLI
 
@@ -126,7 +126,7 @@ grok mcp add -s user -t http queen "http://127.0.0.1:39237/mcp?token=<token>"
 url = "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
-For detailed usage, see the **[User Guide](docs/userguide.en.md)**, and for common pitfalls, see [Troubleshooting](docs/troubleshooting.en.md).
+For detailed usage, see the **[User Guide](docs/guide/userguide.en.md)**, and for common pitfalls, see [Troubleshooting](docs/guide/troubleshooting.en.md).
 
 ## 🧰 Tech Stack
 
@@ -160,7 +160,7 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the same change; for release progress, update [docs/inside/phase3.md](docs/inside/phase3.md); and for user-visible behavior, update the [User Guide](docs/userguide.en.md) as well.
+When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the same change; for release progress, update [docs/design/plan.md](docs/design/plan.md); and for user-visible behavior, update the [User Guide](docs/guide/userguide.en.md) as well.
 
 ## 🗺️ Roadmap
 
@@ -170,19 +170,19 @@ When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the s
 - [x] **Phase 3.0–3.8** — Git diff/commit, worktree isolation, logical resume, resource monitoring, Queen pins/notes/inbox/reply/await (18 tools)
 - [x] **Phase 3.9** — Linux test support (PATH restoration, Ubuntu CI, `.deb` / AppImage packaging)
 
-For the background on this direction, see the [Competitive Analysis](docs/competitive-landscape.en.md) (we chose the "coordinate on one screen" approach rather than a worktree-isolation one). Phase 3 proceeds feature by feature while preserving compatibility, following the [phased release plan](docs/inside/phase3.md).
+For the background on this direction, see the [Competitive Analysis](docs/design/competitive-landscape.en.md) (we chose the "coordinate on one screen" approach rather than a worktree-isolation one). Phase 3 proceeded feature by feature while preserving compatibility; the additive contract for each step is recorded in [CONTRACT.md](CONTRACT.md).
 
 ## 📚 Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/userguide.en.md](docs/userguide.en.md) | Installation, reading the UI, ptygrid.yml reference, and how to use Queen |
-| [docs/design.en.md](docs/design.en.md) | Design document (OSS research, stack selection, architecture) |
-| [docs/competitive-landscape.en.md](docs/competitive-landscape.en.md) | Competitive analysis of similar tools and positioning |
-| [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | Pitfalls found through real-world dogfooding, and their fixes |
-| [docs/inside/phase3.md](docs/inside/phase3.md) | The independent phased release plan for Phase 3, and its progress |
-| [docs/plan.md](docs/plan.md) | Work plan (current-status summary, next tasks, versioning conventions) |
-| [docs/porting.en.md](docs/porting.en.md) | Linux test-support status, Linux build/package steps, and the Windows porting plan |
+| [docs/guide/userguide.en.md](docs/guide/userguide.en.md) | Installation, reading the UI, ptygrid.yml reference, and how to use Queen |
+| [docs/design/design.en.md](docs/design/design.en.md) | Design document (OSS research, stack selection, architecture) |
+| [docs/design/competitive-landscape.en.md](docs/design/competitive-landscape.en.md) | Competitive analysis of similar tools and positioning |
+| [docs/guide/troubleshooting.en.md](docs/guide/troubleshooting.en.md) | Pitfalls found through real-world dogfooding, and their fixes |
+| [docs/README.md](docs/README.md) | Documentation index (full listing of guide / spec / design) |
+| [docs/design/plan.md](docs/design/plan.md) | Work plan (current-status summary, next tasks, versioning conventions) |
+| [docs/design/porting.en.md](docs/design/porting.en.md) | Linux test-support status, Linux build/package steps, and the Windows porting plan |
 | [CONTRACT.md](CONTRACT.md) | The backend ⇄ frontend IPC contract (for developers) |
 
 ## System Requirements

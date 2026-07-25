@@ -19,7 +19,7 @@
 > `6bad859`(`track/e-orch-5.0.4`)でコミット済み。「未コミット」は当時の状態を
 > 指す historical な記述であり現在は解消している。ただし `orchestrator.rs` の
 > 実行系配線は未完了のままで、下表 §1 の ❌ 判定は変わらず有効。詳細は
-> [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
+> [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
 
 > 追記(2026-07-25、docs 同期): 同ブランチ作業ツリー上(未コミット)で `orchestrator.rs` に
 > `check_timeouts` / `apply_retry_policy` が実装され `advance_run` へ配線された。`timeoutMs`
@@ -27,7 +27,7 @@
 > が動くようになっているが、未コミット・未マージ・unit test 0 本・実機未検証であり、下表
 > §1 の `timeoutMs` / `retry:` 行の ❌ 判定は変わらず有効。既知の未解決ギャップ(retry 再起動
 > の一部経路で kickoff が再配送されない)を含め詳細は §1 該当行・§7.4、および
-> [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
+> [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」の該当追記を参照。
 
 > 追記(2026-07-25、docs 同期・続報): 直前2件の「work-tree 未コミット」追記のうち、
 > `WorkflowDef.pattern` の `#[serde(default)]` 追加(§2.1)と `validate_workflows` の
@@ -38,7 +38,7 @@
 > 6bad859 で先にコミット済みだったが、専用テストは本コミット以前は0本だった)。一方、
 > `check_timeouts` / `apply_retry_policy`(`orchestrator.rs`)は本コミットの対象外
 > (diffstat 上 `config.rs` のみ)で、直前2件の追記が記す「未コミット・unit test 0 本」は
-> こちらには変わらず該当する。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」
+> こちらには変わらず該当する。詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」
 > 続報6を参照。
 
 ---
@@ -94,7 +94,7 @@
 > 「動作が確認された」を意味しないという注意は、この 1 点においてまだ有効である。
 
 > [!WARNING]
-> `docs/inside/spec-phase5-0.md` はこの機能セットの**設計ドキュメント**であり、`retry` /
+> `docs/spec/spec-phase5-0.md` はこの機能セットの**設計ドキュメント**であり、`retry` /
 > `timeoutMs` 実行 / `joinOn: reply` / supervisor / handoff を実装込みで説明している箇所がある。
 > spec は「最終形の設計」を書いたもので、「今何が動くか」は上の表と `CONTRACT.md` の
 > 「Phase 5.0 追加契約」節(状態: 5.0.0 実装済み、5.0.1 以降は設計のみ、と明記)を信じること。
@@ -133,14 +133,14 @@ workflows:
 > 省略した workflow は(deserialize エラーにならず)既定の `pipeline` として扱われるように
 > なっている。上のサンプルの「必須」表記はこの行がコミット・マージされた時点で不正確になる
 > 見込み — 未コミット・未マージ・専用テスト無しの段階のため、現状は明示しておくことを推奨。
-> 詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」続報4を参照。
+> 詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」続報4を参照。
 
 > 追記(2026-07-25、docs 同期・続報): 上記の `#[serde(default)]` は commit `5d3c1b5`
 > (`track/e-orch-5.0.4`)でコミット済み(work-tree 未コミットは解消、`main` へは未マージ)。
 > 上のサンプルの「必須」表記は既に不正確 — `pattern:` を省略した workflow は既定
 > `pipeline` として parse される。ただし、この挙動自体を直接検証する専用テストは同コミット
 > にも含まれない(新設された他フィールドの unit test が副次的に `pattern:` 省略 YAML を
-> 使っているのみ)。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」続報6を参照。
+> 使っているのみ)。詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」続報6を参照。
 
 `agent`(step)、`agents:`(定義参照)、`agent:`(team_presets メンバー)と紛らわしい名前が
 並ぶが、**workflow の step から起動できるのは `agents:` に定義された名前だけ**
@@ -200,7 +200,7 @@ workflows:
         agent: opus-planner
         kickoff: >-
           Phase 5.5.0「MCP 2026-07-28 RC 両立ルータ」の設計です。
-          docs/inside/spec-phase5-5.md の §3.1(M1)と §5(Contract)を読み、
+          docs/spec/spec-phase5-5.md の §3.1(M1)と §5(Contract)を読み、
           設計方針を pins キー「design-5.5.0」に書き出してください。
           設計のみでコードは書かない(ワーキングツリーを汚さない)。
       - id: implement
@@ -224,7 +224,7 @@ workflows:
         agent: sonnet-docs
         dependsOn: [verify]
         kickoff: >-
-          approve 済みの変更について CONTRACT.md と docs/userguide.md を
+          approve 済みの変更について CONTRACT.md と docs/guide/userguide.md を
           追記のみで更新してください。既存契約は破壊しない。
 ```
 
@@ -295,7 +295,7 @@ agents:
     cwd: "."
     autostart: false
     instructions: >-
-      あなたは Track の設計担当(Opus)。docs/inside/spec-phase5-5.md の該当節を読み、
+      あなたは Track の設計担当(Opus)。docs/spec/spec-phase5-5.md の該当節を読み、
       実装方針を pins に短く書き出す。実装コードは書かない。
 ```
 
@@ -468,7 +468,7 @@ integrator が `kill_pty` 相当の操作(ペインを手動で閉じる、ま�
 > ただし (a) 未コミット・`main` 未マージ、(b) unit test 0 本・実機未検証、(c) retry の
 > `restart_session` 経路は `kickoff` を再配送しない既知のギャップがあり retry 後に空の
 > inbox で再起動されうる、という3点から、上記の運用結論(保険にならない前提で運用しない
-> こと)は変わらず有効。詳細は §1 表の該当行と [CONTRACT.md](../CONTRACT.md)「Phase 5.0
+> こと)は変わらず有効。詳細は §1 表の該当行と [CONTRACT.md](../../CONTRACT.md)「Phase 5.0
 > 追加契約」を参照。
 
 > **追記(2026-07-25、続報7 — 本節の結論を差し替える)**: 4 フィールドすべて
@@ -507,6 +507,6 @@ npm run check   # svelte-check
 - [userguide.md](userguide.md) — 基本フィールド一覧、信頼確認、team_presets、Queen セットアップ
 - [troubleshooting.md](troubleshooting.md) — Queen MCP 接続・Inbox・pins conflict 等の実運用トラブル集
 - [autonomous-operation-guide.md](autonomous-operation-guide.md) — kickoff の書き方の鉄則、integrator の運用、障害分類
-- [inside/spec-phase5-0.md](inside/spec-phase5-0.md) — workflows の設計ドキュメント(§1 の警告を踏まえて読むこと)
-- [CONTRACT.md](../CONTRACT.md) 「Phase 5.0 追加契約」節 — 実装状況の一次情報
-- [ptygrid.example.yml](../ptygrid.example.yml) — 注釈付きの基本設定例(workflows は未収録、追記の余地あり)
+- [inside/spec-phase5-0.md](../spec/spec-phase5-0.md) — workflows の設計ドキュメント(§1 の警告を踏まえて読むこと)
+- [CONTRACT.md](../../CONTRACT.md) 「Phase 5.0 追加契約」節 — 実装状況の一次情報
+- [ptygrid.example.yml](../../ptygrid.example.yml) — 注釈付きの基本設定例(workflows は未収録、追記の余地あり)

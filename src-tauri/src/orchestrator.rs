@@ -6,7 +6,7 @@
 // path and no new trust boundary — anything a workflow can launch, a manual
 // `spawn_agent` could too.
 //
-// Wire contract: CONTRACT.md "Phase 5.0 追加契約". Design: docs/spec-phase5-0.md
+// Wire contract: CONTRACT.md "Phase 5.0 追加契約". Design: docs/spec/spec-phase5-0.md
 // (§2.1 "Workflow モデル", §3.1 "M3 Orchestrator 状態機械"). Phase 5.0.4 lands
 // the full pattern set: pipeline, fan-out, supervisor, handoff; `join_on:
 // all|any|N|reply`; per-step `retry`/`timeout_ms`; `condition:` predicates.

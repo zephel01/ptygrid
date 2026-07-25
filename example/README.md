@@ -16,6 +16,7 @@
 | [worktree/](worktree/ptygrid.yml) | エージェントごとに linked worktree で作業ツリーを分離 |
 | [teammates/](teammates/ptygrid.yml) | Claude Code の subagent/teammate をペインで観測（Phase 4.0/4.1） |
 | [team-preset/](team-preset/ptygrid.yml) | ローカルLLM主体 + クラウド standby のチームを 👥 で一括起動（Phase 4.3） |
+| [adaptive-orchestration/](adaptive-orchestration/ptygrid.yml) | タスクを分類して worker を事前選抜し、Verifier 合格まで反復させる（Phase 5.7.0）。router + routing_hints 表 + plan-build-verify + 総当たり bakeoff |
 
 各ファイルは省略可能なフィールドをコメントで残しています。既定値は
-[docs/userguide.md](../docs/userguide.md) の設定リファレンスを参照してください。
+[docs/guide/userguide.md](../docs/guide/userguide.md) の設定リファレンスを参照してください。

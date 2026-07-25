@@ -16,7 +16,7 @@ Claude Code / Codex / Grok をスプリットペインで同時に走らせ、�
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#動作環境)
 [![Status](https://img.shields.io/badge/status-v0.4.8-brightgreen)](#ロードマップ)
 
-[ユーザーガイド](docs/userguide.md) · [設計ドキュメント](docs/design.md) · [Linux / Windows移植](docs/porting.md) · [競合調査](docs/competitive-landscape.md) · [トラブルシューティング](docs/troubleshooting.md)
+[ユーザーガイド](docs/guide/userguide.md) · [設計ドキュメント](docs/design/design.md) · [Linux / Windows移植](docs/design/porting.md) · [競合調査](docs/design/competitive-landscape.md) · [トラブルシューティング](docs/guide/troubleshooting.md)
 
 <img src="docs/screenshot-phase0.4.5.png" width="1100" alt="ptygrid v0.4.5: Claude Code×2、Codex、Grokを4ペインで実行。左ドックに各ペインの意味的ステータス一覧（ステータス/Gitタブ）、下部フッターにQueen・Teammates・CPU/メモリ・ペイン数を表示している画面" />
 
@@ -77,7 +77,7 @@ session IDを指定します。
 前提: Rust (rustup), Node.js 20+, Git、およびOS別のTauri依存
 
 - macOS: Xcode Command Line Tools
-- Ubuntu / Debian: `libwebkit2gtk-4.1-dev`など（詳細は[Linuxセットアップ](docs/userguide.md#linuxubuntu--debian)）
+- Ubuntu / Debian: `libwebkit2gtk-4.1-dev`など（詳細は[Linuxセットアップ](docs/guide/userguide.md#linuxubuntu--debian)）
 
 ```bash
 git clone https://github.com/zephel01/ptygrid.git
@@ -115,7 +115,7 @@ processes:
 初めて読み込むプロジェクト（作業フォルダ／起動フォルダ由来の `ptygrid.yml`）では、`autostart` の
 コマンドを勝手に実行しないよう **「このフォルダを信頼しますか？」の確認**が一度だけ出ます。
 「信頼して起動」で以後そのフォルダは記憶され、確認は出ません（`~/.ptygrid` のグローバル設定は常に信頼済み）。
-詳細は [docs/userguide.md](docs/userguide.md) の「信頼確認」を参照。
+詳細は [docs/guide/userguide.md](docs/guide/userguide.md) の「信頼確認」を参照。
 
 ### Queen を各 CLI に登録する
 
@@ -138,7 +138,7 @@ grok mcp add -s user -t http queen "http://127.0.0.1:39237/mcp?token=<token>"
 url = "http://127.0.0.1:39237/mcp?token=<token>"
 ```
 
-詳しい使い方は **[ユーザーガイド](docs/userguide.md)** を、ハマりどころは [トラブルシューティング](docs/troubleshooting.md) を参照してください。
+詳しい使い方は **[ユーザーガイド](docs/guide/userguide.md)** を、ハマりどころは [トラブルシューティング](docs/guide/troubleshooting.md) を参照してください。
 
 ## 🧰 技術スタック
 
@@ -173,7 +173,7 @@ cargo clippy --all-targets --all-features
 ```
 
 IPC / MCP schemaを変更する場合は[CONTRACT.md](CONTRACT.md)、release進捗は
-[docs/inside/phase3.md](docs/inside/phase3.md)、user-visibleな操作は[ユーザーガイド](docs/userguide.md)も
+[docs/design/plan.md](docs/design/plan.md)、user-visibleな操作は[ユーザーガイド](docs/guide/userguide.md)も
 同じ変更で更新します。
 
 ## 🗺️ ロードマップ
@@ -184,20 +184,20 @@ IPC / MCP schemaを変更する場合は[CONTRACT.md](CONTRACT.md)、release進�
 - [x] **Phase 3.0–3.8** — Git diff/commit・worktree分離・logical resume・リソース監視・Queen pins/notes/inbox/reply/await(18 tools)
 - [x] **Phase 3.9** — Linuxテスト対応(PATH復元、Ubuntu CI、`.deb` / AppImage packaging)
 
-方向性の背景は [競合調査](docs/competitive-landscape.md) を参照(worktree 隔離系ではなく「同一画面で協調する系」を選んでいます)。
-Phase 3 は [段階リリース計画](docs/inside/phase3.md) に沿って、互換性を保ちながら機能単位で進めます。
+方向性の背景は [競合調査](docs/design/competitive-landscape.md) を参照(worktree 隔離系ではなく「同一画面で協調する系」を選んでいます)。
+Phase 3 は段階リリース計画に沿って、互換性を保ちながら機能単位で進めました（各段階の追加契約は [CONTRACT.md](CONTRACT.md) に記録）。
 
 ## 📚 ドキュメント
 
 | ドキュメント | 内容 |
 |---|---|
-| [docs/userguide.md](docs/userguide.md) | インストール・画面の見方・ptygrid.yml リファレンス・Queen の使い方 |
-| [docs/design.md](docs/design.md) | 設計ドキュメント(OSS 調査・スタック選定・アーキテクチャ) |
-| [docs/competitive-landscape.md](docs/competitive-landscape.md) | 類似ツールの競合調査とポジショニング |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | 実際のドッグフーディングで判明した罠と対処 |
-| [docs/inside/phase3.md](docs/inside/phase3.md) | Phase 3の段階独立リリース計画と進捗 |
-| [docs/plan.md](docs/plan.md) | 作業計画（現在地サマリ・次の作業・バージョニング規約） |
-| [docs/porting.md](docs/porting.md) | Linuxテスト対応状況、Linux build/package手順、Windows移植計画 |
+| [docs/guide/userguide.md](docs/guide/userguide.md) | インストール・画面の見方・ptygrid.yml リファレンス・Queen の使い方 |
+| [docs/design/design.md](docs/design/design.md) | 設計ドキュメント(OSS 調査・スタック選定・アーキテクチャ) |
+| [docs/design/competitive-landscape.md](docs/design/competitive-landscape.md) | 類似ツールの競合調査とポジショニング |
+| [docs/guide/troubleshooting.md](docs/guide/troubleshooting.md) | 実際のドッグフーディングで判明した罠と対処 |
+| [docs/README.md](docs/README.md) | ドキュメント索引（guide / spec / design の全一覧） |
+| [docs/design/plan.md](docs/design/plan.md) | 作業計画（現在地サマリ・次の作業・バージョニング規約） |
+| [docs/design/porting.md](docs/design/porting.md) | Linuxテスト対応状況、Linux build/package手順、Windows移植計画 |
 | [CONTRACT.md](CONTRACT.md) | backend ⇄ frontend の IPC 契約(開発者向け) |
 
 ## 動作環境

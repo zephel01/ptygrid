@@ -8,7 +8,7 @@ per-lead Unix socket RPC・env/PATH 注入・実 PTY teammate ペイン・フォ
 teammate-focus / teammate-fallback イベント・`teams_host_status` コマンド、フロントエンドの host
 teammate ペイン（確認付き close・focus 強調・Teammates パネル host セクション）まで配線済み。
 契約は CONTRACT.md「Phase 4.1 追加契約」「Phase 4.2 追加契約」を参照。
-関連: [design.md](design.md) · [inside/phase3.md](inside/phase3.md) · [competitive-landscape.md](competitive-landscape.md) · [CONTRACT.md](../CONTRACT.md)
+関連: [design.md](../design/design.md) · [competitive-landscape.md](../design/competitive-landscape.md) · [CONTRACT.md](../../CONTRACT.md) · `docs/inside/phase3.md`（git 管理外の内部資料）
 
 > 表記規約: 本書では **[公式]** = docs.claude.com / code.claude.com/docs で確認できた事実、
 > **[観測]** = cmux 等コミュニティ実装で確認された非公式挙動（Claude Code のバージョン変更で
@@ -47,7 +47,7 @@ lead の Claude Code が teammate / subagent を起動したとき、ptygrid に
 ### 1.3 cmux との関係
 
 cmux は tmux 互換シムで split-pane teammate を自ペインにホストする方式を実証済み（macOS 専用・
-Ghostty ネイティブ）。ptygrid は [competitive-landscape.md](competitive-landscape.md) の方針どおり
+Ghostty ネイティブ）。ptygrid は [competitive-landscape.md](../design/competitive-landscape.md) の方針どおり
 **端末プリミティブでは cmux と正面競争しない**。ptygrid の強みは Queen 型協調（config-as-code +
 許可リスト spawn + inbox/await）であり、本機能もその軸に沿って「公式 hooks で堅牢に観測 →
 opt-in で実 PTY ホスト」の順で設計する。
@@ -589,7 +589,7 @@ inside/phase3.md の流儀（各リリースは独立 release、既存契約を�
 - it2（iTerm2 CLI, iterm2 モード用）: https://github.com/mkusaka/it2
 
 ptygrid 内部:
-- [docs/design.md](design.md) / [docs/inside/phase3.md](inside/phase3.md) /
-  [docs/competitive-landscape.md](competitive-landscape.md) / [CONTRACT.md](../CONTRACT.md)
-- 調査レポート: [research/claude-code-teams-research.md](research/claude-code-teams-research.md),
-  [research/cmux-research.md](research/cmux-research.md)
+- [docs/design/design.md](../design/design.md) / [docs/design/competitive-landscape.md](../design/competitive-landscape.md) /
+  [CONTRACT.md](../../CONTRACT.md)
+- 調査レポート（いずれも git 管理外の内部資料）: `docs/research/claude-code-teams-research.md`,
+  `docs/research/cmux-research.md`

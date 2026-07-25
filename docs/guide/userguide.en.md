@@ -218,7 +218,7 @@ banner:
 
 Loaded files are watched (the global config watches `~/.ptygrid`; a launch-folder config watches that
 folder), and when you change them, you can reload from the "Reload" toast.
-Samples: [ptygrid.example.yml](../ptygrid.example.yml) (annotated) / [example/](../example/README.md) (by use case)
+Samples: [ptygrid.example.yml](../../ptygrid.example.yml) (annotated) / [example/](../../example/README.md) (by use case)
 
 ```yaml
 project: my-app
@@ -774,7 +774,7 @@ conditions** instead:
 > (3) a human says 'ask opus'. Procedure: spawn_agent \"opus\", send an inbox message with
 > a summary and what you tried, and await the reply."
 
-See [example/team-preset/ptygrid.yml](../example/team-preset/ptygrid.yml) for the full sample.
+See [example/team-preset/ptygrid.yml](../../example/team-preset/ptygrid.yml) for the full sample.
 Even though both panes run the same `claude` binary, ptygrid distinguishes them by definition
 name, and one `-s user` Queen MCP registration covers every pane.
 
@@ -816,7 +816,7 @@ Even for TUIs like Grok that frequently redraw the whole screen, `read_output` r
 clears, so it does not simply concatenate past redraws. Still, while the TUI keeps updating what it
 displays, the completion judgment can be delayed. If `sent to #<id>` appears, the send itself succeeded.
 When waiting a long time, also check whether the deliverables have been updated. See
-`docs/troubleshooting.md` for details.
+`docs/guide/troubleshooting.md` for details.
 
 ### Operating from a script, externally
 
@@ -853,4 +853,4 @@ definition names in the loaded `ptygrid.yml`. Since there is no authentication, 
 - The traps discovered through real dogfooding (registration scope, the sandbox's localhost restriction,
   how to read TUI output, composer double-input, and so on) are collected in
   [troubleshooting.md](troubleshooting.en.md).
-- For the design background and architecture, see [design.md](design.en.md).
+- For the design background and architecture, see [design.md](../design/design.en.md).

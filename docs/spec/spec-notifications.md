@@ -3,15 +3,15 @@
 作成日: 2026-07-17 / 状態: 実装済み（Phase 4.4.2）/ 対象: セッション終了・エージェント状態変化の外部通知
 
 関連: [spec-agent-status.md](spec-agent-status.md)（通知イベントの供給源: blocked/done 検出）/
-[design.md](design.md)（アーキテクチャ原則）/ [competitive-landscape.md](competitive-landscape.md)
-（「通知リング / 要承認ハイライト」バックログ）/ [plan.md](plan.md)（バージョニング）/
-[../CONTRACT.md](../CONTRACT.md)（IPC/MCP 契約）/
-[../ptygrid.example.yml](../ptygrid.example.yml)（注釈付き設定例）。
+[design.md](../design/design.md)（アーキテクチャ原則）/ [competitive-landscape.md](../design/competitive-landscape.md)
+（「通知リング / 要承認ハイライト」バックログ）/ [plan.md](../design/plan.md)（バージョニング）/
+[../CONTRACT.md](../../CONTRACT.md)（IPC/MCP 契約）/
+[../ptygrid.example.yml](../../ptygrid.example.yml)（注釈付き設定例）。
 
-実装: [../src-tauri/src/notifications.rs](../src-tauri/src/notifications.rs)（本体）/
-[../src-tauri/src/config.rs](../src-tauri/src/config.rs)（`notifications:` スキーマ）/
-配線元 [../src-tauri/src/agent_status.rs](../src-tauri/src/agent_status.rs)・
-[../src-tauri/src/session.rs](../src-tauri/src/session.rs)。
+実装: [../src-tauri/src/notifications.rs](../../src-tauri/src/notifications.rs)（本体）/
+[../src-tauri/src/config.rs](../../src-tauri/src/config.rs)（`notifications:` スキーマ）/
+配線元 [../src-tauri/src/agent_status.rs](../../src-tauri/src/agent_status.rs)・
+[../src-tauri/src/session.rs](../../src-tauri/src/session.rs)。
 
 ---
 
@@ -35,7 +35,7 @@ Discord / Telegram のチャット）へ**エッジトリガの通知**として
 
 通知は**新しい状態レイヤを足さない**。既存の2つの**エッジ**をそのまま外部へ中継するだけである。
 
-- **プロセス生死**（`SessionState`、[../CONTRACT.md](../CONTRACT.md) Phase 1）の `exited` 遷移。
+- **プロセス生死**（`SessionState`、[../CONTRACT.md](../../CONTRACT.md) Phase 1）の `exited` 遷移。
 - **意味的状態**（`AgentStatus`、[spec-agent-status.md](spec-agent-status.md)）の `blocked` / `done`
   への変化。
 
@@ -69,7 +69,7 @@ Discord / Telegram のチャット）へ**エッジトリガの通知**として
 | `needs-attention` | ● | ● | — | — | 「止まってたら教えて」 |
 | `all` | ● | ● | ● | ● | 全部（短いタスクを回す・監視したい） |
 
-判定は純関数 `should_send(level, event)`（[notifications.rs](../src-tauri/src/notifications.rs)）で、
+判定は純関数 `should_send(level, event)`（[notifications.rs](../../src-tauri/src/notifications.rs)）で、
 上表と1対1に対応する。
 
 ---
@@ -126,14 +126,14 @@ notifications:
 - チャネルの `level` は**そのチャネルの購読閾値**で、省略時はトップの `level` にフォールバックする。
   これにより「共有 Slack は critical で静かに、手元 Telegram は needs-attention で細かく」が成立する。
 - `webhook` / `bot_token` / `chat_id` は**verbatim 保存**し、送信時に `${VAR}` 展開する（`env` 値と同じ扱い、
-  [config.rs](../src-tauri/src/config.rs) `expand_vars`）。設定ファイルに秘密情報を直書きしなくてよい。
+  [config.rs](../../src-tauri/src/config.rs) `expand_vars`）。設定ファイルに秘密情報を直書きしなくてよい。
 - 前方互換: 未知のキーは無視（他の 4.x ブロックと同様）。`type` と `level` だけは閉じた列挙で、
   綴り間違いは明確な serde エラーになる。
 
 ### 4.2 有効化とリロード
 
 `load_config` のたびに `notifications::apply` が現在のブロックを managed state に差し替える
-（[commands.rs](../src-tauri/src/commands.rs)）。ファイル監視によるリロードでも即時反映され、
+（[commands.rs](../../src-tauri/src/commands.rs)）。ファイル監視によるリロードでも即時反映され、
 `enabled: false` / ブロック削除で state はクリアされる（再度有効化するまで無送信）。
 
 ### 4.3 バリデーション方針

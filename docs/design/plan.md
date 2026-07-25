@@ -4,8 +4,8 @@
 
 この文書は「いま何が終わっていて、次に何をやるか」と「バージョンの付け方」を
 1か所にまとめる作業計画である。Phase 3.x の詳細な実績とリリース規律は
-[inside/phase3.md](inside/phase3.md)、teams 機能の設計は
-[spec-claude-teams-panes.md](spec-claude-teams-panes.md)、方向性の背景は
+`docs/inside/phase3.md`（git 管理外の内部資料）、teams 機能の設計は
+[spec-claude-teams-panes.md](../spec/spec-claude-teams-panes.md)、方向性の背景は
 [competitive-landscape.md](competitive-landscape.md) を参照。
 
 ---
@@ -51,7 +51,7 @@ docs/inside のバグ/セキュリティ調査（teammate 分担レビュー）�
 | 認証トークンの永続化（`auth-tokens.json`、再起動後も再登録不要、再生成コマンド） | 0af8de4 |
 
 Defer/Skip 判定（u32 wrap 等の理論値、稀なレース、実験機能の DoS、S3 caller-id 等）は
-[docs/inside/evaluation-2026-07-16.md](inside/evaluation-2026-07-16.md) に整理（この文書は git 管理外）。
+`docs/inside/evaluation-2026-07-16.md`（git 管理外の内部資料）に整理。
 
 ### 実装済みの基盤
 
@@ -77,9 +77,9 @@ focus 強調・Teammates パネル host セクション・paneless 昇格・孤�
 ### Phase 4.3 — Queen team preset（方式C、Claude Code 内部に非依存）【v0.4.6 リリース済み】
 
 方針決定・実装・**リリース（v0.4.6 タグ）・実機偵察まで完了（2026-07-17）**。
-詳細仕様・設計差分・偵察ログは [spec-team-presets.md](spec-team-presets.md)、
+詳細仕様・設計差分・偵察ログは [spec-team-presets.md](../spec/spec-team-presets.md)、
 wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
-[verify-team-preset.md](verify-team-preset.md)。
+[verify-team-preset.md](../guide/verify-team-preset.md)。
 
 - 実装: config 検証 + `team_presets.rs` + Queen tool `spawn_team`（19本目）+ Tauri command +
   👥 チップ UI + example/team-preset。cargo test 210 / svelte-check 0 errors / build 通過
@@ -171,7 +171,7 @@ wire 契約は CONTRACT.md「Phase 4.3 追加契約」、検証手順は
 
 ## 5. Phase 5.0 / 5.5 / 6.0 の予約（未実装・設計のみ）
 
-詳細は [inside/phase5-6.md](inside/phase5-6.md) と 3 spec([inside/spec-phase5-0.md](inside/spec-phase5-0.md) / [inside/spec-phase5-5.md](inside/spec-phase5-5.md) / [inside/spec-phase6-0.md](inside/spec-phase6-0.md)) を参照。**先行実装は Phase 5.0 の MVO(Minimum Viable Orchestrator)**、それ以降は Track A/B/C/D の 4 並列(`ptygrid.yml` の `workflows:` セクション参照)。
+詳細は 3 spec([spec-phase5-0.md](../spec/spec-phase5-0.md) / [spec-phase5-5.md](../spec/spec-phase5-5.md) / [spec-phase6-0.md](../spec/spec-phase6-0.md)) と `docs/inside/phase5-6.md`（git 管理外の内部資料）を参照。**先行実装は Phase 5.0 の MVO(Minimum Viable Orchestrator)**、それ以降は Track A/B/C/D の 4 並列(`ptygrid.yml` の `workflows:` セクション参照)。
 
 ### 5.1 SQLite `PRAGMA user_version` 予約表
 
