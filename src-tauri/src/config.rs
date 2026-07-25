@@ -2,12 +2,13 @@
 // relative-cwd resolution, and the file watcher (notify) that emits
 // `config-changed` events per the Phase 1 contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -514,10 +515,21 @@ impl TeamMember {
     }
 }
 
-/// Phase 5.0: DAG orchestration pattern. `pipeline` and `fan-out` are the
-/// MVO bootstrap (5.0.0); `supervisor` and `handoff` land in 5.0.4 — they
-/// parse today but the state machine rejects execution with an explicit
-/// "not-yet-implemented" error until the completion patch.
+/// Phase 5.0: DAG orchestration pattern. `pipeline` and `fan-out` were the MVO
+/// bootstrap (5.0.0); `supervisor` and `handoff` became executable in 5.0.4 and
+/// all four now run. Two distinct things key off this value:
+///
+/// - SHAPE VALIDATION in `validate_workflows` below: `supervisor` demands
+///   exactly one root that every other step depends on, `handoff` demands a
+///   single linear chain, `fan-out` demands at least one step with `fanOut`
+///   (anywhere in the graph — a dependent satisfies it, not just a root), and
+///   `pipeline` forbids `fanOut` entirely.
+/// - COPY EXPANSION at runtime, in `orchestrator::copies_for`, which is the
+///   only place the orchestrator matches on the pattern: `fan-out` expands a
+///   step into `fanOut` parallel sessions, every other pattern yields exactly
+///   one. Everything else in the driver — dependency readiness, joins,
+///   `condition`, `handoffTo`, retry, timeouts — is driven purely by the step
+///   graph and is pattern-agnostic.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkflowPattern {
@@ -539,11 +551,19 @@ pub enum OnFailure {
     Continue,
 }
 
-/// Phase 5.0: fan-out join rule. `all` waits for every parallel step to
-/// SUCCEED; `any` completes on the first success and CANCELs the rest;
-/// numeric `n` completes on the n-th success (MVO ships all/any; `n` and
-/// `reply` land in 5.0.4). Untagged serde so YAML `joinOn: all` and
-/// `joinOn: 3` both work.
+/// Phase 5.0: fan-out join rule, consumed by `orchestrator::dep_satisfied`.
+/// `all` needs every parallel copy to SUCCEED; `any` is satisfied by the first
+/// success; numeric `n` by the n-th; `reply` completes the step itself on an
+/// inbox reply to its own kickoff thread. MVO (5.0.0) shipped all/any only;
+/// `n` and `reply` became executable in 5.0.4 and all four now run. Untagged
+/// serde so YAML `joinOn: all` and `joinOn: 3` both work.
+///
+/// NOTE, correcting the pre-5.0.4 wording here: `any` and `n` do NOT cancel the
+/// copies that have not finished. The join only decides when DEPENDENTS may
+/// spawn; the losing copies keep running to their own natural end and the run
+/// does not finalize until every copy is terminal (`orchestrator::all_terminal`).
+/// Cooperative cancellation of in-flight siblings is still unimplemented —
+/// `StepState::Cancelled` is written only by an explicit `cancel_workflow`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum JoinOn {
@@ -556,8 +576,11 @@ pub enum JoinOn {
 pub enum JoinOnName {
     All,
     Any,
-    /// Complete when an `inbox` reply to the step's kickoff arrives.
-    /// Not implemented in MVO — parses today, rejected at execution.
+    /// Complete when an `inbox` reply to the step's kickoff thread arrives,
+    /// sent by the step's own agent. Implemented in 5.0.4
+    /// (`orchestrator::detect_reply_completions`). Requires a non-empty
+    /// `kickoff:` on the same step — validated below, because without a thread
+    /// to reply on the step could never complete.
     Reply,
 }
 
@@ -567,6 +590,7 @@ pub enum JoinOnName {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowDef {
+    #[serde(default)]
     pub pattern: WorkflowPattern,
     #[serde(default)]
     pub steps: Vec<WorkflowStep>,
@@ -584,6 +608,20 @@ pub struct WorkflowDef {
     /// above). Wire: `autoClose` (WorkflowDef is `rename_all = "camelCase"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_close: Option<AutoCloseMode>,
+}
+
+/// Phase 5.0.4: per-step retry policy. `max` bounds the number of restart
+/// attempts after the first failed attempt; `backoff_ms` (default 0 when
+/// omitted) is the delay before the next attempt spawns. See
+/// `orchestrator::retry` for the pure attempts/backoff calculation and
+/// `orchestrator::arm_retry_backoff`/`orchestrator::fire_due_retries` for the
+/// driver wiring.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicy {
+    pub max: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
 }
 
 /// One entry under `workflows.<name>.steps`. Members reference `agents:`
@@ -611,6 +649,39 @@ pub struct WorkflowStep {
     /// (= definition name) — the same durable inbox path team_presets uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kickoff: Option<String>,
+    /// Phase 5.0.4: restart policy applied when this step's spawn attempt
+    /// fails (route1/route2/timeout). `None` means no retry — a single
+    /// failed attempt is terminal, same as pre-5.0.4 behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+    /// Phase 5.0.4: regex evaluated once against the single dependency's
+    /// `reply_body`, at the moment that dependency becomes satisfied and before
+    /// this step is spawned (`orchestrator::condition_targets`). Three outcomes,
+    /// and the third is the one to read carefully:
+    ///
+    /// - Match => the step spawns normally.
+    /// - No match => `StepState::Skipped`. A cleanly declined branch, NOT a
+    ///   failure: `Skipped` is neutral for run finalization, so the run can
+    ///   still report `Succeeded`.
+    /// - Dependency completed with NO reply at all — it produced no
+    ///   `reply_body`, either because it declares no `kickoff:` to reply on or
+    ///   because it declares one its agent never answered before completing via
+    ///   route 1 (PTY exit) or route 2 (semantic `done`)
+    ///   => `StepState::Failed`, not `Skipped`. There is nothing to match
+    ///   against, so treating it as a decline would report the run green while
+    ///   having silently dropped a branch the operator's config could never
+    ///   have gated. This is the common mistake: a `condition:` is only
+    ///   meaningful when its dependency produces a reply.
+    ///
+    /// Requires exactly one `dependsOn` entry; rejected on a `fanOut` step or
+    /// a step depending on one (validated in `validate_workflows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Phase 5.0.4 (handoff pattern): the next step in the chain. When this
+    /// step completes via a durable inbox reply, that reply's body is
+    /// prepended to the target step's `kickoff` (see `orchestrator::handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_to: Option<String>,
 }
 
 /// Phase 5.0 parse-time validation of the `workflows:` block. Every error
@@ -652,6 +723,140 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                     "{ctx}: step '{}' references agent '{}' not defined under agents:                      (processes: entries cannot be workflow steps)",
                     step.id, step.agent
                 ));
+            }
+            // Phase 5.0.4 field-level checks (apply regardless of pattern).
+            if let Some(retry) = step.retry {
+                if retry.max < 1 || retry.max > 10 {
+                    return Err(format!(
+                        "{ctx}: step '{}' retry.max ({}) must be between 1 and 10",
+                        step.id, retry.max
+                    ));
+                }
+                if let Some(backoff) = retry.backoff_ms {
+                    if backoff > 60_000 {
+                        return Err(format!(
+                            "{ctx}: step '{}' retry.backoffMs ({}) must be <= 60000",
+                            step.id, backoff
+                        ));
+                    }
+                }
+            }
+            if let Some(timeout) = step.timeout_ms {
+                if !(100..=86_400_000).contains(&timeout) {
+                    return Err(format!(
+                        "{ctx}: step '{}' timeoutMs ({}) must be between 100 and 86400000",
+                        step.id, timeout
+                    ));
+                }
+            }
+            if let Some(JoinOn::Count(n)) = step.join_on {
+                let max = step.fan_out.unwrap_or(1);
+                if n < 1 || n > max {
+                    return Err(format!(
+                        "{ctx}: step '{}' joinOn ({}) must be between 1 and fanOut ({})",
+                        step.id, n, max
+                    ));
+                }
+            }
+            if let Some(pattern) = &step.condition {
+                if Regex::new(pattern).is_err() {
+                    return Err(format!(
+                        "{ctx}: step '{}' condition is not a valid regex: '{}'",
+                        step.id, pattern
+                    ));
+                }
+                let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                if deps.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: step '{}' condition requires exactly one dependsOn (found {})",
+                        step.id, deps.len()
+                    ));
+                }
+                if step.fan_out.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both fanOut and condition; not supported",
+                        step.id
+                    ));
+                }
+                if let Some(dep_step) = wf.steps.iter().find(|s| s.id == deps[0]) {
+                    if dep_step.fan_out.is_some() {
+                        return Err(format!(
+                            "{ctx}: step '{}' condition depends on fan-out step '{}'; not supported",
+                            step.id, dep_step.id
+                        ));
+                    }
+                }
+            }
+            // Phase 5.0.4: `joinOn: reply` completes ONLY on an inbox reply to
+            // the step's own kickoff thread (`orchestrator::
+            // detect_reply_completions`). With no `kickoff:` there is no thread
+            // to reply on, so the step would sit Running forever and the run
+            // would never finalize. Reject it at parse time rather than ship a
+            // config shape whose only possible outcome is a wedged run.
+            if matches!(step.join_on, Some(JoinOn::Named(JoinOnName::Reply)))
+                && !step
+                    .kickoff
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty())
+            {
+                return Err(format!(
+                    "{ctx}: step '{}' declares joinOn: reply but has no kickoff; \
+                     a reply join completes on a reply to its own kickoff thread, \
+                     so without one the step can never complete",
+                    step.id
+                ));
+            }
+            if let Some(target) = &step.handoff_to {
+                if target == &step.id {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo references itself",
+                        step.id
+                    ));
+                }
+                if !wf.steps.iter().any(|s| &s.id == target) {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo '{}' which is not a step id",
+                        step.id, target
+                    ));
+                }
+                // A fan-out SOURCE would leave `orchestrator::handoff_bodies`
+                // choosing between N copies' `reply_body`s, and it resolves
+                // first-writer-wins over `run.steps` order — so the carried
+                // kickoff would depend on spawn ordering rather than on
+                // anything the author wrote. Reject it, mirroring the same
+                // rule already applied to `condition`.
+                if step.fan_out.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both fanOut and handoffTo; not supported \
+                         (which copy's reply would be carried is undefined)",
+                        step.id
+                    ));
+                }
+                // `handoffTo` only does anything where the DAG makes the target
+                // spawn AFTER the source. `orchestrator::spawn_ready` looks the
+                // carried body up at the instant it spawns the target, and
+                // `ready_steps` is driven purely by `dependsOn` — so without the
+                // back-edge the target is spawnable immediately, usually on the
+                // very first tick, long before the source has replied, and the
+                // carry is silently dropped. Pre-5.0.4 only `pattern: handoff`
+                // required this edge (in a stricter 1:1 form, enforced below);
+                // under every other pattern `handoffTo` validated clean and then
+                // did nothing, which is the worst of both worlds — the author
+                // sees no error and gets no chaining.
+                let target_depends_on_source = wf
+                    .steps
+                    .iter()
+                    .find(|s| &s.id == target)
+                    .and_then(|s| s.depends_on.as_deref())
+                    .is_some_and(|deps| deps.iter().any(|dep| dep == &step.id));
+                if !target_depends_on_source {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo '{}' but '{}' does not dependOn '{}'; \
+                         the carried reply is only read when the target spawns, so without \
+                         that edge the target can start first and the handoff is lost",
+                        step.id, target, target, step.id
+                    ));
+                }
             }
         }
         // dependsOn references must be known step ids.
@@ -710,9 +915,113 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                     }
                 }
             }
-            WorkflowPattern::Supervisor | WorkflowPattern::Handoff => {
-                // MVO parses these patterns but the state machine returns a
-                // typed "not-yet-implemented" error at spawn time (Phase 5.0.4).
+            WorkflowPattern::Supervisor => {
+                let roots: Vec<&WorkflowStep> = wf
+                    .steps
+                    .iter()
+                    .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                    .collect();
+                if roots.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: supervisor pattern requires exactly one root step (found {})",
+                        roots.len()
+                    ));
+                }
+                let root_id = roots[0].id.clone();
+                for step in &wf.steps {
+                    if step.id == root_id {
+                        continue;
+                    }
+                    if !step
+                        .depends_on
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .contains(&root_id)
+                    {
+                        return Err(format!(
+                            "{ctx}: supervisor step '{}' must dependOn root step '{}'",
+                            step.id, root_id
+                        ));
+                    }
+                }
+            }
+            WorkflowPattern::Handoff => {
+                // Handoff is a strict linear chain: `depends_on` still drives
+                // the generic driver (`ready_steps`/`spawn_ready`), so it must
+                // mirror the `handoff_to` chain 1:1 rather than being a second,
+                // independent graph.
+                for step in &wf.steps {
+                    let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                    if deps.len() > 1 {
+                        return Err(format!(
+                            "{ctx}: handoff step '{}' has {} dependencies;                              handoff is linear (max 1 dependsOn per step)",
+                            step.id, deps.len()
+                        ));
+                    }
+                }
+                // SUBSUMED as of 5.0.4, kept as a narrower assertion. The
+                // back-edge requirement moved to the field-level loop above,
+                // where it now applies under EVERY pattern and runs before this
+                // match — so a missing back-edge already errors with the
+                // specific message there and can no longer masquerade as a
+                // second root here. What survives is the stricter *exactly one*
+                // dependency form: the loop above accepts extra dependencies on
+                // the target, and this block does not. Under `handoff` that
+                // difference is itself already covered by the `deps.len() > 1`
+                // check directly above, which makes this provably unreachable
+                // today; it is retained because it is the only place the linear
+                // 1:1 chain shape is stated outright.
+                for step in &wf.steps {
+                    if let Some(next) = &step.handoff_to {
+                        let next_step = wf
+                            .steps
+                            .iter()
+                            .find(|s| &s.id == next)
+                            .expect("handoffTo target existence already validated above");
+                        let next_deps = next_step.depends_on.as_deref().unwrap_or(&[]);
+                        if next_deps.len() != 1 || next_deps[0] != step.id {
+                            return Err(format!(
+                                "{ctx}: handoff step '{}' handoffTo '{}' but '{}' does not dependOn '{}'",
+                                step.id, next, next, step.id
+                            ));
+                        }
+                    }
+                }
+                let roots: Vec<&WorkflowStep> = wf
+                    .steps
+                    .iter()
+                    .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                    .collect();
+                if roots.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: handoff pattern requires exactly one root step (found {})",
+                        roots.len()
+                    ));
+                }
+                let mut visited: HashSet<&str> = HashSet::new();
+                let mut cur = roots[0].id.as_str();
+                loop {
+                    if !visited.insert(cur) {
+                        return Err(format!(
+                            "{ctx}: handoff chain revisits step '{}' (cycle)",
+                            cur
+                        ));
+                    }
+                    let step = wf.steps.iter().find(|s| s.id == cur).expect(
+                        "handoff chain walk only visits ids already known to be valid step ids",
+                    );
+                    match &step.handoff_to {
+                        Some(next) => cur = next.as_str(),
+                        None => break,
+                    }
+                }
+                if visited.len() != wf.steps.len() {
+                    return Err(format!(
+                        "{ctx}: handoff chain covers {} of {} declared steps;                              every step must be part of the single root->terminal chain",
+                        visited.len(),
+                        wf.steps.len()
+                    ));
+                }
             }
         }
     }
@@ -2250,5 +2559,306 @@ agents:
             "agents:\n  - name: a\n    cmd: x\n    close_on_exit: sometimes\n"
         )
         .is_err());
+    }
+
+    // ---- Phase 5.0.4: retry / timeout / condition / handoffTo / supervisor
+    // field-level and pattern-shape validation (validate_workflows). ----
+
+    const WF_AGENTS: &str =
+        "agents:\n  - name: a\n    cmd: \"a\"\n  - name: b\n    cmd: \"b\"\n  - name: c\n    cmd: \"c\"\n";
+
+    #[test]
+    fn workflow_retry_max_range_is_validated() {
+        let wf = |max: i32| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        retry:\n          max: {max}\n"
+            )
+        };
+        let err = parse_config(&wf(0)).unwrap_err();
+        assert!(err.contains("retry.max"), "error was: {err}");
+        let err = parse_config(&wf(11)).unwrap_err();
+        assert!(err.contains("retry.max"), "error was: {err}");
+        assert!(parse_config(&wf(1)).is_ok());
+        assert!(parse_config(&wf(10)).is_ok());
+    }
+
+    #[test]
+    fn workflow_retry_backoff_ms_range_is_validated() {
+        let wf = |backoff: u64| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        retry:\n          max: 3\n          backoffMs: {backoff}\n"
+            )
+        };
+        assert!(parse_config(&wf(60_000)).is_ok());
+        let err = parse_config(&wf(60_001)).unwrap_err();
+        assert!(err.contains("backoffMs"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_timeout_ms_range_is_validated() {
+        let wf = |timeout: u64| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        timeoutMs: {timeout}\n"
+            )
+        };
+        assert!(parse_config(&wf(100)).is_ok());
+        assert!(parse_config(&wf(86_400_000)).is_ok());
+        let err = parse_config(&wf(99)).unwrap_err();
+        assert!(err.contains("timeoutMs"), "error was: {err}");
+        let err = parse_config(&wf(86_400_001)).unwrap_err();
+        assert!(err.contains("timeoutMs"), "error was: {err}");
+    }
+
+    /// `joinOn: n` must land in `1..=fanOut`, where an undeclared `fanOut` is 1.
+    ///
+    /// Both ends of that range used to be reachable, and each broke the run in
+    /// its own way. `joinOn: 0` was fail-open: the dependent became ready with
+    /// zero successes and spawned alongside its own unfinished dependency. A
+    /// `joinOn` above the copy count was the opposite — unsatisfiable, so the
+    /// dependent never became ready, fail-fast had nothing to cancel, and the
+    /// run sat in `Running` forever. Neither shape is representable now; this
+    /// test is what keeps them that way.
+    ///
+    /// Note what is still legal, and therefore still broken: an IN-range
+    /// `joinOn` can also become unreachable once enough copies fail
+    /// terminally. That defect is pinned by
+    /// `count_join_partial_success_wedges_run_known_defect` in orchestrator.rs
+    /// and cannot be closed here — the config is fine, the tick is not.
+    #[test]
+    fn workflow_join_on_count_range_is_validated() {
+        // No `fanOut`: exactly one copy, so 1 is the only legal count.
+        let plain = |join: u32| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n        joinOn: {join}\n      - id: second\n        agent: b\n        dependsOn: [first]\n"
+            )
+        };
+        assert!(parse_config(&plain(1)).is_ok());
+        let err = parse_config(&plain(0)).unwrap_err();
+        assert!(err.contains("joinOn"), "error was: {err}");
+        let err = parse_config(&plain(2)).unwrap_err();
+        assert!(err.contains("joinOn"), "error was: {err}");
+
+        // `fanOut: 3`: 1..=3 legal, 4 is not.
+        let fanned = |join: u32| {
+            format!(
+                "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: candidate\n        agent: a\n        fanOut: 3\n        joinOn: {join}\n      - id: reduce\n        agent: b\n        dependsOn: [candidate]\n"
+            )
+        };
+        assert!(parse_config(&fanned(1)).is_ok());
+        assert!(parse_config(&fanned(3)).is_ok());
+        let err = parse_config(&fanned(4)).unwrap_err();
+        assert!(err.contains("joinOn"), "error was: {err}");
+
+        // `joinOn: all` is the other untagged variant and carries no count to
+        // range-check, so the check above must not reject it.
+        let named = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: candidate\n        agent: a\n        fanOut: 3\n        joinOn: all\n      - id: reduce\n        agent: b\n        dependsOn: [candidate]\n"
+        );
+        assert!(parse_config(&named).is_ok());
+    }
+
+    #[test]
+    fn workflow_condition_requires_valid_regex() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n        dependsOn: [first]\n        condition: \"(\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("not a valid regex"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_condition_requires_exactly_one_dependency() {
+        let no_deps = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&no_deps).unwrap_err();
+        assert!(err.contains("exactly one dependsOn (found 0)"), "error was: {err}");
+
+        let two_deps = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n      - id: third\n        agent: c\n        dependsOn: [first, second]\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&two_deps).unwrap_err();
+        assert!(err.contains("exactly one dependsOn (found 2)"), "error was: {err}");
+
+        let one_dep = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: first\n        agent: a\n      - id: second\n        agent: b\n        dependsOn: [first]\n        condition: \"^ACCEPT\"\n"
+        );
+        assert!(parse_config(&one_dep).is_ok());
+    }
+
+    #[test]
+    fn workflow_condition_rejects_fan_out_on_conditional_step() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: build\n        agent: a\n        fanOut: 2\n      - id: gate\n        agent: b\n        dependsOn: [build]\n        fanOut: 2\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("declares both fanOut and condition"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_condition_rejects_dependency_with_fan_out() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: build\n        agent: a\n        fanOut: 3\n      - id: gate\n        agent: b\n        dependsOn: [build]\n        condition: \"^ACCEPT\"\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("condition depends on fan-out step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_reply_join_requires_a_kickoff() {
+        // Without a kickoff there is no inbox thread for the agent to reply on,
+        // so `detect_reply_completions` could never fire and the run would hang
+        // in Running forever. Parse time is the only place to catch it.
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        joinOn: reply\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("joinOn: reply but has no kickoff"),
+            "error was: {err}"
+        );
+
+        // Whitespace is not a kickoff either — `send_inbox` trims and then
+        // rejects an empty body, so this would fail delivery and leave the
+        // same wedge.
+        let blank = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        joinOn: reply\n        kickoff: \"   \"\n"
+        );
+        let err = parse_config(&blank).unwrap_err();
+        assert!(
+            err.contains("joinOn: reply but has no kickoff"),
+            "error was: {err}"
+        );
+
+        // With a real kickoff it parses.
+        let ok = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        joinOn: reply\n        kickoff: answer me\n"
+        );
+        assert!(parse_config(&ok).is_ok(), "a reply join with a kickoff is valid");
+    }
+
+    #[test]
+    fn workflow_handoff_to_rejects_a_fan_out_source() {
+        // Which of the N copies' reply bodies would be carried is undefined,
+        // so the config shape is rejected rather than resolved arbitrarily.
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: build\n        agent: a\n        fanOut: 3\n        handoffTo: gate\n      - id: gate\n        agent: b\n        dependsOn: [build]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("both fanOut and handoffTo"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn workflow_handoff_to_rejects_self_reference() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        handoffTo: only\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("handoffTo references itself"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_to_rejects_unknown_target() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n        handoffTo: nope\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("not a step id"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_requires_exactly_one_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root1\n        agent: a\n      - id: root2\n        agent: b\n      - id: child\n        agent: c\n        dependsOn: [root1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("requires exactly one root step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_children_must_depend_on_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root\n        agent: a\n      - id: mid\n        agent: b\n        dependsOn: [root]\n      - id: stray\n        agent: c\n        dependsOn: [mid]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("must dependOn root step"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_supervisor_valid_shape_is_accepted() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root\n        agent: a\n      - id: child1\n        agent: b\n        dependsOn: [root]\n      - id: child2\n        agent: c\n        dependsOn: [root]\n"
+        );
+        assert!(parse_config(&yaml).is_ok());
+    }
+
+    #[test]
+    fn workflow_handoff_rejects_step_with_multiple_dependencies() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n      - id: b1\n        agent: b\n      - id: c1\n        agent: c\n        dependsOn: [a1, b1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("handoff is linear (max 1 dependsOn per step)"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_requires_exactly_one_root() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n      - id: b1\n        agent: b\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("requires exactly one root step"), "error was: {err}");
+    }
+
+    /// Phase 5.0.4: the back-edge requirement is no longer `pattern: handoff`
+    /// only. Under supervisor/fan-out/pipeline a `handoffTo` with no matching
+    /// `dependsOn` used to load clean and then carry nothing, because
+    /// `spawn_ready` reads the carried body at spawn time and `ready_steps`
+    /// only looks at `dependsOn`.
+    #[test]
+    fn workflow_handoff_to_requires_the_target_to_depend_on_the_source() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: lead\n        agent: a\n      - id: w1\n        agent: b\n        dependsOn: [lead]\n        handoffTo: w2\n      - id: w2\n        agent: c\n        dependsOn: [lead]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("'w2' does not dependOn 'w1'"),
+            "error was: {err}"
+        );
+
+        // Adding the edge the carry actually needs makes it load.
+        let fixed = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: lead\n        agent: a\n      - id: w1\n        agent: b\n        dependsOn: [lead]\n        handoffTo: w2\n      - id: w2\n        agent: c\n        dependsOn: [lead, w1]\n"
+        );
+        assert!(parse_config(&fixed).is_ok(), "{:?}", parse_config(&fixed));
+    }
+
+    #[test]
+    fn workflow_handoff_chain_must_match_depends_on() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("does not dependOn"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_chain_must_cover_all_steps() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n      - id: orphan\n        agent: c\n        dependsOn: [a1]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(err.contains("chain covers 2 of 3 declared steps"), "error was: {err}");
+    }
+
+    #[test]
+    fn workflow_handoff_valid_chain_is_accepted() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n        handoffTo: c1\n      - id: c1\n        agent: c\n        dependsOn: [b1]\n"
+        );
+        assert!(parse_config(&yaml).is_ok());
     }
 }
