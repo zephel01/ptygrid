@@ -2,7 +2,7 @@
 
 # 競合調査: 類似ツールの比較 (Competitive Landscape)
 
-調査日: 2026-07-16(grok による Web 横断調査、32+ サイト。docs/design.md の記述を起点に更新)
+調査日: 2026-07-16(grok による Web 横断調査、32+ サイト。docs/design/design.md の記述を起点に更新)
 
 > 外部projectの数値は調査日時点のsnapshot。ptygridの実装状況はPhase 3.8へ更新済み。
 

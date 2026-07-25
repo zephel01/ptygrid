@@ -8,7 +8,7 @@
 > ユーザー判断により偵察ゲートは「エスカレーション既定パターンの決定」のみに縮小し、
 > 実装を先行した。実装時に確定した設計差分は 10 章を参照。
 
-関連: [spec-claude-teams-panes.md](spec-claude-teams-panes.md) 2章（方式Cの位置づけ）・11章（未解決事項「方式Cの具体像」）、[plan.md](plan.md)、[competitive-landscape.md](competitive-landscape.md)
+関連: [spec-claude-teams-panes.md](spec-claude-teams-panes.md) 2章（方式Cの位置づけ）・11章（未解決事項「方式Cの具体像」）、[plan.md](../design/plan.md)、[competitive-landscape.md](../design/competitive-landscape.md)
 
 ---
 
@@ -254,7 +254,7 @@ CONTRACT.md への追記（実装前に先行追記）:
 ## 9. リリース計画とテスト
 
 - リリースは **v0.4.4（Phase 4.3）** の1本を想定（plan.md のバージョニング規約に従う）
-- [inside/phase3.md](inside/phase3.md) のリリース規律を踏襲: CONTRACT 先行追記、`lib.rs`/hot path に
+- `docs/inside/phase3.md`（git 管理外の内部資料）のリリース規律を踏襲: CONTRACT 先行追記、`lib.rs`/hot path に
   新ロジックを置かない、該当挙動のみ userguide 更新
 
 テスト:

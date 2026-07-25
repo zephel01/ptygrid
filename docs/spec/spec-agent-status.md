@@ -2,10 +2,10 @@
 
 作成日: 2026-07-17 / 状態: ドラフト / 対象: Phase 4.4（未実装・仕様のみ）
 
-関連: [herdr-research.md](research/herdr-research.md)（検出方式の参考元）/
-[design.md](design.md)（アーキテクチャ原則）/ [competitive-landscape.md](competitive-landscape.md)
-（「通知リング / 要承認ハイライト」バックログ）/ [plan.md](plan.md)（バージョニング）/
-[../CONTRACT.md](../CONTRACT.md)（IPC/MCP 契約）。
+関連: `docs/research/herdr-research.md`（検出方式の参考元。git 管理外の内部資料）/
+[design.md](../design/design.md)（アーキテクチャ原則）/ [competitive-landscape.md](../design/competitive-landscape.md)
+（「通知リング / 要承認ハイライト」バックログ）/ [plan.md](../design/plan.md)（バージョニング）/
+[../CONTRACT.md](../../CONTRACT.md)（IPC/MCP 契約）。
 
 ---
 
@@ -19,9 +19,9 @@ ptygrid は複数の AI CLI を PTY ペインで並行実行するが、Phase 4.
 
 herdr はこの問題を「**端末出力ヒューリスティック（TOML manifest の正規表現）でエージェント
 状態を Blocked/Working/Done/Idle に自動分類し、色分け表示する**」ことで解決し、これが最大の
-差別化点になっている（[herdr-research.md](research/herdr-research.md) 3章）。競合調査でも
+差別化点になっている（`docs/research/herdr-research.md` 3章。git 管理外）。競合調査でも
 「通知リング / 要承認ハイライト」は cmux / Architect が強い UX 領域として、ptygrid が次に
-取るべき機能に挙がっている（[competitive-landscape.md](competitive-landscape.md)）。
+取るべき機能に挙がっている（[competitive-landscape.md](../design/competitive-landscape.md)）。
 
 本仕様は、この価値を ptygrid に翻案する。ただし herdr と同じ TOML リモート更新ではなく、
 ptygrid の設計思想（config-as-code / ptygrid.yml）に沿って **内蔵既定パターン + ptygrid.yml
@@ -29,7 +29,7 @@ ptygrid の設計思想（config-as-code / ptygrid.yml）に沿って **内蔵�
 
 ### プロセス生死とは別レイヤの「意味的状態」
 
-ptygrid には既に `SessionState = starting|running|exited|restarting`（[CONTRACT.md](../CONTRACT.md)
+ptygrid には既に `SessionState = starting|running|exited|restarting`（[CONTRACT.md](../../CONTRACT.md)
 Phase 1）がある。これは **PTY プロセスの生死**を表すランタイム状態で、backend が生成する権威的な
 事実である。本仕様が導入する `working|blocked|done|idle`（+ `unknown`）は、それとは**別レイヤ**の
 **意味的状態（semantic status）**であり、生きている PTY（`running`）の**上に重ねて**推定する
@@ -89,14 +89,14 @@ Phase 1）がある。これは **PTY プロセスの生死**を表すランタ�
 1. **agent 定義名** — セッションが ptygrid.yml の agent 定義由来（`spec.name = Some("claude")` 等）で、
    その名前に対応するルールセット（内蔵既定 or `agent_status.patterns` の同名キー）があればそれ。
 2. **フォアグラウンドプロセス名** — 上記が無い／adhoc シェル（`spec.name = None`）の場合、その PTY の
-   フォアグラウンドプロセス名（既存 `foreground_pid` → `process_name`、[session.rs](../src-tauri/src/session.rs)）が
+   フォアグラウンドプロセス名（既存 `foreground_pid` → `process_name`、[session.rs](../../src-tauri/src/session.rs)）が
    ルールセットのキーに一致すればそれ。手打ちで起動した `claude` / `codex` を拾うため。
 3. **どちらも無ければ `unknown`** — ルールセットを割り当てず、状態は `unknown`（バッジ非表示）。
    generic なフォールバックルールは**既定では割り当てない**（誤検出を避ける保守方針。generic を
    使いたいユーザーは `agent_status.patterns` に `"*"` キーを定義して opt-in できる、4.2）。
 
 フォアグラウンドプロセス名は変動するため、ルールセット選択は**評価のたびに**行う（`list_sessions`
-と同じく遅延解決。spawn 時に固定しない。[session.rs](../src-tauri/src/session.rs) の既存注記に従う）。
+と同じく遅延解決。spawn 時に固定しない。[session.rs](../../src-tauri/src/session.rs) の既存注記に従う）。
 
 ### 3.2 検出入力の作り方（ANSI 再構成の再利用）
 
@@ -104,8 +104,8 @@ Phase 1）がある。これは **PTY プロセスの生死**を表すランタ�
 screen で壊れる。そこで **Queen `read_output` と同じ経路**を使う:
 
 1. `SessionManager::output_snapshot(id)` で ring 全体（最大 256 KiB）と現在の cols/rows を取得
-   （[session.rs](../src-tauri/src/session.rs) の既存 API）。
-2. `ansi::render_terminal(&text, rows, cols)`（[ansi.rs](../src-tauri/src/ansi.rs)）で**現在の端末画面を
+   （[session.rs](../../src-tauri/src/session.rs) の既存 API）。
+2. `ansi::render_terminal(&text, rows, cols)`（[ansi.rs](../../src-tauri/src/ansi.rs)）で**現在の端末画面を
    再構成**したテキストを得る（スピナーは最終状態に畳まれ、alternate screen は現在アクティブな面のみ
    残る）。
 3. その末尾 **N 行**（既定 `N = 24`、`agent_status.tail_lines` で 4..=200 に clamp）を検出対象文字列とする。
@@ -147,7 +147,7 @@ blocked > working > done > idle**:
 
 ### 3.5 transcript（observe）の検出
 
-observe transcript は PTY を持たず、tail の整形済みテキスト（`role: text` 連結、[transcript.rs](../src-tauri/src/transcript.rs)）を
+observe transcript は PTY を持たず、tail の整形済みテキスト（`role: text` 連結、[transcript.rs](../../src-tauri/src/transcript.rs)）を
 保持する。この場合:
 
 - ANSI 再構成は行わず（既に整形済み）、tail テキストの末尾 N 行をそのまま検出対象にする。
@@ -269,7 +269,7 @@ export type AgentStatusConfig = {
 ```
 
 Rust 側は既存 `TeammatesConfig` と同じ `#[serde(skip_serializing_if = "Option::is_none")]` +
-`effective_*()` アクセサ方式で既定補完する（[config.rs](../src-tauri/src/config.rs) パターン）。
+`effective_*()` アクセサ方式で既定補完する（[config.rs](../../src-tauri/src/config.rs) パターン）。
 
 ### 4.4 内蔵既定パターン（バイナリ同梱）
 
@@ -299,7 +299,7 @@ Rust 側は既存 `TeammatesConfig` と同じ `#[serde(skip_serializing_if = "Op
 
 ### 5.1 ペインヘッダーの意味的状態バッジ
 
-既存のペインヘッダー（[App.svelte](../src/App.svelte) の `.pane-header`、状態ドット `.dot.state-*`）は
+既存のペインヘッダー（[App.svelte](../../src/App.svelte) の `.pane-header`、状態ドット `.dot.state-*`）は
 **PTY 生死**を表す。意味的状態は**それに重ねる別バッジ**として、状態ドットの直後に小さな
 色付きバッジ（丸 or ラベル）を追加する:
 
@@ -340,7 +340,7 @@ blocked は最重要状態なので、ヘッダーバッジに加えて**ペイ�
 - **ヘッダー**: 「🔴 N」（blocked ペイン数）を上部に集約表示。0 のときは控えめ表示。
 - **格納時**: サイドバーを畳んだ状態では、ツールバーに集約バッジ「🔴 N」を出す（クリックで最初の
   blocked ペインへフォーカス／サイドバーを一時展開）。畳んでいても状態は裏で更新し続ける。
-- **永続化**: 開閉状態と幅は app 設定（[app_settings](../src-tauri/src/app_settings.rs) 相当）に保存し、
+- **永続化**: 開閉状態と幅は app 設定（[app_settings](../../src-tauri/src/app_settings.rs) 相当）に保存し、
   project 非依存で復元する。
 - **実装**: `ui.sessions` / `ui.agentStatus` / `ui.panes` を参照する**純粋な派生ビュー**。状態は
   `agent-status` イベントで既に届くため、サイドバー用の新規 backend / IPC は不要（frontend のみ）。
@@ -353,8 +353,8 @@ blocked は最重要状態なので、ヘッダーバッジに加えて**ペイ�
 ### 6.1 ネイティブ通知の経路
 
 blocked 検出時に **macOS ネイティブ通知**を出す。実装は Tauri v2 の
-**`tauri-plugin-notification`** を採用する（現状 [Cargo.toml](../src-tauri/Cargo.toml) 未導入・
-[capabilities/default.json](../src-tauri/capabilities/default.json) に権限未追加のため、依存追加 +
+**`tauri-plugin-notification`** を採用する（現状 [Cargo.toml](../../src-tauri/Cargo.toml) 未導入・
+[capabilities/default.json](../../src-tauri/capabilities/default.json) に権限未追加のため、依存追加 +
 capability 追加 + `Builder::plugin(tauri_plugin_notification::init())` 登録が前提。実装フェーズで
 プラグイン API を [mcp-server-check 方式のスタンドアロン検証]相当で一度実証してから本体へ入れる）。
 
@@ -410,7 +410,7 @@ capability 追加 + `Builder::plugin(tauri_plugin_notification::init())` 登録�
 ### 7.1 検出ロジックの置き場所
 
 新モジュール **`src-tauri/src/agent_status.rs`** に隔離する（session hot path・lib.rs に regex を
-置かない原則、[design.md](design.md) §11）。責務:
+置かない原則、[design.md](../design/design.md) §11）。責務:
 
 - ルールセットのコンパイル・キャッシュ（内蔵既定 + config マージ、config reload で再構築）。
 - **純関数 `classify(text: &str, rules: &CompiledRuleSet) -> (AgentStatus, Option<RuleId>)`**
@@ -443,10 +443,10 @@ export type AgentStatusPayload = {
 
 ### 7.3 既存経路の再利用
 
-- 出力再構成は `ansi::render_terminal`（[ansi.rs](../src-tauri/src/ansi.rs)）、末尾抽出は queen.rs の
+- 出力再構成は `ansi::render_terminal`（[ansi.rs](../../src-tauri/src/ansi.rs)）、末尾抽出は queen.rs の
   `tail_lines` 相当（共通化して `agent_status.rs` からも使えるよう `pub(crate)` 化）。
 - foreground 解決は `pty::process_name` / `foreground_pid`（既存）。
-- 通知トーストのフォールバックは既存 `queen-notify`/notices 経路（[stores.svelte.ts](../src/lib/stores.svelte.ts)）。
+- 通知トーストのフォールバックは既存 `queen-notify`/notices 経路（[stores.svelte.ts](../../src/lib/stores.svelte.ts)）。
 
 ### 7.4 Queen 連携（任意・将来）
 
@@ -506,7 +506,7 @@ export type AgentStatusPayload = {
 
 ## 9. Phase リリース計画
 
-[plan.md](plan.md) の流儀（y=Phase 番号、z=Phase 内連番、CONTRACT 先行追記、両プラットフォーム CI）に
+[plan.md](../design/plan.md) の流儀（y=Phase 番号、z=Phase 内連番、CONTRACT 先行追記、両プラットフォーム CI）に
 従い、**Phase 4.4** として3段階に分ける。
 
 ### Phase 4.4.0 — 検出基盤 + ヘッダー表示（通知なし）
@@ -616,11 +616,11 @@ export type AgentStatusPayload = {
 
 ## 12. 参考
 
-- [docs/research/herdr-research.md](research/herdr-research.md) — herdr の状態検出方式（TOML manifest、
+- `docs/research/herdr-research.md`（git 管理外の内部資料） — herdr の状態検出方式（TOML manifest、
   blocked 保守判定、pane→tab→workspace ロールアップ、リモート自動更新）。本仕様の翻案元。
-- [docs/competitive-landscape.md](competitive-landscape.md) — 「通知リング / 要承認ハイライト」を
+- [docs/design/competitive-landscape.md](../design/competitive-landscape.md) — 「通知リング / 要承認ハイライト」を
   次に取る UX として位置づけ（cmux / Architect 対抗）。
-- [docs/design.md](design.md) — hot path 分離・config-as-code・推測回避の原則。
-- [docs/plan.md](plan.md) — バージョニング（Phase=minor）とリリース規律。
-- [CONTRACT.md](../CONTRACT.md) — 既存 `session-state` / `SessionInfo` / Phase 4.x イベント・
+- [docs/design/design.md](../design/design.md) — hot path 分離・config-as-code・推測回避の原則。
+- [docs/design/plan.md](../design/plan.md) — バージョニング（Phase=minor）とリリース規律。
+- [CONTRACT.md](../../CONTRACT.md) — 既存 `session-state` / `SessionInfo` / Phase 4.x イベント・
   teammate 契約。本仕様の追記先。

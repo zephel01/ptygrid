@@ -2,7 +2,7 @@
 
 # Competitive Research: Comparing Similar Tools (Competitive Landscape)
 
-Survey date: 2026-07-16 (a cross-web survey conducted via Grok, covering 32+ sites; updated from the baseline description in docs/design.md)
+Survey date: 2026-07-16 (a cross-web survey conducted via Grok, covering 32+ sites; updated from the baseline description in docs/design/design.md)
 
 > Figures for external projects are a snapshot as of the survey date. ptygrid's implementation status has been updated through Phase 3.8.
 

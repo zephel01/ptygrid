@@ -277,7 +277,7 @@ commit `6bad859`(`track/e-orch-5.0.4`)でコミット済み — 「作業ツリ�
 まま)。ただし実行系(再試行・タイムアウト強制・condition 評価・handoffTo チェイン・
 `join_on: reply` 完了判定)は pin `design-5.0.4` の残タスクとして着手済みだが未完了・
 未承認であり、本節の結論(retry/timeout/reply 完了判定に基づく自動リカバリは存在しない)
-は変わらない。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」および
+は変わらない。詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」および
 [ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1 を参照。)
 
 (2026-07-25 追記(docs 同期): 同ブランチ作業ツリー上(未コミット)で `check_timeouts` /
@@ -289,7 +289,7 @@ spawn)が動くようになっている。ただし (a) 同ブランチにも未
 書いた step が retry で再起動すると空の inbox で起動しうる、という3点により、本節冒頭の
 結論(retry/timeout/reply 完了判定に基づく自動リカバリは存在しない)は変わらない。
 「timeoutMs / retry を書けば安全装置になる」という前提で運用しないことは、特に (c) の
-ため現時点でも重要。詳細は [CONTRACT.md](../CONTRACT.md)「Phase 5.0 追加契約」および
+ため現時点でも重要。詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」および
 [ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1・§7.4 を参照。)
 
 ---
@@ -323,5 +323,5 @@ spawn)が動くようになっている。ただし (a) 同ブランチにも未
 - [ptygrid-yml-guide.md](ptygrid-yml-guide.md) — ptygrid.yml の構文・フィールド・実装状況マトリクス
 - [troubleshooting.md](troubleshooting.md) — Queen MCP 接続・Inbox・pins conflict 等の実運用トラブル集
 - [userguide.md](userguide.md) — 基本操作、team_presets、Queen セットアップ
-- [design.md](design.md) — 設計原則の背景(hot path 分離、config-as-code 等)
-- [CONTRACT.md](../CONTRACT.md) — Phase ごとの実装済み契約の一次情報
+- [design.md](../design/design.md) — 設計原則の背景(hot path 分離、config-as-code 等)
+- [CONTRACT.md](../../CONTRACT.md) — Phase ごとの実装済み契約の一次情報

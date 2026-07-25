@@ -2,11 +2,11 @@
 
 作成日: 2026-07-22 / 状態: ドラフト / 対象: Phase 5.5（未実装・仕様のみ）
 
-関連: [spec-agent-status.md](../spec-agent-status.md)（意味的状態 `AgentStatus` の供給源。本仕様の Rings と OTel の親フレームとして再利用）/
-[spec-notifications.md](../spec-notifications.md)（`error` / `needs-attention` エッジ配線と competing しない設計）/
-[design.md](../design.md)（hot path 分離・config-as-code・推測回避）/
-[competitive-landscape.md](../competitive-landscape.md)（「通知リング / 要承認ハイライト」バックログを本仕様の M5 に格上げ）/
-[plan.md](../plan.md)（バージョニング）/
+関連: [spec-agent-status.md](spec-agent-status.md)（意味的状態 `AgentStatus` の供給源。本仕様の Rings と OTel の親フレームとして再利用）/
+[spec-notifications.md](spec-notifications.md)（`error` / `needs-attention` エッジ配線と competing しない設計）/
+[design.md](../design/design.md)（hot path 分離・config-as-code・推測回避）/
+[competitive-landscape.md](../design/competitive-landscape.md)（「通知リング / 要承認ハイライト」バックログを本仕様の M5 に格上げ）/
+[plan.md](../design/plan.md)（バージョニング）/
 [../CONTRACT.md](../../CONTRACT.md)（IPC / MCP 契約）/
 [../ptygrid.example.yml](../../ptygrid.example.yml)（注釈付き設定例）。
 
@@ -20,7 +20,7 @@
 
 ## 1. 目的と背景
 
-ptygrid は Phase 3〜4.4 で「複数 AI CLI を PTY で並行実行し、Queen（18 tools）で協調させる」までを揃えたが、Phase 4.4 の意味的状態と通知（[spec-agent-status.md](../spec-agent-status.md) / [spec-notifications.md](../spec-notifications.md)）を実運用に投入した結果、次の3つの構造的な穴が同時に露呈した。
+ptygrid は Phase 3〜4.4 で「複数 AI CLI を PTY で並行実行し、Queen（18 tools）で協調させる」までを揃えたが、Phase 4.4 の意味的状態と通知（[spec-agent-status.md](spec-agent-status.md) / [spec-notifications.md](spec-notifications.md)）を実運用に投入した結果、次の3つの構造的な穴が同時に露呈した。
 
 - **穴 M1 — プロトコル互換**: Queen は rmcp `streamable-http` の 2025 系実装で、`initialize` ハンドシェイクと `Mcp-Session-Id` によるスティッキー経路に依存している。上流の Model Context Protocol は 2026-07-28 RC で **stateless（セッションレス）** へ大きく舵を切り、`Mcp-Method` / `Mcp-Name` ルーティングヘッダを必須化した。Roots / Sampling / Logging は 12 ヶ月 deprecation window で撤去予定。追随しなければ、来年出そろう Tier 1 SDK のクライアント（Claude Code / Codex 側の MCP クライアント）から Queen が徐々に読めなくなる。
 - **穴 M2 — オブザーバビリティ**: いま ptygrid は「1 ペイン単位の PTY 生死」「意味的状態バッジ」「resource 監視（CPU/RSS）」を持つが、**どのエージェントが何秒でいくら燃やしたか**を追跡する経路が無い。ローカル LLM 混在チーム（Phase 4.3 `team_presets`）に入ってから、コスト事故（Opus に丸投げしっぱなし）と潜在バグ（tool 呼び出しの階層が見えない）の両方が起きている。
@@ -79,7 +79,7 @@ pub struct PriceRow {
 }
 ```
 
-内蔵デフォルトは `src-tauri/src/cost_defaults.yml` に compile-time 同梱（`include_str!`）し、[`ptygrid.yml`](../../ptygrid.example.yml) の `pricing:` ブロックで**追記・上書き**できる（[spec-agent-status.md](../spec-agent-status.md) §4.4 と同じ merge/replace 方針）。通貨換算は `pricing.fx_rate` に **手動 USD→JPY 等の固定レート** を書ける（外部 FX API を叩かない・オフライン方針）。
+内蔵デフォルトは `src-tauri/src/cost_defaults.yml` に compile-time 同梱（`include_str!`）し、[`ptygrid.yml`](../../ptygrid.example.yml) の `pricing:` ブロックで**追記・上書き**できる（[spec-agent-status.md](spec-agent-status.md) §4.4 と同じ merge/replace 方針）。通貨換算は `pricing.fx_rate` に **手動 USD→JPY 等の固定レート** を書ける（外部 FX API を叩かない・オフライン方針）。
 
 ### 2.3 Ring モデル（M5）
 
@@ -120,7 +120,7 @@ RC は `_meta.traceparent` / `_meta.tracestate` / `_meta.baggage` の位置を�
 
 ### 3.3 OTel パイプライン（M2）
 
-依存は `opentelemetry`（1.36+）と `opentelemetry-otlp` の gzip+http/protobuf。**gRPC は使わない**（tonic を Cargo に持ち込むと build ツリーが 30% 肥大するため。ptygrid は lean な依存構成を優先、[spec-notifications.md](../spec-notifications.md) §6.3 と同方針で reqwest すら避けて `ureq` を採用してきた原則を維持）。
+依存は `opentelemetry`（1.36+）と `opentelemetry-otlp` の gzip+http/protobuf。**gRPC は使わない**（tonic を Cargo に持ち込むと build ツリーが 30% 肥大するため。ptygrid は lean な依存構成を優先、[spec-notifications.md](spec-notifications.md) §6.3 と同方針で reqwest すら避けて `ureq` を採用してきた原則を維持）。
 
 - エクスポータ既定は **`stdout`（無効）**。opt-in で OTLP HTTP エンドポイント（`observability.otlp.endpoint`）または **ローカル SQLite シンク**（`observability.sink: sqlite`）へ流す。
 - SQLite シンクは backend 単一プロセス内の同期 batch writer。1 秒間隔 or 512 span でフラッシュ。既存の SQLite（WAL、project-scoped）にテーブルを追加する（3.4）。
@@ -165,7 +165,7 @@ export type AgentCostPayload = {
 };
 ```
 
-デバウンスは要らない（`gen_ai.chat` は自然に低頻度）。**ホットパス（PTY reader / regex 評価タスク）から `span.end` を呼ばない**（[spec-agent-status.md](../spec-agent-status.md) §7.1 hot path 分離原則）。span は Queen tool 経路と OTel の受動的な `agent.turn` 抽出（3.5）でのみ生まれる。
+デバウンスは要らない（`gen_ai.chat` は自然に低頻度）。**ホットパス（PTY reader / regex 評価タスク）から `span.end` を呼ばない**（[spec-agent-status.md](spec-agent-status.md) §7.1 hot path 分離原則）。span は Queen tool 経路と OTel の受動的な `agent.turn` 抽出（3.5）でのみ生まれる。
 
 ### 3.5 `agent.turn` の抽出（PTY 側からモデル呼び出しを見る問題）
 
@@ -175,7 +175,7 @@ ptygrid は PTY 越しに CLI を回すので、モデル呼び出し自体を�
 2. **Queen 経由**（M1 の `_meta.traceparent`）— MCP クライアントが `queen.tool` を呼ぶ際に自身の親コンテキストを渡してくれる場合、そこから間接的に「呼び出し中の turn がある」と推定できる。
 3. **推定なし**（unknown）— どちらも取れないときは、`agent.turn` は emit しない。既存 `AgentStatus`（`working`）だけが唯一の観測になる。
 
-方針は「**素材が無いなら黙る**」（[spec-agent-status.md](../spec-agent-status.md) §2.3 保守主義に一致）。cost が取れないターンは Ring cost バッジも出さない。**推測でコスト表示は絶対にしない**。ローカル LLM（coderouter 経由）で API 課金が発生しないケースでも「0 円」表示にせず、`unpriced` を返して非表示にする（誤解を招くため）。
+方針は「**素材が無いなら黙る**」（[spec-agent-status.md](spec-agent-status.md) §2.3 保守主義に一致）。cost が取れないターンは Ring cost バッジも出さない。**推測でコスト表示は絶対にしない**。ローカル LLM（coderouter 経由）で API 課金が発生しないケースでも「0 円」表示にせず、`unpriced` を返して非表示にする（誤解を招くため）。
 
 ### 3.6 Deprecation ヘッダの出力
 
@@ -187,7 +187,7 @@ Sunset: Wed, 28 Jul 2027 00:00:00 GMT
 Link: <https://modelcontextprotocol.io/spec/2026-07-28>; rel="deprecation"
 ```
 
-`Mcp-Session-Id` を発行する系（旧経路）でのみ付与。RC 経路では付与しない。backend ログには **1 リクエストあたり最大 1 行**の `deprecated_route` 警告を per-day dedupe で出す（ログ爆発を避ける、[spec-notifications.md](../spec-notifications.md) §6.2 と同じ精神）。
+`Mcp-Session-Id` を発行する系（旧経路）でのみ付与。RC 経路では付与しない。backend ログには **1 リクエストあたり最大 1 行**の `deprecated_route` 警告を per-day dedupe で出す（ログ爆発を避ける、[spec-notifications.md](spec-notifications.md) §6.2 と同じ精神）。
 
 ### 3.7 Status Ring の合成（M5）
 
@@ -277,7 +277,7 @@ ui:
 
 ### 4.2 マージ／置換セマンティクス
 
-`pricing.models` は [spec-agent-status.md](../spec-agent-status.md) §4.2 と同じ規則で内蔵デフォルトへ **既定マージ（追記）**。同一 `(system, model)` が重複した場合は**ユーザー定義が優先**（順序ではなくキー一致で上書き）。`replace: true` を model 単位で付ければ内蔵の同キーを廃棄。
+`pricing.models` は [spec-agent-status.md](spec-agent-status.md) §4.2 と同じ規則で内蔵デフォルトへ **既定マージ（追記）**。同一 `(system, model)` が重複した場合は**ユーザー定義が優先**（順序ではなくキー一致で上書き）。`replace: true` を model 単位で付ければ内蔵の同キーを廃棄。
 
 `mcp.*` / `observability.*` はスカラのみで merge 概念なし。未知キーは前方互換のため無視（他の 4.x ブロック同様）。
 
@@ -307,7 +307,7 @@ ui:
 | `query_spans` | `{ sessionId?: number, traceId?: string, sinceNs?: number, limit?: number }` | `Span[]` | Waterfall / cost breakdown 用の SQLite クエリ。frontend の open-code SQL を排し、read only の投影に限定 |
 | `set_capture_content` | `{ enabled: boolean }` | `void` | 実行時に prompt 本体キャプチャを toggle。config の `capture_content` を上書き（永続化はしない、次回起動で config 値へ戻る） |
 
-read-only。既存 `list_sessions` / `read_output` / `spawn_agent` などは**一切変更しない**（[spec-agent-status.md](../spec-agent-status.md) §8.3 の非回帰と同じ扱い）。
+read-only。既存 `list_sessions` / `read_output` / `spawn_agent` などは**一切変更しない**（[spec-agent-status.md](spec-agent-status.md) §8.3 の非回帰と同じ扱い）。
 
 ### 5.3 Tauri Event（新設）
 
@@ -344,7 +344,7 @@ export type Span = {
 
 - Phase 3.x〜4.4 の全 CONTRACT 断面は**追加のみ**で維持。
 - 旧 MCP クライアントは `mcp.legacy_2025_06: true` の間は無改修で動く。
-- `observability.enabled: false`（既定）では新規テーブルの作成もイベントの emit も**一切起きない**（[spec-notifications.md](../spec-notifications.md) の opt-in と同じ姿勢）。
+- `observability.enabled: false`（既定）では新規テーブルの作成もイベントの emit も**一切起きない**（[spec-notifications.md](spec-notifications.md) の opt-in と同じ姿勢）。
 
 ---
 
@@ -354,9 +354,9 @@ export type Span = {
 
 Ring 色は `AgentStatus` を**そのまま**引く。新しい状態モデルを作らず、`spec-agent-status.md` §2 の 5 値のみを表す。**Ring は事実の再表示であって新たな判定はしない**。したがって `agent_status.enabled: false` のとき Ring も自動で色を落として `unknown`（透明）扱い。
 
-### 6.2 通知（[spec-notifications.md](../spec-notifications.md)）との共存
+### 6.2 通知（[spec-notifications.md](spec-notifications.md)）との共存
 
-- コスト超過通知（例「10 分で $5 を超えた」）は **本仕様で新設しない**。通知は既存の 4 イベント（`error`/`needs-attention`/`complete`/`progress`）に閉じる。将来 `progress` の供給源として cost threshold を足す余地があるが（[spec-notifications.md](../spec-notifications.md) §9）、Phase 5.5 では出さない。
+- コスト超過通知（例「10 分で $5 を超えた」）は **本仕様で新設しない**。通知は既存の 4 イベント（`error`/`needs-attention`/`complete`/`progress`）に閉じる。将来 `progress` の供給源として cost threshold を足す余地があるが（[spec-notifications.md](spec-notifications.md) §9）、Phase 5.5 では出さない。
 - 「握り潰さない」原則との整合: OTel エクスポート失敗（OTLP endpoint に届かない）は backend ログのみ、UI に出さない。ただし **SQLite シンクの書き込み失敗**は `queen-notify` 経路で1回だけトーストする（データ欠損は誤解の温床なので）。
 
 ### 6.3 `session-resources` との重複回避
@@ -365,7 +365,7 @@ CPU/RSS/git dirty は既存 `session-resources` で 2 秒に 1 度サンプル�
 
 ### 6.4 host teammate / observe transcript
 
-- host teammate（Phase 4.2）の実 PTY もペインなので Ring を出す。**lead と teammate は独立**にリング色を持つ（lead の `AgentStatus` を子に持ち込まない、[spec-agent-status.md](../spec-agent-status.md) §11 host teammate 節参照）。
+- host teammate（Phase 4.2）の実 PTY もペインなので Ring を出す。**lead と teammate は独立**にリング色を持つ（lead の `AgentStatus` を子に持ち込まない、[spec-agent-status.md](spec-agent-status.md) §11 host teammate 節参照）。
 - observe transcript（Phase 4.1）は PTY を持たないので **Ring 色は `unknown`（薄グレー枠）**、バッジは `inbox` のみ表示（cost / git dirty は無意味）。
 
 ### 6.5 config reload
@@ -433,10 +433,10 @@ Queen `await` tool は「呼び出し中スレッドが長時間 blocking する
 - **rmcp の旧経路を即撤去**: 却下。RC は 12 ヶ月 window を明示している。ユーザーの Claude Code / Codex が追随するまでの期間、片側だけを動かすと fragmentation が起きる。両立ルータで一段吸収する。
 - **`initialize` の負担を残すため RC でも `Mcp-Session-Id` を出す**: 却下。RC 準拠クライアントは Session-Id を無視するし、こちらから発行するとロードバランサ経路で誤ってスティッキーが復活しうる。仕様通り「発行しない」。
 - **プロンプト本体を attribute に載せる**（OTel の一部 SDK 慣習）: 却下。GenAI semconv は **span event として opt-in** を推奨。attribute はサンプリング / エクスポートで欠落しにくく高価値だが、機密の温床。仕様通り event 側に閉じる。
-- **cost 超過通知を本仕様で足す**: 却下。通知の粒度設計は [spec-notifications.md](../spec-notifications.md) の 4 イベントで完結させたい。「別レイヤの雑音を通知に混ぜない」原則を維持。将来 progress イベント源として cost を足す余地は残す。
+- **cost 超過通知を本仕様で足す**: 却下。通知の粒度設計は [spec-notifications.md](spec-notifications.md) の 4 イベントで完結させたい。「別レイヤの雑音を通知に混ぜない」原則を維持。将来 progress イベント源として cost を足す余地は残す。
 - **Ring を CSS ではなく Canvas で描く**: 却下。CSS の box-shadow + border で十分。Canvas は accessibility ツリーから落ちる。
 - **色だけで状態を区別**: 却下。色覚多様性配慮でパターン（実線 / 破線 / 二重線 / 細線）を併用（3.7）。
-- **リモート pricing 更新（自動）**: 却下。オフライン方針を維持。[spec-agent-status.md](../spec-agent-status.md) §11「パターン陳腐化」と同じで、内蔵デフォルト + config 上書きで運用する。fx レートも手動固定。
+- **リモート pricing 更新（自動）**: 却下。オフライン方針を維持。[spec-agent-status.md](spec-agent-status.md) §11「パターン陳腐化」と同じで、内蔵デフォルト + config 上書きで運用する。fx レートも手動固定。
 - **OAuth 2.1 / OIDC を Phase 5.5 で実装**: 却下。ptygrid は 127.0.0.1 バインド + token（Phase 4.3 で永続化済み）で完結しており、OAuth の恩恵が薄い。RC の OAuth 硬化は将来リモート実行モードへ拡張したときの土台として位置付ける（本仕様は「対応可能性を明記」まで）。
 - **Roots / Sampling / Logging を即撤去**: 却下。12 ヶ月 window に従い受理は残す。ptygrid は Roots も Sampling も未使用のため実害はないが、旧 SDK クライアントの互換のために No-op で受ける。
 
@@ -444,7 +444,7 @@ Queen `await` tool は「呼び出し中スレッドが長時間 blocking する
 
 ## 9. リリース段階分割案
 
-[plan.md](../plan.md) の流儀（y=Phase 番号 = `0.5.z`、CONTRACT 先行追記、両プラットフォーム CI、1 リリース = 1 patch）に従い、**Phase 5.5** を 5 段に分ける。
+[plan.md](../design/plan.md) の流儀（y=Phase 番号 = `0.5.z`、CONTRACT 先行追記、両プラットフォーム CI、1 リリース = 1 patch）に従い、**Phase 5.5** を 5 段に分ける。
 
 ### Phase 5.5.0 — MCP RC 両立ルータ（backend のみ、UI 変化なし）
 
@@ -508,7 +508,7 @@ Queen `await` tool は「呼び出し中スレッドが長時間 blocking する
 - **RC 仕様の最終確定タイミング**: 2026-07-28 RC は 10 週間の validation window 中に細部が動きうる。Phase 5.5.0 の実装凍結は **仕様最終化を待って**行う（早出しはしない）。
 - **rmcp 側の RC 対応の実状**: rmcp が RC を公式サポートする前に本仕様が動く場合、`queen_compat.rs` で薄く自前パースする覚悟が要る。純粋な axum ハンドラで完結するよう設計しておく（3.1 の意図）。
 - **OTel Rust の semconv バージョン追随**: 1.36+ が `gen_ai.time_to_first_token_ms` を持つが、attribute 名は 1.37 で改名されうる。エクスポート時にキー名を集中管理する `sem::GEN_AI_*` const module を作り、追随コストを局所化する。
-- **pricing の陳腐化**: [spec-agent-status.md](../spec-agent-status.md) §11 と同じ課題。内蔵デフォルトはリリースごとに更新 + ユーザー上書き前提。将来「pricing 更新チャンネル」（署名付き・手動取得）を足す余地を残す。
+- **pricing の陳腐化**: [spec-agent-status.md](spec-agent-status.md) §11 と同じ課題。内蔵デフォルトはリリースごとに更新 + ユーザー上書き前提。将来「pricing 更新チャンネル」（署名付き・手動取得）を足す余地を残す。
 - **多エージェント PTY で `agent.turn` の帰属が取れないケース**: hook を投げない CLI（旧 codex の一部モード等）ではモデル呼び出し数・トークン数が観測できない。3.5 で「黙る」方針だが、Ring cost が長期に「無表示」だとユーザーは「壊れている」と感じる。userguide に「未対応 CLI では cost バッジは出ません」を明記する。
 - **1m 距離視認**: 9 面時のフォントサイズと Ring 太さの実測は macOS 27" と 14" MBA で並行検証する必要がある。CI では代替できない。
 - **OAuth 2.1 硬化の実装余地**: RC は `iss` 検証などを要求する。本仕様は 127.0.0.1 バインドで恩恵薄だが、将来のリモート実行モード（design.md §1 の「対象外」欄にある将来課題）に備えて `queen_compat.rs` の auth 層を差し替え可能な trait にしておく。
@@ -527,8 +527,8 @@ Queen `await` tool は「呼び出し中スレッドが長時間 blocking する
 - Finout, [Anthropic API Pricing in 2026](https://www.finout.io/blog/anthropic-api-pricing) / [Claude Opus 4.7 Pricing 2026](https://www.finout.io/blog/claude-opus-4.7-pricing-the-real-cost-story-behind-the-unchanged-price-tag) — 内蔵 pricing table の一次値。
 - TLDL, [Anthropic API Pricing (July 2026)](https://www.tldl.io/resources/anthropic-api-pricing) — Opus 4.8 / Sonnet 5 の per-1M 単価スナップショット。
 - Shuttle, [How to Build a Streamable HTTP MCP Server in Rust](https://www.shuttle.dev/blog/2025/10/29/stream-http-mcp) — rmcp `streamable-http` の実装パターン（`queen_compat.rs` のベース）。
-- [docs/spec-agent-status.md](../spec-agent-status.md) — `AgentStatus` 5 値、hot path 分離、config-as-code の merge/replace 規約、blocked 保守主義。Ring 色の供給源。
-- [docs/spec-notifications.md](../spec-notifications.md) — opt-in / エラー握り潰さない原則、ureq デタッチ送信の設計。cost 通知を本仕様に混ぜない根拠。
-- [docs/design.md](../design.md) — hot path 分離・config-as-code・推測回避。
-- [docs/plan.md](../plan.md) — バージョニング規約（1 リリース = 1 patch）。
+- [docs/spec/spec-agent-status.md](spec-agent-status.md) — `AgentStatus` 5 値、hot path 分離、config-as-code の merge/replace 規約、blocked 保守主義。Ring 色の供給源。
+- [docs/spec/spec-notifications.md](spec-notifications.md) — opt-in / エラー握り潰さない原則、ureq デタッチ送信の設計。cost 通知を本仕様に混ぜない根拠。
+- [docs/design/design.md](../design/design.md) — hot path 分離・config-as-code・推測回避。
+- [docs/design/plan.md](../design/plan.md) — バージョニング規約（1 リリース = 1 patch）。
 - [CONTRACT.md](../../CONTRACT.md) — 既存 IPC / MCP 契約。本仕様の追記先。

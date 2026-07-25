@@ -2,11 +2,11 @@
 
 作成日: 2026-07-22 / 状態: draft / 対象 Phase: 5.0（Phase 5.0 orchestration・memory リリース後）
 
-関連: [spec-notifications.md](../spec-notifications.md)（sandbox 起動失敗の外部通知は既存経路にそのまま乗る）/
-[spec-agent-status.md](../spec-agent-status.md)（quarantine 状態は Ring 色で表現）/
+関連: [spec-notifications.md](spec-notifications.md)（sandbox 起動失敗の外部通知は既存経路にそのまま乗る）/
+[spec-agent-status.md](spec-agent-status.md)（quarantine 状態は Ring 色で表現）/
 [spec-phase5-5.md](spec-phase5-5.md)（OTel span を replay の tool 呼び出し軸に統合、secrets audit を span 化）/
 [spec-phase5-0.md](spec-phase5-0.md)（workflow step 単位で sandbox プロファイル・record を切替可能に）/
-[design.md](../design.md) / [plan.md](../plan.md) / [competitive-landscape.md](../competitive-landscape.md) /
+[design.md](../design/design.md) / [plan.md](../design/plan.md) / [competitive-landscape.md](../design/competitive-landscape.md) /
 [../CONTRACT.md](../../CONTRACT.md)（IPC/MCP 契約の追記先）/
 [../ptygrid.example.yml](../../ptygrid.example.yml)。
 

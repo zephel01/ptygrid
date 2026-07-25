@@ -6,7 +6,7 @@
 // delivery of role instructions. It introduces no new trust boundary and no
 // new protocol. Wire shapes and launch semantics are specified in
 // CONTRACT.md "Phase 4.3 追加契約"; design background in
-// docs/spec-team-presets.md.
+// docs/spec/spec-team-presets.md.
 //
 // Kept outside lib.rs and outside the session hot path per the release
 // discipline (phase3.md).

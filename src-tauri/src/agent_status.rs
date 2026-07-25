@@ -6,7 +6,7 @@
 // from terminal-output heuristics, never a fact, and it never mutates
 // `SessionState`.
 //
-// Design constraints (see docs/spec-agent-status.md §7 and docs/design.md §11):
+// Design constraints (see docs/spec/spec-agent-status.md §7 and docs/design/design.md §11):
 // - The session reader hot path NEVER runs regex/render here. It only marks a
 //   session dirty (`mark_dirty`, an atomic + unbounded channel send).
 // - A single debounced task (`start`) wakes every `debounce_ms` (default
