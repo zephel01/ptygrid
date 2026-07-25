@@ -861,7 +861,7 @@ impl QueenServer {
     }
 
     #[tool(
-        description = "Launch a named workflow declared under workflows: in ptygrid.yml as a DAG run. Steps spawn only agents/processes from the ptygrid.yml allowlist (the same allow-list spawn_agent uses) — workflows introduce no new spawn path. MVO supports the pipeline and fan-out patterns (a fan-out step's fanOut count expands its root into that many parallel sessions); supervisor and handoff are rejected until Phase 5.0.4. Downstream (non-root) steps start Pending — the DAG-progression driver lands in 5.0.0.c — so poll with join_workflow or list_workflow_runs to observe completion. Returns the initial WorkflowRun JSON snapshot."
+        description = "Launch a named workflow declared under workflows: in ptygrid.yml as a DAG run. Steps spawn only agents/processes from the ptygrid.yml allowlist (the same allow-list spawn_agent uses) — workflows introduce no new spawn path. All four patterns run: pipeline, fan-out (a fan-out step's fanOut count expands its root into that many parallel sessions), supervisor, and handoff. Only root steps spawn immediately; downstream steps start Pending and a background driver advances the DAG every 200ms, completing steps on a PTY exit code, a semantic done status, or an inbox reply (joinOn: reply), and honouring per-step timeoutMs, retry, condition and handoffTo. Poll with join_workflow or list_workflow_runs to observe completion. Returns the initial WorkflowRun JSON snapshot taken right after the root spawns, so downstream steps in it are expected to read Pending. Note that concurrent runs of the SAME workflow name share one inbox mailbox, so prefer joining a run before starting it again."
     )]
     fn spawn_workflow(
         &self,

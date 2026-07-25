@@ -183,8 +183,12 @@ pub fn spawn_team(
 
 /// Phase 5.0.0.e/f: launch a named workflow declared under workflows: in
 /// ptygrid.yml — the same backend function as the Queen `spawn_workflow`
-/// tool. MVO supports pipeline/fan-out; supervisor/handoff reject with a
-/// "not implemented in MVO" error until Phase 5.0.4.
+/// tool. Phase 5.0.4 removed the spawn-time pattern gate: all four of
+/// pipeline / fan-out / supervisor / handoff now spawn, and the old
+/// "not implemented in MVO" error no longer exists anywhere in live source.
+/// This corrects the stale wording that stood here until 2026-07-25 — see
+/// CONTRACT.md, the 2026-07-25 addendum (続報7), for the execution-layer
+/// contract and, importantly, for the verification limits that apply to it.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn spawn_workflow(

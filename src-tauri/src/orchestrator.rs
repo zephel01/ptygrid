@@ -99,14 +99,16 @@ pub struct StepOutcome {
     #[serde(default)]
     pub started_at_ms: u64,
     /// `root_message_id` of the kickoff message sent for this attempt, if
-    /// any. Internal only (never serialized) — used by
-    /// `detect_reply_completions` to correlate an inbox reply back to this
-    /// step.
+    /// any. Internal only (never serialized) — `detect_reply_completions`
+    /// correlates an inbox reply back to this step through it, and every
+    /// retry path overwrites it because each attempt opens a new thread.
     #[serde(skip)]
     pub kickoff_root_msg_id: Option<i64>,
-    /// Body of the reply that completed this step via route 3 (durable
-    /// inbox), if any. Internal only — feeds `condition` evaluation on
-    /// dependents and the `handoff_to` kickoff prefix.
+    /// Body of the most recent inbox reply seen on this attempt's kickoff
+    /// thread, if any. Internal only — read by `condition_targets` to
+    /// evaluate a dependent's `condition`, and by `handoff_bodies` to build
+    /// the `handoff_to` kickoff prefix. Recorded for every join policy, but
+    /// only `joinOn: reply` treats its arrival as completion.
     #[serde(skip)]
     pub reply_body: Option<String>,
     /// Set while a Failed outcome is waiting out its retry backoff; `None`
@@ -326,37 +328,144 @@ fn spawn_step<R: Runtime>(
     }
 }
 
-/// Deliver a step's `kickoff` message to its inbox mailbox (= definition
-/// name) via the durable Queen store, same path team_presets uses.
+/// The run's own mailbox: kickoffs are sent *from* it and replies arrive
+/// *to* it, which is what lets `detect_reply_completions` scan one mailbox
+/// for every step of the workflow.
+///
+/// Single source of truth — `deliver_kickoff`, `detect_reply_completions`
+/// and the ack pass must all agree on this string or route 3 silently never
+/// fires.
+fn workflow_mailbox(workflow_name: &str) -> String {
+    format!("queen:workflow/{workflow_name}")
+}
+
+/// Deliver a step's kickoff message to its agent's inbox via the durable
+/// Queen store, same path team_presets uses.
+///
+/// `carried` is the upstream `handoff_to` reply body to prepend, if any; see
+/// `handoff::compose_kickoff` for how it combines with the step's declared
+/// `kickoff`. Returns the new thread's `root_message_id` so the caller can
+/// stash it on the outcome for `detect_reply_completions` to correlate
+/// against, or `Ok(None)` when there was nothing to send (no declared
+/// `kickoff` and no carried body) — that is a no-op, not a failure.
 fn deliver_kickoff(
     store: &QueenStore,
     project_dir: &std::path::Path,
     workflow_name: &str,
     step: &WorkflowStep,
-) -> Result<(), String> {
-    let Some(kickoff) = step.kickoff.as_ref() else {
-        return Ok(());
+    carried: Option<&str>,
+) -> Result<Option<i64>, String> {
+    let Some(body) = handoff::compose_kickoff(step.kickoff.as_deref(), carried) else {
+        return Ok(None);
     };
     store
         .send_inbox(
             project_dir,
-            format!("queen:workflow/{workflow_name}"),
+            workflow_mailbox(workflow_name),
             step.agent.clone(),
             format!("workflow:{workflow_name} step:{} kickoff", step.id),
-            kickoff.clone(),
+            body,
         )
-        .map(|_| ())
+        .map(|message| Some(message.root_message_id))
+}
+
+/// Fold a `deliver_kickoff` result onto the outcome about to be persisted.
+///
+/// Shared by all four spawn/respawn sites (`spawn_workflow`'s root loop,
+/// `spawn_ready`, `respawn_fresh`, and `fire_due_retries`' restart-in-place
+/// branch) because they must agree on two rules that are easy to get subtly
+/// different when written out four times:
+///
+/// 1. **A failed delivery clears `kickoff_root_msg_id`.** Any surviving id
+///    belongs to a thread THIS attempt never opened, and
+///    `detect_reply_completions` would happily correlate a stale reply against
+///    it and complete the step on the previous attempt's answer.
+/// 2. **On a `joinOn: reply` step, a missing root id is FATAL to the step.**
+///    Kickoff delivery is otherwise best-effort by design: the pane is alive
+///    and the human can still drive the agent by hand, so route 1 (PTY exit)
+///    and route 2 (semantic `done`) both still complete normally and the
+///    failure is recorded as text on `error`. Route 3 has no such fallback —
+///    `detect_reply_completions` matches replies *by thread root id*, so with
+///    no id there is no thread, no reply can ever be attributed, and the step
+///    sits `Running` until the run is cancelled by hand. Failing it converts a
+///    silent permanent wedge into an ordinary failure: `arm_retry_backoff`
+///    gives it its retry budget if the step declares one, and if it does not,
+///    fail-fast cascades and the run finalizes `Failed` with the reason
+///    attached.
+///
+/// Only ever escalates a `Running` outcome. A spawn that never got a pane is
+/// already `Failed` with its own more proximate error, which must not be
+/// overwritten by a downstream symptom.
+///
+/// KNOWN LIMITATION of rule 2: the escalation to `Failed` happens here, on the
+/// outcome alone, while the pane that spawn just opened stays open. This
+/// function is called from four sites that hold neither the `PtyManager` nor the
+/// `StatusView`, so it cannot close it, and the step is no longer `Running` so
+/// no later route reaps it either — the pane is orphaned until the operator
+/// closes it. Accepted for now because it needs a store `send_inbox` failure to
+/// trigger at all, and because a step that declares `retry` recovers the pane
+/// instead of leaking a second one: the outcome still carries `attempts: 1`
+/// (every `spawn_step` return path sets it, and this function is only reached
+/// on a `Running` outcome), so `arm_retry_backoff`'s `attempts == 0` guard does
+/// not skip it, and once armed `holds_a_pane` is true and `fire_due_retries`
+/// restarts the SAME session in place. Note "once armed", which for the three
+/// call sites inside `advance_run` is the SAME tick: an escalation from
+/// `spawn_ready` (:2272) is armed by the second `arm_retry_backoff` pass
+/// (:2294) before `finalize_state` (:2296) — that is exactly the pass bug 【G】
+/// added — and one from `fire_due_retries`/`respawn_fresh` (:2231) is armed by
+/// the first pass (:2244). Only the fourth site, `spawn_workflow`'s root loop
+/// (:538), sits outside `advance_run`, so there the outcome stays unarmed until
+/// the first driver tick ~200 ms later. A step with no `retry` policy at all
+/// never leaves the unarmed state anywhere.
+fn attach_kickoff_result(
+    step: &WorkflowStep,
+    outcome: &mut StepOutcome,
+    delivered: Result<Option<i64>, String>,
+) {
+    match delivered {
+        Ok(root_id) => outcome.kickoff_root_msg_id = root_id,
+        Err(err) => {
+            outcome.kickoff_root_msg_id = None;
+            append_error(outcome, &format!("kickoff delivery failed: {err}"));
+        }
+    }
+    if outcome.state == StepState::Running
+        && matches!(effective_join(step), JoinOn::Named(JoinOnName::Reply))
+        && outcome.kickoff_root_msg_id.is_none()
+    {
+        outcome.state = StepState::Failed;
+        append_error(
+            outcome,
+            "joinOn: reply has no kickoff thread to await a reply on, \
+             so this step could never complete",
+        );
+    }
+}
+
+/// Append to `outcome.error`, preserving any text already there. Spawn and
+/// kickoff delivery can each contribute a reason for the same outcome and the
+/// earlier one is usually the more proximate cause, so neither may clobber the
+/// other.
+fn append_error(outcome: &mut StepOutcome, msg: &str) {
+    outcome.error = Some(match outcome.error.as_deref() {
+        Some(base) if !base.is_empty() => format!("{base}; {msg}"),
+        _ => msg.to_string(),
+    });
 }
 
 /// Launch a named workflow. See CONTRACT.md Phase 5.0 §5.0.3 for the exact
-/// wire semantics. MVO scope (5.0.0):
+/// wire semantics:
 ///
 /// 1. Validate the workflow exists in the loaded config;
 /// 2. For `pipeline`: spawn the single root step and deliver its kickoff;
 /// 3. For `fan-out`: spawn N parallel copies of each fanOut-marked root step
 ///    and deliver each one's kickoff;
-/// 4. For `supervisor` / `handoff`: return `Err("pattern not implemented in MVO")`
-///    (5.0.4 will land these);
+/// 4. For `supervisor` / `handoff`: spawn the roots exactly as `pipeline`
+///    does (Phase 5.0.4 — these no longer return a typed defer). Both
+///    patterns are shape-validated in `config.rs`; the only runtime
+///    difference is that several of their steps may name the *same* agent,
+///    which `agent_claimed_by_other_step` keeps from collapsing onto one
+///    shared pane;
 /// 5. Return an initial `WorkflowRun` snapshot with state=Running and each
 ///    launched step in state=Running.
 ///
@@ -385,18 +494,6 @@ pub fn spawn_workflow<R: Runtime>(
         .ok_or_else(|| format!("workflow '{workflow_name}' not found in config"))?
         .clone();
 
-    // MVO gates: reject patterns whose runtime driver is not yet implemented.
-    match wf.pattern {
-        WorkflowPattern::Pipeline | WorkflowPattern::FanOut => {}
-        WorkflowPattern::Supervisor | WorkflowPattern::Handoff => {
-            return Err(format!(
-                "workflow '{workflow_name}': pattern {:?} not implemented in MVO \
-                 (lands in Phase 5.0.4)",
-                wf.pattern
-            ));
-        }
-    }
-
     let run_id = new_run_id();
     let started_at_ms = now_ms();
     let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(wf.steps.len());
@@ -422,35 +519,27 @@ pub fn spawn_workflow<R: Runtime>(
 
     // Roots launch immediately. fan-out expands roots per fanOut count.
     for step in root_steps(&wf) {
-        let copies = match (wf.pattern, step.fan_out) {
-            (WorkflowPattern::FanOut, Some(n)) if n >= 2 => n as usize,
-            _ => 1,
-        };
-        // copies == 1 -> singular step (pipeline or un-fanned root): keep the
-        // idempotent reuse. copies >= 2 -> fan-out expansion: every copy must
-        // spawn fresh.
-        let reuse_existing = copies == 1;
+        let copies = copies_for(wf.pattern, step);
         for _ in 0..copies {
-            let outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
-            // Best-effort kickoff delivery — a failed delivery does NOT flip
-            // the step to Failed (the pane is already alive; the agent can
-            // still work via manual instruction). The failure is surfaced on
-            // the outcome.error field. Same posture team_presets uses.
+            // copies == 1 -> singular step: keep the idempotent pane reuse,
+            // UNLESS another root already claimed this agent's pane — two
+            // `supervisor`/`handoff` roots may legitimately name the same
+            // agent, and adopting one pane for both would make one exit
+            // complete both steps. copies >= 2 -> fan-out expansion: every
+            // copy must spawn fresh.
+            let reuse_existing = copies == 1 && !agent_claimed_by_other_step(&outcomes, step);
+            // Roots have no upstream, so nothing is ever carried in here;
+            // `handoff_to` bodies only reach dependents, via `spawn_ready`.
+            let carried = None;
+            let mut outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
+            // Kickoff delivery is best-effort — a failure does NOT flip the
+            // step to Failed (the pane is already alive; the agent can still
+            // work via manual instruction), it is surfaced on `outcome.error`.
+            // Same posture team_presets uses. `attach_kickoff_result` holds the
+            // one exception, `joinOn: reply`, which has no such fallback.
             if outcome.state == StepState::Running {
-                if let Err(err) = deliver_kickoff(store, &project_dir, workflow_name, step) {
-                    // Attach as suffix, keeping any earlier error text.
-                    let base = outcome.error.clone().unwrap_or_default();
-                    let joined = if base.is_empty() {
-                        format!("kickoff delivery failed: {err}")
-                    } else {
-                        format!("{base}; kickoff delivery failed: {err}")
-                    };
-                    outcomes.push(StepOutcome {
-                        error: Some(joined),
-                        ..outcome
-                    });
-                    continue;
-                }
+                let delivered = deliver_kickoff(store, &project_dir, workflow_name, step, carried);
+                attach_kickoff_result(step, &mut outcome, delivered);
             }
             outcomes.push(outcome);
         }
@@ -685,7 +774,7 @@ pub fn abandon_workflow(
 // Phase 5.0.0.c: DAG progression driver
 // -----------------------------------------------------------------------------
 //
-// Two independent completion signals feed the driver:
+// Three independent completion signals feed the driver:
 //
 //   route 1 (process exit)   — the step's PTY child exited; `classify_session_exit`
 //                                maps its exit code to Succeeded/Failed.
@@ -696,6 +785,16 @@ pub fn abandon_workflow(
 //                                alive. `StatusView` is the shared, thread-safe
 //                                bridge from that event listener to the driver
 //                                loop.
+//   route 3 (inbox reply)    — the step's agent replied to its kickoff thread
+//                                in the durable Queen inbox
+//                                (`detect_reply_completions`). This is the only
+//                                route for a `joinOn: reply` step, whose pane is
+//                                expected to stay alive so that routes 1 and 2
+//                                never fire. The reply body is also what
+//                                `condition:` is matched against and what
+//                                `handoffTo:` carries into the next step's
+//                                kickoff, so it is recorded regardless of the
+//                                step's join policy.
 //
 // The driver itself is intentionally poll-based (`driver_loop` ticks every
 // `DRIVER_TICK`), not event-driven: `advance_run` re-derives what *should*
@@ -768,7 +867,7 @@ fn base_id(step_id: &str) -> &str {
 /// Whether a step's outcome is terminal (the step will never transition
 /// again without external intervention like `cancel_workflow`). A `Failed`
 /// outcome that is still waiting out its `retry` backoff (`next_retry_at_ms`
-/// set) is deliberately NOT terminal — `apply_retry_policy` may yet flip it
+/// set) is deliberately NOT terminal — `fire_due_retries` may yet flip it
 /// back to `Running` once the deadline passes.
 fn is_terminal(outcome: &StepOutcome) -> bool {
     match outcome.state {
@@ -779,8 +878,8 @@ fn is_terminal(outcome: &StepOutcome) -> bool {
 }
 
 /// Phase 5.0.4 retry bookkeeping: pure attempts/backoff arithmetic, kept
-/// free of PTY/store I/O so it can be unit-tested directly. `apply_retry_policy`
-/// (driver section below) is the only caller.
+/// free of PTY/store I/O so it can be unit-tested directly.
+/// `arm_retry_backoff` (driver section below) is the only caller.
 mod retry {
     use crate::config::RetryPolicy;
 
@@ -798,6 +897,233 @@ mod retry {
     /// Failed outcome becomes eligible for its next attempt.
     pub fn due_at(now_ms: u64, policy: &RetryPolicy) -> u64 {
         now_ms + policy.backoff_ms.unwrap_or(0)
+    }
+}
+
+/// Phase 5.0.4 `handoffTo` chaining: pure composition of the kickoff text a
+/// chained step receives. Kept in its own module next to `mod retry` for the
+/// same reason — no store, no PTY, no clock, so the composition rule can be
+/// pinned by unit test without a mailbox.
+///
+/// The rule is not invented here: `config::WorkflowStep::handoff_to`'s own doc
+/// comment (the committed schema) says the reply body is *prepended* to the
+/// target's `kickoff`. CONTRACT.md never states a composition rule, so that
+/// field doc is the authority, and prepending is also the useful order: the
+/// carried work lands first, the target's standing instructions read as a
+/// suffix qualifying it, and an agent that truncates a long message keeps the
+/// payload rather than the boilerplate.
+mod handoff {
+    /// Byte cap on the carried half of a synthesized kickoff.
+    ///
+    /// `QueenStore::send_inbox` REJECTS a body over its private 64 KiB
+    /// `MAX_MESSAGE_BODY_BYTES` outright, and kickoff delivery is best-effort:
+    /// a rejected send only records `"kickoff delivery failed"` on the
+    /// outcome, so an oversized reply body would cost the target its OWN
+    /// declared `kickoff` too. The carried half is the unbounded,
+    /// agent-authored one, so it is the half that gets clipped; 48 KiB leaves
+    /// ~16 KiB of headroom for the declared text and the separator.
+    pub const MAX_HANDOFF_BODY_BYTES: usize = 48 * 1024;
+
+    /// Appended when `clip` actually cut something, so the receiving agent can
+    /// distinguish a truncated handoff from a genuinely terse reply instead of
+    /// silently reasoning about half a payload.
+    /// `pub` only so the tests can compute `clip`'s real walk-back start
+    /// (`cap - len`) instead of hard-coding 25 — an assertion written against
+    /// the cap itself is vacuous now that the marker is reserved inside it.
+    pub const TRUNCATION_MARKER: &str = "\n[handoff body truncated]";
+
+    /// Mirrors `queen_store`'s private `MAX_MESSAGE_BODY_BYTES`: the hard cap
+    /// `send_inbox` REJECTS on. Duplicated as a local constant because that one
+    /// is not `pub`. Clipping the carried half alone is not sufficient to stay
+    /// under it — the declared `kickoff` is appended after the clip and is not
+    /// length-validated at config load, so a 48 KiB carry plus a >16 KiB
+    /// declared kickoff still oversteps and loses the delivery entirely. Under
+    /// the reply-join sealing in `attach_kickoff_result` that lost delivery is
+    /// no longer cosmetic: it fails the step.
+    pub const MAX_KICKOFF_BODY_BYTES: usize = 64 * 1024;
+
+    /// Byte-clip to at most `cap` bytes INCLUDING the truncation marker, at the
+    /// nearest char boundary. Three details are load-bearing:
+    ///
+    /// - Walking the boundary DOWN rather than slicing blind: `reply_body` is
+    ///   agent output, so a multi-byte char straddling the cap is entirely
+    ///   plausible and `&body[..cap]` would panic on it.
+    /// - Reserving `TRUNCATION_MARKER.len()` inside the cap rather than
+    ///   appending past it. Appending past it returns `cap + 25` bytes, which
+    ///   defeats the only caller that has a hard external limit:
+    ///   `compose_kickoff`'s `MAX_KICKOFF_BODY_BYTES` clip exists precisely so
+    ///   the composed body fits `send_inbox`'s 64 KiB `validated_required`
+    ///   check, and that check rejects on `len() > max`. Overshooting by the
+    ///   marker made the "backstop" produce exactly the rejection it was added
+    ///   to prevent — and under `attach_kickoff_result` a rejected kickoff FAILS
+    ///   a `joinOn: reply` step, so the off-by-25 was a step failure, not a
+    ///   cosmetic truncation.
+    /// - Returning empty for a `cap` too small to hold the marker at all. The
+    ///   `<= cap` guarantee is only useful if it is unconditional, and
+    ///   `saturating_sub` on its own would quietly return the bare 25-byte
+    ///   marker for a 4-byte cap.
+    ///
+    /// `pub` within this private module purely so the tests can pin the
+    /// small-`cap` branch directly; no non-test caller outside `handoff` uses
+    /// it.
+    pub fn clip(body: &str, cap: usize) -> String {
+        if body.len() <= cap {
+            return body.to_string();
+        }
+        // A cap too small to hold even the marker: emit nothing rather than a
+        // 25-byte marker that overshoots the cap it was asked to respect. No
+        // caller does this today (48 KiB and 64 KiB are the only two), but the
+        // `<= cap` guarantee above has to hold unconditionally or it is not a
+        // guarantee, and `saturating_sub` alone would silently break it.
+        if cap <= TRUNCATION_MARKER.len() {
+            return String::new();
+        }
+        let mut end = cap - TRUNCATION_MARKER.len();
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{TRUNCATION_MARKER}", &body[..end])
+    }
+
+    /// Join every reply body one tick captured for a single step, oldest
+    /// first, into the one `reply_body` the outcome can hold.
+    ///
+    /// Lives here rather than at the call site so the byte cap on
+    /// agent-authored prose is applied in exactly one place. `reply_body` is
+    /// `#[serde(skip)]`, so this body never reaches the `workflow-state` event
+    /// or `steps_json` — the bound is not a wire-payload concern but a memory
+    /// one (`WorkflowRegistry` holds every run's full `Vec<StepOutcome>` for the
+    /// process lifetime, and `advance_run` clones the run on each changed tick)
+    /// and, more importantly, a correctness one: this string becomes
+    /// `compose_kickoff`'s carried half, and an unbounded carry means a kickoff
+    /// `send_inbox` rejects. Clipping here makes `compose_kickoff`'s inner clip
+    /// a no-op re-check on this path, which is intended — it still guards the
+    /// other callers.
+    ///
+    /// Separated by a BLANK line, the same separator `compose_kickoff` puts
+    /// between the carried and declared halves, and for the same reason: both
+    /// sides are free-form prose and a bare `\n` would run the last line of one
+    /// message into the first line of the next. No per-message marker is
+    /// inserted — this body is fed to another agent as instructions, and
+    /// framing noise there costs more than the message boundary is worth.
+    ///
+    /// Blank entries are dropped. `send_inbox` trims and then rejects an empty
+    /// body, so a stored reply is never blank and the filter is defensive only;
+    /// it exists so that a future non-store caller cannot produce a body that is
+    /// pure separator.
+    pub fn merge_reply_bodies(bodies: &[&str]) -> String {
+        let joined = bodies
+            .iter()
+            .map(|body| body.trim())
+            .filter(|body| !body.is_empty())
+            .collect::<Vec<&str>>()
+            .join("\n\n");
+        clip(&joined, MAX_HANDOFF_BODY_BYTES)
+    }
+
+    /// The single kickoff body to deliver to a step, given what it declared
+    /// (`kickoff:`) and what a `handoffTo` predecessor carried into it.
+    /// `None` means "send nothing at all", preserving `deliver_kickoff`'s
+    /// pre-5.0.4 no-op for a step with no `kickoff`.
+    ///
+    /// Four cases, and each one is a deliberate choice:
+    ///
+    /// - carried + declared -> carried, blank line, declared. Prepend per the
+    ///   schema doc; a BLANK line (not one newline) because both halves are
+    ///   free-form prose and a bare `\n` would let the last line of a reply
+    ///   run into the first line of the instructions.
+    /// - carried only -> carried alone. This is the common chain shape: a
+    ///   middle link usually declares no `kickoff` of its own and exists
+    ///   purely to act on what the previous link said. Refusing to send here
+    ///   would make `handoffTo` inert for exactly the configs that need it.
+    /// - declared only -> declared, byte-identical to the pre-5.0.4 path.
+    ///   `reply_body` is `None` for every step that completed via route 1
+    ///   (PTY exit) or route 2 (semantic done), which is most of them, so
+    ///   this branch is the norm, not the edge case — a missing reply must
+    ///   never degrade a step below its old behaviour.
+    /// - neither -> `None`, same no-op as today.
+    ///
+    /// A whitespace-only carried body counts as absent: `send_inbox` trims
+    /// and then rejects an empty body, so passing one through would turn a
+    /// no-content handoff into a spurious delivery failure on a step that is
+    /// otherwise fine.
+    ///
+    /// The composed result is clipped a second time against
+    /// `MAX_KICKOFF_BODY_BYTES`. That outer clip is a backstop, not the primary
+    /// bound — the inner one keeps the agent-authored half to 48 KiB precisely
+    /// so the declared half survives intact — and it necessarily cuts the
+    /// declared tail, which is the wrong half to lose. Reaching it at all means
+    /// a `kickoff:` over ~16 KiB was authored in the YAML. Cutting the tail
+    /// still beats the alternative, which is `send_inbox` rejecting the whole
+    /// message and the step receiving no instructions at all.
+    pub fn compose_kickoff(declared: Option<&str>, carried: Option<&str>) -> Option<String> {
+        let carried = carried.map(str::trim).filter(|body| !body.is_empty());
+        let composed = match (carried, declared) {
+            (Some(body), Some(declared)) => {
+                format!("{}\n\n{declared}", clip(body, MAX_HANDOFF_BODY_BYTES))
+            }
+            (Some(body), None) => clip(body, MAX_HANDOFF_BODY_BYTES),
+            (None, Some(declared)) => declared.to_string(),
+            (None, None) => return None,
+        };
+        Some(clip(&composed, MAX_KICKOFF_BODY_BYTES))
+    }
+}
+
+/// Phase 5.0.4 `condition:` evaluation, pure half: regex matching against an
+/// upstream step's reply body. Deliberately shaped like `mod retry` above —
+/// no PTY, no store, no clock — so the gate decision is unit-testable
+/// standalone, and so the only impure thing in the whole feature stays the
+/// `set_step_state` loop in `advance_run`.
+mod condition {
+    use regex::Regex;
+
+    /// Whether `pattern` matches anywhere in `haystack`.
+    ///
+    /// A pattern that fails to compile answers `false` (gate CLOSED) rather
+    /// than panicking or defaulting open. `validate_workflows` already
+    /// rejected every uncompilable `condition` at config load, so reaching
+    /// this branch means the config was edited under a live run; refusing to
+    /// spawn is the conservative answer, and the caller records a reason
+    /// string either way so the skip is never silent.
+    ///
+    /// Compiled per call rather than cached: the caller only evaluates a step
+    /// that is still `Pending` with its single dependency already satisfied,
+    /// and the very next pass either spawns it or Skips it — so in practice
+    /// this compiles once per conditional step per run, not once per 200ms
+    /// driver tick. A cache here would be premature.
+    pub fn matches(pattern: &str, haystack: &str) -> bool {
+        Regex::new(pattern)
+            .map(|re| re.is_match(haystack))
+            .unwrap_or(false)
+    }
+}
+
+/// How many parallel copies of one declared step a pattern launches.
+///
+/// Replaces the `match (wf.pattern, step.fan_out)` that `spawn_workflow` and
+/// `spawn_ready` each had a copy of. Two reasons to name it now:
+///
+/// 1. Removing the MVO pattern gate deletes the module's ONLY exhaustive
+///    match on `WorkflowPattern`, so a fifth pattern would compile straight
+///    into the old wildcard arm and silently spawn one copy. This match is
+///    exhaustive on purpose, and is now the place the compiler stops that.
+/// 2. It records that `fanOut` is IGNORED under supervisor/handoff rather
+///    than honoured — `validate_workflows` rejects `fanOut` only for
+///    `pipeline`, so `pattern: supervisor` + `fanOut: 3` loads clean and
+///    lands here.
+fn copies_for(pattern: WorkflowPattern, step: &WorkflowStep) -> usize {
+    match pattern {
+        // `fanOut` under 2 is rejected at load time; the filter is belt-and-
+        // braces so a 1 could never collapse the reuse decision below.
+        WorkflowPattern::FanOut => step
+            .fan_out
+            .filter(|n| *n >= 2)
+            .map(|n| n as usize)
+            .unwrap_or(1),
+        // Singular per declared step. Supervisor parallelism comes from
+        // having several sibling steps, handoff has none by construction.
+        WorkflowPattern::Pipeline | WorkflowPattern::Supervisor | WorkflowPattern::Handoff => 1,
     }
 }
 
@@ -837,17 +1163,148 @@ fn dep_satisfied(dep_step: &WorkflowStep, outcomes: &[StepOutcome]) -> bool {
         return false;
     }
     match effective_join(dep_step) {
-        JoinOn::Named(JoinOnName::All) => copies.iter().all(|o| o.state == StepState::Succeeded),
-        // TODO(5.0.4): `Count(n)` should require >= n successful copies, not
-        // just >= 1. MVO folds it into `any` semantics until the join-count
-        // bookkeeping (and its interaction with fail-fast) is designed.
-        JoinOn::Named(JoinOnName::Any) | JoinOn::Count(_) => {
-            copies.iter().any(|o| o.state == StepState::Succeeded)
+        // `reply` is satisfied by `detect_reply_completions` marking every
+        // copy Succeeded (it never leaves a copy Failed/Running once it
+        // fires), so it shares `all`'s "every copy succeeded" check.
+        JoinOn::Named(JoinOnName::All) | JoinOn::Named(JoinOnName::Reply) => {
+            copies.iter().all(|o| o.state == StepState::Succeeded)
         }
-        // Reply-based join needs a reply-message correlation MVO does not
-        // implement (lands in 5.0.4); a dependent gated on it never becomes
-        // ready and the run stays Running until cancelled.
-        JoinOn::Named(JoinOnName::Reply) => false,
+        JoinOn::Named(JoinOnName::Any) => copies.iter().any(|o| o.state == StepState::Succeeded),
+        JoinOn::Count(n) => {
+            copies
+                .iter()
+                .filter(|o| o.state == StepState::Succeeded)
+                .count() as u32
+                >= n
+        }
+    }
+}
+
+/// The mirror of `dep_satisfied`: `true` when this dependency can never
+/// become satisfied no matter what the still-in-flight copies do.
+///
+/// Compares the join's *required* success count against the successes
+/// already banked plus the copies still capable of producing one (anything
+/// not yet `is_terminal` — including a Failed copy mid-retry-backoff, which
+/// `fire_due_retries` may still bring back to Running). When the ceiling
+/// falls below the requirement, every dependent is doomed.
+///
+/// This replaces `failfast_targets`' old "a Failed copy exists AND (join is
+/// `all` OR every copy terminated without success)" test, which missed the
+/// count-join case: `joinOn: 2` over 3 copies with 1 success and 2 terminal
+/// failures can never reach 2, yet the surviving success defeated the
+/// `all()` check and wedged the run in `Running` forever.
+///
+/// A dependency with any `Pending` copy is never reported unsatisfiable. Both
+/// `spawn_workflow` and `resume_workflow` represent a not-yet-spawned fan-out
+/// step as exactly ONE bare-id (`"candidate"`, not `"candidate#0"`) `Pending`
+/// row — the `#k` copies only materialise at spawn time. Counting that single
+/// placeholder as the whole ceiling makes `joinOn: 2` over `fanOut: 3` look
+/// doomed (`in_play = 1 < 2`) before the step has run at all, skipping its
+/// dependents and — since `finalize_state` now treats `Skipped` as neutral —
+/// reporting the run `Succeeded` with steps that never executed.
+///
+/// This cannot wedge the run: a `Pending` copy that is *genuinely* doomed is
+/// skipped by the cascade from its own upstream, re-enters as `Skipped`, and
+/// `Skipped` is terminal — so the very next tick sees no `Pending` copy and
+/// the ceiling arithmetic below applies normally. Deliberately NOT
+/// "arithmetic against the declared fan-out width unconditionally": that
+/// credits copies which will never exist once the step has already spawned
+/// and lost some, restoring the count-join hang this function exists to fix.
+fn dep_unsatisfiable(dep_step: &WorkflowStep, outcomes: &[StepOutcome]) -> bool {
+    let copies: Vec<&StepOutcome> = outcomes
+        .iter()
+        .filter(|o| base_id(&o.step_id) == dep_step.id.as_str())
+        .collect();
+    if copies.is_empty() || dep_satisfied(dep_step, outcomes) {
+        return false;
+    }
+    if copies.iter().any(|o| o.state == StepState::Pending) {
+        return false;
+    }
+    let required = match effective_join(dep_step) {
+        JoinOn::Named(JoinOnName::All) | JoinOn::Named(JoinOnName::Reply) => copies.len() as u32,
+        JoinOn::Named(JoinOnName::Any) => 1,
+        JoinOn::Count(n) => n,
+    };
+    let banked = copies
+        .iter()
+        .filter(|o| o.state == StepState::Succeeded)
+        .count() as u32;
+    let in_play = copies.iter().filter(|o| !is_terminal(o)).count() as u32;
+    banked + in_play < required
+}
+
+/// Per-target `handoff_to` bodies to carry into the next kickoff, keyed by
+/// the *target* step id.
+///
+/// `config.rs` fixes the semantics: the reply body of the step declaring
+/// `handoffTo: X` is prepended to X's own `kickoff`. Validation guarantees
+/// `handoffTo` targets are singular (never fan-out), so the first copy
+/// carrying a non-blank `reply_body` wins; a target claimed by two sources
+/// keeps the first in declaration order rather than concatenating, which
+/// would make the carried context order-dependent on tick timing.
+///
+/// Steps whose upstream produced no reply yield no entry — `compose_kickoff`
+/// then falls back to the declared `kickoff` alone.
+fn handoff_bodies(wf: &WorkflowDef, run: &WorkflowRun) -> HashMap<String, String> {
+    let mut bodies: HashMap<String, String> = HashMap::new();
+    for step in &wf.steps {
+        let Some(target) = step.handoff_to.as_deref() else {
+            continue;
+        };
+        if bodies.contains_key(target) {
+            continue;
+        }
+        let carried = run
+            .steps
+            .iter()
+            .filter(|o| base_id(&o.step_id) == step.id.as_str())
+            .find_map(|o| o.reply_body.as_deref())
+            .filter(|body| !body.trim().is_empty());
+        if let Some(body) = carried {
+            bodies.insert(target.to_string(), body.to_string());
+        }
+    }
+    bodies
+}
+
+/// `true` when some *other* step of this run currently holds a live pane for
+/// the same agent.
+///
+/// `spawn_step`'s `reuse_existing` path adopts an already-running pane for
+/// the agent instead of opening a second one. That is right for a pipeline
+/// (one step per agent) but wrong for `supervisor`/`handoff`, where several
+/// steps legitimately name the same agent: the second step would silently
+/// adopt the first step's pane, so both outcomes would track one session and
+/// the first step's exit would complete both.
+fn agent_claimed_by_other_step(outcomes: &[StepOutcome], step: &WorkflowStep) -> bool {
+    outcomes.iter().any(|o| {
+        holds_a_pane(o) && o.agent == step.agent && base_id(&o.step_id) != step.id.as_str()
+    })
+}
+
+/// Whether an outcome still owns the agent's pane. `Running` is the obvious
+/// case; a `Failed` outcome with its retry backoff armed is the subtle one —
+/// `fire_due_retries` will respawn into that pane once the deadline passes, so
+/// handing it to another step during the backoff window would give two live
+/// steps one session. Deliberately NOT `!is_terminal`: `Pending` is
+/// non-terminal but holds nothing, and treating it as a claim would block
+/// legitimate reuse for every not-yet-spawned downstream step.
+///
+/// The armed-retry arm also requires a `session_id`. `check_timeouts` clears
+/// it after `kill_pty`, and `spawn_step`'s pane-cap and resolve/spawn failure
+/// paths never set one — in all three the backoff is armed but there is no pane
+/// to hold, and `fire_due_retries` will take the fresh-spawn branch rather than
+/// restarting in place. Claiming a pane that does not exist would block a
+/// sibling step from a session neither of them owns.
+fn holds_a_pane(outcome: &StepOutcome) -> bool {
+    match outcome.state {
+        StepState::Running => true,
+        StepState::Failed => outcome.next_retry_at_ms.is_some() && outcome.session_id.is_some(),
+        StepState::Pending | StepState::Succeeded | StepState::Skipped | StepState::Cancelled => {
+            false
+        }
     }
 }
 
@@ -906,31 +1363,16 @@ fn transitive_dependents<'a>(wf: &'a WorkflowDef, step_id: &str) -> Vec<&'a Work
 }
 
 /// Step ids (declared, not fan-out-suffixed) that must be cascade-Skipped
-/// this tick: every still-`Pending` step transitively downstream of an
-/// upstream step whose dependency can now never be satisfied — a
-/// `JoinOn::All`/singular step that has already Failed, or an `any`/count
-/// joined step every one of whose copies has terminated without a success.
-/// MVO defers cooperative cancellation of in-flight fail-fast siblings to
-/// 5.0.4, so only `Pending` (not-yet-spawned) steps are targeted here.
+/// this tick: every still-`Pending` step transitively downstream of a step
+/// whose join can no longer be satisfied (see `dep_unsatisfiable`).
+///
+/// Cooperative cancellation of *in-flight* fail-fast siblings remains
+/// deferred, so only `Pending` (not-yet-spawned) steps are targeted here —
+/// a Running sibling is left to finish or time out on its own.
 fn failfast_targets(wf: &WorkflowDef, run: &WorkflowRun) -> Vec<String> {
     let mut doomed: Vec<String> = Vec::new();
     for step in &wf.steps {
-        let copies: Vec<&StepOutcome> = run
-            .steps
-            .iter()
-            .filter(|o| base_id(&o.step_id) == step.id.as_str())
-            .collect();
-        if copies.is_empty() || !copies.iter().any(|o| o.state == StepState::Failed) {
-            continue;
-        }
-        let unsatisfiable = match effective_join(step) {
-            JoinOn::Named(JoinOnName::All) => true,
-            JoinOn::Named(JoinOnName::Any) | JoinOn::Count(_) => copies
-                .iter()
-                .all(|o| is_terminal(o) && o.state != StepState::Succeeded),
-            JoinOn::Named(JoinOnName::Reply) => true,
-        };
-        if unsatisfiable {
+        if dep_unsatisfiable(step, &run.steps) {
             doomed.push(step.id.clone());
         }
     }
@@ -949,6 +1391,78 @@ fn failfast_targets(wf: &WorkflowDef, run: &WorkflowRun) -> Vec<String> {
     targets
 }
 
+/// `(step_id, state, reason)` triples for steps whose `condition:` has now
+/// been decided against them and must leave `Pending` this tick.
+///
+/// A `condition` step is evaluated exactly once, at the moment its single
+/// dependency becomes satisfied: `config.rs` validation guarantees such a
+/// step declares exactly one `dependsOn` entry and that neither it nor that
+/// dependency is fan-out, so "the dependency's reply" is unambiguous.
+///
+/// Three outcomes, and the third does NOT get the same state as the second:
+///   * the regex matches the upstream reply → no entry; the step stays
+///     Pending and `spawn_ready` launches it on the same or a later tick;
+///   * the regex does not match → `Skipped` with the pattern quoted. This is
+///     the gate working as designed, and `finalize_state` treats `Skipped` as
+///     neutral so a declined branch leaves the run green;
+///   * the upstream satisfied its join *without* leaving a reply body (it
+///     completed via route 1/2 rather than route 3) → `Failed`, not `Skipped`.
+///     Nothing was evaluated here: the condition the operator wrote never ran,
+///     and the branch was declined by the ABSENCE of input rather than by its
+///     content. Under the neutral-`Skipped` rule, reporting it as a skip would
+///     make the whole run green while silently discarding a branch on a
+///     technicality — a misconfiguration (a `condition:` whose dependency has
+///     no `kickoff:`, hence never any reply to match) that looks exactly like
+///     a successful run. `Failed` keeps the run progressing to a terminal
+///     state, which wedging in `Pending` would not, while reporting red; the
+///     reason string names the missing reply so the fix is obvious.
+fn condition_targets(wf: &WorkflowDef, run: &WorkflowRun) -> Vec<(String, StepState, String)> {
+    let mut targets: Vec<(String, StepState, String)> = Vec::new();
+    for step in &wf.steps {
+        let Some(pattern) = step.condition.as_deref() else {
+            continue;
+        };
+        let pending = run
+            .steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == step.id.as_str() && o.state == StepState::Pending);
+        if !pending {
+            continue;
+        }
+        let Some(dep_id) = step.depends_on.as_deref().unwrap_or(&[]).first() else {
+            continue;
+        };
+        let Some(dep_step) = wf.steps.iter().find(|s| s.id == *dep_id) else {
+            continue;
+        };
+        if !dep_satisfied(dep_step, &run.steps) {
+            continue;
+        }
+        let dep_reply = run
+            .steps
+            .iter()
+            .find(|o| base_id(&o.step_id) == dep_step.id.as_str())
+            .and_then(|o| o.reply_body.as_deref());
+        let (state, reason) = match dep_reply {
+            Some(body) if condition::matches(pattern, body) => continue,
+            Some(_) => (
+                StepState::Skipped,
+                format!("skipped: condition '{pattern}' did not match the reply from '{dep_id}'"),
+            ),
+            None => (
+                StepState::Failed,
+                format!(
+                    "condition '{pattern}' could not be evaluated: step '{dep_id}' completed \
+                     without an inbox reply, so there was nothing to match against — give \
+                     '{dep_id}' a kickoff: so it has a thread to reply on"
+                ),
+            ),
+        };
+        targets.push((step.id.clone(), state, reason));
+    }
+    targets
+}
+
 /// Every declared step has at least one outcome copy, and every copy of
 /// every declared step is terminal.
 fn all_terminal(wf: &WorkflowDef, run: &WorkflowRun) -> bool {
@@ -963,25 +1477,44 @@ fn all_terminal(wf: &WorkflowDef, run: &WorkflowRun) -> bool {
 }
 
 /// The run-level state implied by the current step outcomes: `Running` while
-/// any declared step still has a non-terminal copy, else `Succeeded` only if
-/// every step's copies are ALL `Succeeded` (a single Failed or Skipped copy
-/// anywhere fails the whole run). Never returns `Cancelled` — that state is
-/// only ever set directly by `cancel_workflow`, and `advance_run` never calls
-/// this on an already-Cancelled run.
+/// any declared step still has a non-terminal copy, else `Failed` if any copy
+/// anywhere is `Failed` or `Cancelled`, else `Succeeded`.
+///
+/// `Skipped` is deliberately NEUTRAL as of Phase 5.0.4 (pre-5.0.4 it failed
+/// the run); the block below explains why, and why that does not lose the old
+/// fail-fast reporting. Never returns `Cancelled` — that state is only ever set
+/// directly by `cancel_workflow`, and `advance_run` never calls this on an
+/// already-Cancelled run.
 fn finalize_state(wf: &WorkflowDef, run: &WorkflowRun) -> WorkflowState {
     if !all_terminal(wf, run) {
         return WorkflowState::Running;
     }
-    let all_succeeded = wf.steps.iter().all(|step| {
-        run.steps
-            .iter()
-            .filter(|o| base_id(&o.step_id) == step.id.as_str())
-            .all(|o| o.state == StepState::Succeeded)
-    });
-    if all_succeeded {
-        WorkflowState::Succeeded
-    } else {
+    // Phase 5.0.4 semantics change: `Skipped` is NEUTRAL, not a failure.
+    //
+    // Pre-5.0.4 the only producer of `Skipped` was fail-fast, so "any Skipped
+    // => run Failed" was a correct shorthand. `condition:` breaks that: a gate
+    // that evaluates cleanly and declines its branch is the feature working,
+    // and reporting the whole run red would make `condition:` unusable for the
+    // control flow it exists to express.
+    //
+    // Keying on a HARD failure instead preserves the old outcome everywhere it
+    // mattered, because a fail-fast skip is only ever reached THROUGH a
+    // `Failed`/`Cancelled` dep (`dep_unsatisfiable` dooms on a terminal
+    // non-success, and a `Skipped` dep can only trace back to either a
+    // condition gate — no failure, correctly green — or a real failure, which
+    // is still present in `run.steps` and still turns the run red).
+    // Scanned over `run.steps` rather than over `wf.steps`' resolved copies:
+    // an outcome row whose `base_id` matches no declared step (the config was
+    // edited under a live run) is a real recorded failure and must still turn
+    // the run red, where the by-declaration walk would skip it silently.
+    let hard_failure = run
+        .steps
+        .iter()
+        .any(|o| matches!(o.state, StepState::Failed | StepState::Cancelled));
+    if hard_failure {
         WorkflowState::Failed
+    } else {
+        WorkflowState::Succeeded
     }
 }
 
@@ -1133,6 +1666,203 @@ fn detect_completions(manager: &PtyManager, view: &StatusView, run: &mut Workflo
     changed
 }
 
+/// How many unacknowledged messages ONE THREAD's scan will look at, so a
+/// mailbox an operator has been talking to by hand cannot make the driver tick
+/// cost grow without limit. `queen_store::list_inbox` clamps its own `limit` to
+/// 200, so this is already the hard ceiling and cannot be raised here alone.
+///
+/// Note what the bound does NOT promise. `list_inbox` applies `LIMIT` in SQL,
+/// before `detect_reply_completions` can filter by thread, and the orchestrator
+/// only acknowledges messages it actually matched — a reply from a sender other
+/// than the step's own agent (deliberately not matched, so an operator cannot
+/// complete a step by hand), a reply that arrived after its step went terminal,
+/// and any non-reply message sent to the workflow mailbox all stay
+/// unacknowledged indefinitely. Those occupy window slots. That is why the scan
+/// is anchored per kickoff thread rather than at one global floor: with a single
+/// `after_id` floor across all live threads, ~200 such messages sitting between
+/// an old thread's root and a newer thread's root push the newer thread's
+/// replies out of the window entirely, and a `joinOn: reply` step then waits
+/// forever with no timeout to rescue it. Per-thread anchoring reduces that to
+/// the far narrower case of ~200 unackable messages arriving above a live
+/// thread's OWN root while it is still running.
+const INBOX_REPLY_SCAN_LIMIT: u32 = 200;
+
+/// Route 3 (durable inbox reply) completion detection.
+///
+/// Scans the run's own mailbox for replies to the kickoff threads of
+/// currently-`Running` steps. A matched reply always records its body on the
+/// outcome — `condition_targets` and `handoff_bodies` read it regardless of
+/// the step's join policy — but only flips the step to `Succeeded` when that
+/// step declares `joinOn: reply`, which is the whole point of that join:
+/// the agent's pane is expected to stay alive, so routes 1 and 2 never fire
+/// and without this the step waits forever.
+///
+/// Every consumed reply is acknowledged so it cannot be re-matched on a
+/// later tick (the `consumed` list guards against two outcomes racing for
+/// the same message within a single tick, which acking alone would not).
+/// Idempotent like the rest of the driver: with no Running step carrying a
+/// kickoff thread there is nothing to scan and the function is a cheap
+/// no-op.
+///
+/// PROTOCOL, and its one sharp edge. `joinOn: reply` is reply-once-when-done:
+/// the composed kickoff asks the agent to answer when it has finished, and the
+/// step completes on the replies visible in the tick that first sees any of
+/// them. Several replies landing in the SAME tick are joined oldest-first, so
+/// the ordinary "ack, then answer" shape is handled. Replies landing in LATER
+/// ticks are not — the step is already `Succeeded` and no longer scanned, so a
+/// verdict sent seconds after an "on it" is dropped. Waiting a quiet tick
+/// before completing does not fix this (it only moves the cutoff 200 ms later);
+/// the real fix would be an explicit end-of-answer marker in the protocol, and
+/// until there is one, workflows must treat the first reply as the answer.
+///
+/// One further residual race: this runs before `detect_completions` and
+/// `check_timeouts` inside a single `advance_run` tick, so a step whose agent
+/// replies and exits in the same 200 ms interval completes via route 3 and its
+/// route 1 exit code is then ignored. The window is one tick wide and route 3
+/// is the more specific signal for a step that asked for it, so this is
+/// accepted rather than serialised.
+fn detect_reply_completions(
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+    workflow_name: &str,
+    view: &StatusView,
+    wf: &WorkflowDef,
+    run: &mut WorkflowRun,
+) -> bool {
+    // One scan per live kickoff thread, each anchored just below that thread's
+    // OWN root — replies always postdate the kickoff they answer. A single
+    // global floor (the minimum root) would be one query instead of N, but
+    // `list_inbox` applies its `LIMIT` in SQL before this function can filter
+    // by thread, so a backlog of messages the orchestrator will never
+    // acknowledge (see `INBOX_REPLY_SCAN_LIMIT`) sitting between an old root
+    // and a newer one would push the newer thread's replies out of the window
+    // entirely — and a `joinOn: reply` step has no timeout to rescue it.
+    //
+    // N is bounded by the concurrent-pane cap, so this is a handful of indexed
+    // point queries per tick at worst (`inbox_recipient_id` covers
+    // `(project_dir, recipient, id)`), not a scan that grows with the run.
+    let mut roots: Vec<i64> = run
+        .steps
+        .iter()
+        .filter(|o| o.state == StepState::Running)
+        .filter_map(|o| o.kickoff_root_msg_id)
+        .collect();
+    if roots.is_empty() {
+        return false;
+    }
+    // Distinct roots only. Nothing today gives two live steps the same kickoff
+    // thread, but if anything ever did, the duplicate page would make
+    // `merge_reply_bodies` join every body on that thread twice — and
+    // `consumed` cannot catch that, because both copies are inside the one
+    // `matched` list it is built from.
+    roots.sort_unstable();
+    roots.dedup();
+
+    let mut replies = Vec::new();
+    for root in &roots {
+        let Ok(mut page) = store.list_inbox(
+            project_dir,
+            workflow_mailbox(workflow_name),
+            (*root - 1).max(0),
+            false,
+            INBOX_REPLY_SCAN_LIMIT,
+        ) else {
+            // A store error is not a step failure — the pane is still alive and
+            // the next tick retries the scan.
+            return false;
+        };
+        // Two threads whose roots are close together return overlapping pages;
+        // narrowing each page to its own thread here keeps `replies` free of
+        // duplicates without a second dedup pass (`consumed` below would catch
+        // them anyway, but only after `merge_reply_bodies` had already joined
+        // the same body twice).
+        page.retain(|m| m.root_message_id == *root);
+        replies.append(&mut page);
+    }
+
+    let mut changed = false;
+    let mut consumed: Vec<i64> = Vec::new();
+
+    for outcome in run.steps.iter_mut() {
+        if outcome.state != StepState::Running {
+            continue;
+        }
+        let Some(root_id) = outcome.kickoff_root_msg_id else {
+            continue;
+        };
+        // Correlate on the thread root, and require the reply to come from
+        // the step's own agent: an operator answering the thread by hand
+        // must not be able to complete the step on the agent's behalf.
+        //
+        // EVERY matching reply is taken, not just the first. `list_inbox`
+        // returns `ORDER BY id ASC`, so `filter` here preserves send order and
+        // `merge_reply_bodies` can concatenate oldest-first without sorting.
+        // Answering one kickoff across several messages ("on it", then the
+        // actual result) is ordinary agent behaviour, and completing on the
+        // first of them would hand `condition_targets` and `handoff_bodies` the
+        // acknowledgement instead of the answer — silently wrong data rather
+        // than a hang, so nothing downstream would flag it. Taking all of them
+        // also ACKS all of them, which is what keeps stragglers from sitting
+        // unacknowledged and consuming the `INBOX_REPLY_SCAN_LIMIT` window that
+        // later threads need.
+        //
+        // Carried as `(id, body)` pairs rather than `&InboxMessage` only to
+        // avoid importing that type for one local binding.
+        let matched: Vec<(i64, &str)> = replies
+            .iter()
+            .filter(|m| {
+                m.root_message_id == root_id
+                    && m.in_reply_to_id.is_some()
+                    && m.sender == outcome.agent
+                    && !consumed.contains(&m.id)
+            })
+            .map(|m| (m.id, m.body.as_str()))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+
+        // REPLACES any body a previous tick recorded rather than appending to
+        // it. Only a non-`reply` join can reach here twice (a `reply` join
+        // Succeeds below and is never scanned again), and for those the field
+        // means "what the agent last said", read once at completion by
+        // `condition_targets` / `handoff_bodies`. Appending across ticks would
+        // instead pin a long-lived chatty step's body at the clip cap for the
+        // whole run, on every emitted `workflow-state`.
+        let bodies: Vec<&str> = matched.iter().map(|(_, body)| *body).collect();
+        outcome.reply_body = Some(handoff::merge_reply_bodies(&bodies));
+        consumed.extend(matched.iter().map(|(id, _)| *id));
+        changed = true;
+
+        // Fan-out copies carry `"<id>#<k>"`, so the declared step must be
+        // looked up through `base_id` — a raw `==` would silently never
+        // match a reply-joined fan-out copy.
+        let Some(step) = wf
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == base_id(&outcome.step_id))
+        else {
+            continue;
+        };
+        if !matches!(effective_join(step), JoinOn::Named(JoinOnName::Reply)) {
+            continue;
+        }
+
+        outcome.state = StepState::Succeeded;
+        outcome.error = None;
+        outcome.next_retry_at_ms = None;
+        if let Some(session_id) = outcome.session_id {
+            view.forget(session_id);
+        }
+    }
+
+    for id in consumed {
+        let _ = store.ack_inbox(project_dir, id, workflow_mailbox(workflow_name));
+    }
+
+    changed
+}
+
 /// Spawn every currently-ready step (see `ready_steps`), expanding fan-out
 /// copies with the `"<id>#<k>"` id convention so each copy is independently
 /// trackable in `run.steps`. Mirrors `spawn_workflow`'s root-spawn loop for
@@ -1151,17 +1881,21 @@ fn spawn_ready<R: Runtime>(
     rows: u16,
 ) -> bool {
     let ready: Vec<WorkflowStep> = ready_steps(wf, run).into_iter().cloned().collect();
+    // Snapshot the carried `handoff_to` bodies BEFORE the spawn loop mutates
+    // `run.steps`: the loop drops Pending placeholders and pushes fresh
+    // outcomes, and a map rebuilt mid-loop could observe a half-updated run.
+    let carried_bodies = handoff_bodies(wf, run);
     let mut changed = false;
     for step in &ready {
-        let copies = match (wf.pattern, step.fan_out) {
-            (WorkflowPattern::FanOut, Some(n)) if n >= 2 => n as usize,
-            _ => 1,
-        };
+        let copies = copies_for(wf.pattern, step);
         // Remove the single Pending placeholder `spawn_workflow` inserted for
         // this step; it is replaced below by one outcome per copy.
         run.steps
             .retain(|o| o.step_id != step.id || o.state != StepState::Pending);
-        let reuse_existing = copies == 1;
+        // See `spawn_workflow`'s root loop: reuse is only safe when no other
+        // step of this run is already running a pane for the same agent.
+        let reuse_existing = copies == 1 && !agent_claimed_by_other_step(&run.steps, step);
+        let carried = carried_bodies.get(&step.id).map(String::as_str);
         for k in 0..copies {
             let step_id = if copies >= 2 {
                 format!("{}#{k}", step.id)
@@ -1171,14 +1905,8 @@ fn spawn_ready<R: Runtime>(
             let mut outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
             outcome.step_id = step_id;
             if outcome.state == StepState::Running {
-                if let Err(err) = deliver_kickoff(store, project_dir, workflow_name, step) {
-                    let base = outcome.error.clone().unwrap_or_default();
-                    outcome.error = Some(if base.is_empty() {
-                        format!("kickoff delivery failed: {err}")
-                    } else {
-                        format!("{base}; kickoff delivery failed: {err}")
-                    });
-                }
+                let delivered = deliver_kickoff(store, project_dir, workflow_name, step, carried);
+                attach_kickoff_result(step, &mut outcome, delivered);
             }
             run.steps.push(outcome);
             changed = true;
@@ -1195,11 +1923,268 @@ fn spawn_ready<R: Runtime>(
     changed
 }
 
-/// Advance one run by exactly one tick: detect completions, cascade
-/// fail-fast Skips, spawn any newly-ready downstream steps, and
-/// finalize/emit the run's state. Standalone and thread-free — this is what
-/// `driver_loop` calls on a schedule, and what tests call directly to assert
-/// transitions without racing a background thread.
+/// Kill-on-timeout: a `Running` step whose `timeout_ms` has elapsed is killed
+/// and marked `Failed` (with a descriptive error), putting it on the same
+/// footing as a route1/2 failure for the retry pass (`arm_retry_backoff`
+/// then `fire_due_retries`) to consider next.
+/// A step with no `timeout_ms` (the default) is never touched here.
+fn check_timeouts(
+    manager: &PtyManager,
+    view: &StatusView,
+    wf: &WorkflowDef,
+    run: &mut WorkflowRun,
+    now: u64,
+) -> bool {
+    let mut changed = false;
+    for outcome in &mut run.steps {
+        if outcome.state != StepState::Running {
+            continue;
+        }
+        let Some(step) = wf.steps.iter().find(|s| s.id.as_str() == base_id(&outcome.step_id)) else {
+            continue;
+        };
+        let Some(timeout_ms) = step.timeout_ms else {
+            continue;
+        };
+        if outcome.started_at_ms == 0 || now.saturating_sub(outcome.started_at_ms) < timeout_ms {
+            continue;
+        }
+        if let Some(session_id) = outcome.session_id {
+            let _ = manager.kill_pty(session_id);
+            view.forget(session_id);
+            // Killed here, not exited on its own: nothing left to reuse, and
+            // waiting on `kill_pty`'s async reap to beat `restart_session`'s
+            // existence check would be a race. Clearing it up front forces
+            // `fire_due_retries` straight down the fresh-spawn path.
+            outcome.session_id = None;
+        }
+        outcome.state = StepState::Failed;
+        outcome.error = Some(format!("timed out after {timeout_ms}ms"));
+        changed = true;
+    }
+    changed
+}
+
+/// Respawn a step from scratch as a retry attempt, replacing its outcome.
+///
+/// Used by both `fire_due_retries` fresh-spawn paths: the outcome that
+/// never held a `session_id` at all, and the one whose in-place
+/// `restart_session` was refused because the slot had already been reaped.
+///
+/// Three things the raw `spawn_step` result must be corrected for:
+///
+/// 1. `step_id` — `spawn_step` derives it from `step.id`, which drops the
+///    `#N` suffix that makes each fan-out copy independently trackable. The
+///    caller's existing id is restored verbatim.
+/// 2. `attempts` — `spawn_step` always reports 1 (it does not know it is a
+///    retry). `prev_attempts` is what the outcome had before this attempt,
+///    so the new count is one greater.
+/// 3. `kickoff` — a brand new agent process has no memory of the original
+///    kickoff, and in the never-spawned case it was never sent at all, so it
+///    is delivered here. Only when the spawn actually reached `Running`:
+///    sending a kickoff to a step that failed to get a pane would leave an
+///    unanswerable message in the mailbox.
+#[allow(clippy::too_many_arguments)]
+fn respawn_fresh<R: Runtime>(
+    app: &AppHandle<R>,
+    manager: &PtyManager,
+    config: &ConfigManager,
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+    workflow_name: &str,
+    step: &WorkflowStep,
+    step_id: &str,
+    carried: Option<&str>,
+    prev_attempts: u32,
+    cols: u16,
+    rows: u16,
+) -> StepOutcome {
+    let mut fresh = spawn_step(app, manager, config, step, false, cols, rows);
+    fresh.step_id = step_id.to_string();
+    fresh.attempts = prev_attempts + 1;
+    if fresh.state == StepState::Running {
+        // `deliver_kickoff` no-ops when there is nothing to send (no declared
+        // `kickoff` and no carried handoff body). The retried attempt is a
+        // brand new agent invocation, so the carried upstream context has to
+        // be re-prepended — it was only ever in the previous attempt's
+        // message, which that agent no longer remembers.
+        // The new attempt opens a NEW kickoff thread; the old root id must not
+        // survive, or `detect_reply_completions` would keep correlating against
+        // a thread this attempt never sent. `attach_kickoff_result` guarantees
+        // that on both arms.
+        let delivered = deliver_kickoff(store, project_dir, workflow_name, step, carried);
+        attach_kickoff_result(step, &mut fresh, delivered);
+    }
+    fresh
+}
+
+/// Phase 5.0.4 retry driver, pure half: a `Failed` outcome whose step
+/// declares a `retry` policy is not left terminal (see `is_terminal`). The
+/// first tick after it fails arms a backoff deadline (`next_retry_at_ms`);
+/// `fire_due_retries` is what actually respawns it once that deadline
+/// passes. Split out from the combined function this used to be so it can
+/// be called a SECOND time in `advance_run`, right after `spawn_ready` —
+/// bug 【G】: a spawn failure produced by `spawn_ready` earlier in the same
+/// tick must get a chance to arm its backoff before `finalize_state` runs,
+/// or it is wrongly treated as a terminal failure with zero retry benefit
+/// (`is_terminal` only clears once `next_retry_at_ms` is set).
+fn arm_retry_backoff(wf: &WorkflowDef, run: &mut WorkflowRun, now: u64) -> bool {
+    let mut changed = false;
+    for outcome in &mut run.steps {
+        if outcome.state != StepState::Failed || outcome.next_retry_at_ms.is_some() {
+            continue;
+        }
+        // `retry` retries ATTEMPTS. Every `spawn_step` return path — success,
+        // pane cap, resolve/spawn error — sets `attempts: 1`, so `attempts == 0`
+        // on a `Failed` outcome means the step was failed without ever having
+        // been spawned. Today that is `condition_targets`' unevaluable-condition
+        // arm, where respawning would be actively wrong: it would launch a step
+        // whose gate never opened, and it would loop, because the missing
+        // upstream reply is not something another attempt can produce.
+        if outcome.attempts == 0 {
+            continue;
+        }
+        let Some(step) = wf.steps.iter().find(|s| s.id.as_str() == base_id(&outcome.step_id)) else {
+            continue;
+        };
+        let Some(policy) = step.retry else {
+            continue;
+        };
+        if retry::allows_another(outcome.attempts, &policy) {
+            outcome.next_retry_at_ms = Some(retry::due_at(now, &policy));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Phase 5.0.4 retry driver, side-effecting half: once a `Failed` outcome's
+/// backoff deadline (armed by `arm_retry_backoff` on a prior tick) has
+/// elapsed, respawn it in place under the SAME `step_id`.
+///
+/// `StatusView::forget` around a restart is mandatory, not cosmetic:
+/// `PtyManager::restart_session` REUSES the session id, so without
+/// forgetting, a stale recorded `Done` from the just-killed attempt would
+/// falsely complete the fresh one on the very next `detect_completions` tick.
+///
+/// A `Failed` outcome with no `session_id` (spawn never even got a pane —
+/// e.g. the pane cap was hit) has nothing to restart; that branch respawns
+/// fresh via `spawn_step` instead and delivers the step's kickoff for the
+/// first time, since the original spawn failure meant it was never sent.
+#[allow(clippy::too_many_arguments)]
+fn fire_due_retries<R: Runtime>(
+    app: &AppHandle<R>,
+    manager: &PtyManager,
+    config: &ConfigManager,
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+    workflow_name: &str,
+    view: &StatusView,
+    wf: &WorkflowDef,
+    run: &mut WorkflowRun,
+    now: u64,
+) -> bool {
+    let (cols, rows) = (run.cols, run.rows);
+    // Hoisted for the same reason as in `spawn_ready`, plus a borrow-checker
+    // one: the loop below takes `&mut run.steps`, so the map cannot be built
+    // inside it.
+    let carried_bodies = handoff_bodies(wf, run);
+    let mut changed = false;
+    for outcome in &mut run.steps {
+        if outcome.state != StepState::Failed {
+            continue;
+        }
+        let Some(due) = outcome.next_retry_at_ms else {
+            continue;
+        };
+        if now < due {
+            continue;
+        }
+        let Some(step) = wf.steps.iter().find(|s| s.id.as_str() == base_id(&outcome.step_id)) else {
+            continue;
+        };
+        let carried = carried_bodies
+            .get(base_id(&outcome.step_id))
+            .map(String::as_str);
+        changed = true;
+        if let Some(session_id) = outcome.session_id {
+            view.forget(session_id);
+            match manager.restart_session(app.clone(), session_id) {
+                Ok(()) => {
+                    outcome.state = StepState::Running;
+                    outcome.attempts += 1;
+                    outcome.started_at_ms = now;
+                    outcome.next_retry_at_ms = None;
+                    outcome.error = None;
+                    // Any reply that completed (or merely annotated) the
+                    // previous attempt belongs to that attempt's thread and
+                    // must not leak into this one — `condition_targets` and
+                    // `handoff_bodies` would otherwise read a stale body.
+                    outcome.reply_body = None;
+                    // The restarted process is a brand new agent
+                    // invocation with no memory of the original
+                    // kickoff, so redeliver it — same as the fresh-
+                    // spawn fallback below.
+                    // On failure `attach_kickoff_result` drops the old root id
+                    // rather than leaving route 3 correlating against a thread
+                    // this attempt never opened.
+                    let delivered =
+                        deliver_kickoff(store, project_dir, workflow_name, step, carried);
+                    attach_kickoff_result(step, outcome, delivered);
+                }
+                Err(_) => {
+                    // `restart_session` requires the session's slot to
+                    // still exist, but `check_timeouts`' `kill_pty`
+                    // (async reap via the reader thread) has usually
+                    // fully removed it by the time backoff elapses —
+                    // there is nothing left to restart in place.
+                    // Falling back to a fresh `spawn_step`, identical
+                    // to the no-`session_id` branch below, keeps the
+                    // retry budget advancing instead of re-arming the
+                    // same backoff forever (attempts frozen, `Failed`
+                    // outcome oscillating None/Some next_retry_at_ms).
+                    *outcome = respawn_fresh(
+                        app,
+                        manager,
+                        config,
+                        store,
+                        project_dir,
+                        workflow_name,
+                        step,
+                        &outcome.step_id,
+                        carried,
+                        outcome.attempts,
+                        cols,
+                        rows,
+                    );
+                }
+            }
+        } else {
+            *outcome = respawn_fresh(
+                app,
+                manager,
+                config,
+                store,
+                project_dir,
+                workflow_name,
+                step,
+                &outcome.step_id,
+                carried,
+                outcome.attempts,
+                cols,
+                rows,
+            );
+        }
+    }
+    changed
+}
+
+/// Advance one run by exactly one tick: detect completions, kill timed-out
+/// steps, apply retry backoff/restart, cascade fail-fast Skips, spawn any
+/// newly-ready downstream steps, and finalize/emit the run's state.
+/// Standalone and thread-free — this is what `driver_loop` calls on a
+/// schedule, and what tests call directly to assert transitions without
+/// racing a background thread.
 #[allow(clippy::too_many_arguments)]
 fn advance_run<R: Runtime>(
     app: &AppHandle<R>,
@@ -1227,8 +2212,53 @@ fn advance_run<R: Runtime>(
     let Ok(project_dir) = resolve_project_dir(config) else {
         return;
     };
+    let workflow_name = run.name.clone();
+    let now = now_ms();
 
-    let mut changed = detect_completions(manager, view, &mut run);
+    // Route 3 FIRST: a step whose agent has already replied is Succeeded,
+    // and `detect_completions`/`check_timeouts` must see that before they
+    // get a chance to reclassify the same still-alive pane as a failure.
+    let mut changed = detect_reply_completions(
+        store,
+        &project_dir,
+        &workflow_name,
+        view,
+        &wf,
+        &mut run,
+    );
+    changed = detect_completions(manager, view, &mut run) || changed;
+    changed = check_timeouts(manager, view, &wf, &mut run, now) || changed;
+    // `fire_due_retries` BEFORE `arm_retry_backoff`, not after: a deadline
+    // armed on this same tick must not also fire on it. `retry::due_at`
+    // falls back to a 0ms backoff when `backoffMs` is undeclared, so
+    // arming first would make `due == now` and respawn instantly, which is
+    // not what "wait out the backoff" means (and is what the combined
+    // function's single `match` arm used to prevent for free).
+    changed = fire_due_retries(
+        app,
+        manager,
+        config,
+        store,
+        &project_dir,
+        &workflow_name,
+        view,
+        &wf,
+        &mut run,
+        now,
+    ) || changed;
+    changed = arm_retry_backoff(&wf, &mut run, now) || changed;
+
+    // `condition` BEFORE fail-fast: a step skipped for an unmet condition
+    // gets the condition's own reason string, which is far more useful to an
+    // operator than the generic fail-fast text it would otherwise inherit if
+    // fail-fast reached it first. Both passes only ever target steps still in
+    // `Pending`, so whichever runs first removes the step from the other's
+    // candidate set: the order decides which reason wins, never whether the
+    // skip happens.
+    for (step_id, state, reason) in condition_targets(&wf, &run) {
+        let decided = set_step_state(&mut run, &step_id, state, Some(reason));
+        changed = changed || decided;
+    }
 
     for step_id in failfast_targets(&wf, &run) {
         let skipped = set_step_state(
@@ -1241,8 +2271,8 @@ fn advance_run<R: Runtime>(
     }
 
     // Hoist the fields borrowed alongside `&mut run` — the borrow checker
-    // (rightly) refuses `&run.name` and `&mut run` in one call.
-    let workflow_name = run.name.clone();
+    // (rightly) refuses `&run.cols` and `&mut run` in one call.
+    // (`workflow_name` is already hoisted above, for the retry pass.)
     let (cols, rows) = (run.cols, run.rows);
     let spawned = spawn_ready(
         app,
@@ -1257,6 +2287,16 @@ fn advance_run<R: Runtime>(
         rows,
     );
     changed = changed || spawned;
+
+    // Second arming pass — the reason `arm_retry_backoff` was split out of
+    // the combined retry function (bug 【G】). A step that `spawn_ready` just
+    // failed to spawn is `Failed` with no `next_retry_at_ms`, so the pass
+    // above (which ran before it existed) never saw it. Without this,
+    // `finalize_state` observes it via `is_terminal` as a terminal failure
+    // on this very tick and the run dies without ever spending its retry
+    // budget. Firing is deliberately NOT repeated here: a deadline armed on
+    // this tick belongs to the next one.
+    changed = arm_retry_backoff(&wf, &mut run, now) || changed;
 
     let new_state = finalize_state(&wf, &run);
     if new_state != run.state {
@@ -1585,8 +2625,13 @@ workflows:
         );
     }
 
+    /// Phase 5.0.4 replaces `supervisor_pattern_is_rejected_with_typed_error`:
+    /// the MVO gate is gone, so a supervisor workflow must now actually
+    /// launch. Its two steps deliberately name the SAME agent — the case
+    /// `agent_claimed_by_other_step` exists for — and only the root is a
+    /// root, so exactly one step should be Running and one Pending.
     #[test]
-    fn supervisor_pattern_is_rejected_with_typed_error() {
+    fn supervisor_pattern_now_spawns_its_root() {
         let handle = mock_handle();
         let manager = PtyManager::new();
         let yaml = "agents:
@@ -1605,11 +2650,51 @@ workflows:
         let (config, store, dir) = harness(yaml);
         let registry = WorkflowRegistry::new();
 
-        let err = spawn_workflow(&handle, &manager, &config, &store, &registry, "sup", 80, 24)
-            .unwrap_err();
-        assert!(
-            err.contains("not implemented in MVO"),
-            "supervisor should be a typed defer, got: {err}"
+        let run = spawn_workflow(&handle, &manager, &config, &store, &registry, "sup", 80, 24)
+            .expect("supervisor should spawn in 5.0.4");
+        assert_eq!(run.state, WorkflowState::Running);
+        let root = run.steps.iter().find(|o| o.step_id == "root").unwrap();
+        let child = run.steps.iter().find(|o| o.step_id == "child").unwrap();
+        assert_eq!(root.state, StepState::Running, "root launches immediately");
+        assert_eq!(child.state, StepState::Pending, "dependent waits");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The handoff pattern's gate is gone too. `config.rs` validates handoff
+    /// shape, so all this asserts is that the runtime no longer refuses.
+    #[test]
+    fn handoff_pattern_now_spawns_its_root() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  hand:
+    pattern: handoff
+    steps:
+      - id: first
+        agent: a
+        handoffTo: second
+      - id: second
+        agent: b
+        dependsOn: [first]
+";
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+
+        let run = spawn_workflow(&handle, &manager, &config, &store, &registry, "hand", 80, 24)
+            .expect("handoff should spawn in 5.0.4");
+        assert_eq!(run.state, WorkflowState::Running);
+        assert_eq!(
+            run.steps
+                .iter()
+                .find(|o| o.step_id == "first")
+                .unwrap()
+                .state,
+            StepState::Running
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1669,6 +2754,7 @@ workflows:
       - id: first
         agent: a
         joinOn: reply
+        kickoff: answer when done
       - id: second
         agent: b
         dependsOn: [first]
@@ -1771,12 +2857,199 @@ workflows:
         assert!(!dep_satisfied(candidate, &none_yet));
     }
 
+    /// Fixture for the count-join defect pinned below. `fanOut: 3` with
+    /// `joinOn: 2` is a LEGAL shape — config.rs only rejects a `joinOn` outside
+    /// `1..=fanOut` — so validation cannot rescue a run from it the way it now
+    /// rescues the two out-of-range shapes (see
+    /// `workflow_join_on_count_range_is_validated` in config.rs).
+    const COUNT_FANOUT_YAML: &str = "agents:
+  - name: worker
+    cmd: /bin/cat
+  - name: reducer
+    cmd: /bin/cat
+workflows:
+  countfan:
+    pattern: fan-out
+    steps:
+      - id: candidate
+        agent: worker
+        fanOut: 3
+        joinOn: 2
+      - id: reduce
+        agent: reducer
+        dependsOn: [candidate]
+";
+
+    /// The defect this test used to characterize, now FIXED by
+    /// `dep_unsatisfiable` (Phase 5.0.4).
+    ///
+    /// With `joinOn: 2` over 3 copies and 1 success + 2 TERMINAL failures, the
+    /// second success is unreachable. `dep_satisfied` is still false, so the
+    /// dependent still never becomes ready — that part was never the bug. The
+    /// bug was that nothing NOTICED: `failfast_targets`' old `all()` check was
+    /// defeated by the single `Succeeded` copy, so `reduce` stayed `Pending`
+    /// and `finalize_state` saw neither a finished nor a failed run, forever.
+    ///
+    /// `dep_unsatisfiable` compares the join's requirement (2) against
+    /// successes banked (1) plus copies still in play (0) and reports the
+    /// dependency doomed, which cascade-Skips `reduce` and lets the run reach
+    /// `Failed`.
     #[test]
-    fn dep_satisfied_reply_join_is_always_false() {
+    fn count_join_partial_success_now_finalizes_failed() {
+        let wf = parse_wf(COUNT_FANOUT_YAML, "countfan");
+        let candidate = wf.steps.iter().find(|s| s.id == "candidate").unwrap();
+        // 1 of 3 copies succeeded, the other 2 failed TERMINALLY (no retry).
+        let steps = vec![
+            mk_outcome("candidate#1", Some(1), StepState::Succeeded),
+            mk_outcome("candidate#2", Some(2), StepState::Failed),
+            mk_outcome("candidate#3", Some(3), StepState::Failed),
+            mk_outcome("reduce", None, StepState::Pending),
+        ];
+        assert!(!dep_satisfied(candidate, &steps), "joinOn:2 unmet");
+        assert!(
+            dep_unsatisfiable(candidate, &steps),
+            "banked 1 + in-play 0 < required 2"
+        );
+        let mut run = WorkflowRun {
+            run_id: "r".into(),
+            name: "countfan".into(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(
+            ready_steps(&wf, &run).is_empty(),
+            "reduce still never becomes ready — the join is genuinely unmet"
+        );
+        assert_eq!(
+            failfast_targets(&wf, &run),
+            vec!["reduce".to_string()],
+            "fail-fast now rescues the run instead of wedging it"
+        );
+        // Apply the cascade the driver would apply, then re-derive.
+        for step_id in failfast_targets(&wf, &run) {
+            set_step_state(&mut run, &step_id, StepState::Skipped, None);
+        }
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Failed,
+            "run reaches a terminal state"
+        );
+    }
+
+    /// The guard rail on the fix: a count join with enough copies STILL in
+    /// play to reach its requirement must not be declared doomed. 1 banked +
+    /// 1 Running >= 2 required, so `reduce` stays Pending and waits.
+    #[test]
+    fn count_join_with_a_live_copy_is_not_doomed() {
+        let wf = parse_wf(COUNT_FANOUT_YAML, "countfan");
+        let candidate = wf.steps.iter().find(|s| s.id == "candidate").unwrap();
+        let steps = vec![
+            mk_outcome("candidate#1", Some(1), StepState::Succeeded),
+            mk_outcome("candidate#2", Some(2), StepState::Failed),
+            mk_outcome("candidate#3", Some(3), StepState::Running),
+            mk_outcome("reduce", None, StepState::Pending),
+        ];
+        assert!(!dep_unsatisfiable(candidate, &steps), "one copy can still win");
+        let run = WorkflowRun {
+            run_id: "r".into(),
+            name: "countfan".into(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(failfast_targets(&wf, &run).is_empty());
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Running);
+    }
+
+    /// The second guard rail, and the one that had teeth: an un-spawned
+    /// fan-out step is ONE bare-id `Pending` row, not `n` expanded `#k` rows.
+    /// Naive ceiling arithmetic reads `in_play = 1 < required 2` and dooms the
+    /// dependent of a step that has never run — and because `finalize_state`
+    /// now treats `Skipped` as neutral, the run would report `Succeeded`.
+    ///
+    /// This is the shape `spawn_workflow`/`resume_workflow` actually persist,
+    /// which every other `dep_unsatisfiable` test misses by hand-building
+    /// already-expanded `candidate#k` rows.
+    #[test]
+    fn count_join_over_an_unspawned_fanout_placeholder_is_not_doomed() {
+        let wf = parse_wf(COUNT_FANOUT_YAML, "countfan");
+        let candidate = wf.steps.iter().find(|s| s.id == "candidate").unwrap();
+        // Exactly what a not-yet-spawned `fanOut: 3` step looks like on disk:
+        // one bare-id placeholder, no `#k` suffix, no session.
+        let steps = vec![
+            mk_outcome("candidate", None, StepState::Pending),
+            mk_outcome("reduce", None, StepState::Pending),
+        ];
+        assert!(
+            !dep_satisfied(candidate, &steps),
+            "nothing has succeeded yet"
+        );
+        assert!(
+            !dep_unsatisfiable(candidate, &steps),
+            "a step that has not spawned cannot already be unsatisfiable"
+        );
+        let mut run = WorkflowRun {
+            run_id: "r".into(),
+            name: "countfan".into(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(
+            failfast_targets(&wf, &run).is_empty(),
+            "reduce must not be skipped before candidate has run"
+        );
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Running,
+            "and the run must not report Succeeded with two steps unexecuted"
+        );
+
+        // Convergence: the guard defers the verdict, it does not suppress it.
+        // Once the placeholder is genuinely terminal, the arithmetic applies.
+        set_step_state(&mut run, "candidate", StepState::Skipped, None);
+        assert!(
+            dep_unsatisfiable(candidate, &run.steps),
+            "a terminal placeholder banks 0 of the 2 required"
+        );
+        assert_eq!(failfast_targets(&wf, &run), vec!["reduce".to_string()]);
+    }
+
+    /// A Failed copy waiting out its retry backoff is NOT terminal, so it
+    /// still counts as in play — fail-fast must not cascade past a step that
+    /// `fire_due_retries` is about to bring back to `Running`.
+    #[test]
+    fn dep_unsatisfiable_respects_pending_retry_backoff() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        let mut failed = mk_outcome("first", Some(1), StepState::Failed);
+        assert!(
+            dep_unsatisfiable(first, std::slice::from_ref(&failed)),
+            "terminally Failed singular step is doomed"
+        );
+        failed.next_retry_at_ms = Some(10_000);
+        assert!(
+            !dep_unsatisfiable(first, std::slice::from_ref(&failed)),
+            "mid-backoff Failed copy is still in play"
+        );
+    }
+
+    #[test]
+    fn dep_satisfied_reply_join_matches_all() {
         let wf = parse_wf(REPLY_YAML, "replywf");
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let succeeded = vec![mk_outcome("first", Some(1), StepState::Succeeded)];
-        assert!(!dep_satisfied(first, &succeeded));
+        assert!(dep_satisfied(first, &succeeded));
     }
 
     #[test]
@@ -1834,6 +3107,197 @@ workflows:
         let mut targets = failfast_targets(&wf, &run);
         targets.sort();
         assert_eq!(targets, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    const RETRY_ZERO_BACKOFF_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  retryzero:
+    pattern: pipeline
+    steps:
+      - id: first
+        agent: a
+        retry:
+          max: 2
+";
+
+    const TIMEOUT_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  timeoutwf:
+    pattern: pipeline
+    steps:
+      - id: first
+        agent: a
+        timeoutMs: 1000
+      - id: second
+        agent: b
+        dependsOn: [first]
+";
+
+    #[test]
+    fn retry_allows_another_boundary() {
+        let policy = crate::config::RetryPolicy { max: 2, backoff_ms: None };
+        assert!(retry::allows_another(0, &policy));
+        assert!(retry::allows_another(1, &policy));
+        assert!(retry::allows_another(2, &policy), "attempts == max still allows one more");
+        assert!(!retry::allows_another(3, &policy), "attempts > max exhausts the budget");
+    }
+
+    #[test]
+    fn retry_due_at_adds_backoff_or_defaults_to_zero() {
+        let none_policy = crate::config::RetryPolicy { max: 1, backoff_ms: None };
+        assert_eq!(retry::due_at(1000, &none_policy), 1000);
+        let backoff_policy = crate::config::RetryPolicy { max: 1, backoff_ms: Some(500) };
+        assert_eq!(retry::due_at(1000, &backoff_policy), 1500);
+    }
+
+    #[test]
+    fn arm_retry_backoff_arms_once_and_respects_budget_exhaustion() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        let mut run = WorkflowRun {
+            run_id: "r1".to_string(),
+            name: "retryzero".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![mk_outcome("first", None, StepState::Failed)],
+            cols: 80,
+            rows: 24,
+        };
+        run.steps[0].attempts = 1;
+        assert!(arm_retry_backoff(&wf, &mut run, 1000));
+        assert_eq!(run.steps[0].next_retry_at_ms, Some(1000));
+
+        // Already armed -> idempotent no-op, does not re-arm/change.
+        assert!(!arm_retry_backoff(&wf, &mut run, 5000));
+        assert_eq!(run.steps[0].next_retry_at_ms, Some(1000));
+
+        // Budget exhausted (attempts > max) -> never arms.
+        run.steps[0].attempts = 3;
+        run.steps[0].next_retry_at_ms = None;
+        assert!(!arm_retry_backoff(&wf, &mut run, 1000));
+        assert_eq!(run.steps[0].next_retry_at_ms, None);
+    }
+
+    #[test]
+    fn arm_retry_backoff_ignores_steps_with_no_retry_policy_declared() {
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let mut run = WorkflowRun {
+            run_id: "r1".to_string(),
+            name: "chain".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![mk_outcome("first", None, StepState::Failed)],
+            cols: 80,
+            rows: 24,
+        };
+        assert!(!arm_retry_backoff(&wf, &mut run, 1000));
+        assert!(run.steps[0].next_retry_at_ms.is_none());
+    }
+
+    #[test]
+    fn check_timeouts_kills_and_fails_only_steps_past_their_declared_timeout() {
+        let wf = parse_wf(TIMEOUT_YAML, "timeoutwf");
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+        let now = 100_000u64;
+
+        // Well past its declared 1000ms timeout -> killed and Failed.
+        let mut run = WorkflowRun {
+            run_id: "r1".to_string(),
+            name: "timeoutwf".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![{
+                let mut o = mk_outcome("first", Some(999), StepState::Running);
+                o.started_at_ms = now - 5000;
+                o
+            }],
+            cols: 80,
+            rows: 24,
+        };
+        assert!(check_timeouts(&manager, &view, &wf, &mut run, now));
+        assert_eq!(run.steps[0].state, StepState::Failed);
+        assert!(run.steps[0].session_id.is_none());
+        assert!(run.steps[0].error.as_deref().unwrap_or_default().contains("timed out"));
+
+        // Well within budget -> untouched.
+        let mut not_due = WorkflowRun {
+            steps: vec![{
+                let mut o = mk_outcome("first", Some(999), StepState::Running);
+                o.started_at_ms = now - 10;
+                o
+            }],
+            ..run.clone()
+        };
+        assert!(!check_timeouts(&manager, &view, &wf, &mut not_due, now));
+        assert_eq!(not_due.steps[0].state, StepState::Running);
+
+        // No declared timeoutMs ("second") -> never touched, however stale.
+        let mut no_timeout = WorkflowRun {
+            steps: vec![{
+                let mut o = mk_outcome("second", Some(999), StepState::Running);
+                o.started_at_ms = 1;
+                o
+            }],
+            ..run.clone()
+        };
+        assert!(!check_timeouts(&manager, &view, &wf, &mut no_timeout, now));
+        assert_eq!(no_timeout.steps[0].state, StepState::Running);
+    }
+
+    #[test]
+    fn fire_due_retries_runs_before_arm_retry_backoff_prevents_same_tick_storm() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let mut run = WorkflowRun {
+            run_id: "r1".to_string(),
+            name: "retryzero".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![mk_outcome("first", None, StepState::Failed)],
+            cols: 80,
+            rows: 24,
+        };
+        // A fresh, never-before-retried Failed outcome: not yet armed.
+        run.steps[0].attempts = 1;
+        registry.put(run.clone());
+
+        advance_run(&handle, &manager, &config, &store, &registry, &view, &run.run_id);
+        let snapshot = registry.get(&run.run_id).unwrap();
+        let first = &snapshot.steps[0];
+        assert_eq!(
+            first.attempts, 1,
+            "fire_due_retries runs BEFORE arm_retry_backoff, so an unarmed Failed \
+             outcome must not respawn on the very tick it fails, even under a 0ms \
+             backoff policy"
+        );
+        assert!(first.session_id.is_none());
+        assert!(first.next_retry_at_ms.is_some(), "the same tick should still ARM the (0ms) backoff");
+
+        // A second tick, after the armed (now-past) deadline, fires the retry.
+        advance_run(&handle, &manager, &config, &store, &registry, &view, &run.run_id);
+        let snapshot = registry.get(&run.run_id).unwrap();
+        let first = &snapshot.steps[0];
+        assert_eq!(first.attempts, 2, "the retry fires on the tick AFTER it was armed");
+        assert!(first.session_id.is_some(), "respawn_fresh should have gotten a fresh pane");
+
+        for s in manager.list_sessions() {
+            let _ = manager.kill_pty(s.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1900,8 +3364,27 @@ workflows:
         };
         assert_eq!(finalize_state(&wf, &run), WorkflowState::Succeeded);
 
+        // Phase 5.0.4: a Skipped step no longer fails the run on its own. A
+        // `condition:` gate declining its branch is normal control flow, so
+        // the run stays green as long as nothing actually failed.
         run.steps[2].state = StepState::Skipped;
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Succeeded,
+            "Skipped is neutral, not a failure"
+        );
+
+        // A real failure anywhere still turns the run red, including when it
+        // is the failure that CAUSED the skip.
+        run.steps[1].state = StepState::Failed;
         assert_eq!(finalize_state(&wf, &run), WorkflowState::Failed);
+        run.steps[1].state = StepState::Cancelled;
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Failed,
+            "a cancelled step is a hard failure too"
+        );
+        run.steps[1].state = StepState::Succeeded;
 
         run.steps[2].state = StepState::Running;
         assert_eq!(finalize_state(&wf, &run), WorkflowState::Running);
@@ -2303,5 +3786,738 @@ workflows:
             let _ = manager.kill_pty(s.id);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5.0.4: execution-layer tests (reply join, condition, handoff)
+    // ------------------------------------------------------------------
+
+    const REPLY_KICKOFF_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  replykick:
+    pattern: pipeline
+    steps:
+      - id: first
+        agent: a
+        joinOn: reply
+        kickoff: review the diff and reply when done
+      - id: second
+        agent: b
+        dependsOn: [first]
+";
+
+    const COND_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  condwf:
+    pattern: pipeline
+    steps:
+      - id: gate
+        agent: a
+        joinOn: reply
+        kickoff: approve or reject
+      - id: apply
+        agent: b
+        dependsOn: [gate]
+        condition: APPROVED
+";
+
+    const HANDOFF_CHAIN_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  handwf:
+    pattern: handoff
+    steps:
+      - id: draft
+        agent: a
+        joinOn: reply
+        handoffTo: polish
+        kickoff: write the draft
+      - id: polish
+        agent: b
+        dependsOn: [draft]
+        kickoff: polish it
+";
+
+    fn mk_run(name: &str, steps: Vec<StepOutcome>) -> WorkflowRun {
+        WorkflowRun {
+            run_id: "r1".to_string(),
+            name: name.to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// A Running outcome wired up the way the driver would leave it after a
+    /// successful kickoff delivery: agent name matching the step, and the
+    /// kickoff thread root recorded for route 3 to correlate against.
+    fn mk_kicked(step_id: &str, agent: &str, root_id: i64) -> StepOutcome {
+        let mut outcome = mk_outcome(step_id, Some(7), StepState::Running);
+        outcome.agent = agent.to_string();
+        outcome.kickoff_root_msg_id = Some(root_id);
+        outcome
+    }
+
+    #[test]
+    fn compose_kickoff_covers_all_four_carried_declared_combinations() {
+        assert_eq!(
+            handoff::compose_kickoff(Some("declared"), Some("carried")).as_deref(),
+            Some("carried\n\ndeclared"),
+            "carried body is PREPENDED to the declared kickoff"
+        );
+        assert_eq!(
+            handoff::compose_kickoff(None, Some("carried")).as_deref(),
+            Some("carried")
+        );
+        assert_eq!(
+            handoff::compose_kickoff(Some("declared"), None).as_deref(),
+            Some("declared")
+        );
+        assert_eq!(
+            handoff::compose_kickoff(None, None),
+            None,
+            "nothing to send is a no-op, not an empty message"
+        );
+        assert_eq!(
+            handoff::compose_kickoff(Some("declared"), Some("   \n  ")).as_deref(),
+            Some("declared"),
+            "a blank carried body is treated as absent"
+        );
+        assert_eq!(
+            handoff::compose_kickoff(None, Some("  \t ")),
+            None,
+            "a blank carried body with no declared kickoff sends nothing"
+        );
+    }
+
+    #[test]
+    fn compose_kickoff_clips_an_oversized_carried_body_on_a_char_boundary() {
+        // Multi-byte chars straddling the cut point must not panic or produce
+        // invalid UTF-8 — `clip` walks back to a boundary.
+        // One leading ASCII byte offsets the 3-byte chars so the byte `clip`
+        // starts from lands strictly INSIDE a char. Note that byte is
+        // `cap - TRUNCATION_MARKER.len()`, NOT `cap`: `clip` reserves the
+        // marker inside the cap, so asserting mid-char-ness at `cap` would say
+        // nothing about the loop this test exists to cover.
+        let huge = format!("x{}", "あ".repeat(handoff::MAX_HANDOFF_BODY_BYTES));
+        let start = handoff::MAX_HANDOFF_BODY_BYTES - handoff::TRUNCATION_MARKER.len();
+        assert!(
+            !huge.is_char_boundary(start),
+            "the offset must put clip's start byte mid-char or this test is vacuous"
+        );
+        let composed = handoff::compose_kickoff(Some("declared"), Some(&huge))
+            .expect("a huge carried body still composes");
+        assert!(
+            composed.contains("[handoff body truncated]"),
+            "truncation is announced in the body"
+        );
+        assert!(composed.ends_with("declared"), "declared kickoff survives");
+        // Clipped payload + marker + declared text; the payload itself is
+        // bounded by the cap.
+        assert!(
+            composed.len() < huge.len(),
+            "the oversized body was actually shortened"
+        );
+    }
+
+    #[test]
+    fn condition_matches_is_a_regex_and_fails_closed_on_a_bad_pattern() {
+        assert!(condition::matches("APPROVED", "verdict: APPROVED, ship it"));
+        assert!(!condition::matches("APPROVED", "verdict: REJECTED"));
+        assert!(condition::matches("^ok$", "ok"));
+        assert!(
+            !condition::matches("(unclosed", "anything at all"),
+            "an uncompilable pattern must never match (config.rs rejects these \
+             at parse time; this is the defense-in-depth path)"
+        );
+    }
+
+    #[test]
+    fn copies_for_expands_only_the_fanout_pattern() {
+        let fan = parse_wf(COUNT_FANOUT_YAML, "countfan");
+        let candidate = fan.steps.iter().find(|s| s.id == "candidate").unwrap();
+        assert_eq!(copies_for(WorkflowPattern::FanOut, candidate), 3);
+        assert_eq!(
+            copies_for(WorkflowPattern::Pipeline, candidate),
+            1,
+            "a fanOut declaration outside the fan-out pattern does not expand"
+        );
+        assert_eq!(copies_for(WorkflowPattern::Supervisor, candidate), 1);
+        assert_eq!(copies_for(WorkflowPattern::Handoff, candidate), 1);
+
+        let pipe = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let first = pipe.steps.iter().find(|s| s.id == "first").unwrap();
+        assert_eq!(
+            copies_for(WorkflowPattern::FanOut, first),
+            1,
+            "no fanOut count means a single copy even under fan-out"
+        );
+    }
+
+    #[test]
+    fn deliver_kickoff_returns_the_thread_root_and_noops_without_a_body() {
+        let (_config, store, dir) = harness(REPLY_KICKOFF_YAML);
+        let wf = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        let second = wf.steps.iter().find(|s| s.id == "second").unwrap();
+
+        let root = deliver_kickoff(&store, &dir, "replykick", first, None)
+            .expect("send should succeed")
+            .expect("a declared kickoff yields a thread root");
+        assert!(root > 0);
+
+        assert_eq!(
+            deliver_kickoff(&store, &dir, "replykick", second, None).unwrap(),
+            None,
+            "a step with no kickoff and no carried body sends nothing"
+        );
+        assert!(
+            deliver_kickoff(&store, &dir, "replykick", second, Some("carried ctx"))
+                .unwrap()
+                .is_some(),
+            "a carried body alone is enough to send"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_reply_completions_completes_a_reply_joined_step() {
+        let (_config, store, dir) = harness(REPLY_KICKOFF_YAML);
+        let wf = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        let view = StatusView::new();
+
+        let root = deliver_kickoff(&store, &dir, "replykick", first, None)
+            .unwrap()
+            .unwrap();
+        let mut run = mk_run(
+            "replykick",
+            vec![
+                mk_kicked("first", "a", root),
+                mk_outcome("second", None, StepState::Pending),
+            ],
+        );
+
+        assert!(
+            !detect_reply_completions(&store, &dir, "replykick", &view, &wf, &mut run),
+            "no reply yet -> nothing changes"
+        );
+        assert_eq!(run.steps[0].state, StepState::Running);
+
+        store
+            .reply_inbox(&dir, root, "a".to_string(), "done: shipped it".to_string())
+            .expect("the agent replies on its own kickoff thread");
+
+        assert!(detect_reply_completions(
+            &store, &dir, "replykick", &view, &wf, &mut run
+        ));
+        assert_eq!(
+            run.steps[0].state,
+            StepState::Succeeded,
+            "joinOn: reply completes on the reply, with the pane still alive"
+        );
+        assert_eq!(run.steps[0].reply_body.as_deref(), Some("done: shipped it"));
+
+        // The reply was acknowledged, so putting the step back to Running must
+        // NOT re-consume it — this is what keeps a retried attempt from being
+        // completed by the previous attempt's reply.
+        run.steps[0].state = StepState::Running;
+        run.steps[0].reply_body = None;
+        assert!(
+            !detect_reply_completions(&store, &dir, "replykick", &view, &wf, &mut run),
+            "an acked reply is never matched twice"
+        );
+        assert_eq!(run.steps[0].state, StepState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_reply_completions_ignores_a_reply_from_anyone_but_the_step_agent() {
+        let (_config, store, dir) = harness(REPLY_KICKOFF_YAML);
+        let wf = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        let view = StatusView::new();
+
+        let root = deliver_kickoff(&store, &dir, "replykick", first, None)
+            .unwrap()
+            .unwrap();
+        // Same thread, but the outcome claims a different agent owns the step,
+        // so this reply is somebody else's traffic.
+        let mut run = mk_run("replykick", vec![mk_kicked("first", "b", root)]);
+        store
+            .reply_inbox(&dir, root, "a".to_string(), "not from b".to_string())
+            .unwrap();
+
+        assert!(
+            !detect_reply_completions(&store, &dir, "replykick", &view, &wf, &mut run),
+            "an operator (or another agent) must not complete the step"
+        );
+        assert_eq!(run.steps[0].state, StepState::Running);
+        assert_eq!(run.steps[0].reply_body, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_reply_completions_records_the_body_without_completing_a_non_reply_join() {
+        let (_config, store, dir) = harness(HANDOFF_CHAIN_YAML);
+        let wf = parse_wf(HANDOFF_CHAIN_YAML, "handwf");
+        let polish = wf.steps.iter().find(|s| s.id == "polish").unwrap();
+        let view = StatusView::new();
+
+        // `polish` has the default `all` join, so its reply must be recorded
+        // (condition/handoff read it) but must NOT complete the step.
+        let root = deliver_kickoff(&store, &dir, "handwf", polish, None)
+            .unwrap()
+            .unwrap();
+        let mut run = mk_run("handwf", vec![mk_kicked("polish", "b", root)]);
+        store
+            .reply_inbox(&dir, root, "b".to_string(), "progress note".to_string())
+            .unwrap();
+
+        assert!(detect_reply_completions(
+            &store, &dir, "handwf", &view, &wf, &mut run
+        ));
+        assert_eq!(
+            run.steps[0].state,
+            StepState::Running,
+            "only joinOn: reply treats a reply as completion"
+        );
+        assert_eq!(run.steps[0].reply_body.as_deref(), Some("progress note"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_reply_completions_joins_every_reply_on_the_thread() {
+        let (_config, store, dir) = harness(REPLY_KICKOFF_YAML);
+        let wf = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        let view = StatusView::new();
+
+        let root = deliver_kickoff(&store, &dir, "replykick", first, None)
+            .unwrap()
+            .unwrap();
+        let mut run = mk_run("replykick", vec![mk_kicked("first", "a", root)]);
+
+        // The realistic shape: the agent acknowledges, then answers. Completing
+        // on the FIRST reply would record "on it" as the step's result and hand
+        // that to `condition_targets` / `handoff_bodies` instead of the verdict.
+        store
+            .reply_inbox(&dir, root, "a".to_string(), "on it".to_string())
+            .unwrap();
+        store
+            .reply_inbox(&dir, root, "a".to_string(), "verdict: APPROVED".to_string())
+            .unwrap();
+
+        assert!(detect_reply_completions(
+            &store, &dir, "replykick", &view, &wf, &mut run
+        ));
+        assert_eq!(run.steps[0].state, StepState::Succeeded);
+        assert_eq!(
+            run.steps[0].reply_body.as_deref(),
+            Some("on it\n\nverdict: APPROVED"),
+            "both replies, oldest first, separated by a blank line"
+        );
+
+        // Both were acked, not just the one that completed the step — the
+        // straggler must not be left occupying the scan window.
+        run.steps[0].state = StepState::Running;
+        run.steps[0].reply_body = None;
+        assert!(
+            !detect_reply_completions(&store, &dir, "replykick", &view, &wf, &mut run),
+            "every consumed reply was acknowledged"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clip`'s contract is `output.len() <= cap`, UNCONDITIONALLY. The
+    /// interesting inputs are the ones no production caller passes: a cap
+    /// smaller than the 25-byte truncation marker, where reserving the marker
+    /// with `saturating_sub` alone would emit the bare marker and blow the cap
+    /// it was asked to respect.
+    #[test]
+    fn clip_never_exceeds_its_cap_even_below_the_marker_length() {
+        let marker = handoff::TRUNCATION_MARKER.len();
+
+        // Under the cap: returned verbatim, no marker.
+        assert_eq!(handoff::clip("abc", 10), "abc");
+        // Exactly at the cap is not truncation either.
+        assert_eq!(handoff::clip("abc", 3), "abc");
+
+        // Too small to hold the marker => empty, never a 25-byte overshoot.
+        for cap in 0..=marker {
+            let out = handoff::clip("abcdefghijklmnopqrstuvwxyz0123456789", cap);
+            assert!(
+                out.is_empty(),
+                "cap {cap} cannot fit the marker, so nothing may be emitted, got {out:?}"
+            );
+        }
+
+        // First cap that can hold the marker plus one byte of content.
+        let out = handoff::clip("abcdefghijklmnopqrstuvwxyz0123456789", marker + 1);
+        assert_eq!(out, format!("a{}", handoff::TRUNCATION_MARKER));
+        assert!(out.len() <= marker + 1);
+
+        // A leading multi-byte char the walk-back cannot fit: `end` starts at 2,
+        // no boundary exists at 2 or 1, the loop runs to 0, and the result is
+        // the marker alone — still within the cap. (The body must exceed the cap
+        // or the early `body.len() <= cap` return fires first: 10 × 3 = 30 > 27.)
+        let out = handoff::clip(&"あ".repeat(10), marker + 2);
+        assert_eq!(out, handoff::TRUNCATION_MARKER);
+        assert!(out.len() <= marker + 2);
+    }
+
+    #[test]
+    fn merge_reply_bodies_drops_blanks_and_clips_at_a_char_boundary() {
+        assert_eq!(handoff::merge_reply_bodies(&["one", "two"]), "one\n\ntwo");
+        assert_eq!(
+            handoff::merge_reply_bodies(&["  one  ", "   ", "two"]),
+            "one\n\ntwo",
+            "bodies are trimmed and blank entries contribute no separator"
+        );
+        assert_eq!(handoff::merge_reply_bodies(&[]), "");
+
+        // Same char-boundary trap as the `clip` test: the leading ASCII byte
+        // puts clip's start byte (`cap - marker`, not `cap`) strictly INSIDE a
+        // multi-byte char, so a blind slice would panic.
+        let huge = format!("x{}", "あ".repeat(handoff::MAX_HANDOFF_BODY_BYTES));
+        let start = handoff::MAX_HANDOFF_BODY_BYTES - handoff::TRUNCATION_MARKER.len();
+        assert!(!huge.is_char_boundary(start));
+        let merged = handoff::merge_reply_bodies(&[huge.as_str()]);
+        assert!(merged.contains("[handoff body truncated]"));
+        // The cap is inclusive of the marker — the exact bound, not a slack
+        // one. A `<= cap + 64` assertion would still pass with the off-by-25
+        // that made `compose_kickoff` overshoot `send_inbox`'s 64 KiB reject
+        // threshold, which is precisely the bug this pins.
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "clip must reserve the marker inside the cap, not append past it"
+        );
+    }
+
+    #[test]
+    fn condition_targets_passes_a_match_and_skips_a_mismatch() {
+        let wf = parse_wf(COND_YAML, "condwf");
+
+        let mut gate = mk_outcome("gate", Some(1), StepState::Succeeded);
+        gate.reply_body = Some("verdict: APPROVED".to_string());
+        let run = mk_run(
+            "condwf",
+            vec![gate.clone(), mk_outcome("apply", None, StepState::Pending)],
+        );
+        assert!(
+            condition_targets(&wf, &run).is_empty(),
+            "a matching condition leaves the step Pending for spawn_ready"
+        );
+        assert_eq!(
+            ready_steps(&wf, &run)
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apply"],
+            "and it does become ready"
+        );
+
+        let mut rejected = gate;
+        rejected.reply_body = Some("verdict: REJECTED".to_string());
+        let run = mk_run(
+            "condwf",
+            vec![rejected, mk_outcome("apply", None, StepState::Pending)],
+        );
+        let targets = condition_targets(&wf, &run);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "apply");
+        assert_eq!(
+            targets[0].1,
+            StepState::Skipped,
+            "a cleanly DECLINED branch is a skip, not a failure"
+        );
+        assert!(
+            targets[0].2.contains("did not match"),
+            "reason names the mismatch: {}",
+            targets[0].2
+        );
+
+        // And the declined branch must leave the run green — this is the whole
+        // point of `finalize_state` treating `Skipped` as neutral.
+        let mut run = run;
+        set_step_state(&mut run, "apply", StepState::Skipped, None);
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Succeeded);
+    }
+
+    /// The asymmetry that matters: a condition that could not be evaluated at
+    /// all is an ERROR, not a declined branch. Under the neutral-`Skipped`
+    /// rule, classifying it as a skip would report the run `Succeeded` while
+    /// having silently dropped a branch because the operator's config could
+    /// never feed the gate any input.
+    #[test]
+    fn condition_targets_fails_when_the_upstream_left_no_reply_to_evaluate() {
+        let wf = parse_wf(COND_YAML, "condwf");
+        // `gate` succeeded via route 1/2 — no inbox reply exists, so the
+        // condition can never be evaluated. CONTRACT.md is silent; failing
+        // (rather than skipping, or wedging in Pending) is 5.0.4's choice.
+        let run = mk_run(
+            "condwf",
+            vec![
+                mk_outcome("gate", Some(1), StepState::Succeeded),
+                mk_outcome("apply", None, StepState::Pending),
+            ],
+        );
+        let targets = condition_targets(&wf, &run);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "apply");
+        assert_eq!(
+            targets[0].1,
+            StepState::Failed,
+            "an unevaluable condition is an error mode, not a declined branch"
+        );
+        assert!(
+            targets[0].2.contains("could not be evaluated"),
+            "the reason must distinguish this from a real mismatch: {}",
+            targets[0].2
+        );
+
+        let mut run = run;
+        set_step_state(&mut run, "apply", targets[0].1, Some(targets[0].2.clone()));
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Failed,
+            "and the run must report red rather than green-with-a-dropped-branch"
+        );
+    }
+
+    /// `retry` retries attempts; a step failed by the unevaluable-condition arm
+    /// never had one. Re-arming it would spawn a step whose gate never opened,
+    /// and would loop, since no further attempt can conjure the missing reply.
+    #[test]
+    fn arm_retry_backoff_ignores_a_failure_that_never_spawned() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        let mut never_spawned = mk_outcome("first", None, StepState::Failed);
+        never_spawned.attempts = 0;
+        let mut run = mk_run("retryzero", vec![never_spawned]);
+        assert!(
+            !arm_retry_backoff(&wf, &mut run, 1_000),
+            "attempts == 0 means the step was failed without ever being spawned"
+        );
+        assert_eq!(run.steps[0].next_retry_at_ms, None);
+
+        // Control: the identical outcome WITH an attempt on the clock arms.
+        run.steps[0].attempts = 1;
+        assert!(arm_retry_backoff(&wf, &mut run, 1_000));
+        assert!(run.steps[0].next_retry_at_ms.is_some());
+    }
+
+    #[test]
+    fn condition_targets_waits_while_the_upstream_is_still_unsatisfied() {
+        let wf = parse_wf(COND_YAML, "condwf");
+        let run = mk_run(
+            "condwf",
+            vec![
+                mk_outcome("gate", Some(1), StepState::Running),
+                mk_outcome("apply", None, StepState::Pending),
+            ],
+        );
+        assert!(
+            condition_targets(&wf, &run).is_empty(),
+            "a condition is evaluated once, when its dependency is satisfied \
+             — never before"
+        );
+    }
+
+    #[test]
+    fn handoff_bodies_keys_by_target_and_ignores_a_blank_reply() {
+        let wf = parse_wf(HANDOFF_CHAIN_YAML, "handwf");
+
+        let mut draft = mk_outcome("draft", Some(1), StepState::Succeeded);
+        draft.reply_body = Some("the drafted text".to_string());
+        let run = mk_run(
+            "handwf",
+            vec![draft.clone(), mk_outcome("polish", None, StepState::Pending)],
+        );
+        let bodies = handoff_bodies(&wf, &run);
+        assert_eq!(
+            bodies.get("polish").map(String::as_str),
+            Some("the drafted text"),
+            "keyed by the TARGET step id, not the source"
+        );
+        assert!(!bodies.contains_key("draft"));
+
+        let mut blank = draft;
+        blank.reply_body = Some("   \n ".to_string());
+        let run = mk_run(
+            "handwf",
+            vec![blank, mk_outcome("polish", None, StepState::Pending)],
+        );
+        assert!(
+            handoff_bodies(&wf, &run).is_empty(),
+            "a whitespace-only reply carries nothing"
+        );
+
+        // No reply at all (completed via route 1/2) also carries nothing; the
+        // target still gets its own declared kickoff.
+        let run = mk_run(
+            "handwf",
+            vec![
+                mk_outcome("draft", Some(1), StepState::Succeeded),
+                mk_outcome("polish", None, StepState::Pending),
+            ],
+        );
+        assert!(handoff_bodies(&wf, &run).is_empty());
+    }
+
+    #[test]
+    fn agent_claimed_by_other_step_only_trips_on_a_live_sibling() {
+        let wf = parse_wf(REPLY_KICKOFF_YAML, "replykick");
+        let second = wf.steps.iter().find(|s| s.id == "second").unwrap();
+        assert_eq!(second.agent, "b");
+
+        let mut sibling = mk_outcome("first", Some(1), StepState::Running);
+        sibling.agent = "b".to_string();
+        assert!(
+            agent_claimed_by_other_step(std::slice::from_ref(&sibling), second),
+            "another step is running a pane for agent 'b'"
+        );
+
+        // Same step id (a fan-out copy of `second` itself) is not "another
+        // step" — reuse there is governed by the copy count, not this guard.
+        let mut own_copy = sibling.clone();
+        own_copy.step_id = "second#1".to_string();
+        assert!(!agent_claimed_by_other_step(
+            std::slice::from_ref(&own_copy),
+            second
+        ));
+
+        // A finished sibling holds nothing.
+        sibling.state = StepState::Succeeded;
+        assert!(!agent_claimed_by_other_step(
+            std::slice::from_ref(&sibling),
+            second
+        ));
+
+        // A sibling waiting out its retry backoff STILL holds the pane —
+        // `fire_due_retries` respawns into it once the deadline passes, so
+        // handing it to `second` now would give two live steps one session.
+        // This is the window `state == Running` alone used to miss: a 5s
+        // backoff leaves the pane claimed for ~25 ticks while the outcome
+        // reads `Failed`.
+        sibling.state = StepState::Failed;
+        sibling.next_retry_at_ms = Some(9_999);
+        assert!(
+            agent_claimed_by_other_step(std::slice::from_ref(&sibling), second),
+            "an armed retry keeps its pane"
+        );
+
+        // ...but only if there IS a pane. `check_timeouts` clears `session_id`
+        // after killing, and a pane-cap spawn failure never had one; those arm a
+        // backoff with nothing to hold, so blocking a sibling would deny it a
+        // session neither step owns.
+        let mut paneless = sibling.clone();
+        paneless.session_id = None;
+        assert!(
+            !agent_claimed_by_other_step(std::slice::from_ref(&paneless), second),
+            "an armed retry with no session holds no pane"
+        );
+
+        // Once the retry budget is spent the outcome is terminal and the pane
+        // is released.
+        sibling.next_retry_at_ms = None;
+        assert!(!agent_claimed_by_other_step(
+            std::slice::from_ref(&sibling),
+            second
+        ));
+
+        // A different agent is irrelevant.
+        let mut other_agent = mk_outcome("first", Some(1), StepState::Running);
+        other_agent.agent = "a".to_string();
+        assert!(!agent_claimed_by_other_step(
+            std::slice::from_ref(&other_agent),
+            second
+        ));
+    }
+
+    #[test]
+    fn a_condition_skip_cascades_to_its_own_dependents() {
+        // `apply` skipped for an unmet condition can never satisfy anything
+        // downstream of it, so fail-fast must carry the skip forward.
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  cascade:
+    pattern: pipeline
+    steps:
+      - id: gate
+        agent: a
+        joinOn: reply
+        kickoff: approve or reject
+      - id: apply
+        agent: b
+        dependsOn: [gate]
+        condition: APPROVED
+      - id: after
+        agent: b
+        dependsOn: [apply]
+";
+        let wf = parse_wf(yaml, "cascade");
+        let mut gate = mk_outcome("gate", Some(1), StepState::Succeeded);
+        gate.reply_body = Some("REJECTED".to_string());
+        let mut run = mk_run(
+            "cascade",
+            vec![
+                gate,
+                mk_outcome("apply", None, StepState::Pending),
+                mk_outcome("after", None, StepState::Pending),
+            ],
+        );
+
+        for (step_id, state, reason) in condition_targets(&wf, &run) {
+            set_step_state(&mut run, &step_id, state, Some(reason));
+        }
+        assert_eq!(
+            run.steps
+                .iter()
+                .find(|o| o.step_id == "apply")
+                .unwrap()
+                .state,
+            StepState::Skipped
+        );
+        assert_eq!(
+            failfast_targets(&wf, &run),
+            vec!["after".to_string()],
+            "the skip propagates instead of leaving `after` Pending forever"
+        );
+
+        // ...and the run it lands in is GREEN. A gate that evaluated cleanly
+        // and declined its branch is the feature working as authored; nothing
+        // failed, so nothing should be reported as failed. This is the whole
+        // reason `finalize_state` stopped treating Skipped as a failure.
+        for step_id in failfast_targets(&wf, &run) {
+            set_step_state(&mut run, &step_id, StepState::Skipped, None);
+        }
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Succeeded,
+            "a declined conditional branch is not a failed run"
+        );
     }
 }

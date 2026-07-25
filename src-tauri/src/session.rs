@@ -1757,6 +1757,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the rev12-E/F orchestrator fixes: `check_timeouts` kills
+    /// a timed-out step's PTY via `kill_pty`, and `fire_due_retries` must
+    /// notice the slot is gone (rather than hang or panic) and fall back to a
+    /// fresh spawn instead of an in-place `restart_session`.
+    #[test]
+    fn kill_pty_removes_slot_so_restart_fails() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let id = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .expect("spawn should succeed");
+        assert_eq!(manager.list_sessions()[0].state, SessionState::Running);
+        // This is exactly what orchestrator::check_timeouts does.
+        manager.kill_pty(id).unwrap();
+        // Let the reader thread reap + apply EofAction::Exit { remove: true }.
+        for _ in 0..200 {
+            if manager.list_sessions().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            manager.list_sessions().is_empty(),
+            "kill_pty must remove the slot (manual_kill semantics)"
+        );
+        // This is exactly what orchestrator::fire_due_retries does next.
+        let err = manager
+            .restart_session(handle.clone(), id)
+            .expect_err("restart after kill_pty must fail");
+        assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
     /// Regression for fix #4: spawn_into_slot with a stale expected
     /// generation must not touch the slot.
     #[test]
