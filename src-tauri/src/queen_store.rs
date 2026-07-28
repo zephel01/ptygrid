@@ -1,7 +1,8 @@
 //! Durable, project-scoped Queen data (Phase 3.6–3.7).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -113,9 +114,71 @@ pub struct InboxWaitOptions {
     pub timeout: Duration,
 }
 
+/// `(project_id, mailbox)` — the exact pair `send_inbox`/`reply_inbox` deliver
+/// to, so a waiter is only ever woken by traffic addressed to it.
+type MailboxKey = (String, String);
+
 pub struct QueenStore {
     connection: Mutex<Connection>,
+    /// Store-wide inbox generation. Superseded by `mailbox_waiters` for waking
+    /// `await_inbox`, but kept as a coarse "something arrived" signal that the
+    /// tests observe directly.
     inbox_generation: watch::Sender<u64>,
+    /// One watch channel per mailbox that currently has at least one waiter.
+    /// Entries are created only by `await_inbox` (via `subscribe_mailbox`) and
+    /// removed by `MailboxSubscription::drop`, so an idle store holds none.
+    ///
+    /// LOCK ORDER: `connection` -> `mailbox_waiters`, one direction only.
+    /// `send_inbox`/`reply_inbox` call `notify_inbox` while still holding the
+    /// `connection` guard, so taking `self.lock()` while holding
+    /// `mailbox_waiters` anywhere would deadlock. Neither `subscribe_mailbox`
+    /// nor `MailboxSubscription::drop` touches `connection`.
+    mailbox_waiters: Mutex<HashMap<MailboxKey, Arc<watch::Sender<u64>>>>,
+}
+
+/// RAII handle over one entry of `QueenStore::mailbox_waiters`, owned by a
+/// single `await_inbox` call. Dropping it garbage-collects the entry once the
+/// last waiter on that mailbox is gone.
+struct MailboxSubscription<'a> {
+    store: &'a QueenStore,
+    key: MailboxKey,
+    /// The exact channel this subscription was handed, kept so `Drop` can tell
+    /// it apart from a later channel registered under the same key.
+    sender: Arc<watch::Sender<u64>>,
+    /// `Option` only so `Drop` can release it before inspecting the map.
+    receiver: Option<watch::Receiver<u64>>,
+}
+
+impl MailboxSubscription<'_> {
+    fn receiver_mut(&mut self) -> &mut watch::Receiver<u64> {
+        self.receiver
+            .as_mut()
+            .expect("mailbox subscription receiver is only taken in Drop")
+    }
+}
+
+impl Drop for MailboxSubscription<'_> {
+    fn drop(&mut self) {
+        // (a) Release our own receiver first, so `receiver_count()` below
+        //     reflects the other waiters only.
+        drop(self.receiver.take());
+        // (b) Decide under the map lock, so a concurrent `subscribe_mailbox`
+        //     cannot slip a new receiver in between the check and the remove.
+        //     Takes no other lock — see the LOCK ORDER note on
+        //     `QueenStore::mailbox_waiters`.
+        let mut waiters = self.store.lock_mailbox_waiters();
+        // (c) Remove only if the mapped channel is still *ours* and nobody is
+        //     listening. Without the `ptr_eq` check, a subscription that lost
+        //     a race (its entry already removed and replaced) would delete a
+        //     fresh channel that another waiter is currently blocked on, and
+        //     that waiter would never be woken again.
+        let is_ours_and_idle = waiters.get(&self.key).is_some_and(|current| {
+            Arc::ptr_eq(current, &self.sender) && current.receiver_count() == 0
+        });
+        if is_ours_and_idle {
+            waiters.remove(&self.key);
+        }
+    }
 }
 
 impl QueenStore {
@@ -267,6 +330,7 @@ impl QueenStore {
         Ok(Self {
             connection: Mutex::new(connection),
             inbox_generation,
+            mailbox_waiters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -275,6 +339,33 @@ impl QueenStore {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// See the LOCK ORDER note on `QueenStore::mailbox_waiters`: never take
+    /// `self.lock()` while the returned guard is alive.
+    fn lock_mailbox_waiters(&self) -> MutexGuard<'_, HashMap<MailboxKey, Arc<watch::Sender<u64>>>> {
+        match self.mailbox_waiters.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Number of live per-mailbox watch entries. Test-only: asserts that the
+    /// map is self-cleaning, i.e. that waiters do not leak channels.
+    #[cfg(test)]
+    pub(crate) fn mailbox_waiter_count(&self) -> usize {
+        self.lock_mailbox_waiters().len()
+    }
+
+    /// Current generation of one mailbox's channel, or `None` when nobody is
+    /// waiting on it. Test-only: lets a test assert that a waiter was *not*
+    /// woken, which a plain timeout assertion cannot distinguish from a
+    /// spurious wakeup that simply re-read an empty inbox.
+    #[cfg(test)]
+    pub(crate) fn mailbox_generation(&self, project: &Path, mailbox: &str) -> Option<u64> {
+        let key = (project_id(project).ok()?, mailbox.to_string());
+        let waiters = self.lock_mailbox_waiters();
+        waiters.get(&key).map(|sender| *sender.borrow())
     }
 
     pub fn set_pin(
@@ -624,7 +715,7 @@ impl QueenStore {
         let message = get_inbox_from(&transaction, &project, id)?
             .ok_or_else(|| "inbox message was inserted but could not be read back".to_string())?;
         transaction.commit().map_err(db_error)?;
-        self.notify_inbox();
+        self.notify_inbox(&project, &recipient);
         Ok(message)
     }
 
@@ -764,7 +855,7 @@ impl QueenStore {
         let reply = get_inbox_from(&transaction, &project, reply_id)?
             .ok_or_else(|| "inbox reply was inserted but could not be read back".to_string())?;
         transaction.commit().map_err(db_error)?;
-        self.notify_inbox();
+        self.notify_inbox(&project, &reply.recipient);
         Ok(reply)
     }
 
@@ -781,7 +872,20 @@ impl QueenStore {
             limit,
             timeout,
         } = options;
-        let mut changes = self.inbox_generation.subscribe();
+        let project_key = project_id(project)?;
+        let mailbox = validated_mailbox("mailbox", mailbox)?;
+        // Subscribe BEFORE the first `list_inbox` below. This ordering is the
+        // only thing preventing a lost wakeup: a message committed between the
+        // read and the `select!` would otherwise notify a channel nobody is
+        // listening to yet, and this call would sleep until its deadline even
+        // though its message is already in the table. Because the subscription
+        // exists first, `notify_inbox` either fires into our receiver (and
+        // `changed()` returns at once) or it happened before we subscribed —
+        // in which case its `COMMIT` also happened before our read, so the
+        // first `list_inbox` already sees the message. Do NOT move this into
+        // the loop.
+        let mut subscription = self.subscribe_mailbox((project_key, mailbox.clone()));
+        let changes = subscription.receiver_mut();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if cancellation.is_cancelled() {
@@ -814,9 +918,57 @@ impl QueenStore {
         }
     }
 
-    fn notify_inbox(&self) {
+    /// Bump the store-wide generation, then wake only the mailbox this message
+    /// was addressed to. Callers pass the already-canonicalised project id and
+    /// the already-validated recipient, so the key matches what `await_inbox`
+    /// subscribed with.
+    ///
+    /// Called with the `connection` guard held (see the LOCK ORDER note on
+    /// `QueenStore::mailbox_waiters`).
+    fn notify_inbox(&self, project: &str, mailbox: &str) {
         self.inbox_generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let waiters = self.lock_mailbox_waiters();
+        // Deliberately a lookup and not an `entry()`: a mailbox nobody is
+        // waiting on must not gain a channel here, otherwise every recipient
+        // ever written to would leak one for the lifetime of the store.
+        if let Some(sender) = waiters.get(&(project.to_string(), mailbox.to_string())) {
+            sender.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    /// Hand out a receiver for `key`, creating the shared channel on first use.
+    /// The returned guard removes the entry again once the last waiter leaves.
+    ///
+    /// `subscribe()` is called *inside* the `mailbox_waiters` lock, not after
+    /// releasing it. If it were called after, another waiter's `Drop` could
+    /// run in the gap: it would see `receiver_count() == 0` (our subscription
+    /// doesn't exist yet), remove the entry, and leave us subscribed to a
+    /// channel nobody can look up via `notify_inbox` any more — a lost
+    /// wakeup that only times out. So the invariant that guards the map isn't
+    /// just the three conditions in `MailboxSubscription::drop` (ours, still
+    /// mapped, idle); it also requires that subscribing to an existing
+    /// channel is atomic with observing it under the same lock.
+    fn subscribe_mailbox(&self, key: MailboxKey) -> MailboxSubscription<'_> {
+        let (sender, receiver) = {
+            // Never touches `connection` — see the LOCK ORDER note.
+            let mut waiters = self.lock_mailbox_waiters();
+            let sender = Arc::clone(
+                waiters
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(watch::channel(0).0)),
+            );
+            // Subscribing here, still under the lock, is the atomicity that
+            // rules out the lost-wakeup race described above.
+            let receiver = sender.subscribe();
+            (sender, receiver)
+        };
+        MailboxSubscription {
+            store: self,
+            key,
+            sender,
+            receiver: Some(receiver),
+        }
     }
 
     /// Write-through persistence of one workflow run snapshot (Phase 5.0.1).
@@ -1492,6 +1644,181 @@ mod tests {
         tokio::task::yield_now().await;
         cancel_handle.cancel();
         assert_eq!(cancelling.await.unwrap().unwrap(), InboxWait::Cancelled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn await_inbox_is_not_woken_by_another_mailbox() {
+        let (root, one, _) = projects();
+        let store = Arc::new(QueenStore::open_in_memory().unwrap());
+        let waiting_store = Arc::clone(&store);
+        let waiting_project = one.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .await_inbox(
+                    &waiting_project,
+                    wait_options(0, Duration::from_millis(150)),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(store.mailbox_waiter_count(), 1);
+        assert_eq!(store.mailbox_generation(&one, "codex"), Some(0));
+        for subject in ["first", "second", "third"] {
+            store
+                .send_inbox(
+                    &one,
+                    "claude".to_string(),
+                    "someone-else".to_string(),
+                    subject.to_string(),
+                    "not addressed to codex".to_string(),
+                )
+                .unwrap();
+        }
+        // Traffic on another mailbox neither registers a channel of its own
+        // nor disturbs the waiter on "codex": its generation never moves, so
+        // the waiter is never woken and sleeps out its full deadline.
+        assert_eq!(store.mailbox_waiter_count(), 1);
+        assert_eq!(store.mailbox_generation(&one, "codex"), Some(0));
+        assert_eq!(*store.inbox_generation.borrow(), 3);
+        assert_eq!(waiting.await.unwrap().unwrap(), InboxWait::TimedOut);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mailbox_watch_entry_is_dropped_when_the_last_waiter_leaves() {
+        let (root, one, _) = projects();
+        let store = Arc::new(QueenStore::open_in_memory().unwrap());
+        assert_eq!(store.mailbox_waiter_count(), 0);
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let waiting_store = Arc::clone(&store);
+            let waiting_project = one.clone();
+            waiters.push(tokio::spawn(async move {
+                waiting_store
+                    .await_inbox(
+                        &waiting_project,
+                        wait_options(0, Duration::from_millis(50)),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        // Both waiters share the single entry for "codex".
+        assert_eq!(store.mailbox_waiter_count(), 1);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap().unwrap(), InboxWait::TimedOut);
+        }
+        assert_eq!(store.mailbox_waiter_count(), 0);
+
+        // A call that returns without ever blocking cleans up just the same.
+        store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "immediate".to_string(),
+                "already here".to_string(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .await_inbox(
+                    &one,
+                    wait_options(0, Duration::from_secs(1)),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+            InboxWait::Messages(_)
+        ));
+        assert_eq!(store.mailbox_waiter_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn subscribe_mailbox_after_a_sibling_drop_still_wakes_on_notify() {
+        // Regression test for the lost-wakeup race on `subscribe_mailbox`:
+        // subscribing must be atomic with the map lookup, or a sibling
+        // waiter's `Drop` can evict the channel before the new subscriber
+        // ever registers on it, orphaning it until timeout.
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let key = (project_id(&one).unwrap(), "codex".to_string());
+
+        // Waiter A subscribes first, creating the shared channel.
+        let sub_a = store.subscribe_mailbox(key.clone());
+        assert_eq!(store.mailbox_waiter_count(), 1);
+
+        // Waiter B subscribes to that same still-live channel...
+        let mut sub_b = store.subscribe_mailbox(key.clone());
+        // ...only then does A leave. This is exactly the ordering the fix
+        // must preserve: by the time A's `Drop` checks `receiver_count()`,
+        // B must already be registered on the same sender, so the entry is
+        // *not* removed out from under B.
+        drop(sub_a);
+        assert_eq!(
+            store.mailbox_waiter_count(),
+            1,
+            "B's subscription must keep the mailbox entry alive"
+        );
+
+        store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "subject".to_string(),
+                "hello".to_string(),
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), sub_b.receiver_mut().changed())
+            .await
+            .expect("B must be woken by notify_inbox instead of being orphaned")
+            .expect("watch channel must still be open");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn two_waiters_on_one_mailbox_are_both_woken() {
+        let (root, one, _) = projects();
+        let store = Arc::new(QueenStore::open_in_memory().unwrap());
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let waiting_store = Arc::clone(&store);
+            let waiting_project = one.clone();
+            waiters.push(tokio::spawn(async move {
+                waiting_store
+                    .await_inbox(
+                        &waiting_project,
+                        wait_options(0, Duration::from_secs(5)),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(store.mailbox_waiter_count(), 1);
+        let arrived = store
+            .send_inbox(
+                &one,
+                "claude".to_string(),
+                "codex".to_string(),
+                "broadcast".to_string(),
+                "wake everyone".to_string(),
+            )
+            .unwrap();
+        for waiter in waiters {
+            assert_eq!(
+                waiter.await.unwrap().unwrap(),
+                InboxWait::Messages(vec![arrived.clone()])
+            );
+        }
+        assert_eq!(store.mailbox_waiter_count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 

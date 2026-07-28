@@ -684,6 +684,18 @@ pub struct WorkflowStep {
     pub handoff_to: Option<String>,
 }
 
+/// Longest workflow name whose run mailbox still fits `queen_store`'s
+/// `MAX_MAILBOX_BYTES` (128).
+///
+/// `orchestrator::workflow_mailbox` builds `"queen:workflow/{name}/{run_id}"`.
+/// The fixed cost is 44 bytes: 15 for `"queen:workflow/"`, 1 for the `/`
+/// separator, and 28 for a `new_run_id` (`"wfr_"` + 16 hex nanos + 8 hex
+/// counter). 128 - 44 = 84 bytes left for the name.
+///
+/// Byte length, not chars: `MAX_MAILBOX_BYTES` bounds the encoded string, so a
+/// multi-byte name is measured the same way the store measures it.
+const WORKFLOW_NAME_MAX_BYTES: usize = 84;
+
 /// Phase 5.0 parse-time validation of the `workflows:` block. Every error
 /// names the offending workflow and step so multi-workflow configs stay
 /// debuggable (same principle as `validate_team_presets`).
@@ -692,7 +704,9 @@ pub struct WorkflowStep {
 /// step id in `dependsOn`, DAG cycle, unknown `agent` reference (must be in
 /// `agents:`), `fanOut < 2`, `fanOut` on a non-`fan-out` pattern, `fanOut`
 /// missing on a `fan-out` pattern's roots, `pipeline` with a step that has
-/// more than one `dependsOn` (pipelines are linear by construction).
+/// more than one `dependsOn` (pipelines are linear by construction), and a
+/// workflow name too long for the run's inbox mailbox
+/// (`WORKFLOW_NAME_MAX_BYTES`).
 fn validate_workflows(config: &Config) -> Result<(), String> {
     let Some(workflows) = &config.workflows else {
         return Ok(());
@@ -701,6 +715,19 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
         let ctx = format!("workflows.{name}");
         if name.trim().is_empty() {
             return Err("workflows: workflow name must not be empty".to_string());
+        }
+        // Checked here rather than at `send_inbox` time so an over-long name
+        // fails loudly at load instead of as an inscrutable per-step kickoff
+        // failure once the run is already on the grid. See
+        // `WORKFLOW_NAME_MAX_BYTES` for the arithmetic.
+        if name.trim().len() > WORKFLOW_NAME_MAX_BYTES {
+            return Err(format!(
+                "{ctx}: workflow name is {} bytes; must be <= {WORKFLOW_NAME_MAX_BYTES} \
+                 (the run's inbox mailbox is 'queen:workflow/<name>/<run_id>', whose \
+                 44 bytes of fixed cost — 15 for the prefix, 1 separator, 28 for the \
+                 run id — leave that much of queen_store's 128-byte mailbox budget)",
+                name.trim().len()
+            ));
         }
         if wf.steps.is_empty() {
             return Err(format!("{ctx}: steps must not be empty"));
@@ -2956,6 +2983,36 @@ agents:
         assert!(
             err.contains("fanOut only has meaning under pattern: fan-out"),
             "error was: {err}"
+        );
+    }
+
+    /// The run mailbox `orchestrator::workflow_mailbox` builds from the
+    /// workflow name has to fit `queen_store`'s 128-byte mailbox cap. Caught
+    /// here, at load, rather than as a `send_inbox` rejection on every kickoff
+    /// of a run that has already taken panes on the grid.
+    ///
+    /// The two cases are adjacent on purpose: 84 bytes is the exact budget, so
+    /// accepting 84 and rejecting 85 is what pins the constant to the
+    /// arithmetic instead of to a round number someone picked.
+    #[test]
+    fn workflow_name_longer_than_the_mailbox_budget_is_rejected_at_load() {
+        let one_step = "    pattern: pipeline\n    steps:\n      - id: only\n        agent: a\n";
+
+        let at_budget = "w".repeat(WORKFLOW_NAME_MAX_BYTES);
+        let yaml = format!("{WF_AGENTS}workflows:\n  {at_budget}:\n{one_step}");
+        assert!(
+            parse_config(&yaml).is_ok(),
+            "a name of exactly {WORKFLOW_NAME_MAX_BYTES} bytes still fits the mailbox"
+        );
+
+        let over_budget = "w".repeat(WORKFLOW_NAME_MAX_BYTES + 1);
+        let yaml = format!("{WF_AGENTS}workflows:\n  {over_budget}:\n{one_step}");
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("workflow name is 85 bytes")
+                && err.contains("queen:workflow/<name>/<run_id>"),
+            "the error must say how long the name is and why the limit exists; \
+             error was: {err}"
         );
     }
 }

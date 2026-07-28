@@ -1820,6 +1820,11 @@ team_presets:
 > （`workflow_mailbox` に run_id が入らず、`spawn_workflow` に重複名ガードも無い）ため、
 > 孤児メッセージを ack して回す GC は導入できない。MCP tool description にも
 > 「並行起動より join を優先せよ」の注意を明記した。
+> **この段落は続報10（2026-07-28）で失効する**: `workflow_mailbox` は run_id を
+> 含むよう変更され（`queen:workflow/<name>/<run_id>`）、同名 workflow の並行 run は
+> もう mailbox を共有しない。`spawn_workflow` tool description の「並行起動より join を
+> 優先せよ」の注意文も撤回済み。`INBOX_REPLY_SCAN_LIMIT` = 200 件の上限自体は変わらず
+> 有効。
 >
 > **(9) 既知の限界: kickoff 配送失敗によるペイン孤児化。** `attach_kickoff_result` は
 > store の `send_inbox` 失敗時に outcome を `Failed` へ格上げするが、この関数は
@@ -1884,7 +1889,10 @@ team_presets:
 > 続報7 §7 の `#[serde(skip)]` による resume ギャップ（`reply_body` /
 > `kickoff_root_msg_id` / `next_retry_at_ms` が `steps_json` に載らない）、§8 の tick を
 > 跨いだ返信取りこぼしと同名 workflow の mailbox 共有、§9 の kickoff 失敗時の孤立 pane は、
-> いずれも unit test では再現しない実行時・再起動時の性質であり、依然として未検証である。
+> いずれも unit test では再現しない実行時・再起動時の性質であり、依然として未検証である
+> （**このうち「同名 workflow の mailbox 共有」は続報10で解消済み** — mailbox は
+> run_id 単位に分離された。tick を跨いだ返信取りこぼしと kickoff 失敗時の孤立 pane は
+> 続報10のスコープ外で、未検証のまま残る）。
 > `main` 未マージも変わらない。続報7 §4 の代理決定 A′（返信の無い `condition:` は
 > `Failed`）と B′（`Skipped` は中立）は、テストが通ったことによって「正しい仕様である」
 > ことが示されたわけではない — テストは決定どおりに実装されていることを示すだけである。
@@ -1968,6 +1976,102 @@ team_presets:
 > `cancel_stragglers` の pane kill は unit test では実ペインを伴わずに検証しており、
 > 実際に fan-out レースの敗者ペインが GUI 上で閉じることの目視確認は未了。
 > `main` 未マージも変わらない。
+>
+
+> 追記（2026-07-28、続報10）: **pane 上限を「失敗」から「待ち」へ変え、driver tick を
+> 軽量化し、inbox mailbox を run 単位に分離した。** 断面は `DESIGN-refactor-5.0.5.md`
+> （リポジトリ直下）の設計どおりに、5 コミット（`ed87a95`/`c09f157`/`9adbd6e`/`4f061cc`/
+> `de0cb5b`）に分けて実装されたもの。以下は各コミットの `orchestrator.rs` / `config.rs` /
+> `session.rs` / `team_presets.rs` / `queen.rs` を直接読んで確認した内容である。
+>
+> **(1) pane 上限「失敗」→「待ち」。** 9 面（`WORKFLOW_SESSION_CAP = 9`、値そのものは
+> 不変）が埋まっている間、spawn できない step は従来のように `Failed` にならず、
+> `Pending` のまま据え置かれる(新設 `StepOutcome.deferred_since_ms: Option<u64>`、
+> `#[serde(skip)]` につき wire は不変)。`ready_steps` は毎 tick 冪等に依存なし step を
+> 再算出するため、次 tick 以降に空きが出れば追加の機構なしに拾われる。占有判定は
+> 「`state != Exited` のセッション数」に統一された(従来は `live_session_id` との間で
+> 全件 `list_sessions()` を数える箇所と不一致があった)。`Exited` セッションは自動 reap
+> されない(`EofAction::Exit { remove: manual_kill }`)ため空きスロットとして正しく
+> 数えられる。待ちには上限 `WORKFLOW_DEFER_MAX_MS = 300_000`(5分)があり、超過すると
+> 従来どおり `Failed` になる(`attempts` を 1 にして `arm_retry_backoff` の
+> `attempts == 0` ガードを通す)。retry の backoff 待ちが枠不足で先送りされる経路
+> (`postpone_retry`)も同じ `WORKFLOW_DEFER_MAX_MS` で有界化されており、give-up の
+> たびに `attempts` を 1 消費するため、worst case は `retry.max * WORKFLOW_DEFER_MAX_MS`
+> で必ず終端する。`timeoutMs` は待ち時間を含まない — `check_timeouts` は `Running` かつ
+> `started_at_ms != 0` の step だけを見る既存ロジックのままで足りる(待っている間は
+> `Pending` で `started_at_ms == 0`)という設計判断が明文化された。deferral 中の
+> `error` フィールドには待機理由 `"waiting for a free pane slot (N/9 occupied)"`
+> (`pane_wait_reason`)が入り、`Pending` かつ `error` 非 null という新しい組み合わせが
+> 生まれた。`spawn_workflow` はグリッド満杯時、root step を `Pending` のプレースホルダ
+> として積んで返す(run 自体は `Running` のまま、
+> `spawn_workflow_leaves_a_root_pending_when_the_grid_is_full` で検証)。fan-out の
+> all-or-nothing は不変 — 空き < `copies` なら 0 copy
+> (`spawn_ready_never_partially_spawns_a_fanout_step`)。`team_presets` の部分起動仕様
+> (`spec-team-presets.md` §4.3)は意図的に変更していない(占有カウントを
+> `live_session_count()` に差し替えた1行のみ)。
+>
+> **(2) driver tick の軽量化。** `PtyManager::session_states()`(`id`/`name`/`state`/
+> `code` のみ、`ps` fork なし)と `live_session_count()`(`state != Exited` の数)を
+> 新設し、`detect_completions` / `live_session_id` / `team_presets::start_team` の
+> 占有判定 / `queen::list_agents` の内部計算が、`ps` fork を伴う重い `list_sessions()`
+> を呼ばなくなった。**MCP `list_agents` の返り値は不変**(`sessions[]` は引き続き
+> フル `SessionInfo`)— 変わったのは内部の計算経路だけである。`WorkflowRegistry` に
+> 終端 run(`Succeeded`/`Failed`/`Cancelled`)の evict(`REGISTRY_TERMINAL_CAP = 100`、
+> `put` が挿入と同一ロックで trim)と、非終端 run の id だけを返す `active_run_ids()`
+> (`advance_all` が `list()` の代わりに使う)を追加した。これは 5.0.1 節の doc だけが
+> 書いていた「last 100 runs」という記述を、初めて実装で裏付けたものである。非終端 run
+> は件数に関わらず evict されない。副作用: evict 済みの終端 run に対する
+> `join_workflow` / `cancel_workflow` は `not found` になる(`registry.get` が `None`
+> を返す経路。200ms 周期の driver tick で終端 run が 100 本を超えない限り起きない)。
+> `list_workflow_runs`(`registry.list()`)は「終端最大 100 + 全 live」に上限化された。
+>
+> **(3) inbox の mailbox 分離。** `workflow_mailbox(name, run_id)` が
+> `queen:workflow/<name>` から **`queen:workflow/<name>/<run_id>`** へ変わり、同名
+> workflow の並行 run はもう mailbox を共有しない。`deliver_kickoff` /
+> `detect_reply_completions` / ack パスは全て `run.run_id` を経由してこの文字列を
+> 再構築する(単一 source of truth)。`INBOX_REPLY_SCAN_LIMIT`(200)と thread ごとの
+> アンカリングは変更していない。**新規制約**: workflow 名は 84 バイト以下でなければ
+> ならない(`config.rs::WORKFLOW_NAME_MAX_BYTES`)。mailbox 文字列の固定コストが
+> 44 バイト(`"queen:workflow/"` 15 + `"/"` 1 + 28 バイトの `run_id`)で、
+> `queen_store::MAX_MAILBOX_BYTES`(128)から引くと 84 バイトが名前の予算になる。
+> これを超える workflow 名は `validate_workflows` が load 時にエラーで拒否する
+> (実行時の不可解な `send_inbox` 失敗を前倒しする)。**旧 mailbox 名へのフォールバック
+> は実装していない** — 唯一旧 mailbox の thread が残りうる経路(跨アップグレードの
+> in-flight run)は、resume 時に `Running` step が全部 `Pending` に戻り新 mailbox へ
+> 再 kickoff されることで解消する(`kickoff_root_msg_id` が `#[serde(skip)]` で
+> 永続化されないため resume 後は必ず失われる — この性質自体は続報7 §(7) の記述どおりで
+> 変わらない)。旧 mailbox に残るメッセージは新スキャンの相手にならない(recipient が
+> 別文字列のため)が、`MAX_MESSAGES_PER_PROJECT` 枠は消費し続ける。**続報7 §(8) が記録した
+> 「同一 workflow 名の並行 run は 1 つの mailbox を共有する」および「MCP tool
+> description にも並行起動より join を優先せよの注意を明記した」は、本追記により
+> 失効する**: `queen.rs` の `spawn_workflow` tool description は「並行起動より join を
+> 優先せよ」という注意文を撤回し、「各 run は run id をキーにした専用 inbox mailbox を
+> 持つため、同名 workflow の並行 run は互いに干渉しない」という記述に書き換えた。run
+> 終端時の mailbox GC は構造的に可能になったが、本断面ではスコープ外・未実装のまま
+> (`DESIGN-refactor-5.0.5.md` の「スコープ外」節)。
+>
+> **(4) wire schema。** 上記いずれも `WorkflowRun` / `StepOutcome` の serialize される
+> 公開フィールドを増減させていない(`deferred_since_ms` も既存の `kickoff_root_msg_id` /
+> `reply_body` / `next_retry_at_ms` と同じく `#[serde(skip)]`)。`workflow-state` イベント
+> の形は不変。5.0.1〜5.0.4 節の schema 表に変更は不要であることを確認済み。
+>
+> **(5) 検証。** 本追記は cargo が使える環境で書かれている(続報8/9 と異なり「静的検証
+> のみ」ではない)。実際に `cargo test` を走らせ、lib **374 passed / 0 failed**(続報9 の
+> 349 に対し、上記 (1)〜(3) 各段で新規テストを追加)、統合 `queen_compat_integration`
+> **14 passed / 0 failed**、失敗ゼロを確認した。ただし `cargo clippy --all-targets -- -D
+> warnings` は本断面と無関係な既存コード(`config.rs:834`、baseline コミットの時点で
+> 既に存在し本作業では触れていない箇所)で `nonminimal_bool` を報告しており、
+> `-D warnings` では通らない。`git blame` で当該行が本作業の変更範囲外であることを
+> 確認済みで、今回変更した箇所自体に起因する新規 clippy 警告ではない。
+>
+> **解除されないもの。** 実機での workflow 1 本流し(GUI / Queen MCP からの
+> `spawn_workflow` 実行)は依然未実施。pane 上限待ちが実機で解消し再開することの目視
+> 確認、mailbox 分離後の同名 workflow 並行起動の実機確認は、いずれも unit test でのみ
+> 検証されている。`main` 未マージも変わらない。続報8 §(8) が記録した「reply-once-when-
+> done: 後続 tick に着いた返信は捨てられる」という残存レースは本断面のスコープ外で
+> あり解消していない。続報7 §(9)(kickoff 配送失敗によるペイン孤児化)、続報9 が指摘した
+> 「fan-out レースの敗者ペインが GUI 上で閉じることの目視確認は未了」も同様に未解消
+> のままである。
 >
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）

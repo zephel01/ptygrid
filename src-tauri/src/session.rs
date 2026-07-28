@@ -278,6 +278,19 @@ pub(crate) struct AgentStatusSnapshot {
     pub cols: u16,
 }
 
+/// Cheap per-slot summary returned by [`PtyManager::session_states`]. Carries
+/// exactly what pane-cap accounting, idempotent same-name reuse lookups, and
+/// PTY-exit completion polling need — id/name/state/code — and nothing that
+/// would force those hot paths to pay for a `cmd`/`worktree`/`teammate`/`kind`
+/// clone or a `ps` fork they never read.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionStateInfo {
+    pub id: u32,
+    pub name: Option<String>,
+    pub state: SessionState,
+    pub code: Option<i32>,
+}
+
 type SharedSessions = Arc<Mutex<HashMap<u32, SessionSlot>>>;
 
 fn lock_map(map: &SharedSessions) -> MutexGuard<'_, HashMap<u32, SessionSlot>> {
@@ -693,6 +706,57 @@ impl PtyManager {
     /// lookup runs after the lock is dropped: on macOS it shells out to ps).
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
         self.list_sessions_with(pty::process_name)
+    }
+
+    /// Cheap liveness snapshot for hot paths that only care about
+    /// id/name/state/code (pane-cap accounting, idempotent same-name reuse
+    /// lookups, PTY-exit completion polling). One lock, no `ps` fork, no
+    /// clone of the heavier per-slot fields (`cmd`/`worktree`/`teammate`/
+    /// `kind`) those callers never read.
+    ///
+    /// Deliberately NOT built on top of `list_sessions_with`: sharing it would
+    /// force every caller here to pay for those clones anyway. Kept in sync
+    /// with `list_sessions` by a test (`session_states_agrees_with_list_sessions`)
+    /// instead.
+    pub(crate) fn session_states(&self) -> Vec<SessionStateInfo> {
+        let mut list: Vec<SessionStateInfo> = {
+            let sessions = self.lock_sessions();
+            sessions
+                .iter()
+                .map(|(id, slot)| SessionStateInfo {
+                    id: *id,
+                    name: slot.spec.name.clone(),
+                    state: slot.state,
+                    code: slot.code,
+                })
+                .collect()
+        };
+        list.sort_by_key(|s| s.id);
+        list
+    }
+
+    /// Count of sessions not currently `Exited` — grid OCCUPANCY, which is
+    /// what every pane-cap decision is made against. Single lock, no
+    /// allocation: the counterpart of
+    /// `session_states().iter().filter(...).count()` for call sites that only
+    /// need the number, not the list.
+    ///
+    /// `Exited` is excluded because such a slot is reclaimable: nothing reaps
+    /// it automatically (`EofAction::Exit { remove: manual_kill }` keeps it on
+    /// the grid so the exit code stays visible and `restart_session` can
+    /// revive it), so counting it would refuse work the grid has room for.
+    /// This is also the definition `live_session_id` uses, which is what makes
+    /// "reuse an existing pane" and "is there room for a new one" agree.
+    ///
+    /// Production callers: `orchestrator::pane_budget` (the per-tick pane
+    /// budget behind workflow step deferral) and `team_presets::start_team`'s
+    /// `TEAM_SESSION_CAP` check.
+    pub(crate) fn live_session_count(&self) -> usize {
+        let sessions = self.lock_sessions();
+        sessions
+            .values()
+            .filter(|slot| slot.state != SessionState::Exited)
+            .count()
     }
 
     /// Snapshot running PTY child roots for the shared resource sampler.
@@ -2132,6 +2196,116 @@ mod tests {
 
         // Transcript sessions are never treated as leads.
         assert!(manager.running_named_sessions().is_empty());
+    }
+
+    // ----- B-1/B-2: lightweight session-state API -----
+
+    /// `session_states` must never drift from `list_sessions`: same id set,
+    /// same state/code/name per id. Mixes a named agent session, an anonymous
+    /// shell session, and a stopped (Exited-but-still-in-the-map) transcript
+    /// session so all three fields are actually exercised, not just typechecked.
+    #[test]
+    fn session_states_agrees_with_list_sessions() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let config =
+            config::parse_config("agents:\n  - name: worker\n    cmd: exec /bin/cat\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        let named = manager
+            .spawn_agent(handle.clone(), &config.agents[0], &cwd, 80, 24)
+            .unwrap();
+        let anonymous = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+        let transcript = manager.create_transcript_session(
+            handle.clone(),
+            "agent-y".to_string(),
+            Some("reviewer".to_string()),
+            1,
+            None,
+        );
+        manager.stop_transcript_session(handle.clone(), "agent-y");
+
+        let states = manager.session_states();
+        let infos = manager.list_sessions();
+
+        assert_eq!(
+            states.iter().map(|s| s.id).collect::<Vec<_>>(),
+            infos.iter().map(|s| s.id).collect::<Vec<_>>(),
+            "id sets (and order) must match"
+        );
+        assert_eq!(states.len(), 3);
+
+        for state in &states {
+            let info = infos.iter().find(|i| i.id == state.id).unwrap();
+            assert_eq!(state.state, info.state, "state mismatch for id {}", state.id);
+            assert_eq!(state.code, info.code, "code mismatch for id {}", state.id);
+            assert_eq!(state.name, info.name, "name mismatch for id {}", state.id);
+        }
+
+        // Spot-check actual values so this isn't two independently-wrong
+        // implementations agreeing with each other.
+        let named_state = states.iter().find(|s| s.id == named).unwrap();
+        assert_eq!(named_state.name.as_deref(), Some("worker"));
+        assert_eq!(named_state.state, SessionState::Running);
+
+        let anon_state = states.iter().find(|s| s.id == anonymous).unwrap();
+        assert_eq!(anon_state.name, None);
+        assert_eq!(anon_state.state, SessionState::Running);
+
+        let transcript_state = states.iter().find(|s| s.id == transcript).unwrap();
+        assert_eq!(transcript_state.state, SessionState::Exited);
+        assert_eq!(transcript_state.name.as_deref(), Some("reviewer"));
+
+        manager.kill_pty(named).unwrap();
+        manager.kill_pty(anonymous).unwrap();
+        manager.kill_pty(transcript).unwrap();
+    }
+
+    /// `live_session_count` counts only non-`Exited` slots, unlike
+    /// `list_sessions().len()` which also counts slots that exited naturally
+    /// and stayed in the map (Exited is never auto-reaped; see F1/A-7 in
+    /// DESIGN-refactor-5.0.5.md).
+    #[test]
+    fn live_session_count_excludes_exited_slots() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+
+        let running1 = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+        let running2 = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+            .unwrap();
+        let transcript = manager.create_transcript_session(
+            handle.clone(),
+            "agent-exit".to_string(),
+            None,
+            9,
+            None,
+        );
+
+        assert_eq!(manager.live_session_count(), 3);
+
+        // Stopping a transcript session leaves its (Exited) slot in the map:
+        // `live_session_count` must exclude it while `list_sessions` still
+        // reports it.
+        manager.stop_transcript_session(handle.clone(), "agent-exit");
+        assert_eq!(
+            manager.list_sessions().len(),
+            3,
+            "the Exited slot is still present in the map"
+        );
+        assert_eq!(
+            manager.live_session_count(),
+            2,
+            "Exited slot must not count as live"
+        );
+
+        manager.kill_pty(running1).unwrap();
+        manager.kill_pty(running2).unwrap();
+        manager.kill_pty(transcript).unwrap();
     }
 
     #[test]

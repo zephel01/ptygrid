@@ -73,9 +73,12 @@ pub struct TeamStartReport {
 /// The live session id for a definition name, if one exists. "Live" is any
 /// non-exited state — a member spawned milliseconds ago is `starting` and must
 /// already count for the idempotent skip.
+/// Uses `session_states()` rather than `list_sessions()`: this only needs
+/// id/name/state, not the foreground-process `ps` lookup or the other
+/// per-slot clones `list_sessions` pays for.
 fn live_session_id(manager: &PtyManager, name: &str) -> Option<u32> {
     manager
-        .list_sessions()
+        .session_states()
         .into_iter()
         .find(|s| s.state != SessionState::Exited && s.name.as_deref() == Some(name))
         .map(|s| s.id)
@@ -136,7 +139,19 @@ pub fn start_team<R: Runtime>(
             });
             continue;
         }
-        if manager.list_sessions().len() >= TEAM_SESSION_CAP {
+        // Occupancy, not slot count: an `Exited` pane is a reclaimable slot,
+        // and counting it would refuse a member the grid has room for. Now
+        // agrees with `live_session_id`'s own "live = not Exited" rule two
+        // branches up (they disagreed until 5.0.5) and with
+        // `orchestrator::pane_budget`. `live_session_count` also skips the
+        // per-session `ps` lookup `list_sessions` pays for.
+        //
+        // The SEMANTICS here deliberately stay "fail the member" rather than
+        // adopting the orchestrator's new wait-for-a-slot behaviour:
+        // `start_team` is a synchronous one-shot with no driver behind it to
+        // retry on, and partial launch with explicit per-member failures is
+        // the contract (spec-team-presets.md §4.3).
+        if manager.live_session_count() >= TEAM_SESSION_CAP {
             members.push(MemberOutcome {
                 agent,
                 standby: false,
