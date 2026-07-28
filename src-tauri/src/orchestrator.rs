@@ -1099,6 +1099,146 @@ mod condition {
     }
 }
 
+/// Phase 5.0.4 run-verdict evaluation, pure half: whether every terminal
+/// `Skipped`/`Cancelled` outcome in a run is structurally explained rather
+/// than evidence that some step never got the chance to run. Deliberately
+/// shaped like `mod condition`/`mod retry` above — pure, no PTY/store/clock —
+/// so `finalize_state`'s judgment is unit-testable standalone.
+///
+/// Exists because `dep_unsatisfiable` can doom a dependency (and cascade
+/// `Skipped` onto everything downstream of it) without ever recording a
+/// literal `Failed`/`Cancelled` outcome, so "any hard-failure state anywhere"
+/// is not sufficient to catch a step that silently never ran. See
+/// `finalize_state` for the two cases that make a `Skipped`/`Cancelled`
+/// outcome legitimate rather than a symptom of that: a `condition:` gate
+/// declining its branch, and a join-loser straggler `cancel_stragglers`
+/// cancels once its step's join is already satisfied by a sibling copy.
+mod verdict {
+    use super::{
+        base_id, dep_satisfied, is_terminal, StepOutcome, StepState, WorkflowDef, WorkflowRun,
+        WorkflowStep,
+    };
+    use std::collections::HashMap;
+
+    /// Whether one copy of `step`, currently in `state` (`Skipped` or
+    /// `Cancelled`), is benign:
+    ///
+    /// (a) `step`'s own join is already satisfied by its OTHER copies — this
+    ///     copy lost a race (a `joinOn: any`/`n` straggler, or exactly what
+    ///     `cancel_stragglers` targets). Applies regardless of `state`: a
+    ///     straggler can be cancelled mid-flight (`Cancelled`) or never
+    ///     spawned at all (`Skipped`);
+    /// (b) `state == Skipped` AND every one of `step`'s declared dependencies
+    ///     is `settled` — this copy is downstream of a branch that is itself
+    ///     fully resolved, whether that dependency succeeded outright or
+    ///     legitimately declined. Restricted to `Skipped`: `Cancelled` is
+    ///     only ever produced by `cancel_stragglers` cancelling a `Running`
+    ///     copy, so a `Cancelled` copy was, by construction, already spawned
+    ///     — it can never be "downstream of an unresolved dependency"; (a) is
+    ///     the only legitimate excuse for it.
+    fn benign_copy(
+        wf: &WorkflowDef,
+        run: &WorkflowRun,
+        step: &WorkflowStep,
+        state: StepState,
+        memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        if dep_satisfied(step, &run.steps) {
+            return true;
+        }
+        if state != StepState::Skipped {
+            return false;
+        }
+        step.depends_on.as_deref().unwrap_or(&[]).iter().all(|dep_id| {
+            wf.steps
+                .iter()
+                .find(|s| s.id == *dep_id)
+                .map(|dep_step| settled(wf, run, dep_step, memo))
+                .unwrap_or(false)
+        })
+    }
+
+    /// `dep`'s outcome is resolved one way or another: its join succeeded
+    /// outright, or it legitimately declined (see `declined`).
+    fn settled(
+        wf: &WorkflowDef,
+        run: &WorkflowRun,
+        dep: &WorkflowStep,
+        memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        dep_satisfied(dep, &run.steps) || declined(wf, run, dep, memo)
+    }
+
+    /// `dep` can never satisfy its own join — every copy is terminal and the
+    /// join still falls short — AND that shortfall is fully accounted for by
+    /// `Skipped`/`Cancelled` copies that are themselves benign (recursively).
+    ///
+    /// The "at least one `Skipped`/`Cancelled` copy" requirement is the part
+    /// that actually catches a false green: a step whose copies are ALL
+    /// `Succeeded` but too few of them to meet its own declared join (the
+    /// `lead` with a `joinOn: 3` but only one copy ever spawned) has no
+    /// `Skipped`/`Cancelled` copy to point to, so it is never `declined` —
+    /// its dependents cannot inherit a benign excuse from it, and the run
+    /// correctly turns red. Without that requirement, a dependency with an
+    /// empty copy-shortfall would vacuously qualify and restore the bug.
+    ///
+    /// Memoized per `dep.id` and defended against cycles (config already
+    /// rejects them, but a `WorkflowDef` built directly in a test could still
+    /// have one): the in-progress marker is written `false` before recursing
+    /// so a cycle resolves closed instead of looping.
+    fn declined(
+        wf: &WorkflowDef,
+        run: &WorkflowRun,
+        dep: &WorkflowStep,
+        memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        if let Some(cached) = memo.get(&dep.id) {
+            return *cached;
+        }
+        memo.insert(dep.id.clone(), false);
+
+        let copies: Vec<&StepOutcome> = run
+            .steps
+            .iter()
+            .filter(|o| base_id(&o.step_id) == dep.id.as_str())
+            .collect();
+        let result = !copies.is_empty()
+            && copies.iter().all(|o| is_terminal(o))
+            && !dep_satisfied(dep, &run.steps)
+            && copies
+                .iter()
+                .any(|o| matches!(o.state, StepState::Skipped | StepState::Cancelled))
+            && copies
+                .iter()
+                .filter(|o| matches!(o.state, StepState::Skipped | StepState::Cancelled))
+                .all(|o| benign_copy(wf, run, dep, o.state, memo));
+
+        memo.insert(dep.id.clone(), result);
+        result
+    }
+
+    /// `true` when every `Skipped`/`Cancelled` outcome anywhere in the run is
+    /// benign — the structural replacement for "no hard-failure state
+    /// anywhere" that also catches a step that never got the chance to run.
+    ///
+    /// An outcome row whose `base_id` matches no declared step (the config
+    /// was edited under a live run) cannot be judged benign by structure and
+    /// counts against the run, same as `finalize_state` did before this.
+    pub fn all_skips_and_cancels_are_benign(wf: &WorkflowDef, run: &WorkflowRun) -> bool {
+        let mut memo: HashMap<String, bool> = HashMap::new();
+        run.steps.iter().all(|o| {
+            if !matches!(o.state, StepState::Skipped | StepState::Cancelled) {
+                return true;
+            }
+            wf.steps
+                .iter()
+                .find(|s| s.id == base_id(&o.step_id))
+                .map(|step| benign_copy(wf, run, step, o.state, &mut memo))
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// How many parallel copies of one declared step a pattern launches.
 ///
 /// Replaces the `match (wf.pattern, step.fan_out)` that `spawn_workflow` and
@@ -1108,10 +1248,11 @@ mod condition {
 ///    match on `WorkflowPattern`, so a fifth pattern would compile straight
 ///    into the old wildcard arm and silently spawn one copy. This match is
 ///    exhaustive on purpose, and is now the place the compiler stops that.
-/// 2. It records that `fanOut` is IGNORED under supervisor/handoff rather
-///    than honoured — `validate_workflows` rejects `fanOut` only for
-///    `pipeline`, so `pattern: supervisor` + `fanOut: 3` loads clean and
-///    lands here.
+/// 2. It records that `fanOut` has meaning ONLY under `pattern: fan-out` —
+///    `validate_workflows` now rejects a step declaring `fanOut` under
+///    `pipeline`, `supervisor`, or `handoff` at load time, so this match is
+///    defense-in-depth against a `WorkflowDef` built directly (bypassing
+///    config validation) rather than a live decision point.
 fn copies_for(pattern: WorkflowPattern, step: &WorkflowStep) -> usize {
     match pattern {
         // `fanOut` under 2 is rejected at load time; the filter is belt-and-
@@ -1477,44 +1618,34 @@ fn all_terminal(wf: &WorkflowDef, run: &WorkflowRun) -> bool {
 }
 
 /// The run-level state implied by the current step outcomes: `Running` while
-/// any declared step still has a non-terminal copy, else `Failed` if any copy
-/// anywhere is `Failed` or `Cancelled`, else `Succeeded`.
+/// any declared step still has a non-terminal copy; `Failed` if any copy
+/// anywhere is `Failed`; `Failed` if any `Skipped`/`Cancelled` copy is not
+/// structurally explained (see `mod verdict`); else `Succeeded`.
 ///
-/// `Skipped` is deliberately NEUTRAL as of Phase 5.0.4 (pre-5.0.4 it failed
-/// the run); the block below explains why, and why that does not lose the old
-/// fail-fast reporting. Never returns `Cancelled` — that state is only ever set
-/// directly by `cancel_workflow`, and `advance_run` never calls this on an
-/// already-Cancelled run.
+/// `Skipped`/`Cancelled` are conditionally NEUTRAL as of Phase 5.0.4 (pre-
+/// 5.0.4 either one failed the run outright): a `condition:` gate declining
+/// its branch, or a `joinOn: any`/`n` straggler losing a race, are both the
+/// feature working, not a failure. `mod verdict` carries the structural
+/// judgment of exactly which occurrences qualify. Never returns `Cancelled`
+/// itself — that state is only ever set directly by `cancel_workflow`, and
+/// `advance_run` never calls this on an already-Cancelled run.
+///
+/// The `Failed` check stays a separate, unconditional pass over `run.steps`
+/// rather than folding into `mod verdict`: `all_skips_and_cancels_are_benign`
+/// only ever inspects `Skipped`/`Cancelled` rows and treats every other state
+/// — `Failed` included — as trivially not its concern, so a bare `Failed`
+/// copy needs its own check here or it would pass through unnoticed.
 fn finalize_state(wf: &WorkflowDef, run: &WorkflowRun) -> WorkflowState {
     if !all_terminal(wf, run) {
         return WorkflowState::Running;
     }
-    // Phase 5.0.4 semantics change: `Skipped` is NEUTRAL, not a failure.
-    //
-    // Pre-5.0.4 the only producer of `Skipped` was fail-fast, so "any Skipped
-    // => run Failed" was a correct shorthand. `condition:` breaks that: a gate
-    // that evaluates cleanly and declines its branch is the feature working,
-    // and reporting the whole run red would make `condition:` unusable for the
-    // control flow it exists to express.
-    //
-    // Keying on a HARD failure instead preserves the old outcome everywhere it
-    // mattered, because a fail-fast skip is only ever reached THROUGH a
-    // `Failed`/`Cancelled` dep (`dep_unsatisfiable` dooms on a terminal
-    // non-success, and a `Skipped` dep can only trace back to either a
-    // condition gate — no failure, correctly green — or a real failure, which
-    // is still present in `run.steps` and still turns the run red).
-    // Scanned over `run.steps` rather than over `wf.steps`' resolved copies:
-    // an outcome row whose `base_id` matches no declared step (the config was
-    // edited under a live run) is a real recorded failure and must still turn
-    // the run red, where the by-declaration walk would skip it silently.
-    let hard_failure = run
-        .steps
-        .iter()
-        .any(|o| matches!(o.state, StepState::Failed | StepState::Cancelled));
-    if hard_failure {
-        WorkflowState::Failed
-    } else {
+    if run.steps.iter().any(|o| o.state == StepState::Failed) {
+        return WorkflowState::Failed;
+    }
+    if verdict::all_skips_and_cancels_are_benign(wf, run) {
         WorkflowState::Succeeded
+    } else {
+        WorkflowState::Failed
     }
 }
 
@@ -2179,9 +2310,99 @@ fn fire_due_retries<R: Runtime>(
     changed
 }
 
+/// Phase 5.0.4 straggler cancellation (spec §3.1): once a step's own join is
+/// already satisfied by one of its copies — a `joinOn: any`/`Count(n)` race
+/// won — the rest of that SAME step's copies are no longer useful. Cancel
+/// them cooperatively instead of letting them run to completion or retry
+/// forever: a `Running` straggler is killed and its pane forgotten, same as
+/// `check_timeouts`; a `Failed` straggler is demoted straight to `Cancelled`,
+/// with any armed `retry` backoff cleared first so `fire_due_retries` can
+/// never respawn it.
+///
+/// The `Failed` arm deliberately does NOT require an armed backoff — i.e. a
+/// loser that already terminated is retired too, not just one still on its
+/// way back. `finalize_state` fails a run for any `Failed` copy anywhere, so
+/// leaving a terminal loser alone would make the run's colour depend on the
+/// order the race happened to resolve in: crash-then-win red, win-then-cancel
+/// green, for the same `joinOn: any` that asked for exactly one success and
+/// got it. A step whose join is NOT satisfied never reaches this loop, so
+/// this cannot launder a failure that actually mattered — the partial-success
+/// count join of `count_join_partial_success_now_finalizes_failed` still
+/// fails, because 1 of a required 2 never satisfies anything.
+///
+/// Skipped entirely for `joinOn: all`/`reply` (the default, `effective_join`
+/// applies): `dep_satisfied` only returns `true` for those once EVERY copy
+/// has already succeeded, so by construction there is never a straggler left
+/// once satisfied — this loop would find nothing to do, but the exclusion
+/// documents that "all" copies are always required rather than leaving it
+/// implicit.
+///
+/// `spawn_ready` always creates every copy of a fan-out step in the same
+/// tick (`copies_for` copies pushed together, never incrementally across
+/// ticks), so a step whose join is satisfied never has a `Pending` copy left
+/// to worry about here — only `Running` and backoff-`Failed` are reachable.
+fn cancel_stragglers(
+    manager: &PtyManager,
+    view: &StatusView,
+    wf: &WorkflowDef,
+    run: &mut WorkflowRun,
+) -> bool {
+    const REASON: &str = "cancelled: this step's join was already satisfied by a sibling copy";
+    let mut changed = false;
+    for step in &wf.steps {
+        if matches!(
+            effective_join(step),
+            JoinOn::Named(JoinOnName::All) | JoinOn::Named(JoinOnName::Reply)
+        ) {
+            continue;
+        }
+        if !dep_satisfied(step, &run.steps) {
+            continue;
+        }
+        for outcome in &mut run.steps {
+            if base_id(&outcome.step_id) != step.id.as_str() {
+                continue;
+            }
+            match outcome.state {
+                StepState::Running => {
+                    if let Some(session_id) = outcome.session_id {
+                        let _ = manager.kill_pty(session_id);
+                        view.forget(session_id);
+                        // Cleared for the same reason `check_timeouts` clears
+                        // it: the pane was killed, not exited, so there is
+                        // nothing left to reuse or reclaim.
+                        outcome.session_id = None;
+                    }
+                    outcome.state = StepState::Cancelled;
+                    outcome.error = Some(REASON.to_string());
+                    changed = true;
+                }
+                StepState::Failed => {
+                    // Already `None` for a loser that terminated outright;
+                    // clearing it unconditionally is what keeps a backoff-
+                    // armed one out of `fire_due_retries`' reach.
+                    outcome.next_retry_at_ms = None;
+                    outcome.state = StepState::Cancelled;
+                    // Overwrites the failure text this copy carried. The
+                    // failure is no longer what decided its fate — the lost
+                    // race is. `session_id` is deliberately kept: unlike the
+                    // `Running` arm nothing was killed here, so the pane (and
+                    // its scrollback, showing why this copy fell over) is
+                    // still worth pointing at.
+                    outcome.error = Some(REASON.to_string());
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
 /// Advance one run by exactly one tick: detect completions, kill timed-out
-/// steps, apply retry backoff/restart, cascade fail-fast Skips, spawn any
-/// newly-ready downstream steps, and finalize/emit the run's state.
+/// steps, apply retry backoff/restart, cascade fail-fast Skips, cooperatively
+/// cancel join stragglers, spawn any newly-ready downstream steps, and
+/// finalize/emit the run's state.
 /// Standalone and thread-free — this is what `driver_loop` calls on a
 /// schedule, and what tests call directly to assert transitions without
 /// racing a background thread.
@@ -2228,6 +2449,15 @@ fn advance_run<R: Runtime>(
     );
     changed = detect_completions(manager, view, &mut run) || changed;
     changed = check_timeouts(manager, view, &wf, &mut run, now) || changed;
+    // `cancel_stragglers` BEFORE the retry pass, and after the three
+    // completion detectors: it needs this tick's winner already recorded as
+    // `Succeeded` to see the join as satisfied, and it must get to a doomed
+    // straggler before `fire_due_retries` respawns one — the alternative
+    // ordering spawns a fresh pane and kills it again within the same tick.
+    // A straggler whose backoff is armed only by `arm_retry_backoff` below
+    // is left for the next tick's pass, which clears it before that deadline
+    // can come due.
+    changed = cancel_stragglers(manager, view, &wf, &mut run) || changed;
     // `fire_due_retries` BEFORE `arm_retry_backoff`, not after: a deadline
     // armed on this same tick must not also fire on it. `retry::due_at`
     // falls back to a 0ms backoff when `backoffMs` is undeclared, so
@@ -4519,5 +4749,279 @@ workflows:
             WorkflowState::Succeeded,
             "a declined conditional branch is not a failed run"
         );
+    }
+
+    /// Phase 5.0.4 straggler cancellation (spec-phase5-0 §3.1): once
+    /// `candidate`'s `joinOn: any` is won, the copies that lost the race are
+    /// no longer useful — the live one is killed, and the one sitting out a
+    /// retry backoff has that backoff cleared so `fire_due_retries` can never
+    /// bring it back.
+    #[test]
+    fn cancel_stragglers_retires_the_losers_once_an_any_join_is_won() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+
+        let mut backoff = mk_outcome("candidate#2", None, StepState::Failed);
+        backoff.next_retry_at_ms = Some(9_000);
+        let mut run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", Some(1), StepState::Succeeded),
+                mk_outcome("candidate#1", Some(999), StepState::Running),
+                backoff,
+                mk_outcome("reduce", None, StepState::Pending),
+            ],
+        );
+
+        assert!(cancel_stragglers(&manager, &view, &wf, &mut run));
+
+        let live = run
+            .steps
+            .iter()
+            .find(|o| o.step_id == "candidate#1")
+            .unwrap();
+        assert_eq!(live.state, StepState::Cancelled);
+        assert!(
+            live.session_id.is_none(),
+            "the killed pane must not be left attached to the outcome"
+        );
+        assert!(live
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already satisfied"));
+
+        let retrying = run
+            .steps
+            .iter()
+            .find(|o| o.step_id == "candidate#2")
+            .unwrap();
+        assert_eq!(retrying.state, StepState::Cancelled);
+        assert!(
+            retrying.next_retry_at_ms.is_none(),
+            "the cleared backoff is what stops `fire_due_retries` respawning a lost race"
+        );
+
+        // The winner and the downstream step are none of its business.
+        assert_eq!(run.steps[0].state, StepState::Succeeded);
+        assert_eq!(
+            run.steps
+                .iter()
+                .find(|o| o.step_id == "reduce")
+                .unwrap()
+                .state,
+            StepState::Pending
+        );
+
+        // Idempotent: the next tick finds nothing left to retire.
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+    }
+
+    /// A loser that crashed BEFORE the winner finished is the same lost race
+    /// as one cancelled after it. Without this the run's colour would depend
+    /// on the order the race resolved in, since `finalize_state` reds a run
+    /// for any `Failed` copy anywhere.
+    #[test]
+    fn cancel_stragglers_retires_a_loser_that_already_failed_terminally() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+
+        let mut crashed = mk_outcome("candidate#1", Some(2), StepState::Failed);
+        crashed.error = Some("agent process exited with code 1".to_string());
+        assert!(
+            crashed.next_retry_at_ms.is_none(),
+            "terminal: no retry to wait out"
+        );
+        let mut run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", Some(1), StepState::Succeeded),
+                crashed,
+                mk_outcome("candidate#2", None, StepState::Cancelled),
+                mk_outcome("reduce", None, StepState::Succeeded),
+            ],
+        );
+
+        assert!(cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert_eq!(run.steps[1].state, StepState::Cancelled);
+        assert!(
+            run.steps[1].session_id.is_some(),
+            "nothing was killed here, so the pane stays pointable"
+        );
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Succeeded,
+            "one success is what `joinOn: any` asked for, whenever the losers fell over"
+        );
+    }
+
+    /// The guard on the above: a join that is NOT satisfied never reaches the
+    /// straggler pass at all, so a failure that genuinely decided the run is
+    /// never laundered into a lost race. `joinOn: 2` with 1 success and 1
+    /// terminal failure can no longer reach 2 — that is a real red.
+    #[test]
+    fn cancel_stragglers_never_launders_a_failure_under_an_unmet_count_join() {
+        let wf = parse_wf(COUNT_FANOUT_YAML, "countfan");
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+
+        let mut run = mk_run(
+            "countfan",
+            vec![
+                mk_outcome("candidate#0", Some(1), StepState::Succeeded),
+                mk_outcome("candidate#1", Some(2), StepState::Failed),
+                mk_outcome("candidate#2", Some(3), StepState::Failed),
+                mk_outcome("reduce", None, StepState::Skipped),
+            ],
+        );
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert_eq!(run.steps[1].state, StepState::Failed);
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Failed);
+    }
+
+    #[test]
+    fn cancel_stragglers_spares_a_race_that_nobody_has_won_yet() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+
+        let mut run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", Some(1), StepState::Running),
+                mk_outcome("candidate#1", Some(2), StepState::Running),
+                mk_outcome("candidate#2", Some(3), StepState::Running),
+            ],
+        );
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(
+            run.steps.iter().all(|o| o.state == StepState::Running),
+            "no copy has succeeded yet, so every one of them is still in the running"
+        );
+    }
+
+    /// Wiring regression. `cancel_stragglers` is only worth anything if
+    /// `advance_run` actually calls it — it was written and left unreferenced
+    /// once already, which the compiler caught only as a `dead_code` warning.
+    /// This drives a whole tick and asserts the straggler is retired by it.
+    #[test]
+    fn advance_run_cancels_a_straggler_once_the_any_join_is_won() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, _dir) = harness(FANJOIN_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        // Hand-built rather than spawned: the winner is already banked, and
+        // the straggler deliberately carries no `session_id`, so
+        // `detect_completions` skips it (it only looks at a Running copy that
+        // holds a session) and the pass under test is the only one that can
+        // move it.
+        let run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", None, StepState::Succeeded),
+                mk_outcome("candidate#1", None, StepState::Running),
+                mk_outcome("reduce", None, StepState::Pending),
+            ],
+        );
+        registry.put(run.clone());
+
+        advance_run(
+            &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+        );
+
+        let snap = registry.get(&run.run_id).unwrap();
+        let straggler = snap
+            .steps
+            .iter()
+            .find(|o| o.step_id == "candidate#1")
+            .unwrap();
+        assert_eq!(
+            straggler.state,
+            StepState::Cancelled,
+            "advance_run must run the straggler pass"
+        );
+    }
+
+    /// The `Cancelled`-is-benign half of `mod verdict`: the copies
+    /// `cancel_stragglers` just retired are the declared join working as
+    /// written, so the run they land in is green.
+    #[test]
+    fn finalize_state_is_green_when_every_cancel_is_a_lost_race() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", None, StepState::Succeeded),
+                mk_outcome("candidate#1", None, StepState::Cancelled),
+                mk_outcome("candidate#2", None, StepState::Cancelled),
+                mk_outcome("reduce", None, StepState::Succeeded),
+            ],
+        );
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Succeeded);
+    }
+
+    /// ...and the other half: a `Cancelled` copy whose own join is NOT
+    /// satisfied lost no race, so nothing structurally explains it and it
+    /// must still turn the run red instead of inheriting the straggler
+    /// excuse. `reduce`'s join is the default `all` over its single copy.
+    #[test]
+    fn finalize_state_is_red_when_a_cancel_is_not_a_lost_race() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", None, StepState::Succeeded),
+                mk_outcome("candidate#1", None, StepState::Succeeded),
+                mk_outcome("candidate#2", None, StepState::Succeeded),
+                mk_outcome("reduce", None, StepState::Cancelled),
+            ],
+        );
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Failed);
+    }
+
+    /// A `Skipped` copy whose dependency neither succeeded nor legitimately
+    /// declined is the false green this whole pass exists to catch: `reduce`
+    /// never ran, and nothing in the run explains why. Reachable only by
+    /// building the def directly — `validate_workflows` now rejects the
+    /// `joinOn` beyond the pattern's effective copy count that used to
+    /// produce this shape from a live config.
+    #[test]
+    fn finalize_state_is_red_when_a_skip_has_no_structural_excuse() {
+        let mut wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        wf.steps[0].fan_out = None;
+        wf.steps[0].join_on = Some(JoinOn::Count(3));
+        let run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate", None, StepState::Succeeded),
+                mk_outcome("reduce", None, StepState::Skipped),
+            ],
+        );
+        assert_eq!(
+            finalize_state(&wf, &run),
+            WorkflowState::Failed,
+            "one success cannot meet joinOn: 3, so `reduce` was skipped for no declared reason"
+        );
+    }
+
+    /// An outcome row whose `base_id` matches no declared step — the config
+    /// was edited under a live run — cannot be judged benign by structure, so
+    /// it counts against the run rather than vanishing from the verdict.
+    #[test]
+    fn finalize_state_is_red_when_a_skip_belongs_to_no_declared_step() {
+        let wf = parse_wf(FANJOIN_YAML, "fanjoin");
+        let run = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", None, StepState::Succeeded),
+                mk_outcome("reduce", None, StepState::Succeeded),
+                mk_outcome("ghost", None, StepState::Skipped),
+            ],
+        );
+        assert_eq!(finalize_state(&wf, &run), WorkflowState::Failed);
     }
 }

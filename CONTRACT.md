@@ -1890,6 +1890,86 @@ team_presets:
 > ことが示されたわけではない — テストは決定どおりに実装されていることを示すだけである。
 >
 
+> 追記（2026-07-28、続報9）: **`fanOut` の黙殺による false green を塞ぎ、続報7 §(10) の
+> 「協調キャンセル未実装」を解除した。** 断面は `track/e-orch-5.0.4` 作業ツリー上の
+> **未コミット**差分（`config.rs` / `orchestrator.rs`）。
+>
+> **(1) 塞いだ欠陥（false green）。** `copies_for` は `fanOut` を `pattern: fan-out`
+> でしか読まないのに、`validate_workflows` は `pipeline` でしか `fanOut` 宣言を弾いて
+> いなかった。このため `pattern: supervisor` + `fanOut: 3` + `joinOn: 3` が load を
+> 通り、実行時には 1 本しか spawn されず join が満たされない → `dep_unsatisfiable` が
+> 下流を cascade `Skipped` にする → 続報7 §(4) B′ で `Skipped` は中立なので、
+> **1 step も実行されていないのに run が Succeeded を報告した**。
+>
+> **(2) ロード時バリデーション 2 規則の追加**（`config.rs`、いずれも load 時 reject）:
+> ① `fan-out` 以外のパターン（`pipeline` / `supervisor` / `handoff`）で `fanOut` を
+> 宣言した step を拒否する（従来は `pipeline` のみ。`handoff` は「同一 step での
+> `fanOut` + `handoffTo` 併用」を既に拒否していたが、`handoffTo` を持たない鎖の最終段が
+> すり抜けていた）。② `joinOn: <N>` の上限を `fanOut` の宣言値ではなく
+> **そのパターンの実効コピー数**（`fan-out` 以外は常に 1）に対して検査する。
+> [ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) §1 の表が当初から
+> 「`fanOut` は fan-out パターン以外では宣言不可」と書いていた通りの挙動に実装が追いついた
+> 形で、wire 契約・既存の正当な yml への影響は無い。
+>
+> **(3) 挙動変更: `Skipped` / `Cancelled` は「無条件に中立」ではなく「構造的に説明が
+> つくときだけ中立」になった。** 続報7 §(4) B′（`Skipped` は中立）を狭める。
+> `finalize_state` は `orchestrator.rs` の新 `mod verdict`（`mod condition` / `mod retry`
+> と同じく純粋・単体テスト可能）に判定を委ね、`Skipped` / `Cancelled` の各 copy が
+> (a) その step 自身の join が他 copy で既に満たされている（レースの敗者）か、
+> (b) `Skipped` かつ全依存先が「満たされた or 正当に降りた」のいずれかに当てはまる場合のみ
+> 中立とする。どちらでもない copy は run を red にする。宣言された step に対応しない
+> outcome 行（run 中に config を編集した場合）は構造判定できないため従来どおり red。
+> `Failed` は従来どおり無条件 red（`mod verdict` は `Skipped` / `Cancelled` 行しか見ない）。
+>
+> **(4) 続報7 §(10) の失効: `any` / `n` join は兄弟を協調キャンセルするようになった。**
+> §(10) は「`StepState::Cancelled` を書くのは明示的な `cancel_workflow` の 2 箇所だけで、
+> in-flight 兄弟の協調キャンセルは未実装」と記録していたが、本追記により**失効する**。
+> `advance_run` は完了検出 3 パスの直後・retry パスの直前で `cancel_stragglers` を呼ぶ。
+> ある step の join（`any` / `n` のみ。`all` / `reply` は全 copy 成功が条件なので
+> そもそも敗者が存在しない）が満たされた時点で、同一 step の残り copy を
+> `Running` ならペインごと kill（`check_timeouts` と同じ扱いで `session_id` を落とす）、
+> `Failed` なら backoff を消して `Cancelled` へ降格する（`session_id` は残す。kill して
+> いないので、なぜ落ちたかを示す scrollback を指し続けられる方が有用）。
+> `error` には「join が兄弟 copy で既に満たされた」旨を記録する。
+> retry パスより前に置くのは、`fire_due_retries` が敗者を再 spawn した直後に
+> 同一 tick で kill し直す無駄を避けるため。これは [spec-phase5-0.md](docs/spec/spec-phase5-0.md)
+> §3.1 / 5.0.5 Arena 節（「`join_on: any` で最初の1つが選ばれると、残りの contender は
+> 自動的に CANCELLED」）が要求していた挙動である。
+>
+> **(5) 決定 C′: レースの敗者は、いつ落ちたかに関わらず run を red にしない。**
+> §(4) の `Failed` 分岐は backoff 待ちに限定せず、**既に終端した敗者 copy も**
+> `Cancelled` へ降格する。`finalize_state` は `Failed` copy が1つでもあれば run を red に
+> するため、終端敗者を残すと「敗者が落ちてから勝者が出た run は red、勝者が出てから敗者を
+> キャンセルした run は green」という**レースの解決順に依存した色**になる。1本成功すれば
+> 十分という `joinOn: any` / `n` の意味論からは、どちらも green が筋である。
+> **join が満たされていない step はこのループに入らない**ので、実際に run を決めた失敗が
+> 揉み消されることはない: `joinOn: 2` で 1 成功 + 2 終端失敗（`count_join_partial_success_now_finalizes_failed`
+> の形）は依然として red のままである。`Failed` を無条件 red とする `finalize_state`
+> 自体は変更していない — 変えたのは「その copy がまだ `Failed` であるべきか」の判定側だけ。
+>
+> **(6) 検証。** 実機 macOS 上で `cargo test` **lib 349 passed / 0 failed**、統合
+> `queen_compat_integration` **14 passed / 0 failed**、失敗ゼロ
+> （続報8 の 337 に対し、config 側 3 本 + orchestrator 側 9 本の新規テストを追加）、
+> `cargo clippy --all-targets -- -D warnings` 警告ゼロ。新規テストは config 側が
+> `workflow_supervisor_count_join_beyond_effective_copies_is_rejected_at_load` /
+> `workflow_supervisor_step_declaring_fan_out_is_rejected_at_load` /
+> `workflow_handoff_step_declaring_fan_out_is_rejected_at_load`、orchestrator 側が
+> `cancel_stragglers_retires_the_losers_once_an_any_join_is_won` /
+> `cancel_stragglers_retires_a_loser_that_already_failed_terminally` /
+> `cancel_stragglers_never_launders_a_failure_under_an_unmet_count_join` /
+> `cancel_stragglers_spares_a_race_that_nobody_has_won_yet` /
+> `advance_run_cancels_a_straggler_once_the_any_join_is_won`（配線そのものの回帰。
+> `cancel_stragglers` は一度「実装したが `advance_run` から呼んでいない」状態で
+> 置かれていた）/ `finalize_state_is_green_when_every_cancel_is_a_lost_race` /
+> `finalize_state_is_red_when_a_cancel_is_not_a_lost_race` /
+> `finalize_state_is_red_when_a_skip_has_no_structural_excuse` /
+> `finalize_state_is_red_when_a_skip_belongs_to_no_declared_step`。
+> **解除されないもの**: 続報8 と同じく実機での workflow 1 本流しは未実施。とくに
+> `cancel_stragglers` の pane kill は unit test では実ペインを伴わずに検証しており、
+> 実際に fan-out レースの敗者ペインが GUI 上で閉じることの目視確認は未了。
+> `main` 未マージも変わらない。
+>
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。

@@ -750,10 +750,20 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                 }
             }
             if let Some(JoinOn::Count(n)) = step.join_on {
-                let max = step.fan_out.unwrap_or(1);
+                // `fanOut` only multiplies copies under `pattern: fan-out`
+                // (see the `copies_for` match in orchestrator.rs); every other
+                // pattern always spawns exactly one copy per step regardless
+                // of what `fanOut` says, so the bound must track that, not
+                // the raw field.
+                let max = match wf.pattern {
+                    WorkflowPattern::FanOut => step.fan_out.unwrap_or(1),
+                    WorkflowPattern::Pipeline
+                    | WorkflowPattern::Supervisor
+                    | WorkflowPattern::Handoff => 1,
+                };
                 if n < 1 || n > max {
                     return Err(format!(
-                        "{ctx}: step '{}' joinOn ({}) must be between 1 and fanOut ({})",
+                        "{ctx}: step '{}' joinOn ({}) must be between 1 and the pattern's effective copy count ({})",
                         step.id, n, max
                     ));
                 }
@@ -916,6 +926,21 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                 }
             }
             WorkflowPattern::Supervisor => {
+                // `copies_for` never expands a step under `supervisor` (only
+                // `fan-out` multiplies copies), so a declared `fanOut` here is
+                // silently ignored at runtime — a `joinOn: n` built against it
+                // can then demand more successes than will ever spawn. Reject
+                // outright rather than let the shape pass and wedge later.
+                for step in &wf.steps {
+                    if step.fan_out.is_some() {
+                        return Err(format!(
+                            "{ctx}: supervisor step '{}' declares fanOut; fanOut only has \
+                             meaning under pattern: fan-out — express supervisor \
+                             parallelism via sibling steps instead",
+                            step.id
+                        ));
+                    }
+                }
                 let roots: Vec<&WorkflowStep> = wf
                     .steps
                     .iter()
@@ -956,6 +981,24 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                         return Err(format!(
                             "{ctx}: handoff step '{}' has {} dependencies;                              handoff is linear (max 1 dependsOn per step)",
                             step.id, deps.len()
+                        ));
+                    }
+                }
+                // `copies_for` never expands a step under `handoff` (only
+                // `fan-out` multiplies copies), so a declared `fanOut` here is
+                // silently ignored at runtime. The field-level loop above
+                // already rejects `fanOut` combined with `handoffTo`, but that
+                // only constrains steps that themselves hand off — the chain's
+                // *last* step has no `handoffTo` and would otherwise slip
+                // through with an ignored `fanOut`. Reject it outright here,
+                // mirroring the `supervisor` rule above.
+                for step in &wf.steps {
+                    if step.fan_out.is_some() {
+                        return Err(format!(
+                            "{ctx}: handoff step '{}' declares fanOut; fanOut only has \
+                             meaning under pattern: fan-out — express handoff \
+                             parallelism via a different pattern instead",
+                            step.id
                         ));
                     }
                 }
@@ -2860,5 +2903,59 @@ agents:
             "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n        handoffTo: c1\n      - id: c1\n        agent: c\n        dependsOn: [b1]\n"
         );
         assert!(parse_config(&yaml).is_ok());
+    }
+
+    /// `copies_for` (orchestrator.rs) never expands a step under `supervisor`
+    /// (only `fan-out` multiplies copies), so a `joinOn: n` built against a
+    /// declared `fanOut` was demanding more successes than would ever spawn —
+    /// the exact shape `probe_supervisor_fanout_count_join_reports_green_with_skipped_child`
+    /// (deleted, orchestrator.rs) used to reach a false-green run through.
+    /// Deliberately does NOT also declare `fanOut` on `lead`, so only this
+    /// gate (not `workflow_supervisor_step_declaring_fan_out_is_rejected_at_load`
+    /// below) fires — the two are meant to be independently testable.
+    #[test]
+    fn workflow_supervisor_count_join_beyond_effective_copies_is_rejected_at_load() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: lead\n        agent: a\n        joinOn: 3\n      - id: child\n        agent: b\n        dependsOn: [lead]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("effective copy count"),
+            "error was: {err}"
+        );
+    }
+
+    /// `fanOut` only has meaning under `pattern: fan-out`; a `supervisor` step
+    /// that declares it would have the field silently ignored by `copies_for`
+    /// at runtime. Rejected at load instead of letting the operator's
+    /// intended parallelism quietly vanish.
+    #[test]
+    fn workflow_supervisor_step_declaring_fan_out_is_rejected_at_load() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: lead\n        agent: a\n        fanOut: 3\n      - id: child\n        agent: b\n        dependsOn: [lead]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("fanOut only has meaning under pattern: fan-out"),
+            "error was: {err}"
+        );
+    }
+
+    /// The field-level loop already rejects `fanOut` combined with
+    /// `handoffTo` on the SAME step, but that leaves the chain's last step —
+    /// which by definition has no `handoffTo` — free to declare `fanOut` and
+    /// have it silently ignored by `copies_for`. Must be placed on the final
+    /// step: declaring it anywhere else in the chain trips the
+    /// `both fanOut and handoffTo` gate first and never reaches this one.
+    #[test]
+    fn workflow_handoff_step_declaring_fan_out_is_rejected_at_load() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: a1\n        agent: a\n        handoffTo: b1\n      - id: b1\n        agent: b\n        dependsOn: [a1]\n        fanOut: 3\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("fanOut only has meaning under pattern: fan-out"),
+            "error was: {err}"
+        );
     }
 }

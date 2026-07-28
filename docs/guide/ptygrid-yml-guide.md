@@ -163,6 +163,15 @@ workflows:
   (pipeline は線形 DAG。分岐/合流したいなら fan-out か将来の supervisor を使う)
 - `pattern: pipeline` なのに `fanOut` を宣言している step がある
   (`pattern: fan-out` を使うこと)
+- (2026-07-28 追加) `pattern: supervisor` / `pattern: handoff` なのに `fanOut` を
+  宣言している step がある。`fanOut` は `fan-out` パターンでのみ意味を持ち、他パターンでは
+  `copies_for` が常に1本しか spawn しないため、宣言は黙って無視されていた。§1 の表が当初から
+  「fan-out パターン以外では宣言不可」と書いていたのに対し、実装は pipeline しか弾いて
+  いなかった。supervisor の並列は兄弟 step で、handoff は構造上そもそも並列しない
+- (2026-07-28 追加) `joinOn: <N>` がそのパターンの実効コピー数を超えている
+  (`fan-out` 以外では実効コピー数は常に1)。従来は `fanOut` の宣言値だけを上限に
+  見ていたため、`supervisor` + `fanOut: 3` + `joinOn: 3` が load を通り、実行時には
+  1本しか spawn されず join が永久に満たされない形が作れた
 - `pattern: fan-out` なのに、どの step も `fanOut` を宣言していない
 - `fanOut` が 2 未満
 - (2026-07-24 追加) `retry.max` が 1..=10 の範囲外、または `retry.backoffMs` が
@@ -263,6 +272,16 @@ pipeline の通常挙動(同名の生きているセッションがあれば再�
 `joinOn: any` にすると最初の1本が成功した時点で親が進み、**残りの fan-out step は
 自動的に CANCELLED になる**(kill_pty される)。「まだ見たいのに消えた」を避けたいなら
 `joinOn: all` を使う。
+
+> **2026-07-28 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報9)**: 上の
+> 「残りは自動的に CANCELLED」は長らく**この文書だけの記述**で、実装は敗者を自然終了まで
+> 走らせていた(CONTRACT.md 続報7 §(10) が本文書の誤りとして記録していた)。`advance_run` に
+> `cancel_stragglers` が入り、記述どおりの挙動になった。適用は `joinOn: any` と数値 `N`
+> のみ(`all` / `reply` は全 copy 成功が条件なのでそもそも敗者が出ない)。
+> **敗者は「落ちた順序」に関わらず run を red にしない** — 走行中なら kill、`retry` の
+> backoff 待ちなら backoff を消して、既に失敗して終端していたものも含めて CANCELLED に
+> 揃える。ただし **join が満たされていない step は対象外**なので、`joinOn: 2` で 1 本しか
+> 成功しなかったといった本当の失敗は従来どおり run が red になる。
 
 ---
 
@@ -448,8 +467,10 @@ workflows を選ぶとよい。書き方は userguide.md 「チームプリセ�
 (fan-out していない step)は**同名 live session があれば再利用してスキップする**
 冪等ロジックが効く。「fan-out で3本のはずが1本しか出ない」場合、fanOut の値そのものが
 `1` になっていないか、pattern を `fan-out` にし忘れて `pipeline` のままになっていないかを
-先に疑うこと(pipeline では `fanOut` 宣言自体がバリデーションエラーで弾かれるので、
-この事故は「エラーにならず黙って1本になる」パターンではなく気づきやすいが、念のため)。
+先に疑うこと(2026-07-28 現在、`fan-out` 以外の全パターンで `fanOut` 宣言自体が
+バリデーションエラーで弾かれるので、この事故は「エラーにならず黙って1本になる」
+パターンではなく気づきやすいが、念のため。それ以前は supervisor / handoff で
+黙って1本になっていた)。
 
 ### 7.4 `retry:` / `condition:` / `handoffTo:` / `timeoutMs` を書いても保険にならない
 
