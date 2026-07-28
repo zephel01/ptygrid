@@ -59,8 +59,8 @@
 | `dependsOn` | 各 step | ✅ | ✅ | 実装済み。循環検出・未知 id 参照はロード時エラー |
 | `fanOut` | 各 step | ✅ | ✅ | 実装済み。`>= 2` 必須、fan-out パターン以外では宣言不可 |
 | `joinOn: all` / `any` / 数値 `N` | 各 step | ✅ | ✅ | 実装済み |
-| `joinOn: reply` | 各 step | ✅ | ✅ | ~~「kickoff への reply で完了」は**未実装**。exit 0 でも `AgentStatus::Done` でも完了扱いにならず、**step が永遠に RUNNING のまま止まる可能性がある**。現状は使わないこと~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: 実装された(`detect_reply_completions`、完了判定 route 3)。**新規則**: 同一 step に非空の `kickoff:` が必須(無いとロード時エラー)。**プロトコルは reply-once-when-done** — 最初に返信を観測した tick で完了するため、同一 tick の複数返信は古い順に結合されるが、**後続 tick に着いた返信は捨てられる**(「了解」→数秒後に「回答」は回答を失う)。最初の返信を回答として書くこと。返信スキャンは thread ごと 200 件が上限。同名 workflow の並行 run は mailbox を共有するので join を優先すること。 |
-| `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ✅ | ~~超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `check_timeouts` が実装され `advance_run` に配線された(超過時に `kill_pty`+`Failed` 化)。ただし未コミット・未マージ・unit test 0 本・実機未検証のため、上記「安全装置にならない」という運用上の結論は変わらない~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `check_timeouts` が `advance_run` に配線され、超過時に `kill_pty` + `Failed`(`error: "timed out after {timeoutMs}ms"`)へ遷移する。未 spawn(`started_at_ms == 0`)の step は対象外。unit test も追加済み(続報3 の「unit test 0 本」は訂正)。ただし**コンパイル・テスト実行・実機検証はいずれも未実施**(§1 末尾の注記を参照)。 |
+| `joinOn: reply` | 各 step | ✅ | ✅ | ~~「kickoff への reply で完了」は**未実装**。exit 0 でも `AgentStatus::Done` でも完了扱いにならず、**step が永遠に RUNNING のまま止まる可能性がある**。現状は使わないこと~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: 実装された(`detect_reply_completions`、完了判定 route 3)。**新規則**: 同一 step に非空の `kickoff:` が必須(無いとロード時エラー)。**プロトコルは reply-once-when-done** — 最初に返信を観測した tick で完了するため、同一 tick の複数返信は古い順に結合されるが、**後続 tick に着いた返信は捨てられる**(「了解」→数秒後に「回答」は回答を失う)。最初の返信を回答として書くこと。返信スキャンは thread ごと 200 件が上限。~~同名 workflow の並行 run は mailbox を共有するので join を優先すること~~(2026-07-28 追記(docs 同期): この記述は失効した。`workflow_mailbox` が run id を含むよう変更され、同名 workflow の並行 run はそれぞれ専用の mailbox を持つため、もう共有しない。並行起動しても互いの返信を取りこぼす心配はない)。 |
+| `timeoutMs` | 各 step | ✅(2026-07-24 追記: 100..=86,400,000ms のレンジバリデーションを追加) | ✅ | ~~超過してもタイムアウトしない。**何も起きない** — 書いても安全装置にならないので注意。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `check_timeouts` が実装され `advance_run` に配線された(超過時に `kill_pty`+`Failed` 化)。ただし未コミット・未マージ・unit test 0 本・実機未検証のため、上記「安全装置にならない」という運用上の結論は変わらない~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `check_timeouts` が `advance_run` に配線され、超過時に `kill_pty` + `Failed`(`error: "timed out after {timeoutMs}ms"`)へ遷移する。未 spawn(`started_at_ms == 0`)の step は対象外。unit test も追加済み(続報3 の「unit test 0 本」は訂正)。ただし**コンパイル・テスト実行・実機検証はいずれも未実施**(§1 末尾の注記を参照)。**2026-07-28 追記(docs 同期、CONTRACT.md 続報10)**: `timeoutMs` は**ペイン枠の空き待ち時間を含まない**ことが確定した。詳細は §7.4。 |
 | `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ✅ | ~~`orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `apply_retry_policy` が実装され `advance_run` に配線された(backoff 経過後に同一 step を `restart_session` または新規 `spawn_step` で再起動)。**未解決の既知ギャップ**: `restart_session` 経路は `deliver_kickoff` を呼ばない(新規 spawn 経路のみ再配送)ため、`kickoff` を書いた step が retry で再起動すると空の inbox で起動しうる。未コミット・未マージ・unit test 0 本・実機未検証でもあり、上記 ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `arm_retry_backoff`(期限を張る)と `fire_due_retries`(期限到来分を再起動)に分割して配線された。**続報3 が挙げた既知ギャップは解消**: in-place restart 経路でも `deliver_kickoff` を再実行するため、`kickoff` を書いた step が空 inbox で再起動することはなくなった。なお `condition:` が評価不能で `Failed` になった step は `attempts == 0` ガードにより再 spawn されない。コンパイル・実機検証は未実施。 |
 | `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ✅ | ~~`orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `condition_targets` が評価する。**3 分岐で、3 番目に注意**: ①マッチ→通常どおり spawn。②非マッチ→`Skipped`(宣言どおり降りたブランチ。`Skipped` は run 終了判定に対して**中立**になったので run は green のまま)。③依存先が返信を残さず完了(`kickoff:` が無い、または `kickoff:` はあるが agent が返信せず exit / `done` で終わった)→**`Failed`**。評価そのものが行われていないため skip 扱いにはしない。`condition:` は依存先が返信を出す構成でのみ意味を持つ。 |
 | `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ✅ | ~~`orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: reply body のチェイニングが実際に効く(kickoff 合成)。**新規則2件**: 同一 step での `fanOut` との併用はロード時エラー。「次段が直前 step のみを `dependsOn` する」逆辺要求が `handoff` 限定から**全パターン**へ拡大された(従来 pipeline / fan-out / supervisor では `handoffTo` が検証を素通りして実行時に無効化していた)。 |
@@ -163,6 +163,15 @@ workflows:
   (pipeline は線形 DAG。分岐/合流したいなら fan-out か将来の supervisor を使う)
 - `pattern: pipeline` なのに `fanOut` を宣言している step がある
   (`pattern: fan-out` を使うこと)
+- (2026-07-28 追加) `pattern: supervisor` / `pattern: handoff` なのに `fanOut` を
+  宣言している step がある。`fanOut` は `fan-out` パターンでのみ意味を持ち、他パターンでは
+  `copies_for` が常に1本しか spawn しないため、宣言は黙って無視されていた。§1 の表が当初から
+  「fan-out パターン以外では宣言不可」と書いていたのに対し、実装は pipeline しか弾いて
+  いなかった。supervisor の並列は兄弟 step で、handoff は構造上そもそも並列しない
+- (2026-07-28 追加) `joinOn: <N>` がそのパターンの実効コピー数を超えている
+  (`fan-out` 以外では実効コピー数は常に1)。従来は `fanOut` の宣言値だけを上限に
+  見ていたため、`supervisor` + `fanOut: 3` + `joinOn: 3` が load を通り、実行時には
+  1本しか spawn されず join が永久に満たされない形が作れた
 - `pattern: fan-out` なのに、どの step も `fanOut` を宣言していない
 - `fanOut` が 2 未満
 - (2026-07-24 追加) `retry.max` が 1..=10 の範囲外、または `retry.backoffMs` が
@@ -178,6 +187,12 @@ workflows:
   2件以上持つ・ルートが1件でない・`handoffTo` を辿った鎖が循環する・鎖上の次段の
   `dependsOn` が直前 step 1件のみと一致しない・鎖が workflow 内の全 step を
   過不足なくカバーしない(孤立 step がある)
+- (2026-07-28 追加、docs 同期) **workflow 名が 84 バイトを超える**。run の inbox
+  mailbox は `queen:workflow/<名前>/<runId>` という文字列で、`queen_store` の
+  128 バイト上限に対して固定コスト 44 バイト(`"queen:workflow/"` 15 + `"/"` 1 +
+  `runId` 28)を引いた残りが名前の予算になる。実行時の不可解な kickoff 失敗を防ぐため
+  load 時に弾く(`config.rs::WORKFLOW_NAME_MAX_BYTES`)。バイト長であり文字数ではない
+  ので、マルチバイトの workflow 名は特に注意すること。
 
 **未知フィールドは無視される**(forward compat)。ただし `pattern` / `joinOn` の名前付き値
 (`all`/`any`/`reply`)のように**閉じた列挙**は綴り間違いで即エラーになる —
@@ -263,6 +278,16 @@ pipeline の通常挙動(同名の生きているセッションがあれば再�
 `joinOn: any` にすると最初の1本が成功した時点で親が進み、**残りの fan-out step は
 自動的に CANCELLED になる**(kill_pty される)。「まだ見たいのに消えた」を避けたいなら
 `joinOn: all` を使う。
+
+> **2026-07-28 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報9)**: 上の
+> 「残りは自動的に CANCELLED」は長らく**この文書だけの記述**で、実装は敗者を自然終了まで
+> 走らせていた(CONTRACT.md 続報7 §(10) が本文書の誤りとして記録していた)。`advance_run` に
+> `cancel_stragglers` が入り、記述どおりの挙動になった。適用は `joinOn: any` と数値 `N`
+> のみ(`all` / `reply` は全 copy 成功が条件なのでそもそも敗者が出ない)。
+> **敗者は「落ちた順序」に関わらず run を red にしない** — 走行中なら kill、`retry` の
+> backoff 待ちなら backoff を消して、既に失敗して終端していたものも含めて CANCELLED に
+> 揃える。ただし **join が満たされていない step は対象外**なので、`joinOn: 2` で 1 本しか
+> 成功しなかったといった本当の失敗は従来どおり run が red になる。
 
 ---
 
@@ -448,8 +473,10 @@ workflows を選ぶとよい。書き方は userguide.md 「チームプリセ�
 (fan-out していない step)は**同名 live session があれば再利用してスキップする**
 冪等ロジックが効く。「fan-out で3本のはずが1本しか出ない」場合、fanOut の値そのものが
 `1` になっていないか、pattern を `fan-out` にし忘れて `pipeline` のままになっていないかを
-先に疑うこと(pipeline では `fanOut` 宣言自体がバリデーションエラーで弾かれるので、
-この事故は「エラーにならず黙って1本になる」パターンではなく気づきやすいが、念のため)。
+先に疑うこと(2026-07-28 現在、`fan-out` 以外の全パターンで `fanOut` 宣言自体が
+バリデーションエラーで弾かれるので、この事故は「エラーにならず黙って1本になる」
+パターンではなく気づきやすいが、念のため。それ以前は supervisor / handoff で
+黙って1本になっていた)。
 
 ### 7.4 `retry:` / `condition:` / `handoffTo:` / `timeoutMs` を書いても保険にならない
 
@@ -483,6 +510,19 @@ integrator が `kill_pty` 相当の操作(ペインを手動で閉じる、ま�
 > 確認が取れたあとは `timeoutMs` が実際の安全装置になるので、長時間走る step には
 > 明示的に書いておくのが望ましい。詰まった step の手動停止手段(ペインを手動で閉じる、
 > integrator へ停止依頼)は引き続き有効なフォールバックである。
+
+> **追記(2026-07-28、docs 同期、CONTRACT.md 続報10)**: `timeoutMs` の意味論が確定した。
+> **`timeoutMs` はエージェントの実行時間だけを測り、ペイン枠が空くのを待っている時間は
+> 含まない**。9 面(`WORKFLOW_SESSION_CAP`)がすべて埋まっていて spawn できない step は
+> 従来「失敗」していたが、現在は `Pending` のまま据え置かれ(`Failed` にはならない)、
+> グリッドに空きが出た次 tick で自動的に spawn される。この「待ち」の間は step がまだ
+> `Running` になっていない(=`timeoutMs` のカウント対象外)ため、グリッドが混雑していても
+> `timeoutMs` の判定結果が変わることはない。待ち自体には別の上限があり、**最大 5 分
+> (`WORKFLOW_DEFER_MAX_MS = 300_000`)待っても空きが出なければ、そこで初めて `Failed` に
+> なる**(`retry:` を書いていれば通常どおり再試行の対象になる)。待っている間、step の
+> `error` には `"waiting for a free pane slot (N/9 occupied)"` のような理由が入るので、
+> `Pending` のまま止まっているように見える step は、まずこの `error` を見て「依存待ち」
+> なのか「pane 待ち」なのかを区別すること。
 
 ---
 

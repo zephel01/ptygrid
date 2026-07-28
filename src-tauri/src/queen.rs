@@ -720,11 +720,20 @@ impl QueenServer {
         description = "List running terminal sessions and the agent/process definitions from ptygrid.yml that can be spawned"
     )]
     fn list_agents(&self) -> Result<CallToolResult, ErrorData> {
+        // The `sessions` field on the wire is `SessionInfo[]` (CONTRACT.md:
+        // "list_agents は引数・返り値ともに不変"), so it still needs the full
+        // `list_sessions()` snapshot (including the lazily-resolved
+        // `foreground` name). But `running_names` below only reads
+        // state+name, so it uses the cheaper `session_states()` instead of
+        // re-deriving from `sessions` — no `ps` fork or per-slot clone for
+        // this half of the function.
         let sessions = self.manager().list_sessions();
-        let running_names: Vec<String> = sessions
-            .iter()
+        let running_names: Vec<String> = self
+            .manager()
+            .session_states()
+            .into_iter()
             .filter(|s| s.state == SessionState::Running)
-            .filter_map(|s| s.name.clone())
+            .filter_map(|s| s.name)
             .collect();
 
         let definitions: Vec<serde_json::Value> = match self.config().current() {
@@ -861,7 +870,7 @@ impl QueenServer {
     }
 
     #[tool(
-        description = "Launch a named workflow declared under workflows: in ptygrid.yml as a DAG run. Steps spawn only agents/processes from the ptygrid.yml allowlist (the same allow-list spawn_agent uses) — workflows introduce no new spawn path. All four patterns run: pipeline, fan-out (a fan-out step's fanOut count expands its root into that many parallel sessions), supervisor, and handoff. Only root steps spawn immediately; downstream steps start Pending and a background driver advances the DAG every 200ms, completing steps on a PTY exit code, a semantic done status, or an inbox reply (joinOn: reply), and honouring per-step timeoutMs, retry, condition and handoffTo. Poll with join_workflow or list_workflow_runs to observe completion. Returns the initial WorkflowRun JSON snapshot taken right after the root spawns, so downstream steps in it are expected to read Pending. Note that concurrent runs of the SAME workflow name share one inbox mailbox, so prefer joining a run before starting it again."
+        description = "Launch a named workflow declared under workflows: in ptygrid.yml as a DAG run. Steps spawn only agents/processes from the ptygrid.yml allowlist (the same allow-list spawn_agent uses) — workflows introduce no new spawn path. All four patterns run: pipeline, fan-out (a fan-out step's fanOut count expands its root into that many parallel sessions), supervisor, and handoff. Only root steps spawn immediately; downstream steps start Pending and a background driver advances the DAG every 200ms, completing steps on a PTY exit code, a semantic done status, or an inbox reply (joinOn: reply), and honouring per-step timeoutMs, retry, condition and handoffTo. Poll with join_workflow or list_workflow_runs to observe completion. Returns the initial WorkflowRun JSON snapshot taken right after the root spawns, so downstream steps in it are expected to read Pending. Each run owns a private inbox mailbox keyed by its run id, so concurrent runs of the same workflow do not interfere with each other."
     )]
     fn spawn_workflow(
         &self,

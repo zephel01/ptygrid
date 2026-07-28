@@ -292,6 +292,23 @@ spawn)が動くようになっている。ただし (a) 同ブランチにも未
 ため現時点でも重要。詳細は [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」および
 [ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1・§7.4 を参照。)
 
+(2026-07-25 追記(docs 同期、CONTRACT.md 続報7/続報8): 実行系(retry 再試行 / timeoutMs
+強制 / condition 評価 / handoffTo チェイン / `join_on: reply` 完了判定)の配線は commit
+`3bd9833` として着地し、続報7 の記録が `71d631a`、続報8 の qa 結果記録が `62f2b90` として
+それぞれコミット済み(`track/e-orch-5.0.4` ブランチ、`main` へは未マージ)。実機 macOS 上で
+`cargo test`(lib 337 passed / 統合 14 passed、失敗ゼロ)と `cargo clippy -- -D warnings`
+(警告ゼロ)を確認済みで、続報7 が明記した「一度もコンパイル・テスト実行していない」という
+限界は解除された。**ただし本節冒頭の結論は依然として変わらない**: 実機で `spawn_workflow`
+を実際に走らせて supervisor / handoff / `joinOn: reply` / `condition:` / `timeoutMs` /
+`retry:` が期待どおり進行することの目視確認はまだ行われておらず、`main` にも未マージ。
+さらに CONTRACT.md 続報7 が記録した既知ギャップ — (7) resume 後に `reply_body` /
+`kickoff_root_msg_id` / backoff 期限が失われる、(8) `joinOn: reply` は最初の返信のみを
+拾い後続 tick の返信を取りこぼす、(9) kickoff 配送失敗時にペインが孤児化しうる — は
+いずれも未解消である。したがって「timeoutMs / retry を書けば安全装置になる」という前提で
+運用しないことは、`main` へのマージと実機 1 本流し検証が済むまで引き続き重要。詳細は
+[CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」続報7・続報8、および
+[ptygrid-yml-guide.md](ptygrid-yml-guide.md) §1 を参照。)
+
 ---
 
 ## 10. 1日を回すためのチェックリスト

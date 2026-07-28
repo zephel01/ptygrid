@@ -186,7 +186,16 @@ type ArenaVote = {
   3. `kickoff` に対する reply を `inbox` に受けた（`reply_inbox` の対象になった）→ SUCCEEDED。**「返信をもって完了」**の明示宣言のみに使う（step に `join_on: "reply"` を書いたときだけ有効化）。
 - **失敗時**: `on_failure: "fail-fast"`（既定）は「次の step を PENDING → CANCELLED にし、走行中 step は kill_pty」、`"continue"` は「独立したブランチは走らせ続ける」。
 - **retry**: step 単位、`max` 回まで backoff。retry では同じ session id を再利用する既存 `restart_session` を使い、pane 追加を発生させない。
-- **timeout**: `timeoutMs` を超えたら `kill_pty` して FAILED（retry があれば消費）。
+- **timeout**: `timeoutMs` を超えたら `kill_pty` して FAILED（retry があれば消費）。retry / timeout については実装状況を [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の表と [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」の追記群を参照。
+
+> 追記（2026-07-28、実装反映）: グリッドの pane 上限（9面）が埋まっていて spawn できない
+> step は、`PENDING → FAILED` に落とさず**`PENDING` のまま据え置く「上限待ち」**を追加した
+> （新しい `StepState` は増やしていない）。`ready_steps` は毎 tick 冪等に再導出するため、
+> 別途のリトライ機構なしに次 tick 以降で拾われる。無限に待たせないための安全弁として
+> `WORKFLOW_DEFER_MAX_MS`（5分）を設け、これを超えて空きが出ない場合のみ従来どおり
+> `FAILED` にする。`timeoutMs`（上記「timeout」項）はこの待ち時間を含まない —
+> 待っている間 step はまだ RUNNING に遷移していないため。詳細は
+> [CONTRACT.md](../../CONTRACT.md)「Phase 5.0 追加契約」続報10を参照。
 
 **fan-out**:
 

@@ -234,3 +234,32 @@ MVO(5.0.0)完成後、Track A/B/C/D を並列に走らせる。branch は 1 patc
   イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` commands。
 - cargo test 251 / clippy 0 / svelte-check 0。実機のクラッシュ→再開テストは継続。
 - バージョン: v0.5.1 タグ候補（3 ファイル version 同期 → 全チェック → annotated tag）。
+
+### 5.6 進捗（2026-07-28）: Orchestrator ハードニング（pane 上限 / driver tick / mailbox）
+
+`DESIGN-refactor-5.0.5.md`（リポジトリ直下）に沿って、5.0.4 Orchestrator の非機能面を
+3点リファクタ。**wire 契約(config スキーマ/IPC/MCP)は無変更**につき CONTRACT.md は
+「Phase 5.0 追加契約」節に追記のみ（続報10）で対応、破壊的変更の互換パス整備は不要。
+
+- pane 上限（9面）が埋まっている間、spawn できない step は `Failed` ではなく `Pending`
+  のまま待ち行列化（最大 `WORKFLOW_DEFER_MAX_MS` = 5分、超過で従来どおり `Failed`）。
+  `timeoutMs` は待ち時間を含まない仕様として確定。
+- `PtyManager::session_states()` / `live_session_count()` を新設し、driver tick /
+  `team_presets` / `queen list_agents` の内部計算が `ps` fork を伴う `list_sessions()`
+  を呼ばなくなった（`list_agents` の返り値自体は不変）。`WorkflowRegistry` に終端 run の
+  evict（`REGISTRY_TERMINAL_CAP` = 100）を追加。
+- workflow の inbox mailbox を `queen:workflow/<name>` から `queen:workflow/<name>/<runId>`
+  へ変更し、同名 workflow の並行 run がもう mailbox を共有しないようにした（新規制約:
+  workflow 名は 84 バイト以下）。
+- cargo test 374 passed / 0 failed（lib）+ 14 passed（統合）。svelte-check は本リファクタが
+  backend のみのため対象外。実機での workflow 1 本流し・GUI 目視確認は継続（Phase 5.0.4
+  以来の既知の未検証事項）。
+- **バージョン提案**: 本断面は wire 契約が不変の内部ハードニングであり、§3 規約上は
+  「破壊的変更ではない」ため単独のリリースタグを必須としない。`orchestrator.rs` の
+  コード内コメントは便宜上「phase 5.0.5」と書いているが、**`5.0.5` は既に §5.1/
+  spec-phase5-0.md で Arena view 用に予約済み**であり衝突する。次のいずれかで解消する
+  ことを提案する: (a) 本断面を「5.0.4 のフォローアップ」として無番号のまま次の
+  リリースタグ（例: v0.5.4 の一部、または次回のまとめリリース）に含める、
+  (b) Arena view の実装時に `5.0.5` はそのまま Arena に割り当て、本断面のコード
+  コメントの「phase 5.0.5」表記は将来の整理コミットで削除する。いずれにせよ
+  **`5.0.5` を本断面に正式採番しない**。
