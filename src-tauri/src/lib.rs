@@ -4,6 +4,7 @@ mod app_settings;
 mod commands;
 mod config;
 mod git_service;
+mod init;
 mod notifications;
 mod orchestrator;
 mod project_state;
@@ -112,6 +113,9 @@ pub fn run() {
             commands::git_stage,
             commands::git_unstage,
             commands::git_commit,
+            commands::init_scan,
+            commands::init_preview,
+            commands::init_write,
             commands::get_projects_root,
             commands::set_projects_root,
             commands::list_project_dirs

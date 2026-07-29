@@ -13,7 +13,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 [![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/)
 [![MCP](https://img.shields.io/badge/MCP-built--in%20server-8A2BE2)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-v0.4.8-brightgreen)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.5.6-brightgreen)](#roadmap)
 
 [User Guide](docs/guide/userguide.en.md) · [Design Document](docs/design/design.en.md) · [Linux / Windows Porting](docs/design/porting.en.md) · [Competitive Analysis](docs/design/competitive-landscape.en.md) · [Troubleshooting](docs/guide/troubleshooting.en.md)
 
@@ -34,6 +34,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 - 📌 **Shared Pins / Notes** — per-project persistent memos shared through Queen. Revision-conflict detection prevents concurrent updates from silently overwriting each other
 - 📬 **Durable Inbox / Reply** — asynchronous agent-to-agent messaging with stable message IDs, acknowledgements, and thread correlation
 - ⏳ **Cancellable Await** — wait for new Inbox arrivals past a cursor without busy polling. Supports timeouts and MCP cancellation
+- 🔀 **Declarative workflows** — describe a DAG under `workflows:` to run several agents in sequence or in parallel (pipeline / fan-out / supervisor / handoff, with retry, timeout, and conditional branches). Launch it from the Queen tool `spawn_workflow` or the 🔀 chip; a run can resume where it left off after a crash
 - 🔒 **Allowlist-based spawn** — `spawn_agent` can only launch names defined in ptygrid.yml, and it binds to 127.0.0.1 only
 - 🎯 **Unambiguous addressing** — every pane shows a `#id`. When multiple panes run the same CLI, target one precisely with `agent: "#3"`; sends that rely on guessing a name are rejected
 - 🔁 **autorestart** — never / on-failure / always (aborts after 5 consecutive attempts). A restart preserves the pane and its session ID
@@ -110,7 +111,7 @@ The first time you load a project (a `ptygrid.yml` from the working folder or th
 
 ### Registering Queen with each CLI
 
-Click the "● Queen :39237" badge on the right of the toolbar to copy a registration command that includes the auth token. `/mcp` is protected by token plus Host/Origin validation, and the URL carries a `?token=<token>`. **The token changes every time the app starts (it is not persistent), so re-register after a restart.** The `<token>` below is a placeholder — use the copy from the badge in practice.
+Click the "● Queen :39237" badge on the right of the toolbar to copy a registration command that includes the auth token. `/mcp` is protected by token plus Host/Origin validation, and the URL carries a `?token=<token>`. **The token is persisted to `auth-tokens.json`, so you do not need to re-register after restarting the app** (since v0.4.3). You can regenerate it from the Teammates panel if you want to; only then do you need to paste the new one. The `<token>` below is a placeholder — use the copy from the badge in practice.
 
 ```bash
 # Claude Code (-s user is required; watch out: the local scope is limited to the directory)
@@ -145,7 +146,7 @@ For detailed usage, see the **[User Guide](docs/guide/userguide.en.md)**, and fo
 
 - `pty-core-check/` (portable-pty standalone smoke test): output capture, resize, and kill confirmed by actual runs
 - `mcp-server-check/` (rmcp standalone smoke test): initialize → tools/list → tools/call confirmed by actual runs
-- `cargo check` + `cargo test` (PTY/session, Git, worktree, state, resource, Queen; 61 tests): passing
+- `cargo check` + `cargo test` (PTY/session, Git, worktree, state, resource, Queen, orchestrator; 375 tests + 14 integration tests): passing
 - `npm run build` + `svelte-check`: 0 errors / 0 warnings
 - GitHub Actions: validates the frontend, Rust tests, clippy, and the Tauri native build on macOS 14 / Ubuntu 22.04
 
@@ -169,6 +170,10 @@ When you change the IPC / MCP schema, update [CONTRACT.md](CONTRACT.md) in the s
 - [x] **Phase 2** — Queen (built-in MCP server: 5 core tools)
 - [x] **Phase 3.0–3.8** — Git diff/commit, worktree isolation, logical resume, resource monitoring, Queen pins/notes/inbox/reply/await (18 tools)
 - [x] **Phase 3.9** — Linux test support (PATH restoration, Ubuntu CI, `.deb` / AppImage packaging)
+- [x] **Phase 4.0–4.2** — teammate hook reception, observe (`transcript` panes), host mode (teammates become real PTY panes through a tmux-compatible shim; experimental)
+- [x] **Phase 4.3–4.4** — team presets launched in one go (`team_presets` + `spawn_team`), semantic agent status, out-of-app notifications (OS notifications / Slack / Mattermost / Discord / Telegram), ssh destination display, English/Japanese UI
+- [x] **Phase 5.x (workflow orchestration)** — declarative `workflows:` with a DAG driver, resume after a crash, the 5.0.4 execution layer (retry / timeout / conditions / handoff), and the 5.5.0 MCP 2026-07-28 RC compatibility router
+- [ ] **Next** — Arena view (a UI for comparing parallel attempts), observability (OTel instrumentation and cost visibility), Memory / local Provider integration, and the Phase 6.0 sandbox and secrets work
 
 For the background on this direction, see the [Competitive Analysis](docs/design/competitive-landscape.en.md) (we chose the "coordinate on one screen" approach rather than a worktree-isolation one). Phase 3 proceeded feature by feature while preserving compatibility; the additive contract for each step is recorded in [CONTRACT.md](CONTRACT.md).
 
@@ -177,6 +182,7 @@ For the background on this direction, see the [Competitive Analysis](docs/design
 | Document | Contents |
 |---|---|
 | [docs/guide/userguide.en.md](docs/guide/userguide.en.md) | Installation, reading the UI, ptygrid.yml reference, and how to use Queen |
+| [docs/guide/ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) | How to write `workflows:`, plus a per-field implementation matrix that separates "parses" from "actually runs" (Japanese only) |
 | [docs/design/design.en.md](docs/design/design.en.md) | Design document (OSS research, stack selection, architecture) |
 | [docs/design/competitive-landscape.en.md](docs/design/competitive-landscape.en.md) | Competitive analysis of similar tools and positioning |
 | [docs/guide/troubleshooting.en.md](docs/guide/troubleshooting.en.md) | Pitfalls found through real-world dogfooding, and their fixes |

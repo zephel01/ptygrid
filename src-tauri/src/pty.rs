@@ -86,7 +86,7 @@ fn is_interpreter(base: &str) -> bool {
 /// bare "amp" hits "example") or excluded entirely (`q`, `cn`, `cursor`,
 /// `droid` — the native-binary agents behind those never reach this path
 /// anyway because their own `comm` identifies them).
-const KNOWN_AGENTS: &[&str] = &[
+pub(crate) const KNOWN_AGENTS: &[&str] = &[
     "cursor-agent",     // Cursor CLI (bare "cursor" is too generic)
     "continuedev",      // @continuedev/cli (its bin `cn` is too short to match)
     "sourcegraph/amp",  // @sourcegraph/amp (bare "amp" hits "example", "ramp", …)

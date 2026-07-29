@@ -14,7 +14,7 @@ Claude Code / Codex / Grok をスプリットペインで同時に走らせ、�
 [![Svelte](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/)
 [![MCP](https://img.shields.io/badge/MCP-built--in%20server-8A2BE2)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20beta-lightgrey?logo=linux)](#動作環境)
-[![Status](https://img.shields.io/badge/status-v0.4.8-brightgreen)](#ロードマップ)
+[![Status](https://img.shields.io/badge/status-v0.5.6-brightgreen)](#ロードマップ)
 
 [ユーザーガイド](docs/guide/userguide.md) · [設計ドキュメント](docs/design/design.md) · [Linux / Windows移植](docs/design/porting.md) · [競合調査](docs/design/competitive-landscape.md) · [トラブルシューティング](docs/guide/troubleshooting.md)
 
@@ -35,6 +35,7 @@ Claude Code / Codex / Grok をスプリットペインで同時に走らせ、�
 - 📌 **共有Pins / Notes** — project単位の永続メモをQueen経由で共有。revision競合検出で同時更新の上書き消失を防止
 - 📬 **永続Inbox / Reply** — 安定message ID、acknowledgement、thread correlation付きの非同期agent間通信
 - ⏳ **Cancellable Await** — cursor以降のInbox到着をbusy pollingなしで待機。timeoutとMCP cancellation対応
+- 🔀 **宣言的 workflow** — `workflows:` に DAG を書いて複数エージェントを順次・並列に走らせる(pipeline / fan-out / supervisor / handoff。retry・timeout・条件分岐つき)。Queen tool `spawn_workflow` または 🔀 チップから起動し、クラッシュ後は途中から再開できる
 - 🔒 **許可リスト方式の spawn** — `spawn_agent` は ptygrid.yml で定義された名前しか起動できない。bind は 127.0.0.1 のみ
 - 🎯 **曖昧でない宛先指定** — 全ペインに`#id`を表示。同名CLIが複数なら`agent: "#3"`で厳密指定し、名前の推測送信を拒否
 - 🔁 **autorestart** — never / on-failure / always(連続5回で打ち切り)。restart してもペインとセッション ID を維持
@@ -121,8 +122,9 @@ processes:
 
 ツールバー右の「● Queen :39237」バッジをクリックすると、認証トークン込みの登録コマンドが
 コピーされます。`/mcp` は token + Host/Origin 検証で保護されており、URL には `?token=<token>`
-が付きます。**トークンはアプリ起動ごとに変わる(非永続)ため、再起動したら再登録してください。**
-下記の `<token>` はプレースホルダなので、実際はバッジのコピーを使ってください。
+が付きます。**トークンは `auth-tokens.json` に永続化されるので、アプリを再起動しても再登録は
+不要です**(v0.4.3 以降)。作り直したい場合は Teammates パネルから再生成でき、その場合だけ
+貼り直しが要ります。下記の `<token>` はプレースホルダなので、実際はバッジのコピーを使ってください。
 
 ```bash
 # Claude Code(-s user 必須。local スコープはディレクトリ限定になる罠あり)
@@ -157,7 +159,7 @@ url = "http://127.0.0.1:39237/mcp?token=<token>"
 
 - `pty-core-check/`(portable-pty 単体スモークテスト): 出力キャプチャ・resize・kill を実走確認
 - `mcp-server-check/`(rmcp 単体スモークテスト): initialize → tools/list → tools/call を実走確認
-- `cargo check` + `cargo test`(PTY/session・Git・worktree・state・resource・Queen、61 tests): 合格
+- `cargo check` + `cargo test`(PTY/session・Git・worktree・state・resource・Queen・orchestrator、375 tests + 統合 14 tests): 合格
 - `npm run build` + `svelte-check`: 0 errors / 0 warnings
 - GitHub Actions: macOS 14 / Ubuntu 22.04でfrontend、Rust tests、clippy、Tauri native buildを検証
 
@@ -183,6 +185,10 @@ IPC / MCP schemaを変更する場合は[CONTRACT.md](CONTRACT.md)、release進�
 - [x] **Phase 2** — Queen(内蔵 MCP サーバー: 基本5 tools)
 - [x] **Phase 3.0–3.8** — Git diff/commit・worktree分離・logical resume・リソース監視・Queen pins/notes/inbox/reply/await(18 tools)
 - [x] **Phase 3.9** — Linuxテスト対応(PATH復元、Ubuntu CI、`.deb` / AppImage packaging)
+- [x] **Phase 4.0–4.2** — teammate hooks受信、observe(`transcript`ペイン)、host モード(tmux互換シムでteammateを実PTYペイン化・実験機能)
+- [x] **Phase 4.3–4.4** — チームプリセット一括起動(`team_presets` + `spawn_team`)、エージェント意味的状態の可視化、アプリ外通知(OS通知 / Slack / Mattermost / Discord / Telegram)、ssh接続先表示、UI多言語化(en/ja)
+- [x] **Phase 5系(workflow orchestration)** — 宣言的な`workflows:`とDAGドライバ、クラッシュ後のresume、5.0.4の実行層(retry / timeout / 条件分岐 / handoff)、5.5.0のMCP 2026-07-28 RC互換ルータまで実装済み
+- [ ] **今後** — Arena view(並列案の比較UI)、観測系(OTel計装とコスト可視化)、Memory / ローカルProvider統合、Phase 6.0のsandbox・secrets
 
 方向性の背景は [競合調査](docs/design/competitive-landscape.md) を参照(worktree 隔離系ではなく「同一画面で協調する系」を選んでいます)。
 Phase 3 は段階リリース計画に沿って、互換性を保ちながら機能単位で進めました（各段階の追加契約は [CONTRACT.md](CONTRACT.md) に記録）。
@@ -192,6 +198,7 @@ Phase 3 は段階リリース計画に沿って、互換性を保ちながら機
 | ドキュメント | 内容 |
 |---|---|
 | [docs/guide/userguide.md](docs/guide/userguide.md) | インストール・画面の見方・ptygrid.yml リファレンス・Queen の使い方 |
+| [docs/guide/ptygrid-yml-guide.md](docs/guide/ptygrid-yml-guide.md) | `workflows:` の書き方と、フィールドごとの実装状況マトリクス(「書けるが動かない」の線引き) |
 | [docs/design/design.md](docs/design/design.md) | 設計ドキュメント(OSS 調査・スタック選定・アーキテクチャ) |
 | [docs/design/competitive-landscape.md](docs/design/competitive-landscape.md) | 類似ツールの競合調査とポジショニング |
 | [docs/guide/troubleshooting.md](docs/guide/troubleshooting.md) | 実際のドッグフーディングで判明した罠と対処 |

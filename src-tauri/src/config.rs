@@ -1395,7 +1395,7 @@ pub fn capture_launch_dir() {
 
 /// The captured launch folder, if any. Returns `None` before `capture_launch_dir`
 /// has run (e.g. in unit tests, which inject the launch folder explicitly).
-fn launch_dir() -> Option<PathBuf> {
+pub(crate) fn launch_dir() -> Option<PathBuf> {
     LAUNCH_DIR.get().cloned().flatten()
 }
 
@@ -1596,7 +1596,7 @@ fn expand_working_dir(input: &str) -> Result<PathBuf, String> {
 ///
 /// `is_file` is injected so the order can be tested without touching the disk.
 /// On failure returns the full ordered list of candidates that were tried.
-fn resolve_config_path_pure(
+pub(crate) fn resolve_config_path_pure(
     work: &Path,
     launch: Option<&Path>,
     home: Option<&Path>,
