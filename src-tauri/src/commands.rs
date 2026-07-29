@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::app_settings::{self, ProjectDirs, ProjectsRoot};
 use crate::config::{ConfigInfo, ConfigManager};
 use crate::git_service::{self, GitCommitInfo, GitDiffInfo, GitStatusInfo};
+use crate::init::{self, InitPreview, InitScanReport, InitTarget, InitWriteResult};
 use crate::project_state::{self, LogicalSession, ProjectState};
 use crate::queen::{self, QueenStatus, QueenStatusInfo};
 use crate::session::{PtyManager, SessionInfo};
@@ -396,4 +397,79 @@ pub async fn git_commit(
     tauri::async_runtime::spawn_blocking(move || git_service::commit(&dir, message))
         .await
         .map_err(|e| format!("git commit task failed: {e}"))?
+}
+
+/// Working folder for the Phase 5.0.2 init commands.
+///
+/// Unlike [`project_dir`] this deliberately does NOT fall back to
+/// `current_dir()`: that is the process launch folder, which spec §3.3 rules
+/// out as a generation target (a GUI launch cwd has nothing to do with what the
+/// user means). The main entry point for init is exactly the state where no
+/// config is loaded, so the frontend must name the folder; without it the
+/// command fails with a `no_target_dir:` prefix rather than writing somewhere
+/// arbitrary. The path is normalized to an absolute one by the init module.
+fn init_dir(config: &ConfigManager, dir: Option<String>) -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = dir {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    config.current().map(|(_config, dir)| dir).ok_or_else(|| {
+        "no_target_dir: no working folder loaded; pass `dir` explicitly".to_string()
+    })
+}
+
+/// Phase 5.0.2 `ptygrid init` — detect only. Never touches the disk.
+///
+/// Reports what init would base a generated config on: agent CLIs on `PATH`,
+/// project kind, whether the folder is a git repo, whether a local LLM router
+/// answers, and any config file the existing search order already finds
+/// (`existing.legacy` marks the old `mterm.yml` name). Every probe is
+/// best-effort, so this never fails on a missing `git` or a dead router.
+#[tauri::command]
+pub fn init_scan(
+    config: State<'_, ConfigManager>,
+    dir: Option<String>,
+) -> Result<InitScanReport, String> {
+    let dir = init_dir(&config, dir)?;
+    Ok(init::scan(&dir))
+}
+
+/// Phase 5.0.2 `ptygrid init` — generate + self-check. Never touches the disk.
+///
+/// `content` is the full generated YAML (editable by the frontend before it is
+/// handed back to `init_write`), `path` the absolute destination — the sidecar
+/// `ptygrid.init.yml` when a config file already exists there (`sidecar: true`,
+/// with the existing text returned as `existingContent` for the diff view).
+/// `valid` is the result of running the generated text through the same
+/// `parse_config` every load path uses.
+#[tauri::command]
+pub fn init_preview(
+    config: State<'_, ConfigManager>,
+    dir: Option<String>,
+    target: Option<InitTarget>,
+) -> Result<InitPreview, String> {
+    let dir = init_dir(&config, dir)?;
+    init::preview(&dir, target.unwrap_or_default())
+}
+
+/// Phase 5.0.2 `ptygrid init` — write `content` after re-checking it.
+///
+/// The content is parsed again (it may have been edited in the preview) and a
+/// failure writes nothing. Writing goes through temp + rename, never overwrites
+/// an existing config (the sidecar takes the output instead), and skips the
+/// write entirely when the destination already holds the same bytes. Refused
+/// with a `legacy_config:` error only when the write would create
+/// `<dir>/ptygrid.yml` while a legacy `mterm.yml` is still there, since the new
+/// file would silently win the search order; a sidecar write takes no such risk
+/// and goes through. Deliberately does NOT reload the config:
+/// `ConfigManager::load` takes the same lock and the frontend owns when to
+/// reload.
+#[tauri::command]
+pub fn init_write(
+    config: State<'_, ConfigManager>,
+    dir: Option<String>,
+    target: Option<InitTarget>,
+    content: String,
+) -> Result<InitWriteResult, String> {
+    let dir = init_dir(&config, dir)?;
+    init::write(&dir, target.unwrap_or_default(), &content)
 }

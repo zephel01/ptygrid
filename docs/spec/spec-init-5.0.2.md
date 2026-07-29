@@ -100,6 +100,13 @@ YAML は既存のキー命名（`AgentDef` は snake_case、`WorkflowDef` 系は
 GUI 起動では起動 cwd がユーザーの意図と結びつかない。`~/.ptygrid/` を作るコードは現状どこにも
 無いので、Global 選択時は **init が `create_dir_all` する**。
 
+**決定: 「`<launch>` には生成しない」を backend 側でも担保する。** `dir` が省略され、かつ
+読み込み済み config も無い場合、`init_scan` / `init_preview` / `init_write` は
+`std::env::current_dir()`（= 起動 cwd）へフォールバックせず、**`no_target_dir:` エラー**を返す
+（`commands.rs::init_dir`）。他の command（`git_status` 等）が使う `project_dir()` は
+現在ロード済み config → `current_dir()` の順にフォールバックするが、init 系だけはこの
+フォールバックを持たない——起動 cwd への暗黙の書き込みを構造的に防ぐための意図的な違いである。
+
 **決定: Project 生成物は trust 確認の対象になる。init はこれを迂回せず、`trust::add_trusted`
 （`trust.rs:194`）も呼ばない。** `trust::is_trusted_pure`（`trust.rs:94-99`）は `Global` / `Default` を
 無条件 trusted、`Project` / `Launch` は trust ストアに載るまで untrusted とするため、
@@ -111,15 +118,24 @@ posture を変える。だからこそ Project を既定にする: 生成物に�
 
 ### 3.4 既存ファイルがあるとき — 上書きせず sidecar に書く
 
-**決定: 既存の設定ファイルがあるときは、それを一切変更しない。生成物は隣の別名ファイルに書く。**
+**決定: 生成先ディレクトリに `ptygrid.yml` 本体が既に存在するときは、それを一切変更せず、
+生成物は隣の別名ファイルに書く。** sidecar になるかどうかは「`resolve_config_path_pure` が
+何らかの既存設定を見つけたか」ではなく、**`<dir>/ptygrid.yml` そのものが存在するか**だけで
+決まる（`init.rs::sidecar_needed`）。
 
 | 項目 | 決定 |
 |---|---|
+| sidecar 判定条件 | **`<dir>/ptygrid.yml` が存在するときだけ**。単独の `mterm.yml`（旧名）は sidecar を発生させない——生成先は素直に `<dir>/ptygrid.yml` のままになり、その書き込みだけを `init_write` が `legacy_config:` で拒否する（後述）。`ptygrid.yml` と `mterm.yml` が両方存在するときは前者を検出した時点で sidecar になり、旧名は既に探索順で無効化されているため書き込みは通る |
 | sidecar のファイル名 | **`ptygrid.init.yml`**（生成先ディレクトリ直下） |
 | 既に sidecar もある場合 | **上書きする**（init の作業用出力であり、ユーザーの資産ではない） |
 | 既存ファイルの扱い | **テキストとして読み、行差分の表示にだけ使う。parse も書き戻しもしない** |
 | 採用のしかた | ユーザーが手でマージするかリネームする。init は代行しない |
 | 差分の見せ方 | **行単位の 2 ペイン表示**（左 = 既存 / 右 = 生成物）。構造マージ表示は 3.1 の問題に戻るため作らない |
+
+frontend は書き込みが拒否されるケースを `init_preview` の結果だけから予測できる:
+**`scan.existing?.legacy === true && preview.sidecar === false`** が真のとき、`init_write` は
+必ず `legacy_config:` で失敗する（`<dir>/ptygrid.yml` が存在しないのに legacy が存在する
+= 単独の `mterm.yml` のケース）。
 
 `ptygrid.init.yml` は探索対象（`ptygrid.yml` / `mterm.yml`）に含まれず、watcher のファイル名
 フィルタにも掛からないため**`config-changed` を誤射しない**。2.2 が禁じるのは書き戻し経路であり、
@@ -152,8 +168,21 @@ posture を変える。だからこそ Project を既定にする: 生成物に�
 既存ファイルとの重複は sidecar 方式なので実害なし）。`cmd` の実行可能性 / `cwd` の存在 / `${VAR}`
 の解決も同様に担保されない。
 
-コメントアウトは**キー行ごと**に行う（`processes:` だけ残すと値が null になり parse に失敗しうる。
-この事故は自己検査で必ず捕まる、7 章に回帰テスト）。
+コメントアウトは**キー行ごと**に行う。ただしその理由は当初の想定（「値が null になり parse に
+失敗する」）とは異なる。`serde_norway 0.9` で実測した挙動は次のとおり
+（`init.rs` の `partially_commented_out_block_is_caught_by_the_self_check` 参照）:
+
+| 残し方 | `parse_config` | 理由 |
+|---|---|---|
+| `processes:` の後に値ノードを一切残さない（キー行のみ） | **Ok** | フィールドが missing 扱いになり `#[serde(default)]` が空 `Vec` を供給する |
+| `processes: null` / `processes: ~` | **Err** | 明示的な unit 値になり、`Vec` に対する型エラーになる |
+| 半端に残ったリスト要素（例: `- name: a` で `cmd` が欠落） | **Err** | 必須フィールド不足で構造体のデシリアライズが失敗する |
+
+つまり「キー行だけ残す」こと自体は parse を落とさない。それでもキー行ごとコメントアウトする
+方針を維持するのは**正しさのためではなく可読性のため**——中途半端に値だけが残った雛形は
+「どこまでコメントを外せば有効になるか」が分かりにくく、キー行から丸ごと揃えたほうが
+ユーザーが編集しやすい。実際に自己検査で必ず捕まるのは、明示的な `null`/`~` と、半端な
+リスト要素を残した場合である（7 章に回帰テスト）。
 
 ### 3.6 呼び出し口 — GUI を主とし、CLI サブコマンドは 5.0.2 では作らない
 
@@ -190,6 +219,7 @@ posture を変える。だからこそ Project を既定にする: 生成物に�
 ```yaml
 # ptygrid.yml — ptygrid init が生成しました (2026-07-29)
 # 検出: claude (PATH) / Cargo.toml / git リポジトリ
+# 未検出: ローカル LLM ルータ (127.0.0.1:3456)
 # 中身はすべて手で編集できます。全ブロックの注釈つき例は ptygrid.example.yml、
 # 用途別の見本は example/ を参照してください。
 
@@ -200,7 +230,26 @@ agents:
     cmd: "claude"
     cwd: "."
     autostart: false     # 読み込みと同時に起動するなら true（初回は手動 ▶ 起動）
+
+# Cargo.toml を検出しました。dev サーバーやテスト watch を常駐させるなら
+# 次のブロックの各行の先頭 # を外してください（agents と同じフィールドを持ちます）。
+# processes:
+#   - name: dev
+#     cmd: "<常駐させたいコマンド>"
+#     cwd: "."
+#     autostart: false
+#     autorestart: on-failure   # 異常終了時のみ再起動
+
+# git リポジトリを検出しました。ペインごとに linked worktree を切るなら
+# example/worktree を参照してください（init は worktree: を生成しません）。
+
+# チーム一括起動 (team_presets:) は example/team-preset、
+# DAG オーケストレーション (workflows:) は example/adaptive-orchestration を参照。
 ```
+
+先頭コメントは「見つけたもの（`# 検出:`）」だけでなく「探したが見つからなかったもの
+（`# 未検出:`）」も記録する——不在ブロックの理由をその場で説明するためで、上の例では
+ローカル LLM ルータが応答しなかったことがそれに当たる（`init.rs::missing_items`）。
 
 D1 が何も見つけなかった場合は `agents:` ブロックごと出さず、`# agents:` から始まる
 **キー行ごとコメントアウトした雛形**（3.5）と「CLI を入れたらコメントを外す」案内だけを出す。
@@ -247,14 +296,25 @@ agents:
   #   autostart: false
 
 # package.json を検出しました。dev サーバーやテスト watch を常駐させるなら
-# 次のブロックのコメントを外してください（agents と同じフィールドを持ちます）。
+# 次のブロックの各行の先頭 # を外してください（agents と同じフィールドを持ちます）。
 # processes:
-#   - name: web
+#   - name: dev
 #     cmd: "npm run dev"
 #     cwd: "."
 #     autostart: false
 #     autorestart: on-failure   # 異常終了時のみ再起動
+
+# git リポジトリを検出しました。ペインごとに linked worktree を切るなら
+# example/worktree を参照してください（init は worktree: を生成しません）。
+
+# チーム一括起動 (team_presets:) は example/team-preset、
+# DAG オーケストレーション (workflows:) は example/adaptive-orchestration を参照。
 ```
+
+`processes:` の雛形の `name:` は常に `dev` で固定（npm 前提の `web` ではない）。`cmd:` は
+npm プロジェクトのときだけ `"npm run dev"` を出し、それ以外の種別（cargo / python / go）では
+`"<常駐させたいコマンド>"` というプレースホルダになる（`init.rs::render_config`、
+`marker_for` と組み合わせた分岐）。
 
 ### 4.3 生成しないもの
 
@@ -288,20 +348,27 @@ agents:
 type InitTarget = "project" | "global";  // project = <work>/ptygrid.yml, global = ~/.ptygrid/ptygrid.yml
 
 interface InitScanReport {
-  dir: string;                     // 走査した作業フォルダ（絶対パス）
+  dir: string;                     // 走査した作業フォルダ（絶対パス。`.`/`..` を字句的に畳んだ値。
+                                    // symlink 解決＝canonicalize はしない — `absolute_dir`）
   agents: string[];                // PATH で見つかった名前（KNOWN_AGENTS の宣言順）
   projectKinds: string[];          // "cargo" | "npm" | "python" | "go"（複数可・空可）
   gitRepo: boolean;
   routerPort: number | null;       // 応答したローカルルータのポート。無ければ null
   existing: ExistingConfig | null; // 探索順で最初に当たった既存設定
 }
-interface ExistingConfig { path: string; origin: "project"|"launch"|"global"; legacy: boolean }
-                                   // legacy: true = mterm.yml（旧名）
+interface ExistingConfig { path: string; origin: "project"|"launch"|"global"|"default"; legacy: boolean }
+                                   // legacy: true = mterm.yml（旧名）。origin は既存 ConfigOrigin
+                                   // をそのまま再利用するため型としては 4 値だが、scan() の経路
+                                   // （resolve_config_path_pure 由来）が実際に返すのは
+                                   // "project" | "launch" | "global" の 3 値のみ。"default" は
+                                   // 理論上の型としてのみ存在し、init からは出ない
 interface InitPreview {
   content: string;                 // 生成された YAML 全文
-  path: string;                    // 書き込み予定の絶対パス（sidecar のときは sidecar 側）
+  path: string;                    // 書き込み予定の絶対パス（sidecar のときは sidecar 側。
+                                    // dir と同じく字句正規化済み・canonicalize はしない）
   target: InitTarget;
-  sidecar: boolean;                // 既存があるため別名に書く場合 true
+  sidecar: boolean;                // <dir>/ptygrid.yml が既に存在するため別名に書く場合 true
+                                    // （mterm.yml 単独の存在は sidecar にしない — 3.4）
   valid: boolean;                  // 自己検査（3.5）の結果
   error?: string;                  // valid=false のときの parse / validate エラー
   existingContent?: string;        // sidecar のとき、差分表示用に読んだ既存の生テキスト
@@ -318,6 +385,11 @@ interface InitWriteResult {
 | `init_scan` | `{ dir?: string }` | `InitScanReport` | 検出のみ。ディスクに**書かない** |
 | `init_preview` | `{ dir?: string, target?: InitTarget }` | `InitPreview` | 生成 + 自己検査。ディスクに**書かない** |
 | `init_write` | `{ dir?: string, target?: InitTarget, content: string }` | `InitWriteResult` | `content` を再検査してから temp + rename で書く |
+
+`dir` 省略時は、現在ロード済み config の working dir を使う。それも無ければ 3.3 のとおり
+`current_dir()`（起動 cwd）へは落とさず、**`no_target_dir:`** エラーを返す（`commands.rs::init_dir`）。
+そのほかのエラー接頭辞（`no_home:` / `invalid_config:` / `legacy_config:`）を含む一覧は
+CONTRACT.md「Phase 5.0.2 追加契約」のエラー接頭辞規約を正とする。
 
 配線先は `commands.rs` の `#[tauri::command]` 群 + `lib.rs:88-118` の `generate_handler!`。
 
@@ -376,8 +448,9 @@ plan.md §2 に U 番号として登録されていること。
   （3.1 の `env` 順序不定問題を踏まないことの回帰）
 - **自己検査**: 全テンプレート分岐（agents 0 / 1 / 3 体 × ルータ有無 × project 種別）の出力が
   `parse_config` を通ること
-- **コメントアウト事故の回帰**: `processes:` のキー行だけを残した YAML が `parse_config` で
-  Err になること（3.5 の罠を固定する）
+- **コメントアウト事故の回帰**: 明示的な `processes: null` / `agents: ~` は `parse_config` で
+  **Err** になり、値ノードを持たないキー行のみ（例: `processes:` の後に何も続かない）は
+  **Ok**（`#[serde(default)]` が空 `Vec` を供給する）になること。両方を固定する（3.5 の実測表）
 - 生成物内の `agents[].name` の一意性 / sidecar 名の決定 / 既存検出（`mterm.yml` → `legacy: true`）
 
 **integration（`cargo test`）** — 一時ディレクトリは

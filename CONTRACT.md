@@ -2103,6 +2103,205 @@ team_presets:
 
 ---
 
+# Phase 5.0.2 追加契約（`ptygrid init`: 設定ファイルの自動生成）
+
+> 状態: **backend 実装済み（2026-07-29）**。frontend（プレビュー UI）は未着手。
+> 本仕様は [docs/spec/spec-init-5.0.2.md](docs/spec/spec-init-5.0.2.md) を参照。
+> 上の「5.0.1 ptygrid.yml スキーマ追加（予約）」〜「5.0.4 非回帰」節が予約していた
+> patch 番号 5.0.1〜5.0.4（Memory / Provider / Arena）は、spec-init-5.0.2.md 冒頭の
+> 採番修正により **5.0.6 以降へ付け直し**が決定している。本節の「5.0.2」はそれとは
+> 別系統の、onboarding 用に空いていた番号（`ptygrid init`）である。番号の対応は
+> plan.md §4 でのタグ確定時に整理する。
+
+`working folder` と host 環境を走査し、意味を持つ `ptygrid.yml` を**コメント付き
+文字列テンプレート**として生成する（`serde_norway::to_string` は使わない — round-trip
+でコメントが消え `env` の出力順も不定になるため）。実体は**検出 + テンプレート文字列 +
+既存 `parse_config` による自己検査**であり、新しいパーサも新しい信頼境界も追加しない。
+既存ファイルは一切書き換えず、別名ファイルへ書く。実装は `src-tauri/src/init.rs`
+（検出・生成・自己検査・atomic write）+ `src-tauri/src/commands.rs` の Tauri command
+3 本。
+
+## wire 型（camelCase、`init.rs` の `#[derive(Serialize)]` そのまま）
+
+```ts
+type InitTarget = "project" | "global"; // 既定 project。project = <work>/ptygrid.yml、
+                                         // global = ~/.ptygrid/ptygrid.yml
+
+interface ExistingConfig {
+  path: string;
+  // 既存 ConfigOrigin をそのまま再利用（Serialize は共用）。scan() が実際に生成できる
+  // のは resolve_config_path_pure 由来の "project" | "launch" | "global" のみで、
+  // "default" は理論上の型としては存在するが scan からは出ない。
+  origin: "project" | "launch" | "global" | "default";
+  legacy: boolean; // true = 旧名 mterm.yml
+}
+
+interface InitScanReport {
+  dir: string;                      // 走査した作業フォルダ（絶対パス。`absolute_dir` が `.`/`..`
+                                     // を字句的に畳んだ値。symlink 解決＝canonicalize はしない）
+  agents: string[];                 // PATH で見つかった名前（KNOWN_AGENTS 宣言順、重複なし）
+  projectKinds: string[];           // "cargo" | "npm" | "python" | "go"（複数可・空可）
+  gitRepo: boolean;
+  routerPort: number | null;        // 応答したローカルルータのポート。無ければ null
+  existing: ExistingConfig | null;  // 探索順で最初に当たった既存設定
+}
+
+interface InitPreview {
+  content: string;                  // 生成された YAML 全文
+  path: string;                     // 書き込み予定の絶対パス（sidecar のときは sidecar 側。
+                                     // dir と同じく字句正規化済み・canonicalize はしない）
+  target: InitTarget;
+  sidecar: boolean;                 // <dir>/ptygrid.yml が既に存在するため別名に書く場合 true。
+                                     // 単独の mterm.yml（旧名）は sidecar にしない — 下記参照
+  valid: boolean;                   // 自己検査（parse_config）の結果
+  error?: string;                   // valid=false のときの parse / validate エラー全文
+  existingContent?: string;         // sidecar のとき、差分表示用に読んだ既存の生テキスト
+  scan: InitScanReport;
+}
+
+interface InitWriteResult {
+  path: string;
+  bytes: number;
+  sidecar: boolean;
+  trustPromptExpected: boolean;     // target=project かつ書き込んだ定義に autostart:true が
+                                     // 1件以上あれば true。init 自身は常に false しか生成し
+                                     // ないので、これが true になるのはプレビュー編集時のみ
+}
+```
+
+JSON 実例（`claude` だけが見つかり、`Cargo.toml` と git repo を検出、既存設定なしの場合）:
+
+```jsonc
+{
+  "content": "# ptygrid.yml — ptygrid init が生成しました (2026-07-29)\n# 検出: claude (PATH) / Cargo.toml / git リポジトリ\n...(以下略)...",
+  "path": "/home/user/my-app/ptygrid.yml",
+  "target": "project",
+  "sidecar": false,
+  "valid": true,
+  "scan": {
+    "dir": "/home/user/my-app",
+    "agents": ["claude"],
+    "projectKinds": ["cargo"],
+    "gitRepo": true,
+    "routerPort": null,
+    "existing": null
+  }
+}
+```
+
+## Tauri command 3 本（すべて同期・additive）
+
+| command | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `init_scan` | `{ dir?: string }` | `InitScanReport` | 検出のみ。ディスクに**書かない**。個々の検出は best-effort — 1つ失敗しても全体は失敗しない |
+| `init_preview` | `{ dir?: string, target?: InitTarget }` | `InitPreview` | 生成 + 自己検査（`parse_config`）。ディスクに**書かない** |
+| `init_write` | `{ dir?: string, target?: InitTarget, content: string }` | `InitWriteResult` | `content` を再検査してから temp + rename で書く |
+
+`dir` 省略時の解決は既存コマンド群（`git_status` 等）が使う `commands::project_dir()`とは
+**異なる**専用関数 `commands::init_dir()` が行う: 明示された `dir` → 現在ロード済み config の
+working dir → （それも無ければ）**`std::env::current_dir()` へは落とさず `no_target_dir:` を
+返す**。`project_dir()` の 3 段目フォールバック（`current_dir()` = 起動 cwd）を init 系だけ
+持たないのは意図的な違いで、spec-init-5.0.2.md §3.3 が禁じる「`<launch>` への生成」を
+backend 側でも構造的に保証するため。`target` 省略時は `InitTarget::Project`（既定）。
+`init_write` は自分で `ConfigManager::load` を呼ばない（`load` が握る `Mutex` との
+デッドロックを避けるため）。
+
+**エラー文字列の接頭辞規約**（実装 = `init.rs` / `commands.rs` を正とする。既存コマンド群の
+`not_found:` と同じ「`snake_case接頭辞: 説明`」慣行を踏襲）:
+
+- `no_target_dir:` — `dir` が省略され、かつ読み込み済み config も無い（`commands::init_dir()`。
+  3 command 共通の前置チェックで、`init.rs` に入る前に `commands.rs` 側で返る）
+- `no_home:` — `target: "global"` で home directory が解決できない
+- `invalid_config:` — `init_write` の再検査で `parse_config` が失敗（`error!()` に
+  parse/validate のエラー全文を連結）
+- `legacy_config:` — 書き込み先が `<dir>/ptygrid.yml` になり、かつ作業フォルダに旧名
+  `mterm.yml` が残っている（`init_write` のみ拒否して書き込まない）。このケースでは
+  `<dir>/ptygrid.yml` 自体は存在しないため `init_preview` は `sidecar: false` の通常の
+  プレビューを返す（`preview.scan.existing?.legacy === true` と組み合わせれば frontend は
+  事前に拒否を予測できる）— 見せることと書くことは独立
+- 上記以外（ディレクトリ作成失敗・temp 書き込み失敗・rename 失敗などの I/O エラー）は
+  接頭辞なしの平文。`project_dir()` 由来の `"cannot determine current dir: {e}"` も
+  同様に無接頭辞で、他コマンドと同一の慣行
+
+## 生成物の不変条件
+
+**`init_write` が書き込む内容は必ず `parse_config` を通っている。** 経路は 2 段:
+
+1. `init_preview` が生成直後に `parse_config` を通し、結果を `valid` / `error` として
+   返す（この時点では書き込まない）。
+2. `init_write` は渡された `content`（プレビューを frontend が編集した可能性がある）を
+   もう一度 `parse_config` に通し、`Err` なら 1 バイトも書かない
+   （`content_failing_the_self_check_is_never_written` で固定）。
+
+どちらも `crate::config::parse_config` そのもの（`validate_team_presets` /
+`validate_workflows` を内包）であり、init 専用の検証経路・init 専用のパーサは存在しない。
+書き込みは temp + rename（`write_atomic_if_changed`）で行い、既存ファイルと内容が
+バイト単位で一致するときは書き込み自体をスキップする。
+
+## sidecar 規約
+
+- **sidecar 判定条件は `<dir>/ptygrid.yml` そのものの存在のみ**（`init::sidecar_needed`）。
+  探索順で見つかる既存設定一般（`existing: ExistingConfig`）ではない。単独の `mterm.yml`
+  （旧名）は sidecar を発生させず、生成先は素直に `<dir>/ptygrid.yml` のままになる——その
+  書き込みだけを上の `legacy_config:` が拒否する。`ptygrid.yml` と `mterm.yml` が両方
+  存在するときは前者を検出した時点で sidecar になり、旧名は既に探索順で無効化されている
+  ため書き込みは通る（`legacy_mterm_yml_beside_a_real_config_still_allows_the_sidecar_write`）。
+- 出力ファイル名は **`ptygrid.init.yml`**（`init::SIDECAR_FILE_NAME`）固定。既存の
+  設定探索順（`resolve_config_path_pure`: `<work>/ptygrid.yml` → `<work>/mterm.yml` →
+  `<launch>/ptygrid.yml` → `~/.ptygrid/ptygrid.yml`）にこの名前は含まれない —
+  sidecar が生成先ディレクトリに存在しても次回ロードは無視する。
+- config watcher（`config::start_watcher`）は**現在ロード中のファイルの exact file
+  name のみ**を見て `config-changed` を emit する。sidecar はそもそもロードされる
+  ことがないため、この一致は原理的に成立せず `config-changed` を誤射しない。
+- 既存ファイル（`ptygrid.yml` / `mterm.yml`）は sidecar 経路でもテキストとして
+  読むだけ（`existing_text`）。parse も書き戻しもしない。
+- 既に sidecar が存在する場合は上書きする（init の作業用出力であり、ユーザーの資産
+  ではないという前提。内容が同一なら §上記のとおり書き込み自体を省略）。
+
+## 新規イベントは追加していない
+
+`lib.rs` の `generate_handler!` に登録されたのは `init_scan` / `init_preview` /
+`init_write` の 3 コマンドのみで、`init.rs` / `commands.rs` の init 経路に
+`app.emit(...)` の呼び出しは一切ない。生成後の反映は既存の `config-changed` にのみ
+依存する（frontend が自動 reload するかは未決、spec-init-5.0.2.md §9）。
+
+## 非回帰（本節はすべて additive）
+
+- `load_config` / `ConfigInfo`（全 field）/ `config-changed` /
+  `trust_working_folder` / `is_working_folder_trusted` は**不変**。init は
+  `trust::add_trusted` を呼ばず、trust ストアの状態を一切変更しない。
+- 既存 Tauri commands（`spawn_agent` / `git_*` / `spawn_workflow` 等）の引数・返り値は
+  不変。新設の 3 本はすべて追加のみで、既存コマンドと名前衝突しない。
+- `ptygrid.yml` のスキーマ（`Config` 構造体・既存フィールド）に変更なし。init は
+  既存キー命名（`AgentDef` は snake_case）を踏襲したテンプレート文字列を組み立てる
+  だけで、`Config` を経由したシリアライズは行わない。
+- init が生成する `agents:` / `processes:` の定義はすべて `autostart: false`
+  固定であり、生成直後の書き込みが trust プロンプトを誘発することはない
+  （`target: "project"` かつユーザーがプレビューを編集して `autostart: true` に
+  した場合のみ `trustPromptExpected: true` を返す）。
+
+## 実装状況・検証
+
+- 実装済み: `src-tauri/src/init.rs`（検出・テンプレート生成・自己検査・atomic
+  write、1402 行）+ `src-tauri/src/commands.rs` の `init_scan` / `init_preview` /
+  `init_write`（3 コマンド）+ `lib.rs` の `generate_handler!` 登録。frontend
+  （プレビューモーダル等、spec-init-5.0.2.md §6）は未着手。
+- `cargo test --lib` **400 passed / 0 failed**（うち init モジュールの unit test
+  **25 本**。PATH 探索・プロジェクト種別検出・テンプレート生成の決定性・全分岐の
+  自己検査通過・コメントアウト事故の回帰（明示 null は Err、キー行のみは Ok）・
+  sidecar 経路での既存ファイル無改変・legacy `mterm.yml` 単独時の書き込み拒否と
+  sidecar 併存時の書き込み許可・作業フォルダの絶対化＋字句正規化・
+  `autostart: true` 編集時の `trustPromptExpected` を個別に検証）。専用の統合
+  テストファイルは無く、`temp_dir()` ヘルパーによる実ファイルシステム操作の
+  テストが同モジュール内で unit test を兼ねる。
+- `cargo clippy --all-targets -- -D warnings` は `config.rs:834` の既存警告
+  （Phase 5.0 節既報のとおり本作業と無関係）以外はゼロ。`init.rs` /
+  `commands.rs` に起因する新規警告はない。
+- 実機手動検証（spec-init-5.0.2.md §7.2 の 4 項目）は未実施。plan.md への U 番号
+  登録は別途行う。
+
+---
+
 # Phase 5.5 追加契約（Observable & Standards-Compliant）
 
 > 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
