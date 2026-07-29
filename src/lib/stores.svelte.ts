@@ -32,6 +32,11 @@ export type LayoutMode = "auto" | 1 | 2 | 3;
 /** Auto-dismissing stacked toast (queen-notify, copy confirmations, ...). */
 export type Notice = { key: number; title: string; message: string };
 
+/** How long a `config-changed` for a path we just wrote is treated as the echo
+ * of that write. The watcher throttles for ~300ms; this leaves room without
+ * masking a real edit made moments later. */
+const SELF_WRITE_ECHO_MS = 3000;
+
 export const ui = $state({
   /** All known sessions keyed by id ({id, name?, cmd, state, code}). */
   sessions: {} as Record<number, SessionInfo>,
@@ -49,6 +54,11 @@ export const ui = $state({
   errorBanner: null as string | null,
   /** Path from the last `config-changed` event (shows the reload toast). */
   configChangedPath: null as string | null,
+  /** A file this app just wrote itself (Phase 5.0.2 init), with the time of the
+   * write. The watcher is throttled, so its `config-changed` for our own write
+   * lands *after* we already reloaded — suppressing it here keeps init from
+   * asking the user to reload the file they just asked us to create. */
+  selfWrite: null as { path: string; at: number } | null,
   /** Untrusted (project/launch) config awaiting a "trust this folder" decision
    * before its autostart commands may run (Finding S2). null when none pending. */
   trustPrompt: null as ConfigInfo | null,
@@ -308,6 +318,16 @@ export async function initGlobalListeners(): Promise<void> {
   });
 
   await listen<ConfigChangedPayload>("config-changed", (event) => {
+    const own = ui.selfWrite;
+    if (own !== null && own.path === event.payload.path) {
+      // Only swallow the echo of our own write; a later external edit of the
+      // same file still raises the toast once the window has passed.
+      if (Date.now() - own.at < SELF_WRITE_ECHO_MS) {
+        ui.selfWrite = null;
+        return;
+      }
+      ui.selfWrite = null;
+    }
     ui.configChangedPath = event.payload.path;
   });
 

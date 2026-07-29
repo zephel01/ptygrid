@@ -44,7 +44,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | config 読み込みとチップ表示のみ / 実走は未（U1） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | 🚧 | v0.5.1（`ac1b94b`） | 未（U5） |
-| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過、実機での操作は未実施。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | 🚧 | 未タグ | 未（U11） |
+| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で主要経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | 🚧 | 未タグ | 済 / 残 1 件（U11） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 未（U1 / U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
@@ -120,7 +120,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U8 | Windows | [porting.md](porting.md) の「Windows 対応チェックリスト」が全項目未着手。`process_name()` が `None` を返すため foreground 名解決 / agent-status / ssh 接続先表示が機能しない |
 | U9 | frontend チェック（`svelte-check` / `npm run build`） | 本作業環境に `node_modules` が無く**未実測**。`src/` は v0.5.1 の `ac1b94b` 以降変更されておらず `v0.5.6..main` の diff も 0 件なので v0.5.1 時点の「0 errors」から変わっていない**はず**だが、これは推測であって実測ではない |
 | U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
-| U11 | `ptygrid init`（5.0.2）の実機検証 | backend + UI とも実装済み・自動テストは通過だが、GUI を開いて操作した実績がゼロ。確認すべき最小項目: (1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て検出結果が実際の PATH と一致すること、(2) 書き込み後に agents チップが出て trust プロンプトが出ないこと（生成物は autostart 全 false のため）、(3) プレビューで `autostart: true` に手編集して書き込むと trust プロンプトが出ること（`loadConfig` → `maybeAutostart` → プロンプトの順序）、(4) 既存 `ptygrid.yml` があるフォルダでは `ptygrid.init.yml` が生成され既存ファイルの内容と mtime が変わらないこと、(5) 書き込み直後に watcher の `config-changed` と frontend の `loadConfig()` が競合して余計なトーストが出ないか（spec §9 で推測であり未実測とされている箇所）、(6) Global 選択で `~/.ptygrid/` が作られること |
+| U11 | `ptygrid init`（5.0.2）の実機検証 | **2026-07-30、macOS で実施**（すべてスクリーンショットで確認済み）。(1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て、検出結果（opencode/claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定なし）が実環境と一致することを確認、(2) 通常生成で `ptygrid.yml`（2,060 バイト）が生成され agents チップ 7 体が並び、生成物は autostart 全 false のため trust プロンプトは出ずペインも自動起動しないことを確認、(4) 既存設定ありの状態では副入口の書き込み先が `ptygrid.init.yml` に切り替わり、書き込み後も既存 `ptygrid.yml` は mtime・内容とも無変更であることを確認（上書き禁止の実測裏付け）、(5) 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが二重に出る競合を実測（spec §9 で推測としていた箇所が確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` + 3 秒窓）を別コミットで修正済み）。**残るのは (3) のみ**: プレビューを手編集して `autostart: true` にしてから書き込んだ場合に trust プロンプトが出ること（`init_write` → `loadConfig` → `maybeAutostart` の順序確認）。(6) Global 選択時の `~/.ptygrid/` 作成は今回未確認。詳細な経緯は §6.4 |
 
 ---
 
@@ -441,6 +441,27 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   「`main` 未マージも変わらない」はこの時点で失効。lib テストは 374 → 375 に増えた（§4 の実測）。
 - **当時の結論**: wire 契約が不変の内部ハードニングであり §4 の規約上は単独タグを必須としない。
   `5.0.5` は Arena view 用の予約なので本断面には採番しない（→ §1 の脚注※）。
+
+### 6.4 2026-07-30: 5.0.2 init の実機検証
+
+詳細な経緯。現在地は §1・§2（U11）。
+
+- 入ったもの: 実機検証そのもの（macOS）に加え、主入口の表示条件のバグ修正（`ffd32c3`）。従来は
+  起動時に `not_found:` を踏んだかのフラグに紐づけていたため、(a) 過去に ptygrid を使い前回の
+  作業フォルダが復元されると設定が見つかり主入口が一度も出ない、(b) 目標フォルダ指定読み込みが
+  既定設定で成功した瞬間にボタンが消える、という二重の不具合があった。条件を「いま設定ファイルが
+  効いているか」（`configInfo` が無い、または origin が `default`）に変更して解消した。
+- 当時の検証: 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」表示、検出結果（opencode/
+  claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定
+  なし）が実環境と一致、通常生成で `ptygrid.yml`（2,060 バイト・agents 7 体）を生成し trust
+  プロンプトなし・ペイン自動起動なしを確認、副入口（⚙→設定ファイル→設定を作る）で既存設定あり
+  時の書き込み先が `ptygrid.init.yml` に切り替わり既存 `ptygrid.yml` の mtime・内容が無変更である
+  ことを確認。すべてスクリーンショットで確認済み。
+- 当時の注記: 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが
+  二重に出る競合を実測した。spec-init-5.0.2.md §9 で「推測であり未実測」としていた watcher と
+  `loadConfig()` の競合がここで実測により確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` +
+  3 秒の窓）を別コミットで追加した。`autostart: true` への手編集後の trust プロンプト確認と
+  Windows（U8）は未実施のまま残る。
 
 ---
 
