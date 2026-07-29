@@ -1086,6 +1086,9 @@
   // maybeAutostart → trust-prompt flow decides whether anything may start.
   async function onInitWritten(result: InitWriteResult): Promise<void> {
     addNotice(m.initWritten(result.path, result.bytes), result.path);
+    // The watcher fires for this path a moment from now; mark it as ours so the
+    // reload toast does not ask for a reload we are about to do ourselves.
+    ui.selfWrite = { path: result.path, at: Date.now() };
     try {
       const info = await loadConfig(initPanelDir);
       ui.errorBanner = null;
