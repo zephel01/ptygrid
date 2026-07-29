@@ -45,7 +45,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | config 読み込みとチップ表示のみ / 実走は未（U1） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | 🚧 | v0.5.1（`ac1b94b`） | 未（U5） |
 | 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ⬜ | — | 該当なし |
-| 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude / grok は CLI コマンド、codex は `~/.codex/config.toml`、grok は `~/.grok/config.toml`）。spec 未作成（→ 脚注※） | ⬜ | — | 該当なし |
+| 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 未（U1 / U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
@@ -72,7 +72,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > 5.0.4 = Orchestrator 実行層**で、5.0.2 / 5.0.3 は長く欠番のままだった（タグメッセージが 5.0.2 と
 > 呼んだ内容は後の 5.0.4 として着地した）。**2026-07-29、ユーザー判断で決着**: 5.0.2 =
 > `ptygrid init`（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)）、5.0.3 = Queen MCP 登録の代行
-> （spec 未作成）に充てる。Memory + Provider は 5.0.6 以降へ回し、番号は着手時に確定する。なお
+> （[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）に充てる。Memory + Provider は 5.0.6 以降へ回し、番号は着手時に確定する。なお
 > `orchestrator.rs` のコード内コメントが 5.0.4 追補を「phase 5.0.5」と書いているが、`5.0.5` は
 > Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
 > §3 バックログ）。
@@ -173,8 +173,10 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 - 5.0.2 `ptygrid init` は spec 済み（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)）。環境検出 →
   テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示、という流れ。
-- 5.0.3（Queen MCP 登録の代行）は spec 未作成。バッジからのコピペ（`claude mcp add` 等）を
-  ptygrid 側で肩代わりする。
+- 5.0.3（Queen MCP 登録の代行）も spec 済み（[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）。
+  claude は CLI を代行実行、codex / grok は `toml_edit` で値単位編集し、差分承認・冪等・登録解除まで
+  を含む。**着手前の gate として「docs と実装の食い違いの確定」がある**（README / userguide は grok を
+  CLI と案内しているが、実装は codex と同一の TOML を出している）。
 - **ただし P1（実機での workflow 1 本流し）より前には置かない**: 入口だけ自動化しても、その先の
   workflow が実走未確認のままでは効果が薄いため。
 
