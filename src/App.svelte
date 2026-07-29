@@ -1052,10 +1052,10 @@
   }
 
   // ---- Phase 5.0.2: `ptygrid init` (config generation) ----
-  // Primary entry: the "no config anywhere" fallback (one bare shell) puts a
-  // "create a config" button in the toolbar. Secondary entry: the ⚙ menu.
-  /** True once the startup auto-load reported `not_found:` (spec §1). */
-  let configMissing = $state(false);
+  // Primary entry: the toolbar shows a "create a config" button whenever no
+  // config *file* is in effect (startup fallback, or a working folder that has
+  // none). Secondary entry: the ⚙ menu. The condition is derived from
+  // `ui.configInfo.origin`, so it survives selecting the target folder.
   let initPanelOpen = $state(false);
   /** The absolute folder handed to init_scan/preview/write. Always explicit —
    * `init_dir()` returns `no_target_dir:` rather than using the launch cwd. */
@@ -1088,7 +1088,6 @@
     addNotice(m.initWritten(result.path, result.bytes), result.path);
     try {
       const info = await loadConfig(initPanelDir);
-      configMissing = false;
       ui.errorBanner = null;
       await maybeAutostart(info);
     } catch (err) {
@@ -1571,8 +1570,8 @@
         const msg = String(err);
         if (msg.startsWith("not_found")) {
           await newShell(); // Phase 0-like: one adhoc shell
-          // Phase 5.0.2: this is init's primary entry point (spec §6).
-          configMissing = true;
+          // Phase 5.0.2: init's primary entry renders from `ui.configInfo`
+          // being absent here (spec §6); no separate flag is kept.
         } else if (!ui.errorBanner) {
           ui.errorBanner = msg;
         }
@@ -1658,9 +1657,15 @@
           {loadingConfig ? m.btnLoading : m.btnLoad}
         </button>
 
-        <!-- Phase 5.0.2 primary entry: only while no config was found anywhere
-             (the one-bare-shell fallback). The ⚙ menu keeps the secondary one. -->
-        {#if configMissing && !ui.configInfo}
+        <!-- Phase 5.0.2 primary entry: shown while no config *file* is in
+             effect. That is both the startup fallback and the case where the
+             working folder is pointed at a folder that has none — a manual load
+             of such a folder succeeds with the built-in default (origin
+             "default"), which is precisely when this button is wanted. Keying
+             this off `configMissing` alone made the button vanish the moment
+             the target folder was selected. The ⚙ menu keeps the secondary
+             entry, which stays available once a real config is loaded. -->
+        {#if !ui.configInfo || ui.configInfo.origin === "default"}
           <button
             class="btn"
             onclick={openInitPanel}
