@@ -358,6 +358,89 @@ const en = {
   trSubStopped:
     "This subagent has stopped (no further transcript output).",
   trWaiting: "Waiting for transcript… (read-only, observe only)",
+
+  // ---- init (Phase 5.0.2: generate ptygrid.yml) ----
+  initCreateConfig: "Create a config",
+  initCreateConfigTitle:
+    "Scan this folder and generate a ptygrid.yml (shown for review before anything is written)",
+  settingsInitLabel: "Config file",
+  initNeedDir:
+    "Enter the working folder in the toolbar first — init always needs an explicit folder (it never falls back to the launch folder).",
+  initTildeDir:
+    "A leading ~ is not expanded for init. Enter an absolute path, or press Load first so the folder is resolved.",
+  initTitle: "Create ptygrid.yml (init)",
+  initAria: "Generate a config file",
+  initLoading: "Scanning…",
+  initPreviewFailed: (err: unknown) => `Could not generate a preview: ${err}`,
+
+  // detection
+  initScanHead: "Detection result",
+  initScanDir: "Scanned folder",
+  initScanAgents: "Agent CLIs on PATH",
+  initScanProject: "Project markers",
+  initScanGit: "git repository",
+  initScanRouter: "Local LLM router",
+  initScanExisting: "Existing config",
+  initValueNone: "not found",
+  initValueYes: "yes",
+  initValueNo: "no",
+  initRouterFound: (port: number) => `127.0.0.1:${port} answered`,
+  initRouterNone: "127.0.0.1:3456 did not answer",
+  initLegacyTag: "legacy name (mterm.yml)",
+  initScanNote:
+    "Anything listed as not found is also the reason its guidance block is missing from the generated file (no git repository ⇒ no worktree note, and so on).",
+
+  // destination
+  initTargetHead: "Destination",
+  initTargetAria: "Destination of the generated file",
+  initTargetProject: "Project",
+  initTargetGlobal: "Global",
+  initTargetProjectNote:
+    "Written to the working folder. It stays subject to the usual trust confirmation before anything auto-starts.",
+  initGlobalWarn:
+    "Warning: configs in this folder auto-start without a trust confirmation.",
+  initDestLabel: "Will be written to",
+
+  // preview / self-check
+  initPreviewHead: "Generated config (editable)",
+  initPreviewAria: "Generated config file (editable)",
+  initCheckOk: "✅ Self-check passed (parse_config)",
+  initCheckNg: "❌ Self-check failed — writing is disabled",
+  initCheckEdited: "✎ Edited — it will be checked again on write",
+  initAutostartNote:
+    "Every autostart in the generated file is false: nothing starts on its own after writing.",
+
+  // sidecar / diff
+  initSidecarHead: "A config already exists here",
+  initSidecarNote: (name: string) =>
+    `The generated file goes to ${name}. The existing file is left untouched — adopt it by hand (merge or rename).`,
+  initDiffHead: "Line diff",
+  initDiffLeft: "Existing",
+  initDiffRight: "Generated",
+  initDiffTooLarge:
+    "Too large to align line by line — both sides are shown side by side without alignment.",
+
+  // legacy
+  initLegacyWarn: (path: string) =>
+    `${path} (the legacy name) is still there. Rename it to ptygrid.yml first — init refuses this write (legacy_config), because a new ptygrid.yml would silently win the search order.`,
+
+  // buttons / outcomes
+  btnInitWrite: "Write",
+  btnInitWriting: "Writing…",
+  btnInitCopy: "Copy to clipboard",
+  btnInitCopyTitle: "Copy the generated text without writing anything to disk",
+  initCopied:
+    "Generated config copied to the clipboard (nothing was written to disk).",
+  initWritten: (path: string, bytes: number) =>
+    `Wrote ${path} (${bytes} bytes).`,
+  initErrLegacy:
+    "The legacy mterm.yml is still in the working folder. Rename it to ptygrid.yml, then run init again.",
+  initErrInvalid:
+    "The edited content does not pass the self-check, so nothing was written. Fix the error below and try again.",
+  initErrNoHome:
+    "Global was selected but the home directory could not be resolved.",
+  initErrNoTargetDir:
+    "init was called without a target folder (a ptygrid bug — the frontend must always pass `dir`).",
 };
 
 export type Messages = typeof en;
@@ -661,6 +744,89 @@ const ja: Messages = {
   trSubStopped:
     "この subagent は停止しました（transcript の追記はありません）。",
   trWaiting: "transcript を待機中…（read-only・観測のみ）",
+
+  // ---- init (Phase 5.0.2: ptygrid.yml の自動生成) ----
+  initCreateConfig: "設定を作る",
+  initCreateConfigTitle:
+    "このフォルダを走査して ptygrid.yml を生成します（書き込む前に内容を確認できます）",
+  settingsInitLabel: "設定ファイル",
+  initNeedDir:
+    "先にツールバーの作業フォルダを入力してください。init は対象フォルダの明示が必須です（起動フォルダへは決してフォールバックしません）。",
+  initTildeDir:
+    "init では先頭の ~ が展開されません。絶対パスを入力するか、先に［読み込み］でフォルダを確定してください。",
+  initTitle: "ptygrid.yml を作成（init）",
+  initAria: "設定ファイルの生成",
+  initLoading: "走査中…",
+  initPreviewFailed: (err: unknown) => `プレビューを生成できませんでした: ${err}`,
+
+  // detection
+  initScanHead: "検出結果",
+  initScanDir: "走査したフォルダ",
+  initScanAgents: "PATH 上の agent CLI",
+  initScanProject: "プロジェクト種別",
+  initScanGit: "git リポジトリ",
+  initScanRouter: "ローカル LLM ルータ",
+  initScanExisting: "既存の設定ファイル",
+  initValueNone: "見つかりません",
+  initValueYes: "あり",
+  initValueNo: "なし",
+  initRouterFound: (port: number) => `127.0.0.1:${port} が応答しました`,
+  initRouterNone: "127.0.0.1:3456 は応答しませんでした",
+  initLegacyTag: "旧名（mterm.yml）",
+  initScanNote:
+    "「見つかりません」の項目は、対応する案内ブロックが生成物に出ない理由でもあります（git リポジトリでない ⇒ worktree の案内が出ない、など）。",
+
+  // destination
+  initTargetHead: "生成先",
+  initTargetAria: "生成先の選択",
+  initTargetProject: "Project",
+  initTargetGlobal: "Global",
+  initTargetProjectNote:
+    "作業フォルダに書きます。自動起動の前には従来どおり信頼確認が入ります。",
+  initGlobalWarn:
+    "警告: このフォルダの設定は信頼確認なしに autostart が走ります。",
+  initDestLabel: "書き込み先",
+
+  // preview / self-check
+  initPreviewHead: "生成物（編集できます）",
+  initPreviewAria: "生成された設定ファイル（編集可能）",
+  initCheckOk: "✅ 自己検査 OK（parse_config を通りました）",
+  initCheckNg: "❌ 自己検査 NG — 書き込みは無効です",
+  initCheckEdited: "✎ 編集済み（書き込み時に検査します）",
+  initAutostartNote:
+    "生成物の autostart はすべて false です。書き込んでも何も自動起動しません。",
+
+  // sidecar / diff
+  initSidecarHead: "既存の設定ファイルがあります",
+  initSidecarNote: (name: string) =>
+    `生成物は ${name} に書きます。既存ファイルは変更しません（採用は手動でマージまたはリネームしてください）。`,
+  initDiffHead: "行単位の差分",
+  initDiffLeft: "既存",
+  initDiffRight: "生成物",
+  initDiffTooLarge:
+    "行の対応付けを行うには大きすぎるため、位置合わせなしで左右に並べています。",
+
+  // legacy
+  initLegacyWarn: (path: string) =>
+    `旧名の ${path} が残っています。先に ptygrid.yml へリネームしてください — 新しい ptygrid.yml が探索順で旧名を黙って無効化するため、init はこの書き込みを拒否します（legacy_config）。`,
+
+  // buttons / outcomes
+  btnInitWrite: "書き込む",
+  btnInitWriting: "書き込み中…",
+  btnInitCopy: "クリップボードにコピー",
+  btnInitCopyTitle: "ディスクに書かずに生成物をコピーします",
+  initCopied:
+    "生成物をクリップボードにコピーしました（ディスクには書いていません）。",
+  initWritten: (path: string, bytes: number) =>
+    `${path} に書き込みました（${bytes} バイト）。`,
+  initErrLegacy:
+    "作業フォルダに旧名の mterm.yml が残っています。ptygrid.yml にリネームしてから init をやり直してください。",
+  initErrInvalid:
+    "編集後の内容が自己検査を通らなかったため、1バイトも書き込んでいません。下のエラーを直して再実行してください。",
+  initErrNoHome:
+    "Global を選びましたが、ホームディレクトリを解決できませんでした。",
+  initErrNoTargetDir:
+    "対象フォルダなしで init が呼ばれました（ptygrid のバグです — frontend は必ず `dir` を渡す必要があります）。",
 };
 
 const DICTS: Record<Locale, Messages> = { en, ja };

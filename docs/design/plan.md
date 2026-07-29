@@ -44,7 +44,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | config 読み込みとチップ表示のみ / 実走は未（U1） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | 🚧 | v0.5.1（`ac1b94b`） | 未（U5） |
-| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ⬜ | — | 該当なし |
+| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過、実機での操作は未実施。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | 🚧 | 未タグ | 未（U11） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 未（U1 / U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
@@ -77,7 +77,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
 > §3 バックログ）。
 
-**いま特に効く読み方**: ⬜ の多さより、**🚧 が 7 行あることのほうが重要**。5.0.0 / 5.0.1 / 5.0.4 /
+**いま特に効く読み方**: ⬜ の多さより、**🚧 が 8 行あることのほうが重要**。5.0.0 / 5.0.1 / 5.0.4 /
 5.0.4 追補 の 4 行はいずれも同じ理由（実機で workflow を 1 本も流していない = U1）で 🚧 に留まり、
 5.0.4 以降のコードはすべてその上に積まれている。workflow 系は「動くはずのコード」のまま 4 断面ぶん
 積み上がった状態であり、新機能（⬜ 群）より先に U1 を消すのが効く（→ §3 P1）。未タグ成果が
@@ -120,6 +120,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U8 | Windows | [porting.md](porting.md) の「Windows 対応チェックリスト」が全項目未着手。`process_name()` が `None` を返すため foreground 名解決 / agent-status / ssh 接続先表示が機能しない |
 | U9 | frontend チェック（`svelte-check` / `npm run build`） | 本作業環境に `node_modules` が無く**未実測**。`src/` は v0.5.1 の `ac1b94b` 以降変更されておらず `v0.5.6..main` の diff も 0 件なので v0.5.1 時点の「0 errors」から変わっていない**はず**だが、これは推測であって実測ではない |
 | U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
+| U11 | `ptygrid init`（5.0.2）の実機検証 | backend + UI とも実装済み・自動テストは通過だが、GUI を開いて操作した実績がゼロ。確認すべき最小項目: (1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て検出結果が実際の PATH と一致すること、(2) 書き込み後に agents チップが出て trust プロンプトが出ないこと（生成物は autostart 全 false のため）、(3) プレビューで `autostart: true` に手編集して書き込むと trust プロンプトが出ること（`loadConfig` → `maybeAutostart` → プロンプトの順序）、(4) 既存 `ptygrid.yml` があるフォルダでは `ptygrid.init.yml` が生成され既存ファイルの内容と mtime が変わらないこと、(5) 書き込み直後に watcher の `config-changed` と frontend の `loadConfig()` が競合して余計なトーストが出ないか（spec §9 で推測であり未実測とされている箇所）、(6) Global 選択で `~/.ptygrid/` が作られること |
 
 ---
 
@@ -171,14 +172,15 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 限り使う回数が増えず、他人にも渡せない（作者本人の個人設定が 790 行 → 棚卸しで 506 行に減った、
 という実データがそれを裏づける）。
 
-- 5.0.2 `ptygrid init` は spec 済み（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)）。環境検出 →
-  テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示、という流れ。
-- 5.0.3（Queen MCP 登録の代行）も spec 済み（[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）。
-  claude は CLI を代行実行、codex / grok は `toml_edit` で値単位編集し、差分承認・冪等・登録解除まで
-  を含む。**着手前の gate として「docs と実装の食い違いの確定」がある**（README / userguide は grok を
-  CLI と案内しているが、実装は codex と同一の TOML を出している）。
-- **ただし P1（実機での workflow 1 本流し）より前には置かない**: 入口だけ自動化しても、その先の
-  workflow が実走未確認のままでは効果が薄いため。
+- 5.0.2 `ptygrid init`（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md): 環境検出 → テンプレート生成 →
+  自己検査 → 既存ファイルがある場合は sidecar で差分提示）は backend（`init.rs` + Tauri command 3 本）と
+  frontend（`InitPanel.svelte` + 入口 2 つ + i18n）を実装済み。残りは実機での操作確認（U11）のみ。
+- 5.0.3（Queen MCP 登録の代行）は spec のみ（[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）
+  で実装は未着手。claude は CLI を代行実行、codex / grok は `toml_edit` で値単位編集し、差分承認・冪等・
+  登録解除までを含む。**着手前の gate として「docs と実装の食い違いの確定」がある**（README / userguide
+  は grok を CLI と案内しているが、実装は codex と同一の TOML を出している）。
+- **5.0.3 の着手は P1（実機での workflow 1 本流し）より前には置かない**: 入口だけ自動化しても、その先の
+  workflow が実走未確認のままでは効果が薄いため。5.0.2 の残作業（U11）は軽量なので先に消してよい。
 
 ### P5. 未着手フェーズ（着手順の案）
 
@@ -272,7 +274,7 @@ v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23。
 
 ### v0.5.6 以降の未タグ成果（`main` = `4c02cbb`）
 
-`v0.5.6..main` は 24 コミット（46 ファイル / +7,949 −729）。内訳:
+`v0.5.6..main` は 24 コミット（46 ファイル / +7,949 −729）+ 本ブランチの 5.0.2 実装。内訳:
 
 | コミット | 経路 | 内容 |
 |---|---|---|
@@ -281,6 +283,7 @@ v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23。
 | `52de433` | PR #3 に同梱 | 5.0.4 実行層の仕上げ: `fanOut` 黙殺による false green の解消（`fan-out` 以外での `fanOut` 宣言を load 時に拒否、`joinOn: N` を実効コピー数で検査）+ straggler cancellation。CONTRACT.md 続報9 |
 | `2dc5e40` | PR #3（`4c02cbb`） | Orchestrator ハードニング。CONTRACT.md 続報10、設計は [refactor-pane-cap-5.0.5.md](refactor-pane-cap-5.0.5.md)、経緯は §6 |
 | `3883128` / `d3eac32` | `main` 直コミット | docs の公開/内部分離 / MIT license 宣言 |
+| 未確定（本ブランチ） | 未マージ | 5.0.2 `ptygrid init`: backend `init.rs`（1402 行）+ Tauri command 3 本 + frontend `InitPanel.svelte`（858 行）+ 入口 2 つ + i18n 53 キー。lib テスト 375→400、統合 14 は不変、clippy は既存の `config.rs` 1 件のみ、`npm run check`/`build` 成功。CONTRACT.md に「Phase 5.0.2 追加契約」を追記済み |
 
 ### 次タグの前提（打つ前に潰すもの）
 

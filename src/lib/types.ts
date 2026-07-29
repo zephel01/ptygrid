@@ -367,3 +367,60 @@ export type GitCommitInfo = {
   summary: string;
   output: string;
 };
+
+// Phase 5.0.2 (`ptygrid init`: 設定ファイルの自動生成)
+// CONTRACT.md「Phase 5.0.2 追加契約」の wire 型と 1:1（camelCase）。
+
+/** 生成先。project=`<work>/ptygrid.yml`（既定）、global=`~/.ptygrid/ptygrid.yml`。
+ * global は trust::is_trusted_pure が無条件 trusted 扱いにするため、選択そのものが
+ * security posture を変える（spec §3.3）。 */
+export type InitTarget = "project" | "global";
+
+/** 既存の設定探索順で最初に当たったファイル。legacy=true は旧名 mterm.yml。
+ * origin は既存 ConfigOrigin の再利用で、scan が実際に返すのは
+ * project / launch / global の 3 値のみ（default は理論上の型のみ）。 */
+export type ExistingConfig = {
+  path: string;
+  origin: ConfigOrigin;
+  legacy: boolean;
+};
+
+/** init_scan の戻り値。個々の検出は best-effort で、1つ失敗しても全体は失敗しない。 */
+export type InitScanReport = {
+  /** 走査した作業フォルダ（絶対パス。`.`/`..` を字句的に畳んだ値。canonicalize はしない） */
+  dir: string;
+  /** PATH で見つかった agent CLI 名（KNOWN_AGENTS 宣言順、重複なし） */
+  agents: string[];
+  /** "cargo" | "npm" | "python" | "go"（複数可・空可） */
+  projectKinds: string[];
+  gitRepo: boolean;
+  /** 応答したローカル LLM ルータのポート。無ければ null */
+  routerPort: number | null;
+  existing: ExistingConfig | null;
+};
+
+/** init_preview の戻り値（生成 + 自己検査。ディスクには書かない）。 */
+export type InitPreview = {
+  content: string;
+  /** 書き込み予定の絶対パス（sidecar のときは sidecar 側） */
+  path: string;
+  target: InitTarget;
+  /** `<dir>/ptygrid.yml` が既に存在するため別名に書く場合 true */
+  sidecar: boolean;
+  /** 自己検査（parse_config）の結果 */
+  valid: boolean;
+  error?: string;
+  /** sidecar のとき、差分表示用に読んだ既存の生テキスト */
+  existingContent?: string;
+  scan: InitScanReport;
+};
+
+/** init_write の戻り値。trustPromptExpected=target:project かつ書き込んだ定義に
+ * autostart:true が1件以上あるとき true（init 生成物は常に false なので、
+ * true になるのはプレビューを編集した場合のみ）。 */
+export type InitWriteResult = {
+  path: string;
+  bytes: number;
+  sidecar: boolean;
+  trustPromptExpected: boolean;
+};

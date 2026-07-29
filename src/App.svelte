@@ -4,6 +4,7 @@
   import Terminal from "./lib/Terminal.svelte";
   import TranscriptPane from "./lib/TranscriptPane.svelte";
   import GitPanel from "./lib/GitPanel.svelte";
+  import InitPanel from "./lib/InitPanel.svelte";
   import StatusSidebar from "./lib/StatusSidebar.svelte";
   import type { StatusRow } from "./lib/StatusSidebar.svelte";
   import WorkflowPanel from "./lib/WorkflowPanel.svelte";
@@ -30,6 +31,7 @@
     AgentStatus,
     ConfigInfo,
     HostLeadStatus,
+    InitWriteResult,
     LogicalSession,
     ProjectState,
     SessionInfo,
@@ -1049,6 +1051,51 @@
     }
   }
 
+  // ---- Phase 5.0.2: `ptygrid init` (config generation) ----
+  // Primary entry: the "no config anywhere" fallback (one bare shell) puts a
+  // "create a config" button in the toolbar. Secondary entry: the ⚙ menu.
+  /** True once the startup auto-load reported `not_found:` (spec §1). */
+  let configMissing = $state(false);
+  let initPanelOpen = $state(false);
+  /** The absolute folder handed to init_scan/preview/write. Always explicit —
+   * `init_dir()` returns `no_target_dir:` rather than using the launch cwd. */
+  let initPanelDir = $state("");
+
+  function openInitPanel(): void {
+    settingsPanelOpen = false;
+    // A loaded config already carries the resolved absolute folder; without one
+    // (the fallback state this feature exists for) the toolbar input is the
+    // only source of the target folder.
+    const dir = ui.configInfo?.dir ?? configDirInput.trim();
+    if (dir === "") {
+      ui.errorBanner = m.initNeedDir;
+      return;
+    }
+    // init::absolute_dir does not expand `~` (unlike config::expand_working_dir),
+    // so a home-relative input would silently resolve under the launch cwd.
+    if (dir.startsWith("~")) {
+      ui.errorBanner = m.initTildeDir;
+      return;
+    }
+    initPanelDir = dir;
+    initPanelOpen = true;
+  }
+
+  // spec §9 decision (a): the frontend reloads after a successful write. init
+  // itself never touches the trust store, so the usual loadConfig →
+  // maybeAutostart → trust-prompt flow decides whether anything may start.
+  async function onInitWritten(result: InitWriteResult): Promise<void> {
+    addNotice(m.initWritten(result.path, result.bytes), result.path);
+    try {
+      const info = await loadConfig(initPanelDir);
+      configMissing = false;
+      ui.errorBanner = null;
+      await maybeAutostart(info);
+    } catch (err) {
+      ui.errorBanner = String(err);
+    }
+  }
+
   async function restartSession(id: number): Promise<void> {
     if (!isTauri()) {
       writeToTerm(id, "\r\n\x1b[2m— restarted —\x1b[0m\r\n");
@@ -1524,6 +1571,8 @@
         const msg = String(err);
         if (msg.startsWith("not_found")) {
           await newShell(); // Phase 0-like: one adhoc shell
+          // Phase 5.0.2: this is init's primary entry point (spec §6).
+          configMissing = true;
         } else if (!ui.errorBanner) {
           ui.errorBanner = msg;
         }
@@ -1608,6 +1657,18 @@
         <button class="btn" onclick={onLoadClick} disabled={loadingConfig}>
           {loadingConfig ? m.btnLoading : m.btnLoad}
         </button>
+
+        <!-- Phase 5.0.2 primary entry: only while no config was found anywhere
+             (the one-bare-shell fallback). The ⚙ menu keeps the secondary one. -->
+        {#if configMissing && !ui.configInfo}
+          <button
+            class="btn"
+            onclick={openInitPanel}
+            title={m.initCreateConfigTitle}
+          >
+            {m.initCreateConfig}
+          </button>
+        {/if}
 
         {#if ui.configInfo}
           <span
@@ -2332,6 +2393,18 @@
               {/each}
             </span>
           </div>
+          <!-- Phase 5.0.2 secondary entry (spec §6): available with a config
+               loaded too, where init generates the ptygrid.init.yml sidecar. -->
+          <div class="settings-row">
+            <span class="settings-label">{m.settingsInitLabel}</span>
+            <button
+              class="btn btn-small"
+              onclick={openInitPanel}
+              title={m.initCreateConfigTitle}
+            >
+              {m.initCreateConfig}
+            </button>
+          </div>
         </div>
       {/if}
     </div>
@@ -2393,6 +2466,14 @@
         {m.btnLater}
       </button>
     </div>
+  {/if}
+
+  {#if initPanelOpen}
+    <InitPanel
+      dir={initPanelDir}
+      onclose={() => (initPanelOpen = false)}
+      onwritten={onInitWritten}
+    />
   {/if}
 </main>
 
