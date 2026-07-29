@@ -44,8 +44,8 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | config 読み込みとチップ表示のみ / 実走は未（U1） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | 🚧 | v0.5.1（`ac1b94b`） | 未（U5） |
-| 5.0.2 | **欠番／未確定**。指すものが 3 資料で割れており、実装としては何も消化していない（→ 脚注※） | ⬜ | — | 該当なし |
-| 5.0.3 | **欠番／未確定**。同様に割れており未消化（→ 脚注※） | ⬜ | — | 該当なし |
+| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ⬜ | — | 該当なし |
+| 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude / grok は CLI コマンド、codex は `~/.codex/config.toml`、grok は `~/.grok/config.toml`）。spec 未作成（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 未（U1 / U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
@@ -62,19 +62,20 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 6.0.4 | Secrets derived + proxy | ⬜ | — | 該当なし |
 | 6.0.5 | Replay UI + Export（spec-phase6-0 §9 は「6.0.5 完了で v1.0.0 昇格を検討」としている） | ⬜ | — | 該当なし |
 
-> **※ 脚注: Phase 5.0 の patch 採番が 3 資料で食い違っている（未解決。説明はここ 1 箇所だけ）**
+> **※ 脚注: Phase 5.0 の patch 採番が 3 資料で食い違っていた経緯と、その決着（2026-07-29）**
 > [spec-phase5-0.md](../spec/spec-phase5-0.md) §9 = 「5.0.0 Provider 基盤 / 5.0.1 Memory 保存経路 /
 > 5.0.2 Memory embedding / 5.0.3 Orchestrator pipeline+supervisor / 5.0.4 Orchestrator
 > fan-out+handoff / 5.0.5 Arena」、CONTRACT.md「Phase 5.0 追加契約」冒頭 = 「5.0.0 MVO /
 > 5.0.1 Memory FTS5 / 5.0.2 Memory embedding / 5.0.3 Provider / 5.0.4 Orchestrator
 > supervisor+handoff / 5.0.5 Arena」、`v0.5.6` のタグメッセージ = 「5.0.2 Workflow Reliability」
 > という第 3 の呼び方。**実際に消化されたのは 5.0.0 = MVO、5.0.1 = Workflow Resume、
-> 5.0.4 = Orchestrator 実行層**で、5.0.2 / 5.0.3 は欠番（タグメッセージが 5.0.2 と呼んだ内容は
-> 後の 5.0.4 として着地した）。結果 Memory + Provider に割り当てられる patch 番号が無い。
-> **どう付け直すかは未確定**で、「空いた 5.0.2 / 5.0.3 を再利用」か「5.0.6 以降に付け直す」かを
-> 着手時に決める。なお `orchestrator.rs` のコード内コメントが 5.0.4 追補を「phase 5.0.5」と
-> 書いているが、`5.0.5` は Arena view 用に予約済み（本表の 5.0.5 行 /
-> [spec-phase5-0.md](../spec/spec-phase5-0.md) §9）のため**本断面には採番しない**。
+> 5.0.4 = Orchestrator 実行層**で、5.0.2 / 5.0.3 は長く欠番のままだった（タグメッセージが 5.0.2 と
+> 呼んだ内容は後の 5.0.4 として着地した）。**2026-07-29、ユーザー判断で決着**: 5.0.2 =
+> `ptygrid init`（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)）、5.0.3 = Queen MCP 登録の代行
+> （spec 未作成）に充てる。Memory + Provider は 5.0.6 以降へ回し、番号は着手時に確定する。なお
+> `orchestrator.rs` のコード内コメントが 5.0.4 追補を「phase 5.0.5」と書いているが、`5.0.5` は
+> Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
+> §3 バックログ）。
 
 **いま特に効く読み方**: ⬜ の多さより、**🚧 が 7 行あることのほうが重要**。5.0.0 / 5.0.1 / 5.0.4 /
 5.0.4 追補 の 4 行はいずれも同じ理由（実機で workflow を 1 本も流していない = U1）で 🚧 に留まり、
@@ -158,25 +159,38 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 安全性の伸びが大きいから。
 
 **根拠**: [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の実装マトリクスで ❌ のまま
-残っているのは 2 行だけで、その 1 つが `escalation`（もう 1 つは `arena: true` で、こちらは P4 の
+残っているのは 2 行だけで、その 1 つが `escalation`（もう 1 つは `arena: true` で、こちらは P5 の
 5.0.5 で解消する）。自主運用（[autonomous-operation-guide.md](../guide/autonomous-operation-guide.md)）は
 「人間が気づく」ことに依存しており、通知が無いと夜間・離席中の失敗が滞留する。4.4.2 の配送機構
 （OS 通知 / Slack / Mattermost / Discord / Telegram）をそのまま使えるので、**新しい配送機構は
 要らず workflow 側のイベントを既存経路へ流すだけ**で済む見込み。
 
-### P4. 未着手フェーズ（着手順の案）
+### P4. 5.0.2 `ptygrid init` / 5.0.3 登録代行（入口の自動化）
 
-**なぜ今それか**: P1〜P3 で足元が固まるまでは着手しない。以下は「固まったあとの順番」の案。
+**なぜ今それか**: エンジン（5.0.4 まで実装済み）より**入口**が律速になっている。設定を手書きする
+限り使う回数が増えず、他人にも渡せない（作者本人の個人設定が 790 行 → 棚卸しで 506 行に減った、
+という実データがそれを裏づける）。
+
+- 5.0.2 `ptygrid init` は spec 済み（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)）。環境検出 →
+  テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示、という流れ。
+- 5.0.3（Queen MCP 登録の代行）は spec 未作成。バッジからのコピペ（`claude mcp add` 等）を
+  ptygrid 側で肩代わりする。
+- **ただし P1（実機での workflow 1 本流し）より前には置かない**: 入口だけ自動化しても、その先の
+  workflow が実走未確認のままでは効果が薄いため。
+
+### P5. 未着手フェーズ（着手順の案）
+
+**なぜ今それか**: P1〜P4 で足元が固まるまでは着手しない。以下は「固まったあとの順番」の案。
 
 | 順 | 内容 | 根拠 |
 |---|---|---|
 | 1 | **5.5.1 OTel 計装 + SQLite シンク** → **5.5.2 Cost 計算 + `agent-cost`** | 5.5.0 で RC ルータと `_meta.traceparent` の受け口だけ作って**エクスポート先が無い**（span を落としているだけ）。半端な状態を先に閉じる。バックエンド完結で UI 変更が要らず、P1/P2 と衝突しにくい |
 | 2 | **5.0.5 Arena view** | fan-out + `joinOn: any` の straggler キャンセルが Arena の前提。spec-phase5-0 §2.4 が要求する「敗者が自動 CANCELLED」は 5.0.4 で満たされているので、いま作れば既存基盤の上に乗る |
-| 3 | **Memory + Provider** | ptygrid 単体で完結せず、embedding backend（Ollama / LM Studio 等）と `sqlite-vec` の配布方式が未決（spec-phase5-0 §10）。外部依存が最も重い。**patch 番号が空いていない**（§1 の脚注※） |
+| 3 | **Memory + Provider** | ptygrid 単体で完結せず、embedding backend（Ollama / LM Studio 等）と `sqlite-vec` の配布方式が未決（spec-phase5-0 §10）。外部依存が最も重い。5.0.6 以降に付け直す（§1 の脚注※） |
 | 4 | **5.5.3 Agent Status Rings / 5.5.4 Trace Waterfall + Cost Dashboard** | どちらも frontend 中心で、5.5.1/5.5.2 のデータが無いと表示するものが無い。順序として後ろ |
 | 5 | **Phase 6.0 Security（6.0.0〜6.0.5）** | `user_version` 4 の 3 テーブル同時導入を伴い、`session.rs`（PTY hot path）に tee tap を入れる最も侵襲的な変更。§5.2 の規律どおり人手レビュー枠が要る。macOS/Linux の sandbox 実装差も大きい |
 
-### P5. Windows 移植 / Linux 実機検証の継続
+### P6. Windows 移植 / Linux 実機検証の継続
 
 **なぜ今それか**: 優先度は低いが、beta 表記を外す前提条件なので落とさずに持っておく（U7 / U8）。
 
@@ -185,12 +199,13 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 ### 継続ウォッチ / バックログ
 
-いずれも「優先度は P1〜P5 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
+いずれも「優先度は P1〜P6 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
 
-- **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P4）までの間は
+- **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P5）までの間は
   [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の ❌ 表記を維持する
-- **Phase 5.0 の patch 採番の整理**（§1 の脚注※）: Memory / Provider の着手前に決め直す。`orchestrator.rs` のコメントの「phase 5.0.5」表記削除も同じ整理コミットで
+- **`orchestrator.rs` のコード内コメントの「phase 5.0.5」表記**: 整理コミットで削除する
+  （5.0.5 は Arena view 用に予約済みで、採番の食い違い自体は §1 の脚注※で決着済み）
 - **`src-tauri/src/orchestrator.rs.bak` が git に追跡されたまま**: live source ではないが、ガイド §1 が
   「commit 済みの `.bak` に旧コードが残るが実行系とは無関係」と注記せざるを得ない。次の整理コミットで削除
 - **spec-phase5-5.md §9 の「バージョン割り当て」表が未修正**: §4 の次タグ案 (a) を採る場合に
@@ -329,7 +344,7 @@ migration は additive、既存 `queen.sqlite3` を壊さない。version bump �
 > 導入し 5.0.0 で skeleton・5.0.1 で本格実装」という下の規律は、実際には **5.0.1 が Workflow
 > Resume に充てられ memory は着手されなかった**ため、v3 は `workflow_runs` のみで確定している。
 > memory 系テーブルを追加する場合は additive migration を v3 内で行うか v4 を切るかを、
-> 着手時に決め直す必要がある（§3 P4）。
+> 着手時に決め直す必要がある（§3 P5）。
 
 **規律**: 未知の新 version は黙って開かない（明示 error でユーザーに再インストールを促す。Phase 3.6
 の規律を継承）/ migration は transactional で既存の pins/notes/inbox データを壊さない /
