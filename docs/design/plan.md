@@ -47,7 +47,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ✅ | 未タグ | 済（U11、2026-07-30） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
-| 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
+| 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | U3 は 2026-07-30 に実施→不整合を発見・修正済みだが再検証待ち（→ §6.6）/ U4 は未 |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
@@ -77,7 +77,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
 > §3 バックログ）。
 
-**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。🚧 が 7 行残っているが、理由はもう共通ではなく個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、resume バナー（U5）、今日のハードニングの pane 上限待ちと mailbox 分離（U3 / U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）。未タグ成果へのタグ付けは「P1 を通してから」という前提を満たしたので、着手できる状態になった（→ §3 P2、§4）。
+**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。🚧 が 7 行残っているが、理由はもう共通ではなく個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、resume バナー（U5）、pane 上限待ち（U3、不整合を発見・修正済みだが再検証待ち）と mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）。未タグ成果へのタグ付けは「P1 を通してから」という前提を満たしたので、着手できる状態になった（→ §3 P2、§4）。
 
 **補足: 主要モジュールの所在**（状態は上表を見ること）
 
@@ -108,7 +108,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 |---|---|---|
 | U1 | **実機での workflow 1 本流し**（GUI の 🔀 チップ または Queen tool `spawn_workflow` から実走し、ペインの挙動を目視） | **2026-07-30、macOS で完了**。`smoke`（`pattern: pipeline` / `autoClose: success` / `a`(t1) → `b`(t2)）を最後まで流し切り、step `a` の終了で step `b` が自動 spawn され、run 完了で 2 枚のペインが自動で閉じるところまで確認。これで「完了判定が実 PTY で発火するか」「DAG が進むか」「`autoClose` が効くか」「`workflow-state` が frontend に届くか」の 4 つの継ぎ目が実機で裏付けられた。**5.0.0 以来続いていた「一度も実走していない」状態はここで解消**。残る実機項目は個別機能ごと（U2〜U5）に分かれる。詳細な経緯は §6.5 |
 | U2 | straggler 協調キャンセルの pane kill（fan-out レースの敗者ペインが GUI 上で実際に閉じること） | 続報9 が名指しで「目視確認未了」。U1 の後続 |
-| U3 | pane 上限（9 面）到達時の待ち行列化が実機で `Pending` のまま待ち、空きで再開すること（`error` に `"waiting for a free pane slot (N/9 occupied)"`） | `2dc5e40` の中核挙動。unit テストのみ |
+| U3 | pane 上限（9 面）到達時の待ち行列化が実機で `Pending` のまま待ち、空きで再開すること（`error` に `"waiting for a free pane slot (N/9 occupied)"`） | **2026-07-30、macOS で実施→不整合を発見**。8 面埋まった状態から `smoke` を起動し step `a` が 9 枚目を占有→`close_on_exit` 未指定のため自然終了後も `Exited` のままセルを占有→次 step の判定は live 基準で空きありと誤認して spawn し、frontend は表示できないまま headless で走った。占有判定を `occupied_pane_count()`（グリッド全セル数、`Exited` 含む）へ修正し `live_session_count()` は削除（詳細 §6.6）。**修正後の再検証は未実施のため U3 は完了としない** |
 | U4 | 同名 workflow の並行 run が互いの返信を取りこぼさないこと（mailbox の run 単位分離） | 同上 |
 | U5 | クラッシュ / 再起動後の resume Y/N バナー（5.0.1） | 5.0.1 完了時点から「継続」のまま |
 | U6 | host モード（Phase 4.2）の Claude Code 実機検証（spec-claude-teams-panes §10.3 の手順） | 実装は入っているが実機手順は未消化。macOS 必須 / Linux はベストエフォート |
@@ -478,6 +478,27 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   straggler キャンセル（U2）、`joinOn: reply` / `condition:` / `handoffTo` / `retry:` / `timeoutMs`
   といった 5.0.4 固有機能、pane 上限待ち（U3）、mailbox の run 単位分離（U4）、resume バナー（U5）
   はいずれも**別途 1 本ずつ確認が要る**。P2（未タグ成果へのタグ付け）の前提条件は満たした。
+
+### 6.6 2026-07-30: U3 で見つかった pane 上限の数え方の不整合
+
+詳細な経緯。現在地は §1・§2（U3）。
+
+- 入ったもの: U3（pane 上限の待ち行列化）の実機 1 本流し中に見つかった不整合の修正。8 面埋まった
+  状態で `smoke` の step `a`(t1) が 9 枚目を占有し、`close_on_exit` 未指定のため自然終了後も
+  `Exited` のままセルを占有し続けた。続報10 決定 A-7 の「`state != Exited` の数」基準では次
+  step の判定が live=8 と見て空きありと誤認して spawn し、frontend は `ui.panes.length`
+  （グリッドの全セル数）でしか描画できず、セッションが表示できないまま headless で走った。
+  占有判定を `PtyManager::occupied_pane_count()`（全 state、`Exited` 含む）へ変更し
+  `live_session_count()` は削除、`team_presets.rs` の判定も同じ基準へ揃えた。
+  `teams_hooks.rs` / `teams_host.rs` の `GRID_MAX_PANES` 判定は元から `sessions.len()`
+  （全 state）基準だったため、これで orchestrator / team_presets / teams 系 / frontend の
+  `MAX_PANES` の 4 経路が同じ基準に揃った。
+- 当時の検証: lib **402 passed**（追加2本 `spawn_ready_counts_an_exited_pane_against_the_budget` /
+  `an_exited_pane_still_fills_the_team_pane_cap`、更新1本 `live_session_count_excludes_exited_slots`
+  → `occupied_pane_count_includes_exited_slots`）、統合14は不変。
+- 当時の注記: 修正後の再検証（8 面埋まった状態から再度 `smoke` を流し、`Pending` のまま待って
+  空きで再開することの目視）は未実施。CONTRACT.md は続報10 への訂正+追記で対応し、設計メモは
+  [refactor-pane-cap-5.0.5.md](refactor-pane-cap-5.0.5.md) A-7 に追記した。
 
 ---
 

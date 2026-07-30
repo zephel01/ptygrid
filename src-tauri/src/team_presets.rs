@@ -139,19 +139,23 @@ pub fn start_team<R: Runtime>(
             });
             continue;
         }
-        // Occupancy, not slot count: an `Exited` pane is a reclaimable slot,
-        // and counting it would refuse a member the grid has room for. Now
-        // agrees with `live_session_id`'s own "live = not Exited" rule two
-        // branches up (they disagreed until 5.0.5) and with
-        // `orchestrator::pane_budget`. `live_session_count` also skips the
-        // per-session `ps` lookup `list_sessions` pays for.
+        // Grid-cell occupancy, matching `orchestrator::pane_budget`: an
+        // `Exited` pane is never auto-reaped and keeps its cell on the
+        // frontend grid (`ui.panes.length`), so it still counts. Counting
+        // live-only (5.0.5 decision A-7) let the backend start sessions the
+        // frontend had no cell to render — reversed 2026-07-30, see
+        // `PtyManager::occupied_pane_count`. Note this is deliberately a
+        // different rule from `live_session_id` two branches up: reuse needs a
+        // pane that is still alive, capacity needs a free cell.
+        // `occupied_pane_count` also skips the per-session `ps` lookup
+        // `list_sessions` pays for.
         //
         // The SEMANTICS here deliberately stay "fail the member" rather than
         // adopting the orchestrator's new wait-for-a-slot behaviour:
         // `start_team` is a synchronous one-shot with no driver behind it to
         // retry on, and partial launch with explicit per-member failures is
         // the contract (spec-team-presets.md §4.3).
-        if manager.live_session_count() >= TEAM_SESSION_CAP {
+        if manager.occupied_pane_count() >= TEAM_SESSION_CAP {
             members.push(MemberOutcome {
                 agent,
                 standby: false,
@@ -363,6 +367,66 @@ mod tests {
         assert_eq!(manager.list_sessions().len(), TEAM_SESSION_CAP);
         // The team still activated (local started), so kickoff is delivered.
         assert!(report.kickoff_delivered);
+
+        for s in manager.list_sessions() {
+            let _ = manager.kill_pty(s.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion to the test above, pinning the 2026-07-30 counting change:
+    /// a pane whose process exited on its own keeps its grid cell (it is never
+    /// auto-reaped), so it fills the cap just like a running one. The partial
+    /// launch SEMANTICS are unchanged — only what counts as occupied.
+    #[test]
+    fn an_exited_pane_still_fills_the_team_pane_cap() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(TEAM_YAML);
+
+        for _ in 0..(TEAM_SESSION_CAP - 1) {
+            manager
+                .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
+                .unwrap();
+        }
+        // The last cell goes to a pane that exits immediately and stays on the
+        // grid as `Exited` (no `close_on_exit`).
+        manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/true".to_string()), None)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if manager
+                .session_states()
+                .iter()
+                .any(|s| s.state == SessionState::Exited)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(manager.occupied_pane_count(), TEAM_SESSION_CAP);
+
+        let report = start_team(&handle, &manager, &config, &store, "daily", 80, 24).unwrap();
+        // No cell left: both non-standby members fail rather than starting
+        // headless sessions the grid cannot show.
+        assert_eq!(report.members[0].status, MemberStatus::Failed);
+        assert_eq!(report.members[1].status, MemberStatus::Standby);
+        assert_eq!(report.members[2].status, MemberStatus::Failed);
+        assert!(report.members[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("pane limit"));
+        assert_eq!(
+            manager.list_sessions().len(),
+            TEAM_SESSION_CAP,
+            "nothing spawned"
+        );
+        assert!(
+            !report.kickoff_delivered,
+            "no member activated, so nothing is delivered"
+        );
 
         for s in manager.list_sessions() {
             let _ = manager.kill_pty(s.id);

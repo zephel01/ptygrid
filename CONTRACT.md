@@ -1988,11 +1988,12 @@ team_presets:
 > 不変）が埋まっている間、spawn できない step は従来のように `Failed` にならず、
 > `Pending` のまま据え置かれる(新設 `StepOutcome.deferred_since_ms: Option<u64>`、
 > `#[serde(skip)]` につき wire は不変)。`ready_steps` は毎 tick 冪等に依存なし step を
-> 再算出するため、次 tick 以降に空きが出れば追加の機構なしに拾われる。占有判定は
-> 「`state != Exited` のセッション数」に統一された(従来は `live_session_id` との間で
-> 全件 `list_sessions()` を数える箇所と不一致があった)。`Exited` セッションは自動 reap
-> されない(`EofAction::Exit { remove: manual_kill }`)ため空きスロットとして正しく
-> 数えられる。待ちには上限 `WORKFLOW_DEFER_MAX_MS = 300_000`(5分)があり、超過すると
+> 再算出するため、次 tick 以降に空きが出れば追加の機構なしに拾われる。占有判定は当初
+> 「`state != Exited` のセッション数」に統一されていた(従来は `live_session_id` との間で
+> 全件 `list_sessions()` を数える箇所と不一致があった)が、**この基準は 2026-07-30 追記で
+> 反転し、現在は `occupied_pane_count()`（グリッドの全セル数、`Exited` 含む）を使う**
+> （理由は本節末尾の追記を参照）。`Exited` を自動 reap しない方針自体は変わらない。
+> 待ちには上限 `WORKFLOW_DEFER_MAX_MS = 300_000`(5分)があり、超過すると
 > 従来どおり `Failed` になる(`attempts` を 1 にして `arm_retry_backoff` の
 > `attempts == 0` ガードを通す)。retry の backoff 待ちが枠不足で先送りされる経路
 > (`postpone_retry`)も同じ `WORKFLOW_DEFER_MAX_MS` で有界化されており、give-up の
@@ -2072,6 +2073,20 @@ team_presets:
 > あり解消していない。続報7 §(9)(kickoff 配送失敗によるペイン孤児化)、続報9 が指摘した
 > 「fan-out レースの敗者ペインが GUI 上で閉じることの目視確認は未了」も同様に未解消
 > のままである。
+>
+> 追記（2026-07-30）: **占有判定を live 基準からグリッド占有基準へ反転した。** 実機検証
+> （plan.md §2 U3）で、8 面埋まった状態から `smoke` を起動すると step `a`(t1) が 9 枚目を
+> 占有し、`close_on_exit` 未指定のため自然終了後も `Exited` としてセルを占有し続けた。
+> 次 step の判定は上記(1)の「`state != Exited` の数」で live=8 と見て空きありと誤認し
+> `t2` を spawn したが、frontend は `ui.panes.length`（グリッドの全セル数）でしか描画
+> できず「Queen が『t2』を起動しましたがペイン上限(9)のため表示できません」を出し、
+> セッションは headless のまま走った。占有判定を `PtyManager::occupied_pane_count()`
+> （全 state、`Exited` 含む）へ変更し、`live_session_count()` は削除した。`Exited` を
+> 自動 reap しない判断(上記(1))は維持し、`team_presets.rs` の判定も同じ基準へ揃えた。
+> 待機理由の文字列は不変だが、N はセル数のためプロセスが全滅していても `9/9` になり
+> 得る。検証: lib **402 passed**(追加2本・更新1本)、統合14は不変。設計の追記は
+> [refactor-pane-cap-5.0.5.md](docs/design/refactor-pane-cap-5.0.5.md) A-7、日付つき
+> 経緯は [plan.md](docs/design/plan.md) §6.6。
 >
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）

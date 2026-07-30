@@ -735,28 +735,38 @@ impl PtyManager {
         list
     }
 
-    /// Count of sessions not currently `Exited` — grid OCCUPANCY, which is
-    /// what every pane-cap decision is made against. Single lock, no
-    /// allocation: the counterpart of
-    /// `session_states().iter().filter(...).count()` for call sites that only
-    /// need the number, not the list.
+    /// Number of grid CELLS currently occupied — every slot in the map, and
+    /// that deliberately **includes `Exited`**. This is what every pane-cap
+    /// decision is made against. Single lock, no allocation, no iteration:
+    /// a slot exists in the map exactly while it owns a cell.
     ///
-    /// `Exited` is excluded because such a slot is reclaimable: nothing reaps
-    /// it automatically (`EofAction::Exit { remove: manual_kill }` keeps it on
-    /// the grid so the exit code stays visible and `restart_session` can
-    /// revive it), so counting it would refuse work the grid has room for.
-    /// This is also the definition `live_session_id` uses, which is what makes
-    /// "reuse an existing pane" and "is there room for a new one" agree.
+    /// Why `Exited` counts (reversal of decision A-7 in
+    /// `docs/design/refactor-pane-cap-5.0.5.md`, which counted only
+    /// non-`Exited` slots): the frontend sizes the grid by `ui.panes.length`
+    /// and a naturally-exited pane keeps its cell, rendered with an "exited"
+    /// tag — nothing reaps it (`EofAction::Exit { remove: manual_kill }` only
+    /// drops the slot on a manual kill, so the exit code stays visible and
+    /// `restart_session` can revive it in place). Counting only live sessions
+    /// therefore told the backend the grid had room while the frontend had no
+    /// cell left to render into. Verified on a real device on 2026-07-30: with
+    /// 9 cells filled (one of them an exited pane) a workflow step was still
+    /// spawned, and the frontend could only answer with
+    /// "Queen started 't2' but the pane limit (9) prevents showing it" while
+    /// the session ran on headless. Aligning the cap with cell occupancy is
+    /// what makes backend capacity and frontend display agree.
+    ///
+    /// `Exited` slots are still never auto-reaped: reaping them here would
+    /// race `handle_eof`'s phases and break `restart_session`. The cost is
+    /// that an abandoned exited pane holds capacity until the operator closes
+    /// it — intentional, and the same thing the operator already sees.
     ///
     /// Production callers: `orchestrator::pane_budget` (the per-tick pane
     /// budget behind workflow step deferral) and `team_presets::start_team`'s
-    /// `TEAM_SESSION_CAP` check.
-    pub(crate) fn live_session_count(&self) -> usize {
-        let sessions = self.lock_sessions();
-        sessions
-            .values()
-            .filter(|slot| slot.state != SessionState::Exited)
-            .count()
+    /// `TEAM_SESSION_CAP` check. NOT used for same-name reuse: that is
+    /// `live_session_id`'s `state != Exited` rule, which must stay live-only
+    /// because an exited pane cannot be handed work.
+    pub(crate) fn occupied_pane_count(&self) -> usize {
+        self.lock_sessions().len()
     }
 
     /// Snapshot running PTY child roots for the shared resource sampler.
@@ -2263,12 +2273,13 @@ mod tests {
         manager.kill_pty(transcript).unwrap();
     }
 
-    /// `live_session_count` counts only non-`Exited` slots, unlike
-    /// `list_sessions().len()` which also counts slots that exited naturally
-    /// and stayed in the map (Exited is never auto-reaped; see F1/A-7 in
-    /// DESIGN-refactor-5.0.5.md).
+    /// `occupied_pane_count` counts grid cells, so an `Exited` slot still
+    /// counts: it is never auto-reaped and keeps its cell on the frontend grid
+    /// (`ui.panes.length`). Pins the 2026-07-30 reversal of A-7 — counting
+    /// live-only let the backend spawn into a grid the frontend had no room
+    /// to render.
     #[test]
-    fn live_session_count_excludes_exited_slots() {
+    fn occupied_pane_count_includes_exited_slots() {
         let handle = mock_handle();
         let manager = PtyManager::new();
 
@@ -2286,21 +2297,34 @@ mod tests {
             None,
         );
 
-        assert_eq!(manager.live_session_count(), 3);
+        assert_eq!(manager.occupied_pane_count(), 3);
 
-        // Stopping a transcript session leaves its (Exited) slot in the map:
-        // `live_session_count` must exclude it while `list_sessions` still
-        // reports it.
+        // Stopping a transcript session leaves its (Exited) slot in the map,
+        // and that slot keeps its cell on the grid: occupancy must NOT drop.
         manager.stop_transcript_session(handle.clone(), "agent-exit");
+        let states = manager.session_states();
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| s.state == SessionState::Exited)
+                .count(),
+            1,
+            "the stopped transcript session is Exited, not removed"
+        );
         assert_eq!(
             manager.list_sessions().len(),
             3,
             "the Exited slot is still present in the map"
         );
         assert_eq!(
-            manager.live_session_count(),
-            2,
-            "Exited slot must not count as live"
+            manager.occupied_pane_count(),
+            3,
+            "an Exited slot still occupies a grid cell, so it still counts"
+        );
+        assert_eq!(
+            manager.occupied_pane_count(),
+            manager.list_sessions().len(),
+            "occupancy is the cell count the frontend sees (ui.panes.length)"
         );
 
         manager.kill_pty(running1).unwrap();
