@@ -168,7 +168,13 @@
                   <span class={`wf-badge wf-badge-sm wf-badge-${step.state}`}>{step.state}</span>
                   <span class="wf-step-id">{step.stepId}</span>
                   <span class="wf-step-agent">{step.agent}</span>
-                  {#if step.error}
+                  {#if step.state === "pending" && step.error}
+                    <!-- A step that is waiting rather than failing (the pane cap
+                         queue, 5.0.4 hardening) explains itself in `error`. Show
+                         it as text: folded into the ⚠ tooltip it was effectively
+                         invisible, and "Pending with no reason" reads as stuck. -->
+                    <span class="wf-step-wait" title={step.error}>{step.error}</span>
+                  {:else if step.error}
                     <span class="wf-step-error" title={step.error}>⚠</span>
                   {/if}
                 </div>
@@ -319,6 +325,13 @@
 
   .wf-step-error {
     color: #e0574a;
+    cursor: help;
+  }
+  .wf-step-wait {
+    color: #d7ba7d;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     cursor: help;
   }
 
