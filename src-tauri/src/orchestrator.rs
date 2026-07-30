@@ -118,6 +118,37 @@ pub struct StepOutcome {
     /// must default rather than fail `resume_workflow`'s deserialize.
     #[serde(default)]
     pub started_at_ms: u64,
+    /// Wall clock at which this step reached a terminal state
+    /// (`Succeeded` / `Failed` with no retry budget left / `Skipped` /
+    /// `Cancelled`). `None` while the step is still `Pending` or `Running`,
+    /// and also while a `Failed` outcome is waiting out its retry backoff —
+    /// that step is not terminal yet (`next_retry_at_ms` is `Some`).
+    /// Old persisted `steps_json` lacks this key, so it must default.
+    ///
+    /// Phase 5.0.6. Paired with `started_at_ms`, which is the *current
+    /// attempt's* start: every path that overwrites `started_at_ms` for a
+    /// fresh attempt clears this back to `None`, so
+    /// `ended_at_ms - started_at_ms` is always the duration of the attempt
+    /// that actually terminated — the step's EXECUTION time. It deliberately
+    /// does NOT include time the step spent queued for a pane; that is
+    /// `waited_for_pane_ms`, a separate number. The two are different
+    /// quantities and must not be added or substituted for one another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    /// Total wall clock this step spent `Pending` because the grid was full,
+    /// accumulated across every deferral and every retry attempt. `0` when it
+    /// never waited. This is the persisted counterpart of the transient
+    /// `deferred_since_ms`, which is `#[serde(skip)]` and therefore gone by
+    /// the time anyone reads the run back.
+    ///
+    /// Phase 5.0.6. Every site that clears `deferred_since_ms` folds the
+    /// elapsed wait in here first (`settle_pane_wait`) — see that function's
+    /// doc comment for the exhaustive list of exits. Unlike
+    /// `ended_at_ms - started_at_ms` this survives re-spawns: a step deferred
+    /// twice reports the SUM of both waits, which is what makes it usable as
+    /// "how much did the 9-pane cap cost this run".
+    #[serde(default)]
+    pub waited_for_pane_ms: u64,
     /// `root_message_id` of the kickoff message sent for this attempt, if
     /// any. Internal only (never serialized) — `detect_reply_completions`
     /// correlates an inbox reply back to this step through it, and every
@@ -149,6 +180,10 @@ pub struct StepOutcome {
     /// this timestamp is read for is bounding the wait
     /// (`WORKFLOW_DEFER_MAX_MS`) so a grid wedged by panes outside this run
     /// cannot hang it forever.
+    ///
+    /// Phase 5.0.6: still `#[serde(skip)]` and still transient — the durable
+    /// record of the same wait is `waited_for_pane_ms`, which every clear of
+    /// this field folds into via `settle_pane_wait`.
     #[serde(skip)]
     pub deferred_since_ms: Option<u64>,
 }
@@ -402,6 +437,11 @@ fn spawn_step<R: Runtime>(
             attempts: 1,
             error: None,
             started_at_ms: now_ms(),
+            // A freshly spawned attempt has not ended; `waited_for_pane_ms`
+            // is re-applied by the caller when this replaces a row that had
+            // already been waiting (see `settle_pane_wait`).
+            ended_at_ms: None,
+            waited_for_pane_ms: 0,
             kickoff_root_msg_id: None,
             reply_body: None,
             next_retry_at_ms: None,
@@ -420,6 +460,8 @@ fn spawn_step<R: Runtime>(
             attempts: 1,
             error: None,
             started_at_ms: now_ms(),
+            ended_at_ms: None,
+            waited_for_pane_ms: 0,
             kickoff_root_msg_id: None,
             reply_body: None,
             next_retry_at_ms: None,
@@ -433,6 +475,14 @@ fn spawn_step<R: Runtime>(
             attempts: 1,
             error: Some(error),
             started_at_ms: 0,
+            // Terminal on arrival: a spawn that never got a pane is `Failed`
+            // with no `next_retry_at_ms`, which `is_terminal` reads as
+            // terminal until `arm_retry_backoff` (possibly on this same tick,
+            // see bug 【G】) decides to spend a retry attempt and clears this
+            // back to `None`. Stamping it here rather than deferring to the
+            // caller keeps the field in step with that existing judgment.
+            ended_at_ms: Some(now_ms()),
+            waited_for_pane_ms: 0,
             kickoff_root_msg_id: None,
             reply_body: None,
             next_retry_at_ms: None,
@@ -524,6 +574,56 @@ fn mark_deferred(outcome: &mut StepOutcome, now: u64, reason: &str) -> bool {
     first || reason_changed
 }
 
+/// Stop the pane-wait clock (`deferred_since_ms`) and fold however long it
+/// ran into the persisted `waited_for_pane_ms` accumulator (phase 5.0.6).
+/// No-op when the outcome was not waiting.
+///
+/// **Every** exit from a deferral must go through here, or the total is
+/// silently under-reported. The complete list of exits, which is what this
+/// function exists to keep honest:
+///
+/// 1. `spawn_ready` — the wait ended because the step SPAWNED. The `Pending`
+///    placeholder holding the clock is about to be dropped by the `retain`,
+///    so the accumulated total is settled and then carried onto the fresh
+///    copies (the only route where the row itself disappears).
+/// 2. `defer_step` — the wait ended because `WORKFLOW_DEFER_MAX_MS` ran out
+///    and the step was failed.
+/// 3. `postpone_retry` — same bound, for a retry that never found a slot.
+/// 4. `fire_due_retries`, in-place `restart_session` branch.
+/// 5. `fire_due_retries`, both `respawn_fresh` branches — a postponed retry
+///    that finally got its slot. Like (1) the row is replaced wholesale, so
+///    the total is settled first and re-applied to the replacement.
+/// 6. `cancel_workflow` — a `Pending` step cancelled mid-wait.
+/// 7. `set_step_state` — the `condition:` / fail-fast passes deciding a
+///    `Pending` step (`Skipped` / `Failed`).
+/// 8. `cancel_stragglers` — a losing fan-out copy retired mid-wait.
+///
+/// Saturating throughout: `now` is wall clock and can move backwards.
+fn settle_pane_wait(outcome: &mut StepOutcome, now: u64) {
+    if let Some(since) = outcome.deferred_since_ms.take() {
+        outcome.waited_for_pane_ms = outcome
+            .waited_for_pane_ms
+            .saturating_add(now.saturating_sub(since));
+    }
+}
+
+/// Stamp `ended_at_ms` for an outcome that has just reached a terminal state
+/// (phase 5.0.6). Idempotent: an outcome that already carries an end time
+/// keeps it, so a second transition over an already-terminal row (a `Failed`
+/// straggler demoted to `Cancelled` by `cancel_stragglers`) reports when the
+/// step actually stopped, not when the bookkeeping caught up.
+///
+/// "Terminal" is exactly `is_terminal`'s judgment, so a `Failed` outcome that
+/// is still waiting out its retry backoff must NOT be passed here — it is not
+/// terminal yet. The two paths that make such an outcome non-terminal again
+/// (`arm_retry_backoff` arming a backoff, and any re-spawn) clear this field
+/// back to `None`; every re-spawn pairs that with overwriting `started_at_ms`.
+fn mark_terminal(outcome: &mut StepOutcome, now: u64) {
+    if outcome.ended_at_ms.is_none() {
+        outcome.ended_at_ms = Some(now);
+    }
+}
+
 /// Diagnostic-only: the run holds no pane anywhere yet has at least one step
 /// waiting for one — i.e. it is making no progress and the grid is full of
 /// panes that are not its own.
@@ -571,7 +671,11 @@ fn defer_step(run: &mut WorkflowRun, step: &WorkflowStep, now: u64, budget: usiz
         match waited {
             Some(waited) if waited > WORKFLOW_DEFER_MAX_MS => {
                 outcome.state = StepState::Failed;
-                outcome.deferred_since_ms = None;
+                // Exit (2) of `settle_pane_wait`: the wait is over, and the
+                // whole of it counts — this step really did sit on the queue
+                // for `waited` ms before anyone gave up on it.
+                settle_pane_wait(outcome, now);
+                mark_terminal(outcome, now);
                 // `arm_retry_backoff` reads `attempts == 0` as "failed
                 // without ever having been spawned" and refuses to retry it
                 // (that encoding belongs to `condition_targets`' unevaluable
@@ -636,9 +740,12 @@ fn postpone_retry(outcome: &mut StepOutcome, now: u64) -> bool {
     }
     // Give up on this attempt. The outcome is already `Failed` (that is the
     // only state this pass looks at); what changes is that it stops being a
-    // pending retry.
+    // pending retry — which is precisely what makes it terminal for
+    // `is_terminal`, hence the `mark_terminal` here even though `state` does
+    // not move. Exit (3) of `settle_pane_wait`.
     outcome.next_retry_at_ms = None;
-    outcome.deferred_since_ms = None;
+    settle_pane_wait(outcome, now);
+    mark_terminal(outcome, now);
     outcome.attempts = outcome.attempts.saturating_add(1);
     outcome.error = Some(format!(
         "no free pane slot for a retry after {waited}ms \
@@ -767,6 +874,13 @@ fn attach_kickoff_result(
         && outcome.kickoff_root_msg_id.is_none()
     {
         outcome.state = StepState::Failed;
+        // Same terminal-on-arrival reasoning as `spawn_step`'s `Err` arm: no
+        // backoff is armed yet, so `is_terminal` says terminal and this must
+        // agree. `now_ms()` rather than a threaded tick clock because two of
+        // the four call sites (`spawn_workflow`'s root loop, `respawn_fresh`)
+        // have no tick to borrow, and the field is a wall-clock stamp with no
+        // arithmetic riding on it.
+        mark_terminal(outcome, now_ms());
         append_error(
             outcome,
             "joinOn: reply has no kickoff thread to await a reply on, \
@@ -843,6 +957,8 @@ pub fn spawn_workflow<R: Runtime>(
                 attempts: 0,
                 error: None,
                 started_at_ms: 0,
+                ended_at_ms: None,
+                waited_for_pane_ms: 0,
                 kickoff_root_msg_id: None,
                 reply_body: None,
                 next_retry_at_ms: None,
@@ -885,6 +1001,12 @@ pub fn spawn_workflow<R: Runtime>(
                     WORKFLOW_SESSION_CAP.saturating_sub(budget),
                 )),
                 started_at_ms: 0,
+                ended_at_ms: None,
+                // The wait starts here; it is folded into
+                // `waited_for_pane_ms` by whichever exit this placeholder
+                // eventually takes (`spawn_ready` / `defer_step` /
+                // `cancel_workflow` / `set_step_state`).
+                waited_for_pane_ms: 0,
                 kickoff_root_msg_id: None,
                 reply_body: None,
                 next_retry_at_ms: None,
@@ -967,6 +1089,10 @@ pub fn cancel_workflow(
     ) {
         return Ok(run);
     }
+    // One clock for the whole cancel, shared with the run's own
+    // `ended_at_ms` below so a cancelled step never reports an end time later
+    // than the run that cancelled it.
+    let now = now_ms();
     for outcome in &mut run.steps {
         match outcome.state {
             StepState::Running => {
@@ -974,22 +1100,28 @@ pub fn cancel_workflow(
                     let _ = manager.kill_pty(id);
                 }
                 outcome.state = StepState::Cancelled;
+                mark_terminal(outcome, now);
             }
             StepState::Pending => {
                 outcome.state = StepState::Cancelled;
                 // A step cancelled mid-wait is not waiting any more. Its
                 // `error` (if any) is the "waiting for a free pane slot"
                 // annotation, which would otherwise read as the reason it
-                // was cancelled; drop both together.
-                if outcome.deferred_since_ms.take().is_some() {
+                // was cancelled; drop both together. Exit (6) of
+                // `settle_pane_wait`: the wait it had already served still
+                // counts, even though it ended in a cancel.
+                let was_waiting = outcome.deferred_since_ms.is_some();
+                settle_pane_wait(outcome, now);
+                if was_waiting {
                     outcome.error = None;
                 }
+                mark_terminal(outcome, now);
             }
             _ => {}
         }
     }
     run.state = WorkflowState::Cancelled;
-    run.ended_at_ms = Some(now_ms());
+    run.ended_at_ms = Some(now);
     registry.put(run.clone());
     // Phase 5.0.1: write-through so a manual cancel is never mistaken for a
     // crash-interrupted run and re-offered as "resume?" after a restart.
@@ -1101,6 +1233,12 @@ pub fn resume_workflow<R: Runtime>(
             attempts: 0,
             error: None,
             started_at_ms: 0,
+            // Collapsed back to "never spawned", so both timing fields reset
+            // with `started_at_ms`: the interrupted attempt's numbers describe
+            // a run of the app that no longer exists, and the pane wait this
+            // fresh placeholder is about to serve starts from zero.
+            ended_at_ms: None,
+            waited_for_pane_ms: 0,
             kickoff_root_msg_id: None,
             reply_body: None,
             next_retry_at_ms: None,
@@ -2035,6 +2173,7 @@ fn set_step_state(
     step_id: &str,
     new_state: StepState,
     error: Option<String>,
+    now: u64,
 ) -> bool {
     match run.steps.iter_mut().find(|o| o.step_id == step_id) {
         Some(outcome) => {
@@ -2049,9 +2188,21 @@ fn set_step_state(
             // misreport, and — if the step were ever re-Pended — resume a
             // `WORKFLOW_DEFER_MAX_MS` countdown that started in another life.
             // The `error` it carried is the wait reason, and is overwritten
-            // by the caller's own reason above.
+            // by the caller's own reason above. Exit (7) of
+            // `settle_pane_wait`: a step decided while queued still waited
+            // for as long as it waited, so the total is banked rather than
+            // discarded with the clock.
             if new_state != StepState::Pending {
-                outcome.deferred_since_ms = None;
+                settle_pane_wait(outcome, now);
+            }
+            // Both states every caller drives a step into (`Skipped` and the
+            // `condition:`-unevaluable `Failed`) are terminal — the latter
+            // because `arm_retry_backoff` refuses to arm an `attempts == 0`
+            // outcome, which is exactly the shape that arm produces. Guarded
+            // by `is_terminal` anyway so a future caller cannot silently
+            // stamp an end time on a step that has not ended.
+            if is_terminal(outcome) {
+                mark_terminal(outcome, now);
             }
             true
         }
@@ -2143,7 +2294,12 @@ fn persist_run(store: &QueenStore, project_dir: &std::path::Path, run: &Workflow
 /// resolved into `Succeeded`/`Failed` in place; returns `true` if anything
 /// changed, so the caller knows whether to re-derive fail-fast/ready/final
 /// state this tick.
-fn detect_completions(manager: &PtyManager, view: &StatusView, run: &mut WorkflowRun) -> bool {
+fn detect_completions(
+    manager: &PtyManager,
+    view: &StatusView,
+    run: &mut WorkflowRun,
+    now: u64,
+) -> bool {
     // Only id/state/code are read below — `session_states()` gets this
     // every-tick scan the same data without the `ps` fork / extra clones
     // `list_sessions()` pays for on every session.
@@ -2161,6 +2317,7 @@ fn detect_completions(manager: &PtyManager, view: &StatusView, run: &mut Workflo
         // still alive (e.g. an interactive pane left open after the task).
         if view.semantic_done(session_id) {
             outcome.state = StepState::Succeeded;
+            mark_terminal(outcome, now);
             view.forget(session_id);
             changed = true;
             continue;
@@ -2181,6 +2338,11 @@ fn detect_completions(manager: &PtyManager, view: &StatusView, run: &mut Workflo
                     None => "agent process exited abnormally (no exit code)".to_string(),
                 });
             }
+            // `Succeeded` unconditionally, `Failed` only until this tick's
+            // `arm_retry_backoff` decides to spend a retry attempt on it and
+            // clears the stamp — the same is-terminal-for-now rule
+            // `spawn_step`'s `Err` arm follows.
+            mark_terminal(outcome, now);
             view.forget(session_id);
             changed = true;
         }
@@ -2385,6 +2547,10 @@ fn detect_reply_completions(
         outcome.state = StepState::Succeeded;
         outcome.error = None;
         outcome.next_retry_at_ms = None;
+        // Route 3's completion instant. `now_ms()` for the same reason as
+        // `attach_kickoff_result`: this pass takes no tick clock, and the
+        // field is a stamp, not an input to any deadline arithmetic.
+        mark_terminal(outcome, now_ms());
         if let Some(session_id) = outcome.session_id {
             view.forget(session_id);
         }
@@ -2459,6 +2625,27 @@ fn spawn_ready<R: Runtime>(
             continue;
         }
         budget -= needed;
+        // Exit (1) of `settle_pane_wait`, and the ONLY one where the row
+        // holding the clock is deleted rather than transitioned: the
+        // placeholder about to be dropped by the `retain` below is where this
+        // step's pane wait was accumulating, so settle it first and carry the
+        // total onto every copy that replaces it. Miss this and the most
+        // common wait of all — the one that ended happily, in a spawn —
+        // vanishes from the run.
+        //
+        // Same predicate as the `retain` (bare id + `Pending`), so exactly the
+        // rows that disappear are the rows that are read. There is normally
+        // one; `max` rather than a sum because multiple placeholders would be
+        // alternatives for the same step, not additional waits.
+        let mut carried_wait = 0u64;
+        for placeholder in run
+            .steps
+            .iter_mut()
+            .filter(|o| o.step_id == step.id && o.state == StepState::Pending)
+        {
+            settle_pane_wait(placeholder, now);
+            carried_wait = carried_wait.max(placeholder.waited_for_pane_ms);
+        }
         // Remove the single Pending placeholder `spawn_workflow` inserted for
         // this step; it is replaced below by one outcome per copy. Only now
         // that the slots are reserved — see invariant 2 above.
@@ -2473,6 +2660,9 @@ fn spawn_ready<R: Runtime>(
             };
             let mut outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
             outcome.step_id = step_id;
+            // Every copy inherits the same wait: they were all held back by
+            // the one placeholder, and a fan-out's copies are minted together.
+            outcome.waited_for_pane_ms = carried_wait;
             if outcome.state == StepState::Running {
                 let delivered =
                     deliver_kickoff(store, project_dir, workflow_name, run_id, step, carried);
@@ -2539,6 +2729,9 @@ fn check_timeouts(
         }
         outcome.state = StepState::Failed;
         outcome.error = Some(format!("timed out after {timeout_ms}ms"));
+        // Terminal until `arm_retry_backoff` says otherwise, same as every
+        // other producer of a `Failed` outcome.
+        mark_terminal(outcome, now);
         changed = true;
     }
     changed
@@ -2550,7 +2743,7 @@ fn check_timeouts(
 /// never held a `session_id` at all, and the one whose in-place
 /// `restart_session` was refused because the slot had already been reaped.
 ///
-/// Three things the raw `spawn_step` result must be corrected for:
+/// Four things the raw `spawn_step` result must be corrected for:
 ///
 /// 1. `step_id` — `spawn_step` derives it from `step.id`, which drops the
 ///    `#N` suffix that makes each fan-out copy independently trackable. The
@@ -2563,6 +2756,13 @@ fn check_timeouts(
 ///    is delivered here. Only when the spawn actually reached `Running`:
 ///    sending a kickoff to a step that failed to get a pane would leave an
 ///    unanswerable message in the mailbox.
+/// 4. `waited_for_pane_ms` — `spawn_step` reports 0 (it has no history), but
+///    the field is a per-STEP running total across every attempt, not a
+///    per-attempt figure. `prev_waited_for_pane_ms` is what the outcome this
+///    replaces had already banked, and the caller must have settled any
+///    in-flight wait into it first (`settle_pane_wait`). `ended_at_ms` needs
+///    no such carry: it is per-attempt and pairs with `started_at_ms`, both
+///    of which `spawn_step` sets fresh.
 ///
 /// Always takes a NEW pane (`reuse_existing: false`), so like every other
 /// `spawn_step` call site it must be reached only with a slot already
@@ -2581,12 +2781,14 @@ fn respawn_fresh<R: Runtime>(
     step_id: &str,
     carried: Option<&str>,
     prev_attempts: u32,
+    prev_waited_for_pane_ms: u64,
     cols: u16,
     rows: u16,
 ) -> StepOutcome {
     let mut fresh = spawn_step(app, manager, config, step, false, cols, rows);
     fresh.step_id = step_id.to_string();
     fresh.attempts = prev_attempts + 1;
+    fresh.waited_for_pane_ms = prev_waited_for_pane_ms;
     if fresh.state == StepState::Running {
         // `deliver_kickoff` no-ops when there is nothing to send (no declared
         // `kickoff` and no carried handoff body). The retried attempt is a
@@ -2638,6 +2840,12 @@ fn arm_retry_backoff(wf: &WorkflowDef, run: &mut WorkflowRun, now: u64) -> bool 
         };
         if retry::allows_another(outcome.attempts, &policy) {
             outcome.next_retry_at_ms = Some(retry::due_at(now, &policy));
+            // Arming a backoff un-terminals the outcome (`is_terminal` reads
+            // `next_retry_at_ms`), so the end stamp that the failure producer
+            // optimistically wrote has to go with it. It is re-written when
+            // the retried attempt itself terminates, or — if the budget runs
+            // out and nothing re-arms — by the failure that exhausted it.
+            outcome.ended_at_ms = None;
             changed = true;
         }
     }
@@ -2730,11 +2938,18 @@ fn fire_due_retries<R: Runtime>(
                     // never coincides with `deferred_since_ms` being set
                     // (that field is only ever populated by `postpone_retry`,
                     // whose own branches always clear it back to `None`
-                    // before this pass runs again). Clearing it here too
+                    // before this pass runs again). Settling it here too
                     // costs nothing and keeps a freshly-restarted attempt
                     // from inheriting a stale wait-clock if a future
                     // `restart_session` failure mode ever lets one survive.
-                    outcome.deferred_since_ms = None;
+                    // Exit (4) of `settle_pane_wait`. Any wait this outcome
+                    // had banked stays banked (the field is cumulative); only
+                    // the running clock stops.
+                    settle_pane_wait(outcome, now);
+                    // Paired with the `started_at_ms` overwrite above: this
+                    // is a NEW attempt, so the previous attempt's end time is
+                    // no longer this outcome's end time.
+                    outcome.ended_at_ms = None;
                     outcome.error = None;
                     // Any reply that completed (or merely annotated) the
                     // previous attempt belongs to that attempt's thread and
@@ -2772,6 +2987,11 @@ fn fire_due_retries<R: Runtime>(
                     }
                     budget -= 1;
                     changed = true;
+                    // Exit (5) of `settle_pane_wait`: a retry that had been
+                    // postponed for want of a slot just got one. Settle
+                    // before the row is replaced wholesale, then hand the
+                    // total to the replacement.
+                    settle_pane_wait(outcome, now);
                     *outcome = respawn_fresh(
                         app,
                         manager,
@@ -2784,6 +3004,7 @@ fn fire_due_retries<R: Runtime>(
                         &outcome.step_id,
                         carried,
                         outcome.attempts,
+                        outcome.waited_for_pane_ms,
                         cols,
                         rows,
                     );
@@ -2797,6 +3018,8 @@ fn fire_due_retries<R: Runtime>(
             }
             budget -= 1;
             changed = true;
+            // Exit (5) of `settle_pane_wait`, other branch — see above.
+            settle_pane_wait(outcome, now);
             *outcome = respawn_fresh(
                 app,
                 manager,
@@ -2809,6 +3032,7 @@ fn fire_due_retries<R: Runtime>(
                 &outcome.step_id,
                 carried,
                 outcome.attempts,
+                outcome.waited_for_pane_ms,
                 cols,
                 rows,
             );
@@ -2858,6 +3082,7 @@ fn cancel_stragglers(
     view: &StatusView,
     wf: &WorkflowDef,
     run: &mut WorkflowRun,
+    now: u64,
 ) -> bool {
     const REASON: &str = "cancelled: this step's join was already satisfied by a sibling copy";
     let mut changed = false;
@@ -2887,7 +3112,9 @@ fn cancel_stragglers(
                     }
                     outcome.state = StepState::Cancelled;
                     outcome.error = Some(REASON.to_string());
-                    outcome.deferred_since_ms = None;
+                    // Exit (8) of `settle_pane_wait`.
+                    settle_pane_wait(outcome, now);
+                    mark_terminal(outcome, now);
                     changed = true;
                 }
                 StepState::Failed => {
@@ -2903,7 +3130,15 @@ fn cancel_stragglers(
                     // its scrollback, showing why this copy fell over) is
                     // still worth pointing at.
                     outcome.error = Some(REASON.to_string());
-                    outcome.deferred_since_ms = None;
+                    // Exit (8) of `settle_pane_wait`, other arm.
+                    settle_pane_wait(outcome, now);
+                    // `mark_terminal` is idempotent, which matters here: a
+                    // loser that had already failed outright carries the end
+                    // time of THAT failure, and the cancel is bookkeeping
+                    // after the fact rather than a second ending. Only a
+                    // straggler that was mid-backoff (hence not terminal,
+                    // hence `ended_at_ms == None`) is stamped now.
+                    mark_terminal(outcome, now);
                     changed = true;
                 }
                 _ => {}
@@ -2961,7 +3196,7 @@ fn advance_run<R: Runtime>(
     // and `detect_completions`/`check_timeouts` must see that before they
     // get a chance to reclassify the same still-alive pane as a failure.
     let mut changed = detect_reply_completions(store, &project_dir, view, &wf, &mut run);
-    changed = detect_completions(manager, view, &mut run) || changed;
+    changed = detect_completions(manager, view, &mut run, now) || changed;
     changed = check_timeouts(manager, view, &wf, &mut run, now) || changed;
     // `cancel_stragglers` BEFORE the retry pass, and after the three
     // completion detectors: it needs this tick's winner already recorded as
@@ -2971,7 +3206,7 @@ fn advance_run<R: Runtime>(
     // A straggler whose backoff is armed only by `arm_retry_backoff` below
     // is left for the next tick's pass, which clears it before that deadline
     // can come due.
-    changed = cancel_stragglers(manager, view, &wf, &mut run) || changed;
+    changed = cancel_stragglers(manager, view, &wf, &mut run, now) || changed;
     // `fire_due_retries` BEFORE `arm_retry_backoff`, not after: a deadline
     // armed on this same tick must not also fire on it. `retry::due_at`
     // falls back to a 0ms backoff when `backoffMs` is undeclared, so
@@ -3001,7 +3236,7 @@ fn advance_run<R: Runtime>(
     // candidate set: the order decides which reason wins, never whether the
     // skip happens.
     for (step_id, state, reason) in condition_targets(&wf, &run) {
-        let decided = set_step_state(&mut run, &step_id, state, Some(reason));
+        let decided = set_step_state(&mut run, &step_id, state, Some(reason), now);
         changed = changed || decided;
     }
 
@@ -3011,6 +3246,7 @@ fn advance_run<R: Runtime>(
             &step_id,
             StepState::Skipped,
             Some("skipped: an upstream dependency failed (fail-fast)".to_string()),
+            now,
         );
         changed = changed || skipped;
     }
@@ -3185,6 +3421,16 @@ mod tests {
             .clone()
     }
 
+    /// A fixed, obviously-synthetic tick clock for the pure-function tests
+    /// that now have to pass one (`set_step_state`, `cancel_stragglers`).
+    /// There is no time-injection seam in this module — `now_ms()` is a free
+    /// function and the production code threads a `now: u64` down from
+    /// `advance_run` — so tests that care about a real elapsed duration take
+    /// `now_ms()` themselves and assert ordering/monotonicity rather than
+    /// exact values (see `ended_at_ms` tests below). This constant is for the
+    /// tests that only need *a* clock, not a realistic one.
+    const TEST_NOW: u64 = 1_000_000;
+
     fn mk_outcome(step_id: &str, session_id: Option<u32>, state: StepState) -> StepOutcome {
         StepOutcome {
             step_id: step_id.to_string(),
@@ -3194,6 +3440,8 @@ mod tests {
             attempts: 1,
             error: None,
             started_at_ms: 0,
+            ended_at_ms: None,
+            waited_for_pane_ms: 0,
             kickoff_root_msg_id: None,
             reply_body: None,
             next_retry_at_ms: None,
@@ -3670,7 +3918,7 @@ workflows:
         );
         // Apply the cascade the driver would apply, then re-derive.
         for step_id in failfast_targets(&wf, &run) {
-            set_step_state(&mut run, &step_id, StepState::Skipped, None);
+            set_step_state(&mut run, &step_id, StepState::Skipped, None, TEST_NOW);
         }
         assert_eq!(
             finalize_state(&wf, &run),
@@ -3756,7 +4004,7 @@ workflows:
 
         // Convergence: the guard defers the verdict, it does not suppress it.
         // Once the placeholder is genuinely terminal, the arithmetic applies.
-        set_step_state(&mut run, "candidate", StepState::Skipped, None);
+        set_step_state(&mut run, "candidate", StepState::Skipped, None, TEST_NOW);
         assert!(
             dep_unsatisfiable(candidate, &run.steps),
             "a terminal placeholder banks 0 of the 2 required"
@@ -4143,7 +4391,8 @@ workflows:
             &mut run,
             "second",
             StepState::Skipped,
-            Some("blocked".to_string())
+            Some("blocked".to_string()),
+            TEST_NOW
         ));
         assert_eq!(run.steps[0].state, StepState::Skipped);
         assert_eq!(run.steps[0].error.as_deref(), Some("blocked"));
@@ -4152,7 +4401,8 @@ workflows:
             &mut run,
             "does-not-exist",
             StepState::Failed,
-            None
+            None,
+            TEST_NOW
         ));
     }
 
@@ -5091,7 +5341,7 @@ workflows:
         // And the declined branch must leave the run green — this is the whole
         // point of `finalize_state` treating `Skipped` as neutral.
         let mut run = run;
-        set_step_state(&mut run, "apply", StepState::Skipped, None);
+        set_step_state(&mut run, "apply", StepState::Skipped, None, TEST_NOW);
         assert_eq!(finalize_state(&wf, &run), WorkflowState::Succeeded);
     }
 
@@ -5128,7 +5378,7 @@ workflows:
         );
 
         let mut run = run;
-        set_step_state(&mut run, "apply", targets[0].1, Some(targets[0].2.clone()));
+        set_step_state(&mut run, "apply", targets[0].1, Some(targets[0].2.clone()), TEST_NOW);
         assert_eq!(
             finalize_state(&wf, &run),
             WorkflowState::Failed,
@@ -5323,7 +5573,7 @@ workflows:
         );
 
         for (step_id, state, reason) in condition_targets(&wf, &run) {
-            set_step_state(&mut run, &step_id, state, Some(reason));
+            set_step_state(&mut run, &step_id, state, Some(reason), TEST_NOW);
         }
         assert_eq!(
             run.steps
@@ -5344,7 +5594,7 @@ workflows:
         // failed, so nothing should be reported as failed. This is the whole
         // reason `finalize_state` stopped treating Skipped as a failure.
         for step_id in failfast_targets(&wf, &run) {
-            set_step_state(&mut run, &step_id, StepState::Skipped, None);
+            set_step_state(&mut run, &step_id, StepState::Skipped, None, TEST_NOW);
         }
         assert_eq!(
             finalize_state(&wf, &run),
@@ -5376,7 +5626,7 @@ workflows:
             ],
         );
 
-        assert!(cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(cancel_stragglers(&manager, &view, &wf, &mut run, TEST_NOW));
 
         let live = run
             .steps
@@ -5417,7 +5667,7 @@ workflows:
         );
 
         // Idempotent: the next tick finds nothing left to retire.
-        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run, TEST_NOW));
     }
 
     /// A loser that crashed BEFORE the winner finished is the same lost race
@@ -5446,7 +5696,7 @@ workflows:
             ],
         );
 
-        assert!(cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(cancel_stragglers(&manager, &view, &wf, &mut run, TEST_NOW));
         assert_eq!(run.steps[1].state, StepState::Cancelled);
         assert!(
             run.steps[1].session_id.is_some(),
@@ -5478,7 +5728,7 @@ workflows:
                 mk_outcome("reduce", None, StepState::Skipped),
             ],
         );
-        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run, TEST_NOW));
         assert_eq!(run.steps[1].state, StepState::Failed);
         assert_eq!(finalize_state(&wf, &run), WorkflowState::Failed);
     }
@@ -5497,7 +5747,7 @@ workflows:
                 mk_outcome("candidate#2", Some(3), StepState::Running),
             ],
         );
-        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run));
+        assert!(!cancel_stragglers(&manager, &view, &wf, &mut run, TEST_NOW));
         assert!(
             run.steps.iter().all(|o| o.state == StepState::Running),
             "no copy has succeeded yet, so every one of them is still in the running"
@@ -6528,6 +6778,578 @@ workflows:
         assert!(second.session_id.is_some());
         assert_eq!(second.error, None);
         assert_eq!(second.deferred_since_ms, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ------------------------------------------------------------------
+    // 5.0.6: per-step timing (`ended_at_ms` / `waited_for_pane_ms`)
+    //
+    // TIME IN THESE TESTS. This module has no time-injection seam: `now_ms()`
+    // is a free function, and the production code threads a `now: u64` down
+    // from `advance_run` into the pure passes. Tests therefore come in two
+    // shapes, matching what the code under test accepts:
+    //
+    //   * a pass that takes `now` gets a synthetic one and the assertion is
+    //     an exact equality — fully deterministic, no wall clock involved;
+    //   * a path that calls `now_ms()` itself (`cancel_workflow`,
+    //     `advance_run`, `spawn_step`) is asserted with ordering and
+    //     containment (`ended >= started`, `before..=after`, "equal to the
+    //     run's own end stamp") rather than an exact value, so a slow or
+    //     descheduled test machine cannot make it flaky.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_succeeded_step_stamps_ended_at_ms_and_the_gap_is_its_run_time() {
+        let manager = PtyManager::new();
+        let view = StatusView::new();
+        let started = 1_000_000u64;
+        let now = started + 2_500;
+
+        let mut run = mk_run(
+            "chain",
+            vec![mk_outcome("first", Some(7), StepState::Running)],
+        );
+        run.steps[0].started_at_ms = started;
+        assert_eq!(
+            run.steps[0].ended_at_ms, None,
+            "a Running step has not ended yet"
+        );
+
+        // Route 2 (semantic done) fires before the session table is consulted,
+        // so no real pane is needed here.
+        view.record(7, AgentStatus::Done);
+        assert!(detect_completions(&manager, &view, &mut run, now));
+
+        assert_eq!(run.steps[0].state, StepState::Succeeded);
+        assert_eq!(run.steps[0].ended_at_ms, Some(now));
+        assert_eq!(
+            run.steps[0].ended_at_ms.unwrap() - run.steps[0].started_at_ms,
+            2_500,
+            "`ended_at_ms - started_at_ms` is what the whole field exists for: \
+             how long this attempt actually ran"
+        );
+        assert_eq!(
+            run.steps[0].waited_for_pane_ms, 0,
+            "a step that never queued for a pane reports no wait — the two \
+             numbers are separate quantities, not one split in half"
+        );
+    }
+
+    #[test]
+    fn a_retry_waiting_out_its_backoff_has_no_ended_at_ms_until_the_budget_is_spent() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        let view = StatusView::new();
+        let mut now = 1_000_000u64;
+
+        // A step whose first attempt has just failed. Whichever detector
+        // produced the failure stamped it terminal, because at that instant
+        // no backoff is armed and `is_terminal` says terminal.
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 1;
+        run.steps[0].started_at_ms = now - 500;
+        run.steps[0].ended_at_ms = Some(now);
+        assert!(is_terminal(&run.steps[0]));
+
+        // Arming the backoff un-terminals it, and the stamp has to go with
+        // the judgment: `next_retry_at_ms` is `Some`, so this step has NOT
+        // reached a terminal state.
+        assert!(arm_retry_backoff(&wf, &mut run, now));
+        assert!(run.steps[0].next_retry_at_ms.is_some());
+        assert!(!is_terminal(&run.steps[0]));
+        assert_eq!(
+            run.steps[0].ended_at_ms, None,
+            "a Failed step mid-retry-backoff must not report an end time"
+        );
+
+        // The retry actually runs. `started_at_ms` is overwritten for the new
+        // attempt; `ended_at_ms` stays cleared as its pair.
+        now += 1_000;
+        run.steps[0].next_retry_at_ms = Some(now - 1);
+        assert!(fire_due_retries(
+            &handle, &manager, &config, &store, &dir, "retryzero", TEST_RUN_ID, &view, &wf,
+            &mut run, now,
+        ));
+        assert_eq!(run.steps[0].state, StepState::Running);
+        assert_eq!(run.steps[0].attempts, 2);
+        assert_eq!(
+            run.steps[0].ended_at_ms, None,
+            "a re-spawned step is running again, so it has no end time"
+        );
+
+        // It fails a second time, now with the retry budget gone
+        // (`retry.max: 2`; `allows_another` admits `attempts <= max`, so
+        // `attempts == 3` is refused). Session 7 is not on the grid, which
+        // route 1 reads as an abnormal exit.
+        now += 1_000;
+        run.steps[0].state = StepState::Running;
+        run.steps[0].session_id = Some(7);
+        run.steps[0].attempts = 3;
+        assert!(detect_completions(&manager, &view, &mut run, now));
+        assert_eq!(run.steps[0].state, StepState::Failed);
+        assert_eq!(run.steps[0].ended_at_ms, Some(now));
+
+        // Nothing re-arms, so the stamp stands: this IS the moment the step
+        // reached its terminal state.
+        assert!(!arm_retry_backoff(&wf, &mut run, now));
+        assert!(is_terminal(&run.steps[0]));
+        assert_eq!(run.steps[0].ended_at_ms, Some(now));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skipped_step_stamps_ended_at_ms() {
+        let now = 4_000_000u64;
+        let mut run = mk_run(
+            "chain",
+            vec![mk_outcome("second", None, StepState::Pending)],
+        );
+        assert_eq!(run.steps[0].ended_at_ms, None);
+
+        // The shape both the `condition:` pass and the fail-fast cascade use.
+        assert!(set_step_state(
+            &mut run,
+            "second",
+            StepState::Skipped,
+            Some("skipped: an upstream dependency failed (fail-fast)".to_string()),
+            now,
+        ));
+        assert_eq!(run.steps[0].state, StepState::Skipped);
+        assert_eq!(
+            run.steps[0].ended_at_ms,
+            Some(now),
+            "`Skipped` is terminal, so it ends when it is decided"
+        );
+    }
+
+    #[test]
+    fn cancelled_steps_stamp_ended_at_ms_alongside_the_run() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+        // One Running step (the root) and one Pending step: `cancel_workflow`
+        // reaches both arms.
+        assert_eq!(run.steps[0].state, StepState::Running);
+        assert_eq!(run.steps[1].state, StepState::Pending);
+
+        let cancelled =
+            cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
+
+        let run_ended = cancelled.ended_at_ms.expect("a cancelled run has ended");
+        for outcome in &cancelled.steps {
+            assert_eq!(outcome.state, StepState::Cancelled);
+            // `cancel_workflow` calls `now_ms()` once and shares it, so this
+            // is an exact equality with no wall-clock flakiness: a cancelled
+            // step can never report an end time later than the run that
+            // cancelled it.
+            assert_eq!(
+                outcome.ended_at_ms,
+                Some(run_ended),
+                "every cancelled step ends when the run does"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_step_that_waited_for_a_pane_banks_the_wait_when_it_finally_spawns() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(CHAIN_YAML);
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let now = 1_000_000u64;
+
+        let fillers = occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
+        let mut run = mk_run(
+            "chain",
+            vec![
+                mk_outcome("first", None, StepState::Succeeded),
+                mk_outcome("second", None, StepState::Pending),
+            ],
+        );
+
+        spawn_ready(
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now,
+            80, 24,
+        );
+        let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(second.deferred_since_ms, Some(now));
+        assert_eq!(
+            second.waited_for_pane_ms, 0,
+            "the accumulator only moves when the wait ENDS; a wait still in \
+             flight lives in `deferred_since_ms`"
+        );
+
+        // The wait ends the ordinary way — a slot frees and the step spawns.
+        // This is the exit that loses the number if it is not settled here,
+        // because the Pending placeholder holding the clock is deleted.
+        free_one_slot(&manager, fillers[0]);
+        spawn_ready(
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run,
+            now + 5_000, 80, 24,
+        );
+
+        let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(second.state, StepState::Running);
+        assert_eq!(second.deferred_since_ms, None, "the clock stopped");
+        assert_eq!(
+            second.waited_for_pane_ms, 5_000,
+            "…and the 5s it ran for is banked on the outcome that replaced the \
+             placeholder, which is the only place it can survive to run end"
+        );
+        assert_eq!(
+            second.ended_at_ms, None,
+            "spawning is not ending: the step has only just started running"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pane_waits_accumulate_across_every_deferral_of_the_same_step() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        let view = StatusView::new();
+        let mut now = 1_000_000u64;
+
+        occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
+
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 1;
+        run.steps[0].next_retry_at_ms = Some(now - 1);
+
+        // Two full rounds of "queue for a slot, never get one, give up". Each
+        // give-up spends one retry attempt and `arm_retry_backoff` re-arms
+        // while the budget allows, which is what puts the SAME step back on
+        // the queue a second time.
+        let mut expected = 0u64;
+        for round in 1..=2u64 {
+            // Round 1 starts the clock; round 2 does after the re-arm below.
+            fire_due_retries(
+                &handle, &manager, &config, &store, &dir, "retryzero", TEST_RUN_ID, &view, &wf,
+                &mut run, now,
+            );
+            assert_eq!(
+                run.steps[0].deferred_since_ms,
+                Some(now),
+                "round {round}: the postpone starts a fresh wait clock"
+            );
+
+            now += WORKFLOW_DEFER_MAX_MS + 1;
+            fire_due_retries(
+                &handle, &manager, &config, &store, &dir, "retryzero", TEST_RUN_ID, &view, &wf,
+                &mut run, now,
+            );
+            expected += WORKFLOW_DEFER_MAX_MS + 1;
+            assert_eq!(
+                run.steps[0].deferred_since_ms, None,
+                "round {round}: the give-up stops the clock"
+            );
+            assert_eq!(
+                run.steps[0].waited_for_pane_ms, expected,
+                "round {round}: waits SUM across deferrals — the second must not \
+                 overwrite the first"
+            );
+            assert_eq!(
+                run.steps[0].ended_at_ms,
+                Some(now),
+                "round {round}: the give-up clears `next_retry_at_ms`, which is \
+                 what makes the outcome terminal even though `state` did not move"
+            );
+
+            // Re-arm for the next round; the arming un-terminals it again.
+            if arm_retry_backoff(&wf, &mut run, now) {
+                assert_eq!(run.steps[0].ended_at_ms, None);
+                run.steps[0].next_retry_at_ms = Some(now - 1);
+            }
+        }
+
+        assert_eq!(
+            run.steps[0].waited_for_pane_ms,
+            2 * (WORKFLOW_DEFER_MAX_MS + 1)
+        );
+        assert_eq!(
+            manager.occupied_pane_count(),
+            WORKFLOW_SESSION_CAP,
+            "nothing ever spawned; the whole run was queue time"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_non_spawn_exit_from_a_pane_wait_banks_it_too() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(CHAIN_YAML);
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let now = 10_000_000u64;
+
+        occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
+
+        // (a) `defer_step`'s WORKFLOW_DEFER_MAX_MS give-up.
+        let mut run = mk_run(
+            "chain",
+            vec![
+                mk_outcome("first", None, StepState::Succeeded),
+                mk_outcome("second", None, StepState::Pending),
+            ],
+        );
+        run.steps[1].deferred_since_ms = Some(now - WORKFLOW_DEFER_MAX_MS - 1);
+        run.steps[1].attempts = 0;
+        spawn_ready(
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now,
+            80, 24,
+        );
+        let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(second.state, StepState::Failed);
+        assert_eq!(
+            second.waited_for_pane_ms,
+            WORKFLOW_DEFER_MAX_MS + 1,
+            "giving up on a wait does not make the wait not have happened"
+        );
+        assert_eq!(second.ended_at_ms, Some(now));
+
+        // (b) `set_step_state` — the `condition:` / fail-fast passes deciding
+        // a step while it is still queued.
+        let mut decided = mk_run(
+            "chain",
+            vec![mk_outcome("second", None, StepState::Pending)],
+        );
+        decided.steps[0].deferred_since_ms = Some(now - 1_234);
+        assert!(set_step_state(
+            &mut decided,
+            "second",
+            StepState::Skipped,
+            Some("skipped: an upstream dependency failed (fail-fast)".to_string()),
+            now,
+        ));
+        assert_eq!(decided.steps[0].deferred_since_ms, None);
+        assert_eq!(decided.steps[0].waited_for_pane_ms, 1_234);
+
+        // (c) `cancel_stragglers` retiring a losing copy that was itself
+        // queued for a slot (a postponed retry).
+        let fanjoin = parse_wf(FANJOIN_YAML, "fanjoin");
+        let view = StatusView::new();
+        let mut race = mk_run(
+            "fanjoin",
+            vec![
+                mk_outcome("candidate#0", Some(1), StepState::Succeeded),
+                mk_outcome("candidate#1", None, StepState::Failed),
+                mk_outcome("candidate#2", Some(3), StepState::Succeeded),
+                mk_outcome("reduce", None, StepState::Pending),
+            ],
+        );
+        race.steps[1].next_retry_at_ms = Some(now + 1_000);
+        race.steps[1].deferred_since_ms = Some(now - 700);
+        assert!(cancel_stragglers(&manager, &view, &fanjoin, &mut race, now));
+        assert_eq!(race.steps[1].state, StepState::Cancelled);
+        assert_eq!(race.steps[1].deferred_since_ms, None);
+        assert_eq!(race.steps[1].waited_for_pane_ms, 700);
+        assert_eq!(race.steps[1].ended_at_ms, Some(now));
+
+        // (d) `cancel_workflow` on a step cancelled mid-wait. This path takes
+        // its own `now_ms()`, so the assertion is a lower bound rather than an
+        // equality (see the section header).
+        let registry = WorkflowRegistry::new();
+        let mut cancelling = mk_run(
+            "chain",
+            vec![mk_outcome("second", None, StepState::Pending)],
+        );
+        cancelling.steps[0].deferred_since_ms = Some(now_ms().saturating_sub(1_500));
+        cancelling.steps[0].error = Some(pane_wait_reason(WORKFLOW_SESSION_CAP));
+        registry.put(cancelling.clone());
+        let cancelled =
+            cancel_workflow(&manager, &config, &store, &registry, &cancelling.run_id).unwrap();
+        assert_eq!(cancelled.steps[0].state, StepState::Cancelled);
+        assert_eq!(cancelled.steps[0].deferred_since_ms, None);
+        assert!(
+            cancelled.steps[0].waited_for_pane_ms >= 1_500,
+            "a step cancelled mid-wait still waited: {}",
+            cancelled.steps[0].waited_for_pane_ms
+        );
+        assert_eq!(
+            cancelled.steps[0].error, None,
+            "the wait annotation is still retired with the wait"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_steps_json_without_the_timing_keys_still_deserializes() {
+        // Exactly what a pre-5.0.6 build persisted: no `endedAtMs`, no
+        // `waitedForPaneMs`. `resume_workflow` decodes this verbatim, so it
+        // must default rather than error.
+        let legacy = r#"[
+            {"stepId":"first","agent":"a","sessionId":3,"state":"succeeded",
+             "attempts":1,"startedAtMs":1700000000000},
+            {"stepId":"second","agent":"b","state":"pending","attempts":0}
+        ]"#;
+        let steps: Vec<StepOutcome> =
+            serde_json::from_str(legacy).expect("old steps_json must still decode");
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].ended_at_ms, None);
+        assert_eq!(steps[0].waited_for_pane_ms, 0);
+        assert_eq!(steps[0].started_at_ms, 1_700_000_000_000);
+        assert_eq!(steps[1].ended_at_ms, None);
+        assert_eq!(steps[1].waited_for_pane_ms, 0);
+
+        // Forward direction: camelCase keys, and `endedAtMs` is omitted while
+        // it is `None` (`skip_serializing_if`) while `waitedForPaneMs` is
+        // always present.
+        let pending = serde_json::to_string(&steps[1]).unwrap();
+        assert!(
+            !pending.contains("endedAtMs"),
+            "a step with no end time must not emit the key: {pending}"
+        );
+        assert!(pending.contains("\"waitedForPaneMs\":0"), "{pending}");
+
+        let mut done = steps[0].clone();
+        done.ended_at_ms = Some(1_700_000_005_000);
+        done.waited_for_pane_ms = 2_000;
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains("\"endedAtMs\":1700000005000"), "{json}");
+        assert!(json.contains("\"waitedForPaneMs\":2000"), "{json}");
+
+        // And a full round trip is lossless for both.
+        let back: StepOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ended_at_ms, done.ended_at_ms);
+        assert_eq!(back.waited_for_pane_ms, done.waited_for_pane_ms);
+    }
+
+    #[test]
+    fn resume_workflow_restores_a_legacy_run_and_backfills_nothing() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // A run persisted by a pre-5.0.6 build: `first` already terminal,
+        // `second` interrupted mid-flight. Neither row has the new keys.
+        let legacy = r#"[
+            {"stepId":"first","agent":"a","sessionId":1,"state":"succeeded",
+             "attempts":1,"startedAtMs":1700000000000},
+            {"stepId":"second","agent":"b","sessionId":2,"state":"running",
+             "attempts":1,"startedAtMs":1700000001000}
+        ]"#;
+        store
+            .upsert_workflow_run(
+                &dir,
+                "wfr_legacy",
+                "demo",
+                "running",
+                1_700_000_000_000,
+                None,
+                legacy,
+            )
+            .unwrap();
+
+        let resumed = resume_workflow(
+            &handle, &manager, &config, &store, &registry, "wfr_legacy", 80, 24,
+        )
+        .expect("a legacy steps_json must not break the resume path");
+
+        assert_eq!(resumed.state, WorkflowState::Running);
+        let first = resumed.steps.iter().find(|o| o.step_id == "first").unwrap();
+        assert_eq!(first.state, StepState::Succeeded);
+        assert_eq!(
+            first.ended_at_ms, None,
+            "a step that ended in a previous process ended at a time this build \
+             does not know; resume must not invent one"
+        );
+        assert_eq!(first.waited_for_pane_ms, 0);
+
+        // The interrupted step is collapsed back to a fresh placeholder, so
+        // both timing fields reset with `started_at_ms`.
+        let second = resumed.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(second.state, StepState::Pending);
+        assert_eq!(second.started_at_ms, 0);
+        assert_eq!(second.ended_at_ms, None);
+        assert_eq!(second.waited_for_pane_ms, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Belt-and-braces over the whole driver rather than one pass: whatever
+    /// route a step took to get there, a terminal step must carry an end
+    /// time. This is the assertion that catches a future terminal transition
+    /// added without a `mark_terminal`.
+    #[test]
+    fn advance_run_leaves_no_terminal_step_without_an_ended_at_ms() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+
+        // /bin/cat never exits, so both completions come through route 2.
+        for _ in 0..2 {
+            let snapshot = registry.get(&run.run_id).unwrap();
+            for session_id in snapshot.steps.iter().filter_map(|o| o.session_id) {
+                view.record(session_id, AgentStatus::Done);
+            }
+            advance_run(
+                &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+            );
+        }
+
+        let snapshot = registry.get(&run.run_id).unwrap();
+        assert_eq!(snapshot.state, WorkflowState::Succeeded);
+        let run_ended = snapshot.ended_at_ms.expect("a terminal run has ended");
+        for outcome in &snapshot.steps {
+            assert!(is_terminal(outcome), "{}", outcome.step_id);
+            let ended = outcome
+                .ended_at_ms
+                .unwrap_or_else(|| panic!("terminal step '{}' has no end time", outcome.step_id));
+            // Wall-clock path (`advance_run` takes its own `now_ms()`), so
+            // these are ordering assertions, not exact values.
+            assert!(
+                ended >= outcome.started_at_ms,
+                "'{}' ended ({ended}) before it started ({})",
+                outcome.step_id,
+                outcome.started_at_ms
+            );
+            assert!(
+                run_ended >= ended,
+                "the run must not end before its last step: {run_ended} < {ended}"
+            );
+            assert_eq!(
+                outcome.waited_for_pane_ms, 0,
+                "nothing queued for a pane in this run"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

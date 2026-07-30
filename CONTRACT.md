@@ -2089,6 +2089,130 @@ team_presets:
 > 経緯は [plan.md](docs/design/plan.md) §6.6。
 >
 
+> 追記（2026-07-30、続報11）: **step 単位の所要時間とペイン待ち時間を wire に載せた
+> （v0.5.8 項目2）。** 続報10 §(4) が「`StepOutcome` の serialize される公開フィールドを
+> 増減させていない」と記録した状態を、**本追記で初めて additive に更新する**。並列化が
+> どれだけ効いているかを事後に測れるようにするのが目的で、Phase 5.5.1（OTel）の前段でも
+> ある。確定 wire 契約は `note-057/wire-5.0.6-timing.md`。
+>
+> **(1) `StepOutcome` に 2 フィールド追加（additive、既存フィールドの意味は不変）。**
+>
+> ```rust
+>     /// 終端に到達した時刻。Pending / Running の間、および retry backoff 待ちの
+>     /// Failed（`next_retry_at_ms` が Some）の間は None。
+>     #[serde(default, skip_serializing_if = "Option::is_none")]
+>     pub ended_at_ms: Option<u64>,
+>
+>     /// グリッド満杯で Pending に据え置かれた合計時間（全 deferral・全 retry 累積）。
+>     #[serde(default)]
+>     pub waited_for_pane_ms: u64,
+> ```
+>
+> wire は camelCase なので **`endedAtMs`**（`None` のとき省略）/ **`waitedForPaneMs`**
+> （常に出力、待たなければ `0`）。`workflow-state` イベントの既存ペイロードに乗るだけで、
+> **新しい Tauri command / event は追加していない**。frontend は
+> `endedAtMs?: number` / `waitedForPaneMs?: number` として、どちらも省略されうる前提で
+> 読むこと。`deferred_since_ms` は続報10 のまま `#[serde(skip)]` で据え置き
+> （persist するようには変えていない。累積側を新設した）。
+>
+> **(2) `ended_at_ms` の意味と、それを立てる経路。** 「終端」は既存の `is_terminal`
+> の判定そのもの（`Succeeded` / `Skipped` / `Cancelled` は常に終端、`Failed` は
+> `next_retry_at_ms` が `None` のときだけ終端）。したがって **retry backoff 待ちの
+> `Failed` には入らない**。立てているのは以下の全経路で、いずれも `mark_terminal`
+> （冪等 — 既に値があれば上書きしない）を通す:
+>
+> - `spawn_step` の `Err` アーム（`resolve_def` / `spawn_agent` 失敗）
+> - `attach_kickoff_result`（`joinOn: reply` の kickoff thread が張れず `Failed`）
+> - `detect_completions` route 2（`AgentStatus::Done` → `Succeeded`）
+> - `detect_completions` route 1（PTY exit → `Succeeded` / `Failed`）
+> - `detect_reply_completions` route 3（inbox 返信 → `Succeeded`）
+> - `check_timeouts`（`timeoutMs` 超過 → `Failed`）
+> - `defer_step` の `WORKFLOW_DEFER_MAX_MS` give-up（→ `Failed`）
+> - `postpone_retry` の give-up（**`state` は `Failed` のまま動かないが
+>   `next_retry_at_ms` を `None` にすることで終端になる**経路。ここを落とすと
+>   「終端なのに終了時刻が無い」step が残る）
+> - `set_step_state`（`condition:` の Skipped / 評価不能 `Failed`、fail-fast の Skipped）
+> - `cancel_stragglers`（`Running` / `Failed` の敗者 → `Cancelled`）
+> - `cancel_workflow`（`Running` / `Pending` → `Cancelled`）
+>
+> 逆に **`None` に戻す**のは、終端でなくなる 3 経路のみ: `arm_retry_backoff` が backoff を
+> arm したとき、`fire_due_retries` の in-place `restart_session` 成功時、および
+> `respawn_fresh`（`spawn_step` が新品を返すので構造的に `None`）。後ろ 2 つは
+> `started_at_ms` の上書きと対になっている。したがって
+> **`ended_at_ms - started_at_ms` は「終端した試行が実際に走っていた時間」**であり、
+> ペイン待ち時間は含まない。`cancel_workflow` は `now_ms()` を 1 回だけ取って step と
+> run の両方に使うので、step の `endedAtMs` が run の `endedAtMs` を追い越すことはない。
+>
+> **(3) `waited_for_pane_ms` は累積で、`deferred_since_ms` を落とす全経路で加算する。**
+> 新設ヘルパ `settle_pane_wait(outcome, now)`（`deferred_since_ms.take()` して
+> `now - since` を加算）を通す経路は 8 つで、これが `deferred_since_ms` が `None` に
+> 戻る箇所の全数でもある:
+>
+> 1. `spawn_ready` — **空きが出て spawn できた**とき。`Pending` プレースホルダは
+>    `retain` で消えるので、消す前に settle して新しい outcome へ引き継ぐ
+>    （fan-out の各コピーは同じ待ち時間を引き継ぐ）。**最頻の経路であり、
+>    唯一「行そのものが消える」経路**なので落としやすい。
+> 2. `defer_step` — `WORKFLOW_DEFER_MAX_MS` 超過で諦めたとき。
+> 3. `postpone_retry` — 同じ上限で retry を諦めたとき。
+> 4. `fire_due_retries` の in-place `restart_session` 成功アーム。
+> 5. `fire_due_retries` の `respawn_fresh` 2 アーム（`restart_session` 失敗の
+>    フォールバックと、`session_id` 無しの fresh spawn）。ここも行が丸ごと
+>    差し替わるので、`respawn_fresh` に `prev_waited_for_pane_ms` 引数を足して
+>    引き継ぐ。
+> 6. `cancel_workflow` の `Pending` アーム（待ち中にキャンセルされた step）。
+> 7. `set_step_state`（`Pending` 以外へ decide されたとき）。
+> 8. `cancel_stragglers` の `Running` / `Failed` 両アーム。
+>
+> `retry` で再 spawn しても **リセットしない**（step 単位の累計であって試行単位では
+> ない）。resume 時に `Running` から `Pending` へ畳み直される step だけは
+> `started_at_ms` と一緒に 0 に戻る。
+>
+> **(4) 永続化と後方互換。** `steps_json` は `Vec<StepOutcome>` をそのまま serialize
+> しているので、2 フィールドは自動的に persist される。両方に `#[serde(default)]` が
+> あるため **旧ビルドが書いた `steps_json`（両キーが無い JSON）はそのまま
+> deserialize でき**、`resume_workflow` の復元経路は回帰しない。旧行の終端 step は
+> `endedAtMs` が `None` のまま残る — **resume 時に現在時刻で埋め戻すことはしない**
+> （終端したのは前プロセスの中であって、その時刻をこのビルドは知らないため）。
+>
+> **(5) 内部シグネチャ変更（wire ではない）。** `detect_completions` /
+> `cancel_stragglers` / `set_step_state` に `now: u64` を追加し、`respawn_fresh` に
+> `prev_waited_for_pane_ms: u64` を追加した。いずれも `orchestrator.rs` 内の非公開関数で、
+> 公開 API・command・event には影響しない。時刻の扱いは既存方針を踏襲 — tick の `now` を
+> 引き回す pass はそれを使い、自前で `now_ms()` を呼んでいた経路
+> （`attach_kickoff_result` / `detect_reply_completions` / `cancel_workflow` /
+> `spawn_step`）はそのまま `now_ms()` を使う。
+>
+> **(6) 検証。** 実際に `cargo test` を走らせ、lib **429 passed / 0 failed**
+> （2026-07-30 追記時点の 419 に対し新規 10 本）、統合 `queen_compat_integration`
+> **14 passed / 0 failed** を確認した。新規テストは
+> `a_succeeded_step_stamps_ended_at_ms_and_the_gap_is_its_run_time` /
+> `a_retry_waiting_out_its_backoff_has_no_ended_at_ms_until_the_budget_is_spent` /
+> `a_skipped_step_stamps_ended_at_ms` /
+> `cancelled_steps_stamp_ended_at_ms_alongside_the_run` /
+> `a_step_that_waited_for_a_pane_banks_the_wait_when_it_finally_spawns` /
+> `pane_waits_accumulate_across_every_deferral_of_the_same_step` /
+> `every_non_spawn_exit_from_a_pane_wait_banks_it_too` /
+> `a_legacy_steps_json_without_the_timing_keys_still_deserializes` /
+> `resume_workflow_restores_a_legacy_run_and_backfills_nothing` /
+> `advance_run_leaves_no_terminal_step_without_an_ended_at_ms` の 10 本。
+> 最後の 1 本は「終端 step に `ended_at_ms` が無い」状態を driver 全体に対して禁止する
+> 網で、将来 `mark_terminal` を伴わない終端遷移が足されたら落ちる。
+> `cargo clippy --all-targets` の警告は続報10 と同じく `config.rs:834` の
+> `nonminimal_bool` **1 件のみ**で、本作業起因の新規警告はゼロ。
+> 時刻注入の仕組みはこのモジュールに無いため（`now_ms()` は自由関数）、
+> `now` を受け取る pass は合成値で厳密等値を、自前で `now_ms()` を呼ぶ経路は
+> 順序・区間（`ended >= started`、`before..=after`、run の終了時刻と一致）で
+> 検証している。この判断はテストコードのセクション冒頭コメントに残した。
+>
+> **解除されないもの。** 実機での確認は未了 — GUI 上で所要が表示されること、
+> 9 面上限で待たされた step の待ち時間が実機で正しく出ることは、いずれも unit test
+> でのみ検証されている。frontend 側（`types.ts` の 2 フィールド追加、
+> `WorkflowPanel.svelte` の表示）は本追記の担当範囲外で、別担当が同じ確定 wire 契約から
+> 実装する。続報10 の「解除されないもの」（実機 workflow 1 本流し未実施、
+> reply-once-when-done レース、kickoff 配送失敗によるペイン孤児化）はいずれも
+> 本断面のスコープ外で、未解消のままである。
+>
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。

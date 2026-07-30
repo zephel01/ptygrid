@@ -8,13 +8,18 @@
   // pattern GitPanel uses), independent of App.svelte's own toolbar chips.
   import { onMount } from "svelte";
   import { ui } from "./stores.svelte";
+  import { formatDurationMs, msg } from "./i18n.svelte";
   import { invokeCmd, isTauri } from "./tauri";
-  import type { WorkflowDef, WorkflowRun } from "./types";
+  import type { StepOutcome, WorkflowDef, WorkflowRun } from "./types";
 
   const DEFAULT_COLS = 80;
   const DEFAULT_ROWS = 24;
   /** Recently-ended runs shown alongside every still-running run. */
   const MAX_RECENT_ENDED = 10;
+
+  /** Same pattern the other panels use: reading it in the template tracks the
+   * locale setting, so a language switch re-renders these labels. */
+  let m = $derived(msg());
 
   let launchingName = $state<string | null>(null);
   let cancellingRunId = $state<string | null>(null);
@@ -56,6 +61,47 @@
     } catch {
       return String(ms);
     }
+  }
+
+  /** Rendered timing for one step row, or null when there is nothing to say.
+   * Phase 5.0.6: `endedAtMs` / `waitedForPaneMs` are both optional on the wire
+   * (`skip_serializing_if` / `default`), so a run persisted before 5.0.6 and
+   * resumed produces null here and the row looks exactly as it did before. */
+  type StepTiming = { text: string; title: string };
+
+  /** Derive the timing label for a step. Read-only and cheap, so it runs from
+   * the template on every re-render: `workflow-state` events already repaint
+   * the panel, and deliberately no timer/interval is added — a running step
+   * simply shows nothing until it reaches a terminal state. */
+  function stepTiming(step: StepOutcome): StepTiming | null {
+    // A terminal step has `endedAtMs`; `startedAtMs === 0` means it was never
+    // spawned, in which case the difference would be an epoch timestamp rather
+    // than a duration. Guard the reversed-clock case too.
+    const ended = step.endedAtMs;
+    const ran =
+      typeof ended === "number" &&
+      Number.isFinite(ended) &&
+      step.startedAtMs > 0 &&
+      ended >= step.startedAtMs;
+    const dur = ran ? formatDurationMs(ended - step.startedAtMs) : null;
+
+    // Pane wait is a separate, cumulative quantity — shown whenever it is
+    // non-zero, including on a step that has not terminated yet. It only moves
+    // when a deferral is settled, so it never ticks on its own either.
+    const waitedMs = step.waitedForPaneMs ?? 0;
+    const wait =
+      Number.isFinite(waitedMs) && waitedMs > 0
+        ? formatDurationMs(waitedMs)
+        : null;
+
+    if (dur === null && wait === null) return null;
+    const text =
+      dur !== null && wait !== null
+        ? m.wfStepDurationWaited(dur, wait)
+        : dur !== null
+          ? dur
+          : m.wfStepWaitOnly(wait as string);
+    return { text, title: m.wfStepTimingTitle(dur, wait) };
   }
 
   async function runWorkflow(name: string): Promise<void> {
@@ -164,6 +210,7 @@
             </div>
             <div class="wf-steps">
               {#each run.steps as step (step.stepId)}
+                {@const timing = stepTiming(step)}
                 <div class="wf-step">
                   <span class={`wf-badge wf-badge-sm wf-badge-${step.state}`}>{step.state}</span>
                   <span class="wf-step-id">{step.stepId}</span>
@@ -176,6 +223,15 @@
                     <span class="wf-step-wait" title={step.error}>{step.error}</span>
                   {:else if step.error}
                     <span class="wf-step-error" title={step.error}>⚠</span>
+                  {/if}
+                  {#if timing}
+                    <!-- Phase 5.0.6: execution time (and cumulative pane wait)
+                         for steps that reported them. Pinned to the right of
+                         the row so it never competes with the wait reason
+                         above, which keeps its ellipsis and shrinks first. -->
+                    <span class="wf-step-timing" title={timing.title}
+                      >{timing.text}</span
+                    >
                   {/if}
                 </div>
               {/each}
@@ -332,6 +388,20 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: help;
+  }
+
+  /* Phase 5.0.6 step timing. `margin-left: auto` right-aligns it and
+     `flex: 0 0 auto` keeps it intact when a long wait reason shares the row —
+     the reason ellipsises instead. Only rendered when the run carries the
+     5.0.6 fields, so older rows are byte-identical to before. */
+  .wf-step-timing {
+    flex: 0 0 auto;
+    margin-left: auto;
+    padding-left: 6px;
+    color: #7f9f7f;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
     cursor: help;
   }
 

@@ -127,6 +127,21 @@ export type StepOutcome = {
   state: StepState;
   attempts: number;
   error?: string;
+  /** 「現在の試行」の開始時刻(epoch ms)。一度も spawn されていない step は 0。
+   * Rust 側は `#[serde(default)]` だが skip_serializing_if は付かないので
+   * wire には必ず出る。0 は「未 spawn」であって 1970 年ではない。 */
+  startedAtMs: number;
+  /** 終端(succeeded / retry 予算切れの failed / skipped / cancelled)に達した
+   * 時刻(epoch ms)。Rust 側が `skip_serializing_if = "Option::is_none"` なので
+   * 未終端・retry backoff 中・5.0.6 以前に永続化された run では**キーごと無い**。
+   * `endedAtMs - startedAtMs` はその step の実行時間で、ペイン待ち
+   * (`waitedForPaneMs`)は含まない。両者は別物なので足し引きしないこと。 */
+  endedAtMs?: number;
+  /** 9面上限でペインが空くのを待った累積時間(ms)。待たなかったら 0。
+   * Rust 側は `#[serde(default)]` で、5.0.6 以前に永続化された run を resume
+   * した場合はキーが無いことがあるので省略されうる前提で読むこと。
+   * 再 spawn をまたいで累積する(`endedAtMs - startedAtMs` と違う点)。 */
+  waitedForPaneMs?: number;
 };
 
 export type WorkflowRunId = string;

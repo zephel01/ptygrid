@@ -59,6 +59,57 @@ export function currentLocale(): Locale {
 }
 
 // ---------------------------------------------------------------------------
+// Shared formatting helpers (locale-independent on purpose).
+// ---------------------------------------------------------------------------
+
+/** Render a millisecond duration as a short, human-readable string.
+ *
+ * Deliberately locale-INDEPENDENT: the `s` / `m` / `h` unit letters read the
+ * same in every locale this app ships, so only the surrounding wording (see
+ * `wfStepDurationWaited` / `wfStepTimingTitle`) goes through the dictionaries.
+ * Phase 5.0.6 uses it for workflow step timings; Phase 5.5.1 (OTel) is
+ * expected to reuse it so both surfaces print the same number.
+ *
+ * Pure — no clock, no locale, no state. Scale-dependent precision so the
+ * string stays short as the magnitude grows:
+ *
+ * | input               | output   |
+ * |---------------------|----------|
+ * | `< 50`              | `0.0s`   |
+ * | `400`               | `0.4s`   |
+ * | `1200`              | `1.2s`   |
+ * | `59_940`            | `59.9s`  |
+ * | `59_950`            | `1m 00s` |
+ * | `123_000`           | `2m 03s` |
+ * | `3_599_400`         | `59m 59s`|
+ * | `3_599_600`         | `1h 00m` |
+ * | `93_780_000`        | `26h 03m`|
+ *
+ * Rounding cascades: a value that rounds up past its bracket's ceiling is
+ * re-formatted in the next bracket, so `59.95s` prints `1m 00s` rather than
+ * the nonsensical `60.0s`. Hours are not capped (no day unit) — a multi-day
+ * step still prints as hours, which is unambiguous.
+ *
+ * Non-finite (`NaN`/`Infinity`) and negative inputs are clamped to `0`, so a
+ * clock that went backwards prints `0.0s` instead of a `-` string. Callers
+ * that must not display anything at all in those cases have to check first.
+ */
+export function formatDurationMs(ms: number): string {
+  const safe = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  // Under a minute: tenths of a second ("0.4s" … "59.9s").
+  const tenths = Math.round(safe / 100);
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)}s`;
+  // Under an hour: whole seconds, zero-padded ("1m 00s" … "59m 59s").
+  const totalSec = Math.round(safe / 1000);
+  if (totalSec < 3600) {
+    return `${Math.floor(totalSec / 60)}m ${String(totalSec % 60).padStart(2, "0")}s`;
+  }
+  // An hour and up: whole minutes, zero-padded ("1h 00m" and beyond).
+  const totalMin = Math.round(safe / 60000);
+  return `${Math.floor(totalMin / 60)}h ${String(totalMin % 60).padStart(2, "0")}m`;
+}
+
+// ---------------------------------------------------------------------------
 // Dictionaries. Grouped by UI area; interpolated strings are functions so
 // word order can differ per language.
 // ---------------------------------------------------------------------------
@@ -369,6 +420,23 @@ const en = {
   trSubStopped:
     "This subagent has stopped (no further transcript output).",
   trWaiting: "Waiting for transcript… (read-only, observe only)",
+
+  // ---- Workflow panel step timings (Phase 5.0.6) ----
+  // `dur` / `wait` are already-formatted strings from `formatDurationMs`.
+  /** Inline label when the step both ran to a terminal state and waited for a
+   * pane at some point — e.g. "4.1s (waited 2.0s)". */
+  wfStepDurationWaited: (dur: string, wait: string) => `${dur} (waited ${wait})`,
+  /** Inline label when only the pane wait is known (step not terminal yet). */
+  wfStepWaitOnly: (wait: string) => `waited ${wait}`,
+  /** Tooltip. Either side may be null; execution time and pane wait are
+   * separate quantities and are shown on separate lines, never summed. */
+  wfStepTimingTitle: (dur: string | null, wait: string | null) =>
+    [
+      dur === null ? null : `Execution time: ${dur}`,
+      wait === null ? null : `Waited for a free pane: ${wait}`,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n"),
 
   // ---- init (Phase 5.0.2: generate ptygrid.yml) ----
   initCreateConfig: "Create a config",
@@ -810,6 +878,17 @@ const ja: Messages = {
   trSubStopped:
     "この subagent は停止しました（transcript の追記はありません）。",
   trWaiting: "transcript を待機中…（read-only・観測のみ）",
+
+  // ---- Workflow panel step timings (Phase 5.0.6) ----
+  wfStepDurationWaited: (dur: string, wait: string) => `${dur}（待ち ${wait}）`,
+  wfStepWaitOnly: (wait: string) => `待ち ${wait}`,
+  wfStepTimingTitle: (dur: string | null, wait: string | null) =>
+    [
+      dur === null ? null : `実行時間: ${dur}`,
+      wait === null ? null : `ペイン待ち: ${wait}`,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n"),
 
   // ---- init (Phase 5.0.2: ptygrid.yml の自動生成) ----
   initCreateConfig: "設定を作る",
