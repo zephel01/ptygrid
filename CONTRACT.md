@@ -2315,6 +2315,140 @@ backend 側でも構造的に保証するため。`target` 省略時は `InitTar
 - 実機手動検証（spec-init-5.0.2.md §7.2 の 4 項目）は未実施。plan.md への U 番号
   登録は別途行う。
 
+## 追補（2026-07-30）: ローカル LLM プローブ
+
+> 状態: **未実装**。仕様は [docs/spec/spec-init-5.0.2.md](docs/spec/spec-init-5.0.2.md) §3.9 / §4.4。
+> **本追補はすべて additive** — 上の「wire 型」「Tauri command 3 本」「生成物の不変条件」
+> 「sidecar 規約」「新規イベントは追加していない」「非回帰」各節は**一切変更しない**。
+
+`InitScanReport.routerPort`（`127.0.0.1:3456` への 200ms TCP connect 1 回）は**そのまま残る**。
+意味づけだけ「既定ルータポートに何かが居るという**弱い手がかり**」に格下げし、Anthropic
+Messages API 互換エンドポイントの**実在確認**は新設の `init_probe_llm` が担う。Ollama は
+v0.14.0 以降、LM Studio も `/v1/messages` を持つため `ANTHROPIC_BASE_URL` の直結で足り、
+translation 層（coderouter）は必須ではない — coderouter は選択肢のひとつとして残る。
+
+### 追加 wire 型（camelCase、`init.rs` の `#[derive(Serialize)]` そのまま）
+
+```ts
+// GET /v1/models に答えたローカルエンドポイント 1 つ。
+interface LocalLlmEndpoint {
+  port: number;                 // 応答したポート
+  models: string[];             // GET /v1/models の data[].id。PROBE_MAX_MODELS(20) で打ち切る
+  // Anthropic Messages API 互換であることが確証できたか。
+  //   true  = 確証あり（現状 /api/version が 0.14.0 以上の Ollama のみ）
+  //   false = 確証をもって非対応
+  //   null  = 不明（OpenAI 互換の応答があっただけ。Rust 側は Option<bool>）
+  anthropic: boolean | null;
+  label: string;                // 表示用ラベル。名乗りが取れたときだけ製品名を入れる。
+                                 // 例: "Ollama 0.14.3" / "127.0.0.1:1234 (OpenAI 互換の応答)"
+}
+
+interface InitProbeReport {
+  probedPorts: number[];        // 実際に当たったポート（入力の重複除去・昇順）
+  endpoints: LocalLlmEndpoint[];// 応答があったものだけ。ポート昇順
+  timedOut: boolean;            // 全体予算を使い切って打ち切ったか（間に合った分は返す）
+}
+```
+
+JSON 実例（Ollama v0.14.3 が 11434 に、正体不明の OpenAI 互換サーバが 1234 に居る場合）:
+
+```jsonc
+{
+  "probedPorts": [1234, 3456, 11434],
+  "endpoints": [
+    {
+      "port": 1234,
+      "models": ["openai/gpt-oss-20b"],
+      "anthropic": null,
+      "label": "127.0.0.1:1234 (OpenAI 互換の応答)"
+    },
+    {
+      "port": 11434,
+      "models": ["qwen3-coder:30b", "gpt-oss:20b"],
+      "anthropic": true,
+      "label": "Ollama 0.14.3"
+    }
+  ],
+  "timedOut": false
+}
+```
+
+### 追加 Tauri command 1 本（同期・additive。init 系は計 4 本になる）
+
+| command | 引数 | 戻り値 | 説明 |
+|---|---|---|---|
+| `init_probe_llm` | `{ ports?: number[] }` | `InitProbeReport` | 既定 3 ポート + `ports`（**追加分のみ**）に `GET /v1/models` を投げる。ディスクに**書かない**。`dir` を取らないため `no_target_dir:` の対象外 |
+
+```rust
+#[tauri::command]
+pub fn init_probe_llm(ports: Option<Vec<u16>>) -> Result<InitProbeReport, String>;
+```
+
+- 既定ポートは `DEFAULT_PROBE_PORTS = [11434, 1234, 3456]`（Ollama / LM Studio / coderouter）。
+  `ports` は**追加ポートのみ**で、`None` / 空なら既定 3 本だけ。渡されたものは既定 3 本と
+  合わせて**重複除去・昇順**にしてから当たる。
+- **127.0.0.1 以外に接続しない。レンジスキャンをしない**（当たるのは既定 3 本 + 手入力のみ）。
+- 上限は定数で固定: `PROBE_PORT_TIMEOUT` 1 秒（1 ポートあたり）/ `PROBE_TOTAL_BUDGET` 3 秒
+  （全体。超過時は `timedOut: true` で打ち切り、間に合った分を返す）/ `PROBE_MAX_BYTES` 64 KiB
+  （応答の読み取り上限）/ `PROBE_MAX_MODELS` 20 件 / `MAX_EXTRA_PORTS` 4 本 /
+  `OLLAMA_MIN_ANTHROPIC` `(0, 14, 0)`。
+- 確証の定義: `GET /api/version` が 200 かつ `version` が `OLLAMA_MIN_ANTHROPIC` 以上のときだけ
+  `anthropic: true`。**`/v1/models` が答えることは `/v1/messages` があることを証明しない**
+  （OpenAI 互換のみのサーバ、Ollama v0.14.0 未満も同じ応答を返す）。
+- `lib.rs` の `generate_handler!` に登録する（新規イベントは追加しない — 上の
+  「新規イベントは追加していない」節の性質は 4 本目でも維持）。
+
+**エラー文字列の接頭辞規約（追加は 1 つだけ）**:
+
+- `bad_port:` — `ports` に `0` が含まれる、または追加分が `MAX_EXTRA_PORTS`（4 本）を超えた。
+  **応答が無いことはエラーではない**（`endpoints` が空の `InitProbeReport` を返す）。
+- 既存の `no_target_dir:` / `no_home:` / `invalid_config:` / `legacy_config:` の意味は不変。
+
+### `init_preview` の引数追加（additive・非退行）
+
+```rust
+#[tauri::command]
+pub fn init_preview(
+    config: State<'_, ConfigManager>,
+    dir: Option<String>,
+    target: Option<InitTarget>,
+    llm: Option<Vec<LocalLlmEndpoint>>,   // ← 追加。None は従来どおりの挙動
+) -> Result<InitPreview, String>;
+```
+
+wire 上の引数は `{ dir?: string, target?: InitTarget, llm?: LocalLlmEndpoint[] }` になる。
+**`llm` が `None` または空のときの出力は現行とバイト単位で同一であること**を契約として宣言する
+（これを守るテストを 1 本置く。既存の生成テストが落ちないことでも担保される）。返り値
+`InitPreview` のフィールドは不変で、プローブ結果は `content` の中身にのみ現れる。
+
+### 生成規則（プローブ結果があるとき）
+
+- `anthropic === true` のエンドポイントは**有効行**として `agents:` に出す。1 エンドポイント
+  につき 1 定義。名前は `local-<port>`（衝突回避のため常にポート付き）。`cmd` は
+  `claude --model <models[0]>`、`env` に `ANTHROPIC_BASE_URL: "http://127.0.0.1:<port>"` と
+  （Ollama の場合）`ANTHROPIC_AUTH_TOKEN: "ollama"`。他に検出したモデルがあれば
+  `# 他に: a / b / c` を 1 行コメントで添える。
+- `anthropic !== true` のものは**コメント行**で同じ形を出し、直前に「`/v1/messages` が応答するか
+  は未確認」の趣旨を 1 行入れる。
+- **`autostart` は常に `false`**。プローブ経路でも例外を作らず、`trust::add_trusted` も呼ばない
+  （上の「非回帰」節の trust 不変宣言はそのまま維持される）。
+- プローブ結果が 1 件でもあるとき、既存の 3456 用コメントブロック（`router.settings.json` の
+  案内）は**同じポートが結果に含まれる場合だけ**抑止する。含まれないなら従来どおり出す。
+- **決定性を維持**: 同じ入力（`scan` + `llm` + 当日日付）から同じバイト列。`models` は受け取った
+  順を保持し、エンドポイントは**ポート昇順**で出す。
+
+### 非回帰（本追補はすべて additive）
+
+- `init_scan` / `scan` / `scan_pure` の既存シグネチャと `InitScanReport` の全 field
+  （`routerPort` を含む）は**不変**。プローブは `scan` に混ぜないため、`init_scan` の
+  best-effort・非ブロッキングという速度上の性質も**無変更**。
+- `init_write` / `InitWriteResult` / `InitPreview` / `InitTarget` / `ExistingConfig` は**不変**。
+  `init_preview` は引数の追加のみで、`llm` を渡さない既存呼び出しの挙動は 1 バイトも変わらない。
+- 「`init_write` が書き込む内容は必ず `parse_config` を通っている」という生成物の不変条件は
+  プローブ経路でも成立する（生成は `init.rs::render_config` が行い、frontend は生成テキストを
+  組み立てない）。sidecar 規約・新規イベント無しも不変。
+- `ptygrid.yml` のスキーマ（`Config` 構造体・既存フィールド）に変更なし。
+
 ---
 
 # Phase 5.5 追加契約（Observable & Standards-Compliant）

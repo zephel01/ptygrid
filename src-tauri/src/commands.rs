@@ -9,7 +9,10 @@ use tauri::{AppHandle, Emitter, State};
 use crate::app_settings::{self, ProjectDirs, ProjectsRoot};
 use crate::config::{ConfigInfo, ConfigManager};
 use crate::git_service::{self, GitCommitInfo, GitDiffInfo, GitStatusInfo};
-use crate::init::{self, InitPreview, InitScanReport, InitTarget, InitWriteResult};
+use crate::init::{
+    self, InitPreview, InitProbeReport, InitScanReport, InitTarget, InitWriteResult,
+    LocalLlmEndpoint,
+};
 use crate::project_state::{self, LogicalSession, ProjectState};
 use crate::queen::{self, QueenStatus, QueenStatusInfo};
 use crate::session::{PtyManager, SessionInfo};
@@ -441,14 +444,37 @@ pub fn init_scan(
 /// with the existing text returned as `existingContent` for the diff view).
 /// `valid` is the result of running the generated text through the same
 /// `parse_config` every load path uses.
+/// `llm` carries a previous `init_probe_llm` result so the generated file can
+/// reflect it; `None` (or an empty list) generates exactly what it did before
+/// the probe existed. The probe is deliberately NOT run from here — it costs
+/// seconds of real HTTP and stays an explicit user action.
 #[tauri::command]
 pub fn init_preview(
     config: State<'_, ConfigManager>,
     dir: Option<String>,
     target: Option<InitTarget>,
+    llm: Option<Vec<LocalLlmEndpoint>>,
 ) -> Result<InitPreview, String> {
     let dir = init_dir(&config, dir)?;
-    init::preview(&dir, target.unwrap_or_default())
+    init::preview(
+        &dir,
+        target.unwrap_or_default(),
+        llm.as_deref().unwrap_or(&[]),
+    )
+}
+
+/// Phase 5.0.2 追補 — probe loopback for a local LLM endpoint. Touches no disk
+/// and no host but 127.0.0.1.
+///
+/// `ports` holds *extra* ports only; the three defaults (11434 / 1234 / 3456)
+/// are always probed and the union is deduplicated and sorted. Fails with the
+/// single `bad_port:` prefix when a port is `0` or more than four extras were
+/// passed — a port that does not answer is not an error, it is simply absent
+/// from `endpoints`. Blocks for at most the whole-probe budget (3s), after
+/// which whatever answered is returned with `timedOut: true`.
+#[tauri::command]
+pub fn init_probe_llm(ports: Option<Vec<u16>>) -> Result<InitProbeReport, String> {
+    init::probe_llm(ports.as_deref())
 }
 
 /// Phase 5.0.2 `ptygrid init` — write `content` after re-checking it.

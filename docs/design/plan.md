@@ -1,8 +1,8 @@
 # ptygrid 作業計画 (plan.md)
 
-更新日: 2026-07-29 / 実装基準: `main` = `4c02cbb`（PR #3 マージ済み / 2026-07-29 01:35 +0900）。
-最新タグは `v0.5.6` で、そこから **24 コミットが未タグ**。`package.json` / `src-tauri/Cargo.toml` /
-`src-tauri/tauri.conf.json` の 3 ファイルはいずれも `0.5.6` で揃っている。
+更新日: 2026-07-30 / 実装基準: `main` = `4c02cbb`（PR #3 マージ済み / 2026-07-29 01:35 +0900）。
+最新タグは `v0.5.7`（2026-07-30 作成）。`package.json` / `src-tauri/Cargo.toml` /
+`src-tauri/tauri.conf.json` の 3 ファイルはいずれも `0.5.7` で揃っている。
 
 **この文書の読み方**: 「結局どこまで終わって何が残っているか」は §1 の通し進捗表 1 本で足りる。
 状態を書くのは §1 だけ、実機検証の詳細は §2、タグとバージョンは §4、日付つきの経緯は §6 にしか
@@ -44,10 +44,10 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out は未（U2） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | ✅ | v0.5.1（`ac1b94b`） | 済（U5、2026-07-30） |
-| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ✅ | 未タグ | 済（U11、2026-07-30） |
+| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ✅ | v0.5.7 | 済（U11、2026-07-30） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
-| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
-| 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
+| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | v0.5.7（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
+| 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | v0.5.7（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
@@ -141,14 +141,9 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
   pane kill（U2）もここで消す。
 - 実走で分かったことは CONTRACT.md の続報として追記し、§6 に日付つきで残す。
 
-### P2. 未タグ成果のリリース（次のタグ）
+### P2. 未タグ成果のリリース（次のタグ）— 完了
 
-**なぜ今それか**: 未タグの成果が 24 コミット積み上がっており、これ以上増やすと「どのバイナリに
-何が入っているか」が追えなくなるから。「1 リリース = 1 patch」という規律（§4）に照らして負債が大きい。
-
-- ただし P1 の実機確認を経ずにタグを打つと「未検証のものをリリースした」記録が残るので、**P1 の後**。
-- タグ番号・前提条件・手順はすべて §4 に書いてある。**打つかどうかを決めるのはユーザー**。
-- `svelte-check` / `npm run build` を実測してから（U9）3 ファイルの version を同期する。
+2026-07-30、`v0.5.7` としてリリース済み（詳細は §4・§6.8）。以降の次の作業は P3 から。
 
 ### P3. retry 枯渇時の外部通知経路（escalation）
 
@@ -208,8 +203,6 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
   （5.0.5 は Arena view 用に予約済みで、採番の食い違い自体は §1 の脚注※で決着済み）
 - **`src-tauri/src/orchestrator.rs.bak` が git に追跡されたまま**: live source ではないが、ガイド §1 が
   「commit 済みの `.bak` に旧コードが残るが実行系とは無関係」と注記せざるを得ない。次の整理コミットで削除
-- **spec-phase5-5.md §9 の「バージョン割り当て」表が未修正**: §4 の次タグ案 (a) を採る場合に
-  繰り下げが要る（数字と得失は §4）。現状は 2 資料が違うことを言っている状態
 - **anthropics/claude-code#26572**（CustomPaneBackend 公式化）: 採用されたら
   シム撤去 + `CLAUDE_PANE_BACKEND_SOCKET` 広告へ移行（teams-backend はそのまま使える）
 - 残りの Defer 項目（backend M5/M8/L3/L4/L6/L7/L11 系、frontend BUG-8/10、
@@ -239,12 +232,15 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 - 原則 **1 リリース = 1 patch**。v0.1.0 のまま Phase 4.2 まで進めたため遡及タグ（v0.4.0 / v0.4.1）は
   付けず、v0.4.2 を最初のリリースタグに集約した。
 
-### タグ実績（11 本）
+### タグ実績（12 本）
 
-実タグは `v0.4.2`〜`v0.4.9` / `v0.5.0` / `v0.5.1` / `v0.5.6` の **11 本**。**`v0.5.2`〜`v0.5.5` は存在
-しない**（`v0.5.6` のタグメッセージが Phase 5.0.2〜5.0.5 用に予約と宣言したまま実装が別の順序で
-進んだため）。作成日は v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、
-v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23。
+実タグは `v0.4.2`〜`v0.4.9` / `v0.5.0` / `v0.5.1` / `v0.5.6` / `v0.5.7` の **12 本**。**`v0.5.2`〜`v0.5.5`
+は存在しない**（`v0.5.6` のタグメッセージが Phase 5.0.2〜5.0.5 用に予約と宣言したまま実装が別の順序で
+進んだため）。`v0.5.7` を採ったことで、[spec-phase5-5.md](../spec/spec-phase5-5.md) §9 の
+「バージョン割り当て」表が予約していた `v0.5.7` = Phase 5.5.1（OTel + SQLite）を `v0.5.8` へ、
+以降の 5.5.2〜5.5.4 も 1 つずつ繰り下げる付け替えが必要になった（同 spec 側で対応済み）。作成日は
+v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / v0.5.1 / v0.5.6 が
+2026-07-23、`v0.5.7` が 2026-07-30。
 
 | バージョン | 内容 |
 |---|---|
@@ -260,6 +256,7 @@ v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23。
 | **v0.5.0** | Phase 5.0.0 MVO（`0182988` + `b1b4f1f`）。cargo test 246。同区間にはクラウド LLM の API キー利用ドキュメント（`665ee82` / `461d2a9`）も含まれる |
 | **v0.5.1** | Phase 5.0.1 Workflow Resume。cargo test 251。**frontend（`src/`）はこの断面が最後の変更** |
 | **v0.5.6** | Phase 5.5.0 RC 互換ルータ。lib 286 + 統合 14 tests / clippy `-D warnings` clean。タグメッセージは「`v0.5.2`〜`v0.5.5` は Phase 5.0.2〜5.0.5 用に予約」と宣言している |
+| **v0.5.7** | Phase 5.0.2 `ptygrid init`（環境検出→テンプレート生成→自己検査、実機確認済み）+ Phase 5.0.4 Orchestrator 実行層（`retry:` / `timeoutMs` / `condition:` / `handoffTo` / `joinOn: reply`、supervisor・handoff の spawn ゲート撤去）+ `fanOut` 黙殺解消・straggler 協調キャンセル + ハードニング（pane 上限待ち行列化 / driver tick 軽量化 / inbox mailbox の run 単位分離）+ docs 公開/内部分離 + MIT license 宣言。lib 402 + 統合 14 tests |
 
 > **v0.5.6 タグメッセージの注意**: 同メッセージは「untagged 5.0.2 Workflow Reliability
 > (retry/timeoutMs/joinOn:reply/escalation) と integrator エージェントを同梱」と書いているが、
@@ -268,47 +265,13 @@ v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23。
 > あるのは 5.0.0 由来の `timeout_ms` のみ）。integrator エージェントは gitignore 対象の
 > `ptygrid.yml` 側の定義でありタグの内容としては追跡できない。
 
-### v0.5.6 以降の未タグ成果（`main` = `4c02cbb`）
+### v0.5.7 として release 済み
 
-`v0.5.6..main` は 24 コミット（46 ファイル / +7,949 −729）+ 本ブランチの 5.0.2 実装。内訳:
+`v0.5.6..main` の 45 コミット + 未マージだった 5.0.2 `ptygrid init`（docs 1 件）をまとめて
+`v0.5.7` としてリリース済み（2026-07-30。60 files changed, +12,673 −1,005）。個別コミットの内訳は
+タグメッセージと `git log v0.5.6..v0.5.7` に残るためここには重複させない。当時の検証と注記は §6.8。
 
-| コミット | 経路 | 内容 |
-|---|---|---|
-| `5d3c1b5` + `3bd9833` | PR #1（`4981ba6`） | 5.0.4 スキーマ + 実行層本体 |
-| `dd7a135` | PR #2（`784f7e9`） | docs を spec / guide / design に再編、3 spec の公開 |
-| `52de433` | PR #3 に同梱 | 5.0.4 実行層の仕上げ: `fanOut` 黙殺による false green の解消（`fan-out` 以外での `fanOut` 宣言を load 時に拒否、`joinOn: N` を実効コピー数で検査）+ straggler cancellation。CONTRACT.md 続報9 |
-| `2dc5e40` | PR #3（`4c02cbb`） | Orchestrator ハードニング。CONTRACT.md 続報10、設計は [refactor-pane-cap-5.0.5.md](refactor-pane-cap-5.0.5.md)、経緯は §6 |
-| `3883128` / `d3eac32` | `main` 直コミット | docs の公開/内部分離 / MIT license 宣言 |
-| 未確定（本ブランチ） | 未マージ | 5.0.2 `ptygrid init`: backend `init.rs`（1402 行）+ Tauri command 3 本 + frontend `InitPanel.svelte`（858 行）+ 入口 2 つ + i18n 53 キー。lib テスト 375→400、統合 14 は不変、clippy は既存の `config.rs` 1 件のみ、`npm run check`/`build` 成功。CONTRACT.md に「Phase 5.0.2 追加契約」を追記済み |
-
-### 次タグの前提（打つ前に潰すもの）
-
-- **`cargo clippy --all-targets --all-features -- -D warnings` が 1 件で落ちる**:
-  `config.rs:834` の `nonminimal_bool`（`joinOn: reply` の kickoff 必須チェック）。`git log -S` で
-  追うと 5.0.4 実行層の `3bd9833` で入ったもので、ハードニング（`52de433` / `2dc5e40`）が持ち込んだ
-  新規警告ではない。**CI（`.github/workflows/ci.yml`）は `cargo clippy --all-targets --locked` を
-  `-D warnings` なしで実行し `RUSTFLAGS` の deny も無いため、この 1 件で main が赤くなることはない**。
-  落ちるのは README「開発時のチェック」と本文書の規律どおり手元で `-D warnings` を付けたときだけ。
-  修正案（`is_none_or`）は Rust 1.82+ を要求するので、直すなら最低対応 toolchain の確認とセットで。
-- **自動テスト実測（2026-07-29、`main` = `4c02cbb` 相当の作業ツリー）**: lib **375 passed** /
-  統合 `queen_compat_integration` **14 passed** / `teams-backend` **30 passed**（18 + 8 + 4）。
-  ただし**並列実行時に `git_service` のテスト（`reads_status_and_diff_from_a_real_repository`）が
-  1 件 flaky に落ちることがある**（単体実行では pass）。regression ではなくテスト間の環境競合と
-  見られるが、「375 / 0」は実行条件つきの値であり無条件の事実ではない。
-- **frontend チェックは未実測**（U9）。3 ファイルの version 同期の前に実測すること。
-
-そのうえで、未タグ成果をまとめて 1 本のリリースにすることを提案する。**打つかどうか・どの番号に
-するかを決めるのはユーザー**であり、本文書は選択肢と得失を並べるところまで。番号は未確定で 2 案:
-
-- **(a) `v0.5.7` を割り当てる**。連番が単調増加し `git tag` の並びと時系列が一致する。ただし
-  [spec-phase5-5.md](../spec/spec-phase5-5.md) §9 の「バージョン割り当て」表と v0.5.6 のタグメッセージが
-  **`v0.5.7` = Phase 5.5.1（OTel + SQLite）を予約している**ため、5.5.1〜5.5.4 を 1 つずつ繰り下げる
-  （`v0.5.8`〜`v0.5.11`）文書修正が要る。
-- **(b) 予約どおり `v0.5.4` を後追いで打つ**（`v0.5.2`〜`v0.5.5` = Phase 5.0.2〜5.0.5 の予約を守る）。
-  予約表は無傷だが、`v0.5.6` より後に `v0.5.4` を作ることになり、タグ順と時系列が逆転する。
-
-文書としての推しは **(a)**（タグ順と時系列が一致するほうが後から追いやすく、予約表の付け替えは
-ドキュメント修正だけで済むため）。どちらを採るにせよ、**§3 P1 を通してから打つ**ことを提案する。
+番号は連番を優先する **(a) `v0.5.7`** を採用した（予約どおり `v0.5.4` を後追いする (b) 案は不採用）。
 
 ### リリース手順（タグ付けの作法）
 
@@ -524,6 +487,27 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   状態でも `9/9 occupied` という古い理由が見えることがあるが矛盾ではない。今日の一連では自動
   テストでは捕まらない不具合が 5 件出た（主入口の表示条件、トーストの二重表示、pane 上限の
   数え方、テストの fd 枯渇と macOS 移植性、待機理由の不可視）。
+
+### 6.8 2026-07-30: v0.5.7 リリース
+
+詳細な経緯。現在地は §1・§4。
+
+- 入ったもの: docs の公開/内部分離（`3883128`）+ MIT license 宣言（`d3eac32`）/ Phase 5.0.4
+  Orchestrator 実行層（`5d3c1b5` → `3bd9833`: `retry:` / `timeoutMs` / `condition:` / `handoffTo` /
+  `joinOn: reply`、supervisor・handoff の spawn ゲート撤去、スキーマ検証）/ docs 再編（`dd7a135`:
+  spec / guide / design、3 spec の公開）/ `fanOut` 黙殺による false green の解消 + straggler 協調
+  キャンセル（`52de433`）/ Orchestrator ハードニング（`2dc5e40`: pane 上限の待ち行列化 / driver
+  tick 軽量化 / inbox mailbox の run 単位分離）/ Phase 5.0.2 `ptygrid init`（`283839c` /
+  `c6528d3` の backend + UI、実機修正 `ffd32c3` / `944ff46`）/ pane 上限をグリッド占有基準へ
+  （`0e9c5ba`）+ 待機理由の可視化（`05799d5`）/ テストの fd 枯渇修正（`f0bee39`）+ macOS 移植性
+  （`22e090c`）/ 実機検証（U11・U1・U3・U5）の記録（`7883d80` / `9384c3c` / `bbb0ba2`）。
+  計 45 コミット + 未マージだった docs 1 件、60 files changed / +12,673 / −1,005。
+- 当時の検証: lib **402 passed** + 統合 **14 passed**。clippy は `config.rs` の既知 1 件のみ
+  （5.0.4 由来、非回帰）。svelte-check 0 / build 成功。実機検証は U1（workflow 1 本流し）・
+  U3（pane 上限待ち行列化）・U5（resume バナー）・U11（`ptygrid init`）がいずれも完了。
+- 当時の注記: `v0.5.2`〜`v0.5.5` の予約（Phase 5.0.2〜5.0.5 用）は使わないまま残る。`v0.5.7` を
+  Phase 5.0.2 + 5.0.4 のリリースに充てたことで、spec-phase5-5.md §9 の「バージョン割り当て」表が
+  予約していた 5.5.1 以降を `v0.5.8`〜`v0.5.11` へ 1 つずつ繰り下げた。
 
 ---
 
