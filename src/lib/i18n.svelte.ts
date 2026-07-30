@@ -113,6 +113,8 @@ const en = {
 
   // ---- errors / banners ----
   clipboardCopyFailed: (err: unknown) => `Failed to copy to clipboard: ${err}`,
+  clipboardPasteFailed: (err: unknown) =>
+    `Failed to paste from the clipboard: ${err}`,
   spawnShellFailed: (err: unknown) =>
     `Failed to start a shell (spawn_shell): ${err}`,
   paneLimitReached: (max: number) => `Pane limit (${max}) reached.`,
@@ -306,6 +308,15 @@ const en = {
   killConfirmText: "Stop this teammate?",
   titleCloseTeammate: "Close (stops the teammate process)",
   titleClosePane: "Close (ends the session)",
+
+  // ---- pane right-click menu (copy / paste) ----
+  ctxMenuAria: "Terminal actions",
+  ctxCopy: "Copy",
+  ctxCopyTitle: "Copy the selection to the clipboard",
+  ctxCopyDisabledTitle:
+    "Nothing selected — drag to select (Option-drag on macOS / Shift-drag elsewhere while a TUI is using the mouse)",
+  ctxPaste: "Paste",
+  ctxPasteTitle: "Paste the clipboard into this pane",
 
   // ---- semantic status ----
   astatusBlocked: "blocked (waiting for approval)",
@@ -540,6 +551,8 @@ const ja: Messages = {
   // ---- errors / banners ----
   clipboardCopyFailed: (err: unknown) =>
     `クリップボードへのコピーに失敗しました: ${err}`,
+  clipboardPasteFailed: (err: unknown) =>
+    `クリップボードからの貼り付けに失敗しました: ${err}`,
   spawnShellFailed: (err: unknown) =>
     `シェルの起動に失敗しました (spawn_shell): ${err}`,
   paneLimitReached: (max: number) =>
@@ -736,6 +749,15 @@ const ja: Messages = {
   killConfirmText: "teammate を停止しますか？",
   titleCloseTeammate: "閉じる（teammate プロセスを停止します）",
   titleClosePane: "閉じる（セッション終了）",
+
+  // ---- pane right-click menu (copy / paste) ----
+  ctxMenuAria: "ターミナル操作",
+  ctxCopy: "コピー",
+  ctxCopyTitle: "選択範囲をクリップボードにコピーします",
+  ctxCopyDisabledTitle:
+    "選択範囲がありません — ドラッグで選択してください（TUI がマウスを使っている間は macOS なら Option＋ドラッグ、それ以外は Shift＋ドラッグ）",
+  ctxPaste: "貼り付け",
+  ctxPasteTitle: "クリップボードの内容をこのペインに貼り付けます",
 
   // ---- semantic status ----
   astatusBlocked: "blocked（承認待ち）",
