@@ -415,6 +415,12 @@ const en = {
   initProbeUnsupported: "not compatible",
   initProbeModels: (first: string, count: number) =>
     count > 1 ? `${first} (+${count - 1} more)` : first,
+  initProbeModelLabel: "Model",
+  initProbeModelTitle:
+    "The model this endpoint is written out with. The rest stay in the generated file as a comment.",
+  initProbeModelCount: (count: number) => `${count} offered`,
+  initProbeModelNote:
+    "Pre-selected: the first name that does not look like an embedding / image / speech / rerank model. Every model this endpoint offers is still in the list — the others were only not picked for you.",
   initProbeConfirmedNote:
     "Written out as a live agent definition (autostart: false, as always).",
   initProbeUnconfirmedNote:
@@ -839,6 +845,12 @@ const ja: Messages = {
   initProbeUnsupported: "非対応",
   initProbeModels: (first: string, count: number) =>
     count > 1 ? `${first} ほか ${count - 1} 件` : first,
+  initProbeModelLabel: "モデル",
+  initProbeModelTitle:
+    "このエンドポイントを生成物に書き出すときのモデルです。残りはコメント行として生成物に載ります。",
+  initProbeModelCount: (count: number) => `全 ${count} 件`,
+  initProbeModelNote:
+    "既定では、埋め込み・画像・音声・再ランクらしい名前を避けて最初の 1 件を選んでいます。このエンドポイントが返したモデルはすべて一覧に残っています（既定で選ばれなかっただけです）。",
   initProbeConfirmedNote:
     "生成物には有効な agent 定義として出ます（autostart は従来どおり false です）。",
   initProbeUnconfirmedNote:

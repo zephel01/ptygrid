@@ -81,6 +81,12 @@
    * buffer. The generated text is NOT dropped in silently — the user picks
    * (see `applyGenerated` / `keepEdits`). */
   let applyPending = $state(false);
+  /** Chosen model per endpoint, keyed by port. `render_config` writes
+   * `models[0]` into `--model` and the rest into the `# 他に:` comment, so the
+   * choice is expressed by reordering `models` before handing the endpoints to
+   * `init_preview` — no extra wire field, no generated text built here.
+   * Recomputed from scratch on every probe (`runProbe`). */
+  let modelChoice = $state<Record<number, string | undefined>>({});
 
   let scan = $derived(preview?.scan ?? null);
 
@@ -88,6 +94,70 @@
   /** The ports actually hit (defaults + accepted extras), as the backend
    * deduplicated and sorted them — not what was typed. */
   let probedPortList = $derived((probe?.probedPorts ?? []).join(" / "));
+
+  // --- default model pick (frontend-only, deliberately) ---
+  //
+  // `ollama list` order says nothing about what a model is for, so the first
+  // entry can be an image model (`x/flux2-klein:latest`) and `models[0]` would
+  // land in `--model`. The guess below only moves the *default* selection; the
+  // backend keeps its single rule (`models[0]`) and stays unaware of this, so
+  // there is no second copy of the heuristic to drift.
+
+  /** Families that are never a chat model, matched anywhere in the name. Each
+   * is long and distinctive enough that a substring hit cannot realistically
+   * be an ordinary chat model, and one entry covers the whole family:
+   * `embed` → `nomic-embed-text` / `text-embedding-3` / `mxbai-embed-large`,
+   * `rerank` → `bge-reranker-v2`, `diffusion` → `stable-diffusion-3.5` and
+   * `stablediffusion`, `whisper` → `whisper-large-v3`. */
+  const NON_CHAT_SUBSTRINGS = ["embed", "rerank", "diffusion", "whisper"];
+
+  /** Families whose names are too short to match as substrings — `clip` sits
+   * inside `eclipse`, `sd` inside plenty of ordinary words. These are matched
+   * only as a whole token between delimiters (`/`, `-`, `_`, `.`, `:`), with a
+   * trailing version number stripped so `flux2` and `sd35` still count. */
+  const NON_CHAT_TOKENS = ["sd", "sdxl", "flux", "clip", "tts", "bge"];
+
+  /** True when the name reads as embedding / image / speech / rerank. Used for
+   * the default selection only — nothing is ever removed from the list. */
+  function looksNonChat(model: string): boolean {
+    const name = model.toLowerCase();
+    if (NON_CHAT_SUBSTRINGS.some((word) => name.includes(word))) return true;
+    for (const token of name.split(/[^a-z0-9]+/)) {
+      if (token === "") continue;
+      const base = token.replace(/\d+$/, "");
+      if (NON_CHAT_TOKENS.includes(token) || NON_CHAT_TOKENS.includes(base)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** First name that does not read as a non-chat model, else `models[0]` —
+   * a list of nothing but embedding models still gets a usable default. */
+  function defaultModel(models: string[]): string | undefined {
+    if (models.length === 0) return undefined;
+    return models.find((name) => !looksNonChat(name)) ?? models[0];
+  }
+
+  /** `chosen` first, everything else in the order the endpoint reported it.
+   * Returns the original array when there is nothing to move, so the endpoint
+   * object handed to `init_preview` stays identical in that case. */
+  function orderedModels(models: string[], chosen: string | undefined): string[] {
+    if (chosen === undefined) return models;
+    const at = models.indexOf(chosen);
+    if (at <= 0) return models;
+    return [chosen, ...models.slice(0, at), ...models.slice(at + 1)];
+  }
+
+  /** The `llm` argument for `init_preview`: the probed endpoints with each
+   * one's `models` rotated so the chosen model is first. Empty (and therefore
+   * omitted by the caller) whenever the probe has never run. */
+  function llmForPreview(): LocalLlmEndpoint[] {
+    return (probe?.endpoints ?? []).map((endpoint) => {
+      const models = orderedModels(endpoint.models, modelChoice[endpoint.port]);
+      return models === endpoint.models ? endpoint : { ...endpoint, models };
+    });
+  }
 
   /** `init_write` refuses when the destination is `<dir>/ptygrid.yml` and a
    * legacy `mterm.yml` is still there. `existing.legacy` can only be true when
@@ -271,7 +341,7 @@
       // `llm` stays out of the call until a probe has actually run. An empty
       // list and "never probed" generate the same bytes by contract, but
       // omitting it keeps the never-pressed path byte-for-byte the old one.
-      const llm = probe?.endpoints ?? [];
+      const llm = llmForPreview();
       const result = await invokeCmd<InitPreview>("init_preview", {
         dir,
         target: next,
@@ -347,6 +417,13 @@
         parsed.ports.length > 0 ? { ports: parsed.ports } : {},
       );
       probe = report;
+      // A fresh result gets fresh defaults: a port that answered with a
+      // different model list must not keep the previous run's selection.
+      const picks: Record<number, string | undefined> = {};
+      for (const endpoint of report.endpoints) {
+        picks[endpoint.port] = defaultModel(endpoint.models);
+      }
+      modelChoice = picks;
       // The generated text belongs to the backend: ask it again with the
       // result rather than splicing endpoints into the buffer here.
       await refreshPreview(target, true);
@@ -358,6 +435,15 @@
     } finally {
       probing = false;
     }
+  }
+
+  /** Picking a model only changes which entry of `models` comes first; the
+   * text itself is regenerated by `init_preview`, and `offerApply` keeps the
+   * hand-edited-buffer rule identical to the probe's own path. */
+  function selectModel(port: number, model: string): void {
+    if (modelChoice[port] === model || probing || loading || writing) return;
+    modelChoice = { ...modelChoice, [port]: model };
+    void refreshPreview(target, true);
   }
 
   /** Take the probe-aware generated text, dropping the hand edits — only ever
@@ -578,15 +664,43 @@
                     class:init-tag-warn={badge.kind === "warn"}
                     class:init-tag-ng={badge.kind === "ng"}>{badge.text}</span
                   >
-                  {#if endpoint.models.length > 0}
+                  {#if endpoint.models.length === 1}
                     <span
                       class="init-path init-models"
-                      title={endpoint.models.join(" / ")}
-                      >{m.initProbeModels(
-                        endpoint.models[0],
-                        endpoint.models.length,
-                      )}</span
+                      title={endpoint.models[0]}
+                      >{m.initProbeModels(endpoint.models[0], 1)}</span
                     >
+                  {/if}
+                  {#if endpoint.models.length > 1}
+                    <!-- More than one on offer, so the pick is the user's. The
+                         summary span is dropped here on purpose: `models[0]`
+                         is no longer what gets written once a model has been
+                         chosen — the select is. -->
+                    <div class="init-row">
+                      <label class="init-model-label">
+                        <span>{m.initProbeModelLabel}</span>
+                        <select
+                          class="init-model-select"
+                          title={m.initProbeModelTitle}
+                          value={modelChoice[endpoint.port] ??
+                            endpoint.models[0]}
+                          onchange={(e) =>
+                            selectModel(endpoint.port, e.currentTarget.value)}
+                          disabled={probing || loading || writing}
+                        >
+                          <!-- Every model the endpoint reported, in its own
+                               order. The guess picks a default; it never hides
+                               a choice. -->
+                          {#each endpoint.models as model, index (index)}
+                            <option value={model}>{model}</option>
+                          {/each}
+                        </select>
+                      </label>
+                      <span class="init-muted"
+                        >{m.initProbeModelCount(endpoint.models.length)}</span
+                      >
+                    </div>
+                    <div class="init-note">{m.initProbeModelNote}</div>
                   {/if}
                   <div class="init-note">{badge.note}</div>
                 </dd>
@@ -916,6 +1030,29 @@
   .init-models {
     margin-left: 6px;
     color: #bbb;
+  }
+
+  .init-model-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #888;
+    min-width: 0;
+  }
+
+  .init-model-select {
+    max-width: 28em;
+    background: #1b1b1b;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .init-model-select:disabled {
+    opacity: 0.45;
   }
 
   .init-port-label {
