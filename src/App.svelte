@@ -1111,6 +1111,14 @@
     }
   }
 
+  // `kill_pty` on a slot the backend already dropped. Matched on the message
+  // because Tauri commands return `Result<_, String>` here, not a typed error;
+  // the text is `session {id} not found` (session.rs). Kept narrow on purpose —
+  // "kill failed: …" is a real orphaned process and must still be surfaced.
+  function isSessionGone(err: unknown): boolean {
+    return typeof err === "string" && /session \d+ not found/.test(err);
+  }
+
   function closePane(id: number): void {
     // Tombstone the id first so a late session-state event racing the kill
     // can't resurrect this pane as a zombie (BUG-2).
@@ -1118,7 +1126,19 @@
     if (isTauri()) {
       // pane close is authoritative on the frontend, but a real kill failure
       // (orphaned process) must be surfaced, not silently swallowed (BUG-5).
+      //
+      // "session N not found" is the one exception: the backend already
+      // removed the slot, which is exactly the state this call was trying to
+      // reach. It happens whenever the backend kills a pane itself and the
+      // frontend's auto-close fires afterwards — `cancel_stragglers` (a
+      // joinOn:any loser) and `check_timeouts` both do that, and both clear
+      // `outcome.session_id`, so `autoCloseModeFor` can no longer see the
+      // session as workflow-owned and falls back to the agent's
+      // `close_on_exit`. Bannering that reads as "the kill failed" when
+      // nothing failed. Observed on hardware 2026-07-31 running
+      // example/measure-parallelism's measure-4-join-any.
       invokeCmd<void>("kill_pty", { id }).catch((err) => {
+        if (isSessionGone(err)) return;
         ui.errorBanner = m.killPaneFailed(id, err);
       });
     }
