@@ -42,11 +42,11 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （UI 横断） | UI 多言語化 en/ja（型付き辞書 `i18n.svelte.ts` + ⚙ 設定メニュー、既定は OS 言語追従） | ✅ | v0.4.7 | 記録なし |
 | （UX トラック） | Phase 4 期に計画外で入った UX 改善: `mterm.yml` → `ptygrid.yml` リネームと用途別サンプル（`da40cb0`）、一括 cd（`cf42ced` / `77d0271`）、作業フォルダと設定探索の分離 + origin バッジ（`acbed94`）、設定なしフォールバック（`0530e3b`）、フォルダサジェスト（`a3a769a`）、終了ペインの明示と一括クローズ（`d8a3d8e`） | ✅ | v0.4.2 | 記録なし |
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
-| 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | config 読み込みとチップ表示のみ / 実走は未（U1） |
+| 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out は未（U2） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | 🚧 | v0.5.1（`ac1b94b`） | 未（U5） |
 | 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ✅ | 未タグ | 済（U11、2026-07-30） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
-| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 未（U1 / U2） |
+| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | 未タグ（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | 未タグ（`2dc5e40`、PR #3 = `4c02cbb`） | 未（U3 / U4） |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
@@ -77,11 +77,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
 > §3 バックログ）。
 
-**いま特に効く読み方**: ⬜ の多さより、**🚧 が 7 行あることのほうが重要**。5.0.0 / 5.0.1 / 5.0.4 /
-5.0.4 追補 の 4 行はいずれも同じ理由（実機で workflow を 1 本も流していない = U1）で 🚧 に留まり、
-5.0.4 以降のコードはすべてその上に積まれている。workflow 系は「動くはずのコード」のまま 4 断面ぶん
-積み上がった状態であり、新機能（⬜ 群）より先に U1 を消すのが効く（→ §3 P1）。未タグ成果が
-24 コミット溜まっている点も同根で、P1 を通してからタグを打つ（→ §3 P2、§4）。
+**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。🚧 が 7 行残っているが、理由はもう共通ではなく個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、resume バナー（U5）、今日のハードニングの pane 上限待ちと mailbox 分離（U3 / U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）。未タグ成果へのタグ付けは「P1 を通してから」という前提を満たしたので、着手できる状態になった（→ §3 P2、§4）。
 
 **補足: 主要モジュールの所在**（状態は上表を見ること）
 
@@ -110,7 +106,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 | # | 未検証の内容 | 状況 |
 |---|---|---|
-| U1 | **実機での workflow 1 本流し**（GUI の 🔀 チップ または Queen tool `spawn_workflow` から実走し、ペインの挙動を目視） | **5.0.4 以来ずっと未実施**。CONTRACT.md 続報8〜続報10 がいずれも「解除されないもの」として同じ内容を記録している。ただし続報8 は macOS 実機での QA を**部分的に**実施したとも書いており、「完全にゼロ」ではなく「1 本流し切った実績が無い」が正確。→ §3 P1 |
+| U1 | **実機での workflow 1 本流し**（GUI の 🔀 チップ または Queen tool `spawn_workflow` から実走し、ペインの挙動を目視） | **2026-07-30、macOS で完了**。`smoke`（`pattern: pipeline` / `autoClose: success` / `a`(t1) → `b`(t2)）を最後まで流し切り、step `a` の終了で step `b` が自動 spawn され、run 完了で 2 枚のペインが自動で閉じるところまで確認。これで「完了判定が実 PTY で発火するか」「DAG が進むか」「`autoClose` が効くか」「`workflow-state` が frontend に届くか」の 4 つの継ぎ目が実機で裏付けられた。**5.0.0 以来続いていた「一度も実走していない」状態はここで解消**。残る実機項目は個別機能ごと（U2〜U5）に分かれる。詳細な経緯は §6.5 |
 | U2 | straggler 協調キャンセルの pane kill（fan-out レースの敗者ペインが GUI 上で実際に閉じること） | 続報9 が名指しで「目視確認未了」。U1 の後続 |
 | U3 | pane 上限（9 面）到達時の待ち行列化が実機で `Pending` のまま待ち、空きで再開すること（`error` に `"waiting for a free pane slot (N/9 occupied)"`） | `2dc5e40` の中核挙動。unit テストのみ |
 | U4 | 同名 workflow の並行 run が互いの返信を取りこぼさないこと（mailbox の run 単位分離） | 同上 |
@@ -463,6 +459,25 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   3 秒の窓）を別コミットで追加した。仕上げに `autostart: true` へ手編集して書き込むと trust プロンプトが出て、
   「信頼して起動」で当該エージェントが起動することまで確認し、U11 を完了とした。Windows（U8）と
   Global 選択時の `~/.ptygrid/` 作成は範囲外のまま。
+
+### 6.5 2026-07-30: P1 — `smoke` workflow の実機 1 本流し
+
+詳細な経緯。現在地は §1・§2（U1）。
+
+- 入ったもの: コード変更なし。**実機検証のみ**。`smoke`（`pattern: pipeline` / `autoClose: success` /
+  step `a` = agent `t1` → step `b` = agent `t2`、各 `sh -c 'echo …; sleep 30; echo …'`）を
+  `~/works/project/ptygrid` の設定で GUI から起動した。
+- 当時の検証: step `a` のペインが立ち上がって出力し、30 秒後の exit 0 で step `a` が完了して
+  **step `b` が自動 spawn**、さらに 30 秒後に run 全体が完了して **2 枚のペインが自動で閉じる**まで
+  を目視で確認。これで (1) 完了判定が実 PTY の終了で発火する、(2) DAG が依存関係どおりに進む、
+  (3) `autoClose: success` が効く、(4) `workflow-state` が frontend に届いてパネルが追随する、の
+  4 つの継ぎ目が実機で裏付けられた。trust プロンプトは出ない（`orchestrator.rs` 冒頭が明言する
+  「workflow は新しい信頼境界を作らない」の実証）。
+- 当時の注記: 5.0.0 以来 CONTRACT.md 続報8〜続報10 が繰り返し「解除されないもの」として記録して
+  いた項目がこれで解除された。ただし `smoke` は pipeline かつ kickoff 無しなので、fan-out と
+  straggler キャンセル（U2）、`joinOn: reply` / `condition:` / `handoffTo` / `retry:` / `timeoutMs`
+  といった 5.0.4 固有機能、pane 上限待ち（U3）、mailbox の run 単位分離（U4）、resume バナー（U5）
+  はいずれも**別途 1 本ずつ確認が要る**。P2（未タグ成果へのタグ付け）の前提条件は満たした。
 
 ---
 
