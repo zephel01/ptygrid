@@ -46,10 +46,60 @@ pub fn run_tmux_compat_if_requested() -> Option<i32> {
     }
 }
 
+/// macOS-only app menu. WKWebView routes Cmd+C / Cmd+V through the app's menu
+/// items, so without an Edit menu the WebView never sees `copy`/`paste` events
+/// and the terminal pane cannot copy or paste. Only the standard predefined
+/// items are used, so there is no app logic here and nothing to dispatch.
+/// Windows/Linux are deliberately left menu-less: adding a menubar there would
+/// change the existing window chrome for no functional gain.
+#[cfg(target_os = "macos")]
+fn build_app_menu<R: tauri::Runtime, M: tauri::Manager<R>>(
+    manager: &M,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{MenuBuilder, SubmenuBuilder};
+
+    let app_menu = SubmenuBuilder::new(manager, "ptygrid")
+        .about(None)
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .quit()
+        .build()?;
+    let edit_menu = SubmenuBuilder::new(manager, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+    let window_menu = SubmenuBuilder::new(manager, "Window")
+        .minimize()
+        .maximize()
+        .separator()
+        .fullscreen()
+        .separator()
+        .close_window()
+        .build()?;
+
+    MenuBuilder::new(manager)
+        .items(&[&app_menu, &edit_menu, &window_menu])
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        // Phase 4.4.x: clipboard READ for the terminal pane's paste paths
+        // (right-click paste, Ctrl+Shift+V) — navigator.clipboard.readText()
+        // is not dependable in WKWebView.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PtyManager::new())
         .manage(ConfigManager::new())
         .manage(TeamsHostManager::new())
@@ -57,6 +107,13 @@ pub fn run() {
         .manage(NotificationManager::new())
         .manage(orchestrator::WorkflowRegistry::new())
         .setup(|app| {
+            // macOS only: install the standard app/Edit/Window menus so the
+            // WebView receives Cmd+C / Cmd+V (see build_app_menu).
+            #[cfg(target_os = "macos")]
+            {
+                let menu = build_app_menu(app.handle())?;
+                let _previous = app.set_menu(menu)?;
+            }
             let app_data = app.path().app_data_dir()?;
             // Load (or first-time generate) the persisted auth tokens before the
             // Queen server binds, so both the /mcp token and the hook Bearer are

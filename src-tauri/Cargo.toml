@@ -62,6 +62,11 @@ fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", rev = "c
 # tauri-plugin-notification: cross-platform desktop OS toast (macOS/Linux/Windows),
 # invoked from the backend on session/agent-status edges.
 tauri-plugin-notification = "2"
+# tauri-plugin-clipboard-manager: programmatic clipboard READ for the terminal
+# pane's paste paths (right-click "paste", Ctrl+Shift+V). `navigator.clipboard
+# .readText()` is unreliable in WKWebView (NotAllowedError), so reads go through
+# the plugin; writes keep using navigator.clipboard.writeText in the frontend.
+tauri-plugin-clipboard-manager = "2"
 # ureq: tiny blocking HTTP client for the chat webhooks (Slack/Mattermost/Discord/
 # Telegram). Each send runs on a detached thread, so blocking I/O never touches
 # the PTY reader or the async runtime. `json` for bodies, `tls` (rustls) for HTTPS.
