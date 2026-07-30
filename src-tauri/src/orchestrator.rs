@@ -3235,6 +3235,7 @@ workflows:
     fn spawn_workflow_pipeline_launches_root_and_leaves_downstream_pending() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(PIPELINE_YAML);
         let registry = WorkflowRegistry::new();
 
@@ -3257,9 +3258,6 @@ workflows:
         // Registry has the run.
         assert!(registry.get(&run.run_id).is_some());
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3267,6 +3265,7 @@ workflows:
     fn spawn_workflow_fanout_launches_n_parallel_root_steps() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(FANOUT_YAML);
         let registry = WorkflowRegistry::new();
 
@@ -3286,9 +3285,6 @@ workflows:
         // Three live sessions on the grid.
         assert_eq!(manager.list_sessions().len(), 3);
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4000,6 +3996,7 @@ workflows:
     fn fire_due_retries_runs_before_arm_retry_backoff_prevents_same_tick_storm() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
         let registry = WorkflowRegistry::new();
         let view = StatusView::new();
@@ -4037,9 +4034,6 @@ workflows:
         assert_eq!(first.attempts, 2, "the retry fires on the tick AFTER it was armed");
         assert!(first.session_id.is_some(), "respawn_fresh should have gotten a fresh pane");
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4228,6 +4222,7 @@ workflows:
     fn advance_run_spawns_downstream_step_after_root_exits_zero() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(EXIT0_YAML);
         let registry = WorkflowRegistry::new();
         let view = StatusView::new();
@@ -4275,9 +4270,6 @@ workflows:
             .unwrap();
         assert_eq!(first.state, StepState::Succeeded);
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4285,6 +4277,7 @@ workflows:
     fn advance_run_fail_fast_skips_downstream_after_root_exits_nonzero() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(EXIT1_YAML);
         let registry = WorkflowRegistry::new();
         let view = StatusView::new();
@@ -4333,9 +4326,6 @@ workflows:
         assert_eq!(second.state, StepState::Skipped);
         assert!(snapshot.ended_at_ms.is_some());
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4343,6 +4333,7 @@ workflows:
     fn advance_run_treats_semantic_done_as_success_without_pty_exit() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         // Both steps are long-lived (/bin/cat never exits on its own), so a
         // completion here can ONLY be observed via route 2 (StatusView),
         // never route 1 (PTY exit).
@@ -4398,9 +4389,6 @@ workflows:
         );
         assert!(second.session_id.is_some());
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4412,6 +4400,7 @@ workflows:
     fn resume_workflow_flips_running_steps_to_pending_and_keeps_terminal_ones() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(PIPELINE_YAML);
         let registry = WorkflowRegistry::new();
 
@@ -4475,9 +4464,6 @@ workflows:
         .unwrap();
         assert_eq!(repeat.steps.len(), resumed.steps.len());
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4485,6 +4471,7 @@ workflows:
     fn resume_workflow_errors_when_run_missing_or_definition_gone() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(PIPELINE_YAML);
         let registry = WorkflowRegistry::new();
 
@@ -4525,9 +4512,6 @@ workflows:
             "stale-definition message: {err}"
         );
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5786,30 +5770,53 @@ workflows:
         dependsOn: [first]
 ";
 
-    /// Occupy `n` panes with anonymous long-lived sessions — the same trick
-    /// `team_presets`' pane-cap test uses. Anonymous (name `None`) matters:
-    /// these must fill the grid without ever satisfying `live_session_id`,
-    /// or a step under test could "reuse" one of them instead of spawning.
+    /// Occupy `n` grid cells with anonymous PTY-**less** sessions.
+    ///
+    /// These fillers exist only to make `occupied_pane_count()` return a
+    /// number, and `occupied_pane_count` is `sessions.len()` — every slot in
+    /// the map owns a cell regardless of whether a PTY hangs off it. So a
+    /// transcript session (`live: None`, no fd, no reader thread, no child) is
+    /// an exact stand-in for a real pane here, and it costs zero file
+    /// descriptors. That matters: filling a 9-cell grid with real PTYs, from
+    /// ~14 tests running in parallel, blew past macOS' default `ulimit -n` of
+    /// 256 and made the whole suite fail with EMFILE ("Too many open files").
+    /// Anything that needs a real process (a step under test actually
+    /// spawning, a pane actually exiting) still gets a real PTY — see
+    /// `occupy_with_exited_pane`.
+    ///
+    /// Anonymous (`role: None`, hence `spec.name == None`) matters just as
+    /// much as it did with `spawn_shell` fillers: these must fill the grid
+    /// without ever satisfying `live_session_id`, or a step under test could
+    /// "reuse" one of them instead of spawning. The `agent_id` is namespaced
+    /// (`grid-filler-*`) so it cannot collide with an agent name either, and
+    /// stays unique per filler so `stop_transcript_session` can address one.
+    /// State is `Running`, so live-vs-occupied assertions read the same as
+    /// they did with `/bin/cat`.
     fn occupy_grid(
         handle: &tauri::AppHandle<tauri::test::MockRuntime>,
         manager: &PtyManager,
         n: usize,
     ) -> Vec<u32> {
         (0..n)
-            .map(|_| {
-                manager
-                    .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
-                    .expect("filler pane should spawn")
+            .map(|i| {
+                manager.create_transcript_session(
+                    handle.clone(),
+                    format!("grid-filler-{i}"),
+                    None,
+                    0,
+                    None,
+                )
             })
             .collect()
     }
 
-    /// Kill one pane and wait for the reader thread to actually reap it.
-    /// `kill_pty` only signals; occupancy drops asynchronously, so polling
-    /// (rather than a fixed sleep) is what keeps this deterministic. A MANUAL
-    /// kill is what frees a cell — the slot is removed from the map
-    /// (`EofAction::Exit { remove: true }`), unlike a natural exit which stays
-    /// as `Exited` and keeps occupying the grid.
+    /// Close one pane and wait for the cell to actually be released.
+    /// A MANUAL kill (`kill_pty`) is what frees a cell — the slot leaves the
+    /// map, unlike a natural exit which stays as `Exited` and keeps occupying
+    /// the grid. For a PTY-backed pane removal is asynchronous (the reader
+    /// thread reaps and applies `EofAction::Exit { remove: true }`), so this
+    /// polls rather than sleeps; for a PTY-less filler `kill_pty` drops the
+    /// slot under its own lock and the first poll already sees it gone.
     fn free_one_slot(manager: &PtyManager, id: u32) {
         manager.kill_pty(id).expect("filler pane should be killable");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5822,16 +5829,16 @@ workflows:
         panic!("killed pane never left the occupancy count");
     }
 
-    fn drain_grid(manager: &PtyManager) {
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
-    }
+    /// Closes every pane the test opened when it goes out of scope — including
+    /// on the panic path, which a tail-of-test `drain_grid(&manager)` never
+    /// reached. See `session::GridGuard`.
+    use crate::session::GridGuard;
 
     #[test]
     fn spawn_step_no_longer_fails_on_capacity() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, _store, dir) = harness(PIPELINE_YAML);
         let wf = parse_wf(PIPELINE_YAML, "demo");
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
@@ -5852,7 +5859,6 @@ workflows:
         assert_eq!(outcome.error, None);
         assert!(outcome.deferred_since_ms.is_none());
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5860,6 +5866,7 @@ workflows:
     fn spawn_ready_defers_a_step_that_does_not_fit_and_keeps_it_pending() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let wf = parse_wf(CHAIN_YAML, "chain");
         let now = 1_000_000u64;
@@ -5904,7 +5911,6 @@ workflows:
             "the wait clock is set once, not restarted every tick"
         );
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5912,6 +5918,7 @@ workflows:
     fn spawn_ready_never_partially_spawns_a_fanout_step() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(WIDE_YAML);
         let wf = parse_wf(WIDE_YAML, "gate");
         let now = 1_000_000u64;
@@ -5946,7 +5953,6 @@ workflows:
         assert_eq!(wide.state, StepState::Pending);
         assert_eq!(wide.deferred_since_ms, Some(now));
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5954,6 +5960,7 @@ workflows:
     fn spawn_ready_spawns_the_deferred_step_once_a_slot_frees() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let wf = parse_wf(CHAIN_YAML, "chain");
         let now = 1_000_000u64;
@@ -5991,7 +5998,6 @@ workflows:
         assert_eq!(second.error, None, "and no longer carries the wait reason");
         assert_eq!(run.steps.len(), 2, "the placeholder was replaced, not duplicated");
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5999,6 +6005,7 @@ workflows:
     fn advance_run_keeps_a_run_running_while_a_step_waits_for_a_pane() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let registry = WorkflowRegistry::new();
         let view = StatusView::new();
@@ -6035,7 +6042,6 @@ workflows:
             assert!(snapshot.ended_at_ms.is_none());
         }
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6043,6 +6049,7 @@ workflows:
     fn spawn_workflow_leaves_a_root_pending_when_the_grid_is_full() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(FANOUT_YAML);
         let registry = WorkflowRegistry::new();
 
@@ -6070,7 +6077,6 @@ workflows:
             "no root pane was taken"
         );
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6078,6 +6084,7 @@ workflows:
     fn fire_due_retries_postpones_without_burning_the_retry_budget_when_the_grid_is_full() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
         let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
         let view = StatusView::new();
@@ -6153,7 +6160,6 @@ workflows:
             "a retry that actually ran is no longer waiting for anything"
         );
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6161,6 +6167,7 @@ workflows:
     fn fire_due_retries_gives_up_after_the_defer_budget_and_burns_one_attempt() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
         let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
         let view = StatusView::new();
@@ -6200,7 +6207,6 @@ workflows:
         );
         assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP);
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6208,6 +6214,7 @@ workflows:
     fn a_retry_waiting_for_a_pane_terminates_within_the_retry_budget() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
         let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
         let view = StatusView::new();
@@ -6257,7 +6264,6 @@ workflows:
         );
         assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP, "never spawned");
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6265,6 +6271,7 @@ workflows:
     fn spawn_ready_fails_a_step_that_has_waited_past_the_defer_budget() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let wf = parse_wf(CHAIN_YAML, "chain");
         let now = 10_000_000u64;
@@ -6317,7 +6324,6 @@ workflows:
         );
         assert_eq!(still_waiting.steps[1].state, StepState::Pending);
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6344,6 +6350,7 @@ workflows:
     fn a_deferred_step_reports_why_it_is_waiting() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let wf = parse_wf(CHAIN_YAML, "chain");
         let now = 1_000_000u64;
@@ -6383,7 +6390,6 @@ workflows:
         assert_eq!(second.error, None);
         assert_eq!(second.deferred_since_ms, None);
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6429,6 +6435,7 @@ workflows:
     fn spawn_ready_counts_an_exited_pane_against_the_budget() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(CHAIN_YAML);
         let wf = parse_wf(CHAIN_YAML, "chain");
         let now = 1_000_000u64;
@@ -6522,7 +6529,6 @@ workflows:
         assert_eq!(second.error, None);
         assert_eq!(second.deferred_since_ms, None);
 
-        drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

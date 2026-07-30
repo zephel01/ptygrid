@@ -235,6 +235,17 @@ mod tests {
 
     #[test]
     fn sysinfo_refresh_includes_the_sampler_process() {
+        // Cap sysinfo's own descriptor cache before the first refresh. On Linux
+        // it keeps one `/proc/<pid>/stat` handle open per indexed process, and
+        // its default budget is HALF the process' `RLIMIT_NOFILE` — so a
+        // whole-system refresh here quietly took ~60 of a 128-fd budget and
+        // starved the PTY-spawning tests running on the other `cargo test`
+        // threads (`Too many open files`). This bounds the cache only; the
+        // refresh below is still the production one (`ProcessesToUpdate::All`
+        // with the sampler's `ProcessRefreshKind`), so what the test proves is
+        // unchanged. No-op on macOS/Windows, where sysinfo uses no descriptors
+        // for this.
+        sysinfo::set_open_files_limit(4);
         let mut system = System::new();
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,

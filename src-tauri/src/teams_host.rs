@@ -1054,6 +1054,11 @@ mod tests {
     fn pane_host_spawn_write_capture_kill_roundtrip() {
         use std::time::Instant;
         let (_app, host) = mock_host(&["cat"]);
+        // Close every pane on the way out, panic path included: the tail-of-test
+        // `host.kill` is unreachable once an assertion above it fires, and the
+        // leaked PTY fd would then outlive this test (see `session::GridGuard`).
+        let manager = _app.state::<PtyManager>();
+        let _grid = crate::session::GridGuard(&manager);
 
         // Allowlist rejects a non-listed binary.
         let denied = host.spawn_agent(SpawnAgentParams {
@@ -1125,6 +1130,10 @@ mod tests {
 
         // A successful spawn, by contrast, does record the spawn.
         let (_app2, host2) = mock_host(&["cat"]);
+        // This spawn is deliberately never killed by the test body; close it on
+        // the way out so its PTY fd does not outlive the test.
+        let manager2 = _app2.state::<PtyManager>();
+        let _grid2 = crate::session::GridGuard(&manager2);
         host2
             .spawn_agent(SpawnAgentParams {
                 command: vec!["/bin/cat".into()],
@@ -1147,6 +1156,11 @@ mod tests {
         use teams_backend::shim_client::SocketClient;
 
         let (_app, host) = mock_host(&["cat"]);
+        // The teammate pane is killed inside the blocking client task, but an
+        // assertion (or an RPC error) before that point would leak its PTY fd
+        // for the rest of the test binary. See `session::GridGuard`.
+        let manager = _app.state::<PtyManager>();
+        let _grid = crate::session::GridGuard(&manager);
         let host_arc: Arc<dyn PaneHost> = Arc::new(host);
 
         // Put the socket inside a dedicated sub-directory, not directly under

@@ -273,10 +273,48 @@ mod tests {
             .collect()
     }
 
+    /// Occupy `n` grid cells with anonymous PTY-**less** sessions.
+    ///
+    /// `TEAM_SESSION_CAP` is checked against `occupied_pane_count()`, which is
+    /// `sessions.len()` — a slot owns a cell whether or not a PTY hangs off it.
+    /// So a transcript session (`live: None`, no fd, no child, no reader
+    /// thread) fills the grid exactly like a real pane at zero file-descriptor
+    /// cost. Filling the grid with real `/bin/cat` PTYs instead is what pushed
+    /// the parallel test suite past macOS' default `ulimit -n` of 256 and made
+    /// unrelated tests fail with EMFILE ("Too many open files").
+    ///
+    /// `role: None` keeps `spec.name` empty so no filler can ever satisfy
+    /// `live_session_id` and be "reused" as a team member, and the `agent_id`
+    /// is namespaced away from any agent name. State is `Running`, so
+    /// live-vs-occupied assertions read the same as with `/bin/cat`.
+    fn occupy_grid(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        manager: &PtyManager,
+        n: usize,
+    ) -> Vec<u32> {
+        (0..n)
+            .map(|i| {
+                manager.create_transcript_session(
+                    handle.clone(),
+                    format!("grid-filler-{i}"),
+                    None,
+                    0,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// Closes every pane the test opened when it goes out of scope — including
+    /// on the panic path, which the old tail-of-test kill loop never reached.
+    /// See `session::GridGuard`.
+    use crate::session::GridGuard;
+
     #[test]
     fn start_team_launches_non_standby_and_delivers_inbox() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(TEAM_YAML);
 
         let report = start_team(&handle, &manager, &config, &store, "daily", 80, 24)
@@ -307,9 +345,6 @@ mod tests {
         assert!(inbox_bodies(&store, &dir, "grok").is_empty()); // no instructions declared
         assert!(report.kickoff_delivered);
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -317,6 +352,7 @@ mod tests {
     fn second_call_is_idempotent_and_delivers_nothing() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(TEAM_YAML);
 
         let first = start_team(&handle, &manager, &config, &store, "daily", 80, 24).unwrap();
@@ -336,9 +372,6 @@ mod tests {
         assert_eq!(inbox_bodies(&store, &dir, "local").len(), local_before);
         assert_eq!(inbox_bodies(&store, &dir, "opus").len(), opus_before);
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -346,14 +379,11 @@ mod tests {
     fn pane_cap_yields_partial_launch_with_explicit_failures() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(TEAM_YAML);
 
         // Occupy the grid up to one slot below the cap.
-        for _ in 0..(TEAM_SESSION_CAP - 1) {
-            manager
-                .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
-                .unwrap();
-        }
+        occupy_grid(&handle, &manager, TEAM_SESSION_CAP - 1);
 
         let report = start_team(&handle, &manager, &config, &store, "daily", 80, 24).unwrap();
         // local fills the last slot; grok is over the cap -> failed, not spawned.
@@ -368,9 +398,6 @@ mod tests {
         // The team still activated (local started), so kickoff is delivered.
         assert!(report.kickoff_delivered);
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -382,13 +409,10 @@ mod tests {
     fn an_exited_pane_still_fills_the_team_pane_cap() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(TEAM_YAML);
 
-        for _ in 0..(TEAM_SESSION_CAP - 1) {
-            manager
-                .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
-                .unwrap();
-        }
+        occupy_grid(&handle, &manager, TEAM_SESSION_CAP - 1);
         // The last cell goes to a pane that exits immediately and stays on the
         // grid as `Exited` (no `close_on_exit`). `/bin/echo` exits at once and exists on
         // both macOS and Linux; `/bin/true` does not exist on macOS (`/usr/bin`).
@@ -429,9 +453,6 @@ mod tests {
             "no member activated, so nothing is delivered"
         );
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -439,6 +460,7 @@ mod tests {
     fn member_launch_failure_is_recorded_and_later_members_still_launch() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         // PTY spawn of a missing binary fails ASYNCHRONOUSLY (fork/exec), so a
         // bad cmd is not a deterministic sync failure. Exercise the sync error
         // path instead: simulate config drift where a preset member no longer
@@ -473,9 +495,6 @@ mod tests {
             "effective lead is declaration-order first non-standby regardless of outcome"
         );
 
-        for s in manager.list_sessions() {
-            let _ = manager.kill_pty(s.id);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -483,6 +502,7 @@ mod tests {
     fn unknown_preset_and_missing_config_error() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let (config, store, dir) = harness(TEAM_YAML);
 
         let err = start_team(&handle, &manager, &config, &store, "nope", 80, 24).unwrap_err();
