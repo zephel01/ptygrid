@@ -33,4 +33,8 @@ _to_delete/
 # 公開用の設定例は ptygrid.example.yml / example/**/ptygrid.yml 側に置く。
 /ptygrid.yml
 /ptygrid.yml.bak-*
+/ptygrid.yml-*
 .aider*
+
+src-tauri/target-basemain/
+
