@@ -114,6 +114,7 @@ pub fn run() {
             commands::git_unstage,
             commands::git_commit,
             commands::init_scan,
+            commands::init_probe_llm,
             commands::init_preview,
             commands::init_write,
             commands::get_projects_root,

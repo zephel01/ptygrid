@@ -390,6 +390,44 @@ const en = {
   initScanNote:
     "Anything listed as not found is also the reason its guidance block is missing from the generated file (no git repository ⇒ no worktree note, and so on).",
 
+  // local LLM probe (5.0.2 addendum: runs only when the button is pressed)
+  btnInitProbe: "Probe",
+  btnInitProbing: "Probing…",
+  btnInitProbeTitle:
+    "Ask 127.0.0.1 on the known ports whether a local LLM answers. Nothing is written to disk.",
+  initProbeHint: (seconds: number) =>
+    `Asks 127.0.0.1 on 11434 / 1234 / 3456 (plus any extra ports). Takes up to ${seconds} seconds, and only runs when this button is pressed.`,
+  initProbeRunning: (seconds: number) =>
+    `Asking 127.0.0.1… (up to ${seconds} seconds)`,
+  initProbeExtraLabel: "Extra ports",
+  initProbeExtraPlaceholder: "e.g. 8080, 5000",
+  initProbeExtraHint: "Comma-separated, up to 4.",
+  initProbeExtraInvalid: (token: string) =>
+    `"${token}" is not a port number. Give whole numbers from 1 to 65535, separated by commas.`,
+  initProbeResult: "Probe result",
+  initProbeProbed: (ports: string) => `Probed: ${ports}`,
+  initProbeNoAnswer: (ports: string) =>
+    `Nothing answered. Probed ${ports} — no local LLM was found there.`,
+  initProbeTimedOut: (seconds: number) =>
+    `Stopped at the ${seconds}-second budget: only the ports that answered in time are listed.`,
+  initProbeConfirmed: "Anthropic API confirmed",
+  initProbeUnconfirmed: "unconfirmed",
+  initProbeUnsupported: "not compatible",
+  initProbeModels: (first: string, count: number) =>
+    count > 1 ? `${first} (+${count - 1} more)` : first,
+  initProbeConfirmedNote:
+    "Written out as a live agent definition (autostart: false, as always).",
+  initProbeUnconfirmedNote:
+    "It answered /v1/models, but whether /v1/messages answers is unconfirmed — it is written out commented-out.",
+  initProbeUnsupportedNote:
+    "This version does not serve the Anthropic Messages API (Ollama 0.14.0 or newer does) — it is written out commented-out.",
+  initProbeApplyAsk:
+    "The probe result is not in the text above, because you have edited it. Replacing it discards your edits.",
+  btnInitProbeApply: "Replace with the generated text",
+  btnInitProbeKeep: "Keep my edits",
+  initErrBadPort:
+    "Those extra ports were refused: 0 is not a port number, and at most four extras can be added.",
+
   // destination
   initTargetHead: "Destination",
   initTargetAria: "Destination of the generated file",
@@ -775,6 +813,44 @@ const ja: Messages = {
   initLegacyTag: "旧名（mterm.yml）",
   initScanNote:
     "「見つかりません」の項目は、対応する案内ブロックが生成物に出ない理由でもあります（git リポジトリでない ⇒ worktree の案内が出ない、など）。",
+
+  // local LLM probe (5.0.2 追補: ボタンを押したときだけ走ります)
+  btnInitProbe: "探す",
+  btnInitProbing: "探しています…",
+  btnInitProbeTitle:
+    "既定のポートの 127.0.0.1 にローカル LLM が居るか問い合わせます。ディスクには何も書きません。",
+  initProbeHint: (seconds: number) =>
+    `127.0.0.1 の 11434 / 1234 / 3456（と追加ポート）に問い合わせます。最大 ${seconds} 秒かかります。このボタンを押したときだけ走ります。`,
+  initProbeRunning: (seconds: number) =>
+    `127.0.0.1 に問い合わせています…（最大 ${seconds} 秒）`,
+  initProbeExtraLabel: "追加ポート",
+  initProbeExtraPlaceholder: "例: 8080, 5000",
+  initProbeExtraHint: "カンマ区切りで最大 4 本まで。",
+  initProbeExtraInvalid: (token: string) =>
+    `「${token}」はポート番号として読めません。1〜65535 の整数をカンマ区切りで入力してください。`,
+  initProbeResult: "プローブ結果",
+  initProbeProbed: (ports: string) => `当たったポート: ${ports}`,
+  initProbeNoAnswer: (ports: string) =>
+    `どこからも応答がありませんでした。${ports} に当たりましたが、ローカル LLM は見つかりません。`,
+  initProbeTimedOut: (seconds: number) =>
+    `${seconds} 秒の上限に達したため残りは打ち切りました。間に合ったポートだけを表示しています。`,
+  initProbeConfirmed: "Anthropic API 確証あり",
+  initProbeUnconfirmed: "未確認",
+  initProbeUnsupported: "非対応",
+  initProbeModels: (first: string, count: number) =>
+    count > 1 ? `${first} ほか ${count - 1} 件` : first,
+  initProbeConfirmedNote:
+    "生成物には有効な agent 定義として出ます（autostart は従来どおり false です）。",
+  initProbeUnconfirmedNote:
+    "/v1/models には応答しましたが、/v1/messages が応答するかは未確認です。生成物にはコメント行として出ます。",
+  initProbeUnsupportedNote:
+    "Anthropic Messages API に対応しないバージョンです（Ollama は 0.14.0 以上が必要）。生成物にはコメント行として出ます。",
+  initProbeApplyAsk:
+    "プレビューを編集済みのため、プローブ結果はまだ上のテキストに入っていません。差し替えると編集内容は失われます。",
+  btnInitProbeApply: "生成物で置き換える",
+  btnInitProbeKeep: "編集を残す",
+  initErrBadPort:
+    "追加ポートが受け付けられませんでした。0 はポート番号として使えません。追加できるのは最大 4 本までです。",
 
   // destination
   initTargetHead: "生成先",
