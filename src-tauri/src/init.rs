@@ -47,6 +47,11 @@ pub const SIDECAR_FILE_NAME: &str = "ptygrid.init.yml";
 /// `router.settings.json` and `example/team-preset`.
 const ROUTER_PORT: u16 = 3456;
 
+/// LM Studio's default server port. Only used to pick the documented
+/// `ANTHROPIC_AUTH_TOKEN` placeholder for that endpoint — see
+/// [`auth_token_for`].
+const LM_STUDIO_PORT: u16 = 1234;
+
 /// Connect timeout for the D4 probe. Loopback only; kept short so a dead port
 /// costs nothing noticeable and a filtered one cannot stall the caller.
 const ROUTER_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -720,8 +725,43 @@ fn marker_for(kind: &str) -> &'static str {
         .unwrap_or("?")
 }
 
+/// One header line for an endpoint that answered the probe.
+///
+/// The address is ours (the port we connected to), never the server's word for
+/// itself. `label` *is* the server's word for itself, so it goes through
+/// [`one_line`] before it reaches the file — the same rule the generated
+/// definitions follow.
+///
+/// The three shapes differ because the reader has to be able to tell a
+/// confirmed endpoint from a merely-responding one from the header alone; that
+/// distinction is exactly what decides whether the definition below is live or
+/// commented out.
+fn detected_llm_item(endpoint: &LocalLlmEndpoint) -> String {
+    let label = one_line(&endpoint.label);
+    let label = label.trim();
+    let detail = match endpoint.anthropic {
+        // Confirmed: the server named itself via `/api/version`, so the label
+        // carries a product and a version ("Ollama 0.32.1").
+        Some(true) if !label.is_empty() => label.to_string(),
+        Some(true) => "応答あり".to_string(),
+        // Also named itself, but the version predates the Messages API. The
+        // separator is `・`, not ` / `, which is what [`wrap_comment`] puts
+        // *between* items — one item must not look like two.
+        Some(false) if !label.is_empty() => format!("{label}・Messages API 非対応"),
+        Some(false) => "Messages API 非対応".to_string(),
+        // Only an OpenAI-compatible answer was seen. The label carries no
+        // product name in this case (it is built from the port we already
+        // print), so stating what is *missing* is the useful half.
+        None => "OpenAI 互換・Messages API 未確認".to_string(),
+    };
+    format!("ローカル LLM 127.0.0.1:{} ({detail})", endpoint.port)
+}
+
 /// What the header records as found (spec §3.2: "何を見て何を出したか").
-fn detected_items(scan: &InitScanReport) -> Vec<String> {
+///
+/// `llm` is the (already ordered and deduplicated) probe result. An empty
+/// slice reproduces the pre-probe header byte for byte.
+fn detected_items(scan: &InitScanReport, llm: &[&LocalLlmEndpoint]) -> Vec<String> {
     let mut items = Vec::new();
     if !scan.agents.is_empty() {
         items.push(format!("{} (PATH)", scan.agents.join(" / ")));
@@ -732,8 +772,16 @@ fn detected_items(scan: &InitScanReport) -> Vec<String> {
     if scan.git_repo {
         items.push("git リポジトリ".to_string());
     }
-    if let Some(port) = scan.router_port {
+    // D4 is only "something accepted a TCP connect on 3456". A probe result for
+    // the same port knows strictly more, so it supersedes the D4 line here for
+    // the same reason it suppresses the router block further down — otherwise
+    // one port would be reported twice, in two different vocabularies.
+    let router_probed = llm.iter().any(|e| Some(e.port) == scan.router_port);
+    if let Some(port) = scan.router_port.filter(|_| !router_probed) {
         items.push(format!("ローカル LLM ルータ 127.0.0.1:{port} (応答あり)"));
+    }
+    for endpoint in llm {
+        items.push(detected_llm_item(endpoint));
     }
     items
 }
@@ -741,7 +789,7 @@ fn detected_items(scan: &InitScanReport) -> Vec<String> {
 /// The other half of the record: what was looked for and NOT found. This is
 /// what explains an absent block ("no git" = "that is why there is no worktree
 /// note"), mirroring the preview UI requirement in spec §6.
-fn missing_items(scan: &InitScanReport) -> Vec<String> {
+fn missing_items(scan: &InitScanReport, llm: &[&LocalLlmEndpoint]) -> Vec<String> {
     let mut items = Vec::new();
     if scan.agents.is_empty() {
         items.push("PATH 上の既知の CLI".to_string());
@@ -754,10 +802,50 @@ fn missing_items(scan: &InitScanReport) -> Vec<String> {
     if !scan.git_repo {
         items.push("git リポジトリ".to_string());
     }
-    if scan.router_port.is_none() {
+    // A port that answered must never also be listed as missing — that is the
+    // misreading this whole pair of functions exists to prevent.
+    //
+    // The router line is kept when 3456 itself stayed silent, even if another
+    // port (11434) answered: "3456 did not answer" is a fact about 3456, and it
+    // is still what explains the absent router block below. With the answering
+    // endpoints now listed on the 検出 side, the two lines read as the separate
+    // statements they are rather than as "no local LLM was found".
+    let router_answered = scan.router_port.is_some() || llm.iter().any(|e| e.port == ROUTER_PORT);
+    if !router_answered {
         items.push(format!("ローカル LLM ルータ (127.0.0.1:{ROUTER_PORT})"));
     }
     items
+}
+
+/// The `ANTHROPIC_AUTH_TOKEN` placeholder for a probed endpoint.
+///
+/// The CLI rejects an empty token before it ever makes a request, so there is
+/// always *some* value; which one is a documentation question, not a security
+/// one — none of these are secrets, and none of them authenticate anything:
+///
+/// - `"ollama"` — Ollama documents the header as required but ignored.
+/// - `"lmstudio"` — the value LM Studio's own docs use in their examples. It is
+///   arbitrary while the server has authentication disabled (the default), and
+///   is meant to be replaced by a real key once it is not.
+/// - `"local"` — anything else that answered: a neutral placeholder rather than
+///   the name of a product we have no evidence is running there.
+///
+/// `label` comes off a local server we do not control, so the match on it is
+/// deliberately naive — lowercase plus substring, no parsing — and the matched
+/// text never reaches the generated file: this returns one of three fixed
+/// literals and nothing derived from its input.
+fn auth_token_for(endpoint: &LocalLlmEndpoint) -> &'static str {
+    let names_ollama = endpoint.label.to_ascii_lowercase().contains("ollama");
+    // `anthropic == Some(true)` can only come from Ollama's `/api/version`
+    // (see the probe module note), so it identifies an Ollama just as well as
+    // the label does — and covers a label that never named the product.
+    if names_ollama || endpoint.anthropic == Some(true) {
+        "ollama"
+    } else if endpoint.port == LM_STUDIO_PORT {
+        "lmstudio"
+    } else {
+        "local"
+    }
 }
 
 /// One generated definition for a probed endpoint (contract §生成).
@@ -799,9 +887,11 @@ fn push_llm_definition(out: &mut String, endpoint: &LocalLlmEndpoint, ind: &str,
     out.push_str(&format!(
         "{head}    ANTHROPIC_BASE_URL: \"http://127.0.0.1:{port}\"\n"
     ));
-    // Ollama documents the token as required-but-ignored; an empty one is
-    // rejected by the CLI before the request is ever made.
-    out.push_str(&format!("{head}    ANTHROPIC_AUTH_TOKEN: \"ollama\"\n"));
+    // Which placeholder this is, and why it is never empty, is [`auth_token_for`].
+    out.push_str(&format!(
+        "{head}    ANTHROPIC_AUTH_TOKEN: \"{}\"\n",
+        auth_token_for(endpoint)
+    ));
     out.push_str(&format!("{head}  autostart: false\n"));
 }
 
@@ -846,9 +936,9 @@ pub(crate) fn render_config(
     out.push_str(&format!(
         "# {CONFIG_FILE_NAME} — ptygrid init が生成しました ({today})\n"
     ));
-    out.push_str(&wrap_comment("検出", &detected_items(scan)));
+    out.push_str(&wrap_comment("検出", &detected_items(scan, &endpoints)));
     out.push('\n');
-    let missing = missing_items(scan);
+    let missing = missing_items(scan, &endpoints);
     if !missing.is_empty() {
         out.push_str(&wrap_comment("未検出", &missing));
         out.push('\n');
@@ -2234,6 +2324,206 @@ agents:
         for def in config.agents.iter().chain(config.processes.iter()) {
             assert_eq!(def.autostart, Some(false), "{} autostarts", def.name);
         }
+    }
+
+    /// An endpoint with a label of its own, which the `endpoint` helper does
+    /// not produce (it only ever builds the two labels the probe builds).
+    fn labelled(port: u16, anthropic: Option<bool>, label: &str) -> LocalLlmEndpoint {
+        LocalLlmEndpoint {
+            port,
+            models: vec!["m".to_string()],
+            anthropic,
+            label: label.to_string(),
+        }
+    }
+
+    /// The 検出 / 未検出 halves of the header, wrapped continuation lines
+    /// folded back in. A continuation is `#` + padding, which is what tells it
+    /// apart from the prose comment lines that follow.
+    fn header_sections(yaml: &str) -> (String, String) {
+        let (mut found, mut missing) = (String::new(), String::new());
+        let (mut into_found, mut active) = (false, false);
+        for line in yaml.lines().take_while(|l| l.starts_with('#')) {
+            if let Some(rest) = line.strip_prefix("# 検出: ") {
+                (into_found, active) = (true, true);
+                found.push_str(rest);
+            } else if let Some(rest) = line.strip_prefix("# 未検出: ") {
+                (into_found, active) = (false, true);
+                missing.push_str(rest);
+            } else if active && line.starts_with("#  ") {
+                let target = if into_found { &mut found } else { &mut missing };
+                target.push(' ');
+                target.push_str(line.trim_start_matches(['#', ' ']));
+            } else {
+                active = false;
+            }
+        }
+        (found, missing)
+    }
+
+    #[test]
+    fn an_endpoint_that_answered_is_recorded_as_detected_never_as_missing() {
+        // The case seen on a real machine: 3456 stayed silent while 11434
+        // answered as an Ollama, and the header still read "not found".
+        let scan = InitScanReport {
+            router_port: None,
+            ..golden_scan()
+        };
+        let llm = vec![
+            labelled(11434, Some(true), "Ollama 0.32.1"),
+            endpoint(1234, &["local-model"], None),
+        ];
+        let (found, missing) = header_sections(&render_config(&scan, &llm, "2026-07-29"));
+
+        // Both answering ports are on the 検出 side, the confirmed one naming
+        // the product, the unconfirmed one saying what is still unknown.
+        assert!(
+            found.contains("ローカル LLM 127.0.0.1:11434 (Ollama 0.32.1)"),
+            "{found}"
+        );
+        assert!(
+            found.contains("ローカル LLM 127.0.0.1:1234 (OpenAI 互換・Messages API 未確認)"),
+            "{found}"
+        );
+        // ...and on neither is repeated as missing.
+        assert!(!missing.contains("11434"), "{missing}");
+        assert!(!missing.contains("1234"), "{missing}");
+        // 3456 really did stay silent, so that line is still the truth — and
+        // is no longer readable as "no local LLM was found".
+        assert!(
+            missing.contains("ローカル LLM ルータ (127.0.0.1:3456)"),
+            "{missing}"
+        );
+
+        // A confirmed-unsupported endpoint says so rather than going quiet.
+        let (found, _) = header_sections(&render_config(
+            &scan,
+            &[labelled(11434, Some(false), "Ollama 0.13.0")],
+            "2026-07-29",
+        ));
+        assert!(
+            found.contains("ローカル LLM 127.0.0.1:11434 (Ollama 0.13.0・Messages API 非対応)"),
+            "{found}"
+        );
+    }
+
+    #[test]
+    fn the_router_port_answering_the_probe_replaces_the_d4_header_line() {
+        // Probed 3456 while D4 saw nothing: it belongs on the 検出 side, and
+        // the missing line it would otherwise explain has to go with it.
+        let silent = InitScanReport {
+            router_port: None,
+            ..golden_scan()
+        };
+        let llm = vec![labelled(
+            ROUTER_PORT,
+            None,
+            "127.0.0.1:3456 (OpenAI 互換の応答)",
+        )];
+        let (found, missing) = header_sections(&render_config(&silent, &llm, "2026-07-29"));
+        assert!(found.contains("ローカル LLM 127.0.0.1:3456"), "{found}");
+        assert!(!missing.contains("3456"), "{missing}");
+
+        // D4 and the probe both saw it: one line, the one that knows more.
+        let (found, missing) = header_sections(&render_config(&golden_scan(), &llm, "2026-07-29"));
+        assert_eq!(found.matches("3456").count(), 1, "{found}");
+        assert!(
+            !found.contains("ルータ 127.0.0.1:3456 (応答あり)"),
+            "{found}"
+        );
+        assert!(!missing.contains("3456"), "{missing}");
+
+        // Without a probe result D4's own line is untouched.
+        let (found, _) = header_sections(&render_config(&golden_scan(), NO_LLM, "2026-07-29"));
+        assert!(
+            found.contains("ローカル LLM ルータ 127.0.0.1:3456 (応答あり)"),
+            "{found}"
+        );
+    }
+
+    #[test]
+    fn the_auth_token_placeholder_follows_the_endpoint() {
+        // 1. Ollama — by confirmation, by name, or by both.
+        assert_eq!(
+            auth_token_for(&labelled(11434, Some(true), "Ollama 0.32.1")),
+            "ollama"
+        );
+        // Named itself but is too old for the Messages API: still an Ollama.
+        assert_eq!(
+            auth_token_for(&labelled(11434, Some(false), "Ollama 0.13.0")),
+            "ollama"
+        );
+        // Confirmed without ever naming the product.
+        assert_eq!(auth_token_for(&labelled(11434, Some(true), "")), "ollama");
+        // Matching is naive on purpose: case and surrounding text do not matter.
+        assert_eq!(
+            auth_token_for(&labelled(9999, None, "custom OLLAMA build")),
+            "ollama"
+        );
+
+        // 2. LM Studio's port, with nothing claiming to be something else.
+        assert_eq!(
+            auth_token_for(&endpoint(LM_STUDIO_PORT, &["m"], None)),
+            "lmstudio"
+        );
+        // An Ollama on that port is still an Ollama; the name beats the port.
+        assert_eq!(
+            auth_token_for(&labelled(LM_STUDIO_PORT, None, "Ollama 0.32.1")),
+            "ollama"
+        );
+
+        // 3. Everything else gets a neutral placeholder.
+        assert_eq!(auth_token_for(&endpoint(8080, &["m"], None)), "local");
+        assert_eq!(
+            auth_token_for(&labelled(ROUTER_PORT, None, "LM Studio")),
+            "local"
+        );
+
+        // ...and that is what lands in the generated file, per endpoint.
+        let llm = vec![
+            labelled(11434, Some(true), "Ollama 0.32.1"),
+            endpoint(LM_STUDIO_PORT, &["local-model"], None),
+            endpoint(8080, &["m"], None),
+        ];
+        let yaml = render_config(&golden_scan(), &llm, "2026-07-29");
+        let token_lines: Vec<&str> = yaml
+            .lines()
+            .filter(|l| l.contains("ANTHROPIC_AUTH_TOKEN"))
+            .map(|l| l.trim_start_matches(['#', ' ']))
+            .collect();
+        assert_eq!(
+            token_lines,
+            vec![
+                "ANTHROPIC_AUTH_TOKEN: \"ollama\"",
+                "ANTHROPIC_AUTH_TOKEN: \"lmstudio\"",
+                "ANTHROPIC_AUTH_TOKEN: \"local\"",
+            ],
+            "{yaml}"
+        );
+        let config = parse_config(&yaml).expect("generated config must parse");
+        let live = config
+            .agents
+            .iter()
+            .find(|a| a.name == "local-11434")
+            .unwrap();
+        assert_eq!(
+            live.env
+                .as_ref()
+                .and_then(|e| e.get("ANTHROPIC_AUTH_TOKEN"))
+                .map(String::as_str),
+            Some("ollama")
+        );
+
+        // The string the decision was made on is never what gets written: a
+        // lowercased match must not turn into a lowercased label.
+        let yaml = render_config(
+            &golden_scan(),
+            &[labelled(9999, None, "MyOllama Server 1.0")],
+            "2026-07-29",
+        );
+        assert!(yaml.contains("MyOllama Server 1.0"), "{yaml}");
+        assert!(yaml.contains("ANTHROPIC_AUTH_TOKEN: \"ollama\""), "{yaml}");
+        assert!(!yaml.contains("myollama"), "{yaml}");
     }
 
     #[test]
