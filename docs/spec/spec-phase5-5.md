@@ -486,14 +486,21 @@ Queen `await` tool は「呼び出し中スレッドが長時間 blocking する
 |---|---|
 | `v0.5.6` | Phase 5.5.0（MCP RC 両立ルータ） |
 | `v0.5.7` | Phase 5.0.2（`ptygrid init`）+ Phase 5.0.4（Orchestrator 実行層） — 2026-07-30 リリース済み |
-| `v0.5.8` | Phase 5.5.1（OTel + SQLite） |
-| `v0.5.9` | Phase 5.5.2（Cost 計算 + agent-cost） |
-| `v0.5.10` | Phase 5.5.3（Status Rings） |
-| `v0.5.11` | Phase 5.5.4（Waterfall + Dashboard） |
-| `v0.5.12〜` | 残 Defer 消化・OAuth 2.1 拡張の実験・pricing 表の 3 ヶ月ごとの更新(Phase 6 系突入で v0.6.0 へ minor bump) |
+| `v0.5.8` | Phase 5.0.2 追補（ローカル LLM プローブ）+ Orchestrator 計測基盤（step 単位の計測フィールド + 合成 workflow による並列化計測） — 未作成 |
+| `v0.5.9` | Phase 5.5.1（OTel + SQLite） |
+| `v0.5.10` | Phase 5.5.2（Cost 計算 + agent-cost） |
+| `v0.5.11` | Phase 5.5.3（Status Rings） |
+| `v0.5.12` | Phase 5.5.4（Waterfall + Dashboard） |
+| `v0.5.13〜` | 残 Defer 消化・OAuth 2.1 拡張の実験・pricing 表の 3 ヶ月ごとの更新(Phase 6 系突入で v0.6.0 へ minor bump) |
 
 > 2026-07-30: `v0.5.7` はこの表が予約していた Phase 5.5.1 用ではなく、Phase 5.0.2 + 5.0.4 の
 > リリースに先に充てられた。5.5.1〜5.5.4 はここで `v0.5.8`〜`v0.5.11` へ 1 つずつ繰り下げる。
+
+> 2026-07-30（続き）: `v0.5.8` も Phase 5.5.1 用ではなく、Phase 5.0.2 追補（ローカル LLM プローブ）+
+> Orchestrator 計測基盤に充てる。**理由はタグ順と時系列を一致させること**（先に完成した成果へ先の番号を
+> 与える。`v0.5.7` のときと同じ判断）。5.5.1〜5.5.4 はこれで**2 度目の繰り下げ**となり
+> `v0.5.9`〜`v0.5.12` になる。なお `v0.5.8` の計測フィールド追加（step 単位の終了時刻・ペイン待ち時間の
+> 記録）は Phase 5.5.1 の前段であり、5.5.1 の `observability.rs` が読む値をあらかじめ揃えることになる。
 
 > Phase 5.0(Orchestrated) の `v0.5.0〜v0.5.5` に続く連番。Phase 5 系(=v0.5.z)の間は連番で埋め、Phase 6.0(Secure) 突入時に `v0.6.0` へ minor bump する。
 

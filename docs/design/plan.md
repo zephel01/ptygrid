@@ -1,8 +1,10 @@
 # ptygrid 作業計画 (plan.md)
 
-更新日: 2026-07-30 / 実装基準: `main` = `4c02cbb`（PR #3 マージ済み / 2026-07-29 01:35 +0900）。
-最新タグは `v0.5.7`（2026-07-30 作成）。`package.json` / `src-tauri/Cargo.toml` /
-`src-tauri/tauri.conf.json` の 3 ファイルはいずれも `0.5.7` で揃っている。
+更新日: 2026-07-30 / 実装基準: `main` = `4e9afb3`（PR #10 マージ済み / 2026-07-30 14:18 +0900）。
+作業中のブランチは `feat/init-llm-probe-5.0.2`（`release/v0.5.7` から分岐、origin に push 済み）。
+最新タグは `v0.5.7`（2026-07-30 作成）、次のタグは `v0.5.8`（未作成）。作業ツリーの
+`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の 3 ファイルはいずれも
+`0.5.7` だが、**タグ `v0.5.7` が指すコミットはそうではない**（→ §4）。
 
 **この文書の読み方**: 「結局どこまで終わって何が残っているか」は §1 の通し進捗表 1 本で足りる。
 状態を書くのは §1 だけ、実機検証の詳細は §2、タグとバージョンは §4、日付つきの経緯は §6 にしか
@@ -44,11 +46,13 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out は未（U2） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | ✅ | v0.5.1（`ac1b94b`） | 済（U5、2026-07-30） |
-| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※） | ✅ | v0.5.7 | 済（U11、2026-07-30） |
+| 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※）。ローカル LLM プローブの追補は次行 | ✅ | v0.5.7 | 済（U11、2026-07-30） |
+| 5.0.2 追補 | ローカル LLM プローブ: `init_probe_llm`（4 本目の Tauri command）で既定 3 ポート + 手入力最大 4 本に `GET /v1/models` を当て、Anthropic Messages API 互換の確証が取れたときだけ有効な agent 定義を出す（それ以外はコメント行）。モデル選択 `<select>`・検出行への反映・`ANTHROPIC_AUTH_TOKEN` の出し分けを含む。実装済み・PR 未作成（ブランチ `feat/init-llm-probe-5.0.2`） | 🚧 | v0.5.8（予定） | 一部済（U12、2026-07-30。残り 3 点） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | v0.5.7（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | v0.5.7（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
+| 5.0.6（案） | Orchestrator の計測とパイプライン化: `StepOutcome` に step 単位の終了時刻とペイン待ち時間を additive 追加 / 合成 workflow 3 本（直列・鎖分割・fan-out + `joinOn: any`）で orchestration の効きだけを測る / cold start（ペイン再利用 vs 毎回 spawn）の実測。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | ⬜ | v0.5.8（予定） | 該当なし |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
 | 5.5.2 | Cost 計算 + `agent-cost` イベント | ⬜ | — | 該当なし |
@@ -77,7 +81,14 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > Arena view 用に予約済み（本表の 5.0.5 行）のため**本断面には採番しない**（コメント表記の削除は
 > §3 バックログ）。
 
-**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了したため、🚧 は 6 行に減った。残る理由は個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）。未タグ成果へのタグ付けは「P1 を通してから」という前提を満たしたので、着手できる状態になった（→ §3 P2、§4）。
+> **※2 脚注: 5.0.6 の採番は未確定（2026-07-30 時点の提案）**
+> ※ の決定は「Memory + Provider は 5.0.6 以降へ回し、番号は着手時に確定する」で止まっている。本表の
+> 「5.0.6（案）」は、その空いている 5.0.6 を**orchestrator の計測とパイプライン化に充てるという提案**
+> であり、**確定はユーザー判断による**。この案を採る場合 Memory + Provider は 5.0.7 以降へずれる。
+> 番号が決まるまで本表の行は「（案）」表記のままとする（v0.5.8 のタグ内容そのものは §4 に書いてあり、
+> patch 番号の確定を待たない）。
+
+**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了した。同日さらにローカル LLM プローブの追補が入り実機 1 回目を通したため 🚧 は 7 行。残る理由は個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）、プローブ追補の残り 3 点（U12）。未タグ成果へのタグ付けは v0.5.7 で一度消化し、次は v0.5.8（→ §4）。
 
 **補足: 主要モジュールの所在**（状態は上表を見ること）
 
@@ -117,6 +128,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U9 | frontend チェック（`svelte-check` / `npm run build`） | 本作業環境に `node_modules` が無く**未実測**。`src/` は v0.5.1 の `ac1b94b` 以降変更されておらず `v0.5.6..main` の diff も 0 件なので v0.5.1 時点の「0 errors」から変わっていない**はず**だが、これは推測であって実測ではない |
 | U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
 | U11 | `ptygrid init`（5.0.2）の実機検証 | **2026-07-30、macOS で実施**（すべてスクリーンショットで確認済み）。(1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て、検出結果（opencode/claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定なし）が実環境と一致することを確認、(2) 通常生成で `ptygrid.yml`（2,060 バイト）が生成され agents チップ 7 体が並び、生成物は autostart 全 false のため trust プロンプトは出ずペインも自動起動しないことを確認、(4) 既存設定ありの状態では副入口の書き込み先が `ptygrid.init.yml` に切り替わり、書き込み後も既存 `ptygrid.yml` は mtime・内容とも無変更であることを確認（上書き禁止の実測裏付け）、(5) 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが二重に出る競合を実測（spec §9 で推測としていた箇所が確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` + 3 秒窓）を別コミットで修正済み）。(3) プレビューを手編集して `autostart: true` にしてから書き込むと**今度は trust プロンプトが出て**、「信頼して起動」で当該エージェントが実際に起動することを確認（`init_write` → `loadConfig` → `maybeAutostart` の順序の実証）。**U11 は完了**。Global 選択時の `~/.ptygrid/` 作成のみ今回の範囲外（必要になった時点で確認する）。詳細な経緯は §6.4 |
+| U12 | ローカル LLM プローブ（5.0.2 追補）の実機検証 | **2026-07-30、macOS で 1 回目を実施**（スクリーンショットで確認済み）。検出フォルダ `~/works/tmp/ptygrid`、PATH 上の CLI 7 体（opencode / claude / codex / gemini / qwen / grok / aider）、プロジェクト種別 npm、git リポジトリあり、既存設定ありのため書き込み先が `ptygrid.init.yml` に切り替わることを確認。プローブは 1234 / 3456 / 11434 を叩き、3456 は無応答、**11434 で `Ollama 0.32.1` が応答して「Anthropic API 確証あり」バッジが出てモデル 20 件を取得**（先頭は `x/flux2-klein:latest`）。**まだ確認していないことが 3 点**: (1) モデル選択 `<select>` の実機動作（実装は 2 つ目のコミット `8931464` で入ったが押していない）、(2) 生成された `local-11434` の定義で実際に Claude Code が起動するか、(3) LM Studio を上げたときに未確証の分岐（コメント行出力）へ落ちるか。**U12 は一部済**（この 3 点が残る）。詳細な経緯は §6.9 |
 
 ---
 
@@ -138,7 +150,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
   実際に閉じる、(3) `workflow-state` で WorkflowPanel が追随、(4) resume Y/N バナー（U5）が出る。
 - 続けてハードニング固有の挙動（U3 / U4）を実機で見る。`joinOn: reply` / `condition:` /
   `handoffTo` / `retry:` を使う workflow は `smoke` が通ってから別途 1 本ずつ。straggler の
-  pane kill（U2）もここで消す。
+  pane kill（U2）と U4 は v0.5.8 の合成 workflow / 並行 run の回で消す（項目と順序は §4）。
 - 実走で分かったことは CONTRACT.md の続報として追記し、§6 に日付つきで残す。
 
 ### P2. 未タグ成果のリリース（次のタグ）— 完了
@@ -151,7 +163,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 安全性の伸びが大きいから。
 
 **根拠**: [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の実装マトリクスで ❌ のまま
-残っているのは 2 行だけで、その 1 つが `escalation`（もう 1 つは `arena: true` で、こちらは P5 の
+残っているのは 2 行だけで、その 1 つが `escalation`（もう 1 つは `arena: true` で、こちらは P6 の
 5.0.5 で解消する）。自主運用（[autonomous-operation-guide.md](../guide/autonomous-operation-guide.md)）は
 「人間が気づく」ことに依存しており、通知が無いと夜間・離席中の失敗が滞留する。4.4.2 の配送機構
 （OS 通知 / Slack / Mattermost / Discord / Telegram）をそのまま使えるので、**新しい配送機構は
@@ -165,7 +177,8 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 - 5.0.2 `ptygrid init`（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md): 環境検出 → テンプレート生成 →
   自己検査 → 既存ファイルがある場合は sidecar で差分提示）は backend（`init.rs` + Tauri command 3 本）と
-  frontend（`InitPanel.svelte` + 入口 2 つ + i18n）を実装済み。残りは実機での操作確認（U11）のみ。
+  frontend（`InitPanel.svelte` + 入口 2 つ + i18n）を実装済み。実機での操作確認（U11）も消化済みで、
+  残っているのは追補（ローカル LLM プローブ）側の U12 の 3 点と、そのブランチの PR 作成のみ。
 - 5.0.3（Queen MCP 登録の代行）は spec のみ（[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）
   で実装は未着手。claude は CLI を代行実行、codex / grok は `toml_edit` で値単位編集し、差分承認・冪等・
   登録解除までを含む。**着手前の gate として「docs と実装の食い違いの確定」がある**（README / userguide
@@ -173,9 +186,22 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 - **5.0.3 の着手は P1（実機での workflow 1 本流し）より前には置かない**: 入口だけ自動化しても、その先の
   workflow が実走未確認のままでは効果が薄いため。5.0.2 の残作業（U11）は軽量なので先に消してよい。
 
-### P5. 未着手フェーズ（着手順の案）
+### P5. 実タスクでの並列化ベースライン測定と、その先の機能の spec（v0.5.8 のタグ内容には数えない）
 
-**なぜ今それか**: P1〜P4 で足元が固まるまでは着手しない。以下は「固まったあとの順番」の案。
+**なぜ今それか**: 合成 workflow による計測（v0.5.8 = §4）は orchestration の効きしか測らない。実運用で
+効くかどうかは実エージェントで測るしかないが、所要がばらつくので**タグの完了条件には入れられない**。
+そのためタグとは切り離してここに置く。着手は v0.5.8 の計測フィールドが入ってから（測る道具が先）。
+
+- **実タスクでのベースライン測定と改良構成の比較**: 同じ課題を直列構成と改良構成で流し、所要を比べる。
+  実エージェントの所要はばらつくので**同じ課題を 2 回ずつ**流して比べる（1 回では差が判定できない）。
+  比較の前提として U4（同名 workflow の並行 run が互いの返信を取りこぼさないこと）が要る。
+- **`onEach: reply` / `mode: serve` の spec 執筆**: どちらを本命にするかは v0.5.8 の cold start 実測
+  （ペイン再利用 vs 毎回 spawn）の結果で決まるため、**結果を見てから書く**。cold start 支配なら常駐
+  ワーカー（`mode: serve`）、think time 支配ならストリーミング依存（`onEach: reply`）。実装は v0.5.9 以降。
+
+### P6. 未着手フェーズ（着手順の案）
+
+**なぜ今それか**: P1〜P5 で足元が固まるまでは着手しない。以下は「固まったあとの順番」の案。
 
 | 順 | 内容 | 根拠 |
 |---|---|---|
@@ -185,7 +211,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | 4 | **5.5.3 Agent Status Rings / 5.5.4 Trace Waterfall + Cost Dashboard** | どちらも frontend 中心で、5.5.1/5.5.2 のデータが無いと表示するものが無い。順序として後ろ |
 | 5 | **Phase 6.0 Security（6.0.0〜6.0.5）** | `user_version` 4 の 3 テーブル同時導入を伴い、`session.rs`（PTY hot path）に tee tap を入れる最も侵襲的な変更。§5.2 の規律どおり人手レビュー枠が要る。macOS/Linux の sandbox 実装差も大きい |
 
-### P6. Windows 移植 / Linux 実機検証の継続
+### P7. Windows 移植 / Linux 実機検証の継続
 
 **なぜ今それか**: 優先度は低いが、beta 表記を外す前提条件なので落とさずに持っておく（U7 / U8）。
 
@@ -194,10 +220,10 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 ### 継続ウォッチ / バックログ
 
-いずれも「優先度は P1〜P6 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
+いずれも「優先度は P1〜P7 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
 
-- **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P5）までの間は
+- **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P6）までの間は
   [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の ❌ 表記を維持する
 - **`orchestrator.rs` のコード内コメントの「phase 5.0.5」表記**: 整理コミットで削除する
   （5.0.5 は Arena view 用に予約済みで、採番の食い違い自体は §1 の脚注※で決着済み）
@@ -236,9 +262,10 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 実タグは `v0.4.2`〜`v0.4.9` / `v0.5.0` / `v0.5.1` / `v0.5.6` / `v0.5.7` の **12 本**。**`v0.5.2`〜`v0.5.5`
 は存在しない**（`v0.5.6` のタグメッセージが Phase 5.0.2〜5.0.5 用に予約と宣言したまま実装が別の順序で
-進んだため）。`v0.5.7` を採ったことで、[spec-phase5-5.md](../spec/spec-phase5-5.md) §9 の
-「バージョン割り当て」表が予約していた `v0.5.7` = Phase 5.5.1（OTel + SQLite）を `v0.5.8` へ、
-以降の 5.5.2〜5.5.4 も 1 つずつ繰り下げる付け替えが必要になった（同 spec 側で対応済み）。作成日は
+進んだため）。次のタグは `v0.5.8`（未作成 → 後述）。`v0.5.7` と `v0.5.8` を続けて Phase 5.0 系に
+充てたため、[spec-phase5-5.md](../spec/spec-phase5-5.md) §9 の「バージョン割り当て」表の予約は
+**2 度繰り下がり**、現在は 5.5.1 = `v0.5.9` / 5.5.2 = `v0.5.10` / 5.5.3 = `v0.5.11` /
+5.5.4 = `v0.5.12` である（同 spec 側で対応済み。以前の対応表はもう有効でない）。作成日は
 v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / v0.5.1 / v0.5.6 が
 2026-07-23、`v0.5.7` が 2026-07-30。
 
@@ -272,6 +299,48 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
 タグメッセージと `git log v0.5.6..v0.5.7` に残るためここには重複させない。当時の検証と注記は §6.8。
 
 番号は連番を優先する **(a) `v0.5.7`** を採用した（予約どおり `v0.5.4` を後追いする (b) 案は不採用）。
+
+### 次のタグ: v0.5.8（未作成）
+
+`v0.5.8` は spec-phase5-5.md §9 の予約では Phase 5.5.1（OTel + SQLite シンク）だったが、**`v0.5.7`
+のときと同じ判断（タグ順と時系列を一致させる = 先に完成した成果へ先の番号を与える）を通し**、下記の
+内容に割り当てる。5.5.1〜5.5.4 は `v0.5.9`〜`v0.5.12` へもう 1 つ繰り下げた（同 spec 側で対応済み）。
+なお項目 2 は Phase 5.5.1 の前段そのもの（5.5.1 の `observability.rs` が読む値を先に揃える）なので、
+繰り下げても 5.5.1 の着手は遅くならない。
+
+**実装項目（この順序で進める）**。順序の根拠は「決定論的なものから」「安いものから」「あとの判断を
+分岐させるものを先に」:
+
+1. **5.0.2 追補: ローカル LLM プローブ**（実装済み・PR 待ち）。`init_probe_llm`（4 本目の Tauri
+   command。既定 11434 / 1234 / 3456 + 手入力最大 4 本に `GET /v1/models`、1 ポート 1 秒・全体 3 秒・
+   応答 64KB・モデル 20 件上限）、確証は `GET /api/version` が 0.14.0 以上のときだけ、確証ありは有効な
+   agent 定義・それ以外はコメント行、`autostart` は常に false、モデル選択の `<select>`（既定は
+   埋め込み/画像/音声/再ランクらしい名前を除いた先頭）、検出行への反映、`ANTHROPIC_AUTH_TOKEN` の
+   出し分け。コミットは `63af84f` と `8931464`、ブランチ `feat/init-llm-probe-5.0.2`（origin に
+   push 済み、PR 未作成）。**前提の訂正**: Ollama v0.14.0 以降と LM Studio が Anthropic Messages API
+   互換になったため、旧設計が想定していた translation 層（coderouter を挟む）は不要になった。
+   lib 402 → 419、統合 14 不変、svelte-check 122 files 0/0。
+2. **計測フィールドの追加**（additive）。`orchestrator.rs` の `StepOutcome` は `started_at_ms` しか
+   持たず step 単位の終了時刻が無く、`deferred_since_ms` は `#[serde(skip)]` で persist されないため、
+   **fan-out の各コピーの所要と、ペイン待ちに使った時間が事後に出せない**。並列化の効きを測るのに
+   これが要る。Phase 5.5.1 の前段。
+3. **合成 workflow を 3 本用意**（直列版 / 項目ごとの鎖に分割した版 / fan-out + `joinOn: any`）。
+   エージェントを `sh -c 'sleep N'` に置き換え、think time を排除して orchestration の効き
+   （tick 間隔・spawn コスト・9 面上限の待ち・依存の解け方）だけを測る。**同じ回で U2（straggler
+   協調キャンセルのペイン kill）を消す**。
+4. **cold start の実測**（同一 step を、既存ペインを再利用する場合と毎回 spawn する場合で比較）。
+   ここだけは実エージェントが必要（測る対象が inbox / pins の読み直し時間なので）。**この結果で次の
+   機能の本命が決まる**: cold start 支配なら常駐ワーカー（`mode: serve`）、think time 支配なら
+   ストリーミング依存（`onEach: reply`）。spec 執筆は §3 P5。
+5. **U4 の消化**（同名 workflow の並行 run が互いの返信を取りこぼさないこと）。2 つの構成を同時に
+   流して比較する場合の前提になる。
+6. **リリース雑務**: `.gitignore` に `src-tauri/target-basemain/`（2.2GB）と `ptygrid.yml-20260729`
+   を追加。**version ファイルの食い違いの記録**: タグ `v0.5.7` が指すコミット（`4e9afb3`）では 3 つの
+   version ファイルが `0.5.6` のままで、`0.5.7` に上げたリリースコミット（`27ecd90`）はブランチ側に
+   残っていた。**公開済みタグは動かさない**方針とし、`v0.5.8` は version を揃えたコミットに打つ。
+
+**タグの内容には数えないもの**: 実タスクでのベースライン測定と改良構成の比較、`onEach: reply` /
+`mode: serve` の spec 執筆（どちらも §3 P5。後者は項目 4 の結果を見てから、実装は v0.5.9 以降）。
 
 ### リリース手順（タグ付けの作法）
 
@@ -308,7 +377,7 @@ migration は additive、既存 `queen.sqlite3` を壊さない。version bump �
 > 導入し 5.0.0 で skeleton・5.0.1 で本格実装」という下の規律は、実際には **5.0.1 が Workflow
 > Resume に充てられ memory は着手されなかった**ため、v3 は `workflow_runs` のみで確定している。
 > memory 系テーブルを追加する場合は additive migration を v3 内で行うか v4 を切るかを、
-> 着手時に決め直す必要がある（§3 P5）。
+> 着手時に決め直す必要がある（§3 P6）。
 
 **規律**: 未知の新 version は黙って開かない（明示 error でユーザーに再インストールを促す。Phase 3.6
 の規律を継承）/ migration は transactional で既存の pins/notes/inbox データを壊さない /
@@ -508,6 +577,32 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
 - 当時の注記: `v0.5.2`〜`v0.5.5` の予約（Phase 5.0.2〜5.0.5 用）は使わないまま残る。`v0.5.7` を
   Phase 5.0.2 + 5.0.4 のリリースに充てたことで、spec-phase5-5.md §9 の「バージョン割り当て」表が
   予約していた 5.5.1 以降を `v0.5.8`〜`v0.5.11` へ 1 つずつ繰り下げた。
+
+### 6.9 2026-07-30（続き）: 5.0.2 追補 — ローカル LLM プローブ
+
+詳細な経緯。現在地は §1・§2（U12）・§4。
+
+- 入ったもの: ローカル LLM プローブを 2 コミットで実装（`63af84f` = `init_probe_llm` と検出行への
+  反映、`8931464` = モデル選択の `<select>` と既定モデルの選び方）。ブランチ
+  `feat/init-llm-probe-5.0.2` を origin に push した時点で、PR は未作成。プローブは既定
+  11434 / 1234 / 3456 と手入力最大 4 本に `GET /v1/models` を当て（1 ポート 1 秒・全体 3 秒・応答
+  64KB・モデル 20 件上限）、Anthropic Messages API 互換の確証は `GET /api/version` が 0.14.0 以上の
+  ときだけとし、確証ありなら有効な agent 定義・それ以外はコメント行を出す（`autostart` は常に
+  false、`ANTHROPIC_AUTH_TOKEN` も確証の有無で出し分け）。
+- 当時の検証: lib 402 → **419 passed**、統合 14 は不変、svelte-check 122 files 0 errors / 0 warnings。
+  実機（macOS）1 回目は検出フォルダ `~/works/tmp/ptygrid` で、CLI 7 体・npm・git あり・既存設定あり
+  （書き込み先が `ptygrid.init.yml` に切り替わる）を確認。プローブは 1234 / 3456 / 11434 を叩き、
+  3456 は無応答、**11434 で `Ollama 0.32.1` が応答して「Anthropic API 確証あり」バッジとモデル
+  20 件（先頭 `x/flux2-klein:latest`）を取得**するところまでスクリーンショットで確認した。
+- 当時の注記: 実機 1 回目で自動テストに掛からない不具合が 2 件出た。(1) 既定モデルに `models[0]` を
+  そのまま使っていたため画像生成モデル（`x/flux2-klein:latest`）が選ばれた → 埋め込み/画像/音声/
+  再ランクらしい名前を除いた先頭を採る `<select>` を入れた。(2) 確証が取れていても検出行のヘッダーが
+  「未検出」のままだった → 反映を修正。**前提の訂正**として、旧設計は Anthropic 互換が無い前提で
+  coderouter を挟む translation 層を想定していたが、Ollama v0.14.0 以降と LM Studio が Anthropic
+  Messages API 互換になっていたため translation 層は不要と判明した。運用上の事実として、接続フォルダ
+  経由の git がロックファイルを削除できず（デバイスブリッジ側の制約）、`_to_delete/gitlocks-20260730/`
+  へ退避して作業を続けた。実機の残り 3 点（`<select>` の実操作、生成された `local-11434` 定義での
+  Claude Code 起動、LM Studio での未確証分岐）は U12 に未消化として残る。
 
 ---
 
