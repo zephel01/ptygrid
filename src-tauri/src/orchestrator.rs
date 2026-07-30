@@ -6393,12 +6393,16 @@ workflows:
     /// in the map and the frontend keeps rendering the cell with an "exited"
     /// tag. Anonymous (name `None`) so no step can reuse it. Polls rather than
     /// sleeps: the reader thread applies the exit asynchronously.
+    /// A filler pane whose process is already gone. `/bin/echo`, which exits at once and
+    /// exists on both macOS and Linux — unlike `/bin/true`, which macOS keeps in
+    /// `/usr/bin` (CI runs these tests on both platforms). `spawn_shell` takes a
+    /// program path, not a shell line, so it must be a single executable.
     fn occupy_with_exited_pane(
         handle: &tauri::AppHandle<tauri::test::MockRuntime>,
         manager: &PtyManager,
     ) -> u32 {
         let id = manager
-            .spawn_shell(handle.clone(), 80, 24, Some("/bin/true".to_string()), None)
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/echo".to_string()), None)
             .expect("short-lived filler pane should spawn");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {

@@ -390,9 +390,10 @@ mod tests {
                 .unwrap();
         }
         // The last cell goes to a pane that exits immediately and stays on the
-        // grid as `Exited` (no `close_on_exit`).
+        // grid as `Exited` (no `close_on_exit`). `/bin/echo` exits at once and exists on
+        // both macOS and Linux; `/bin/true` does not exist on macOS (`/usr/bin`).
         manager
-            .spawn_shell(handle.clone(), 80, 24, Some("/bin/true".to_string()), None)
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/echo".to_string()), None)
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
