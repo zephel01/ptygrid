@@ -1311,6 +1311,46 @@ fn format_ids(ids: &[u32]) -> String {
         .join(", ")
 }
 
+/// Closes every pane a test opened, and does not return until the file
+/// descriptors are actually gone. Shared by every test module that puts panes
+/// on the grid (`session`, `orchestrator`, `team_presets`).
+///
+/// Two problems it solves, both of which surfaced as
+/// `Too many open files (os error 24)` on macOS, whose default `ulimit -n` is
+/// 256 while `cargo test` runs one thread per core:
+///
+/// 1. A tail-of-test kill loop never runs when an assertion fires first, and
+///    dropping `PtyManager` does not clean up either — the reader threads hold
+///    `Arc` clones of the session map, so while a child is alive the map (and
+///    its PTY master fds) outlives the test and is only reclaimed when the
+///    whole test binary exits. One panicking test used to poison every test
+///    scheduled after it. `Drop` runs during unwinding, so a guard fixes that.
+/// 2. `kill_pty` only *signals*; the master fd is released later, by the
+///    reader thread. Returning immediately let a finished test's descriptors
+///    overlap the next test on the same runner thread, so the suite's peak fd
+///    count grew with core count rather than with how many panes any one test
+///    actually needs. Waiting makes the peak bounded.
+///
+/// Best-effort by construction: it never panics (a panic here during unwinding
+/// would abort the process and hide the real assertion failure) and gives up
+/// after `DRAIN_TIMEOUT`.
+#[cfg(test)]
+pub(crate) struct GridGuard<'a>(pub(crate) &'a PtyManager);
+
+#[cfg(test)]
+impl Drop for GridGuard<'_> {
+    fn drop(&mut self) {
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+        for s in self.0.list_sessions() {
+            let _ = self.0.kill_pty(s.id);
+        }
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        while self.0.occupied_pane_count() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 // ---------- spawn / reader / autorestart machinery (detached-thread safe) ----------
 
 /// Generation-guarded "give up as exited" transition used by failure paths
@@ -1789,6 +1829,7 @@ mod tests {
     fn restart_failure_marks_session_exited() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         // Spawn a session whose binary we can delete afterwards.
         let dir = std::env::temp_dir().join(format!("mterm-test-{}", std::process::id()));
@@ -1839,6 +1880,7 @@ mod tests {
     fn kill_pty_removes_slot_so_restart_fails() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let id = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
             .expect("spawn should succeed");
@@ -1869,6 +1911,7 @@ mod tests {
     fn stale_spawn_does_not_stomp_slot() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let id = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
@@ -1903,6 +1946,7 @@ mod tests {
     fn foreground_name_listed_and_resolvable() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let id1 = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
@@ -1973,6 +2017,7 @@ mod tests {
     fn foreground_names_lists_running_pty_sessions() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let id = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
@@ -2019,6 +2064,7 @@ mod tests {
     fn foreground_names_pass_resolved_name_to_detail_resolver() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let id = manager
             .spawn_shell(handle, 80, 24, Some("/bin/cat".to_string()), None)
             .unwrap();
@@ -2048,6 +2094,7 @@ mod tests {
     fn duplicate_definition_names_require_an_exact_session_id() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let config =
             config::parse_config("agents:\n  - name: worker\n    cmd: exec /bin/cat\n").unwrap();
         let cwd = std::env::current_dir().unwrap();
@@ -2078,6 +2125,7 @@ mod tests {
     fn write_pty_roundtrip_via_ring_buffer() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let id = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
@@ -2112,6 +2160,7 @@ mod tests {
     fn transcript_session_is_pty_less_and_stops_on_subagent_stop() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let id = manager.create_transcript_session(
             handle.clone(),
@@ -2165,6 +2214,7 @@ mod tests {
     fn transcript_read_output_returns_appended_text_and_rejects_restart() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let id = manager.create_transcript_session(
             handle.clone(),
             "agent-2".to_string(),
@@ -2194,6 +2244,7 @@ mod tests {
     fn transcript_stats_and_lead_counts() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         manager.create_transcript_session(handle.clone(), "a".into(), None, 5, None);
         manager.create_transcript_session(handle.clone(), "b".into(), None, 5, None);
         manager.create_transcript_session(handle.clone(), "c".into(), None, 7, None);
@@ -2218,6 +2269,7 @@ mod tests {
     fn session_states_agrees_with_list_sessions() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let config =
             config::parse_config("agents:\n  - name: worker\n    cmd: exec /bin/cat\n").unwrap();
         let cwd = std::env::current_dir().unwrap();
@@ -2282,6 +2334,7 @@ mod tests {
     fn occupied_pane_count_includes_exited_slots() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
 
         let running1 = manager
             .spawn_shell(handle.clone(), 80, 24, Some("/bin/cat".to_string()), None)
@@ -2336,6 +2389,7 @@ mod tests {
     fn resource_roots_expose_each_running_pty_child() {
         let handle = mock_handle();
         let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
         let id = manager
             .spawn_shell(handle, 80, 24, Some("/bin/cat".to_string()), None)
             .unwrap();
