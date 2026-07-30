@@ -2,7 +2,8 @@
 
 更新日: 2026-07-31 / 実装基準: `main`（PR #10 のあと PR #11 / #12 = `17860e0` / `b8300a4` が
 マージされ、`.gitignore` 追加の `89411b9` が直接コミットされている）。作業中のブランチは
-`feat/terminal-copy-paste`（`main` から分岐、**origin へ push 未・PR 未作成**）。
+`feat/step-timing-5.0.6` と `feat/terminal-copy-paste`（どちらも `main` から分岐、**origin へ
+push 未・PR 未作成**）。
 最新タグは `v0.5.7`（2026-07-30 作成）、次のタグは `v0.5.8`（未作成）。作業ツリーの
 `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の 3 ファイルはいずれも
 `0.5.7` だが、**タグ `v0.5.7` が指すコミットはそうではない**（→ §4）。
@@ -46,15 +47,15 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | （UI 横断） | ターミナルのコピー & ペースト（macOS 限定のアプリメニュー App / Edit / Window + `tauri-plugin-clipboard-manager`、コピーは macOS が Cmd+C・それ以外が Ctrl+Shift+C で選択が無いときは介入せず PTY へ、貼り付けは macOS がネイティブ経路・Ctrl+Shift+V が自前ハンドラで `term.paste()` 経由、右クリックメニュー、`macOptionClickForcesSelection: true`） | 🚧 | v0.5.8（予定） | 一部済（U13、2026-07-31。残り 4 点） |
 | （UX トラック） | Phase 4 期に計画外で入った UX 改善: `mterm.yml` → `ptygrid.yml` リネームと用途別サンプル（`da40cb0`）、一括 cd（`cf42ced` / `77d0271`）、作業フォルダと設定探索の分離 + origin バッジ（`acbed94`）、設定なしフォールバック（`0530e3b`）、フォルダサジェスト（`a3a769a`）、終了ペインの明示と一括クローズ（`d8a3d8e`） | ✅ | v0.4.2 | 記録なし |
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
-| 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out は未（U2） |
+| 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | ✅ | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out 実走 済（U2、2026-07-31） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | ✅ | v0.5.1（`ac1b94b`） | 済（U5、2026-07-30） |
 | 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※）。ローカル LLM プローブの追補は次行 | ✅ | v0.5.7 | 済（U11、2026-07-30） |
 | 5.0.2 追補 | ローカル LLM プローブ: `init_probe_llm`（4 本目の Tauri command）で既定 3 ポート + 手入力最大 4 本に `GET /v1/models` を当て、Anthropic Messages API 互換の確証が取れたときだけ有効な agent 定義を出す（それ以外はコメント行）。モデル選択 `<select>`・検出行への反映・`ANTHROPIC_AUTH_TOKEN` の出し分けを含む。ブランチ `feat/init-llm-probe-5.0.2` は `main` にマージ済み（→ §4） | 🚧 | v0.5.8（予定） | 一部済（U12、2026-07-30。残り 3 点） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
-| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | v0.5.7（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
+| 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | v0.5.7（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ straggler 協調キャンセル 済（U2、2026-07-31）/ `joinOn: reply`・`condition:`・`handoffTo`・`retry:`・`timeoutMs` の実走は未（§2 に項番を立てていない） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | v0.5.7（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
-| 5.0.6（案） | Orchestrator の計測とパイプライン化: `StepOutcome` に step 単位の終了時刻とペイン待ち時間を additive 追加 / 合成 workflow 3 本（直列・鎖分割・fan-out + `joinOn: any`）で orchestration の効きだけを測る / cold start（ペイン再利用 vs 毎回 spawn）の実測。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | ⬜ | v0.5.8（予定） | 該当なし |
+| 5.0.6（案） | Orchestrator の計測とパイプライン化: `StepOutcome` に step 単位の終了時刻とペイン待ち時間を additive 追加 / 合成 workflow（直列・鎖分割・9 面待ち・fan-out + `joinOn: any` の 4 本）で orchestration の効きだけを測る / cold start（ペイン再利用 vs 毎回 spawn）の実測。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | 🚧 | v0.5.8（予定） | 合成 workflow 4 本の実走と実測 済（2026-07-31、同じ回で U2 も消化）/ cold start 実測と U4 は未 |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
 | 5.5.2 | Cost 計算 + `agent-cost` イベント | ⬜ | — | 該当なし |
@@ -90,7 +91,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > 番号が決まるまで本表の行は「（案）」表記のままとする（v0.5.8 のタグ内容そのものは §4 に書いてあり、
 > patch 番号の確定を待たない）。
 
-**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了した。同日さらにローカル LLM プローブの追補が入り実機 1 回目を通し、翌 2026-07-31 にターミナルのコピー & ペーストが入って実機 1 回目を通したため 🚧 は 8 行。残る理由は個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）、プローブ追補の残り 3 点（U12）、コピー & ペーストの残り 4 点（U13）。未タグ成果へのタグ付けは v0.5.7 で一度消化し、次は v0.5.8（→ §4）。
+**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了した。同日さらにローカル LLM プローブの追補が入り実機 1 回目を通し、翌 2026-07-31 にターミナルのコピー & ペーストが入って実機 1 回目を通した。**同じ 2026-07-31 に合成 workflow で U2（fan-out + straggler 協調キャンセル）も完了**し、5.0.0 は実機側の積み残しが無くなって ✅ になった一方、その計測作業そのものである「5.0.6（案）」が実装 + 実測まで進んで残作業ありの状態になったため、**🚧 は 8 行のまま**。残る理由は個別機能ごとに分かれている: Linux 常用（U7）、host モード（U6）、コピー & ペーストの残り 4 点（U13）、プローブ追補の残り 3 点（U12）、5.0.4 の残る固有機能（`joinOn: reply` / `condition:` / `handoffTo` / `retry:` / `timeoutMs` の実走。§2 に項番を立てていない）、mailbox 分離（U4。5.0.4 追補と 5.0.6（案）の両方がこれを待っている）、5.0.6（案）の cold start 実測、5.5.0 の実機記録なし（U10）。未タグ成果へのタグ付けは v0.5.7 で一度消化し、次は v0.5.8（→ §4）。
 
 **補足: 主要モジュールの所在**（状態は上表を見ること）
 
@@ -120,9 +121,9 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | # | 未検証の内容 | 状況 |
 |---|---|---|
 | U1 | **実機での workflow 1 本流し**（GUI の 🔀 チップ または Queen tool `spawn_workflow` から実走し、ペインの挙動を目視） | **2026-07-30、macOS で完了**。`smoke`（`pattern: pipeline` / `autoClose: success` / `a`(t1) → `b`(t2)）を最後まで流し切り、step `a` の終了で step `b` が自動 spawn され、run 完了で 2 枚のペインが自動で閉じるところまで確認。これで「完了判定が実 PTY で発火するか」「DAG が進むか」「`autoClose` が効くか」「`workflow-state` が frontend に届くか」の 4 つの継ぎ目が実機で裏付けられた。**5.0.0 以来続いていた「一度も実走していない」状態はここで解消**。残る実機項目は個別機能ごと（U2〜U5）に分かれる。詳細な経緯は §6.5 |
-| U2 | straggler 協調キャンセルの pane kill（fan-out レースの敗者ペインが GUI 上で実際に閉じること） | 続報9 が名指しで「目視確認未了」。U1 の後続 |
+| U2 | straggler 協調キャンセルの pane kill（fan-out レースの敗者ペインが GUI 上で実際に閉じること） | **2026-07-31、macOS で実施**（スクリーンショットで確認済み）。`example/measure-parallelism` の `measure-4-join-any`（`gate` → `race` が `fanOut: 3` + `joinOn: any` → `report`）を **3 回**実行（03:05:30 / 03:06:11 / 03:07:18）。3 回とも `race#0` が SUCCEEDED（5.1〜5.3 秒）、`race#1` / `race#2` が **CANCELLED**（同 5.1〜5.3 秒）で、敗者は 45 秒 sleep に入っていたため **`[race] loser end` の行が 1 度も出ていない**。これが「敗者が待ち切らずに kill された」ことの直接証拠になる（時間切れではなく kill）。敗者ペインはグリッドから消え、最終状態は gate / 勝者 / report の 3 枚（フッター `3/9 ペイン`）。`report` は勝者の終了直後に spawn され、run 全体は SUCCEEDED。**U2 は完了**。この回で敗者 kill 時のバナー誤表示（`session N not found`）を 1 件見つけて修正した（`58e9c95`）。詳細な経緯は §6.11 |
 | U3 | pane 上限（9 面）到達時の待ち行列化が実機で `Pending` のまま待ち、空きで再開すること（`error` に `"waiting for a free pane slot (N/9 occupied)"`） | **2026-07-30、macOS で実施→不整合を発見・修正済み**。8 面埋まった状態から `smoke` を起動し step `a` が 9 枚目を占有→`close_on_exit` 未指定のため自然終了後も `Exited` のままセルを占有→次 step の判定は live 基準で空きありと誤認して spawn し、frontend は表示できないまま headless で走った。占有判定を `occupied_pane_count()`（グリッド全セル数、`Exited` 含む）へ修正（`0e9c5ba`、詳細 §6.6）。**加えて表示側の欠落も判明**: 待機理由は `outcome.error` に入っていたが、パネルが全ての error を ⚠ のツールチップに畳んでいたため待っている step と止まっている step が見分けられなかった。`Pending` で理由があるときは step 行にテキストで出すよう修正（`05799d5`）。修正後の再検証で、step 行に `waiting for a free pane slot (9/9 occupied)` が表示されることを**スクリーンショットで確認**。ペインを閉じると `Running` に遷移することは**ユーザー報告**。**U3 は完了**（詳細 §6.7） |
-| U4 | 同名 workflow の並行 run が互いの返信を取りこぼさないこと（mailbox の run 単位分離） | 同上 |
+| U4 | 同名 workflow の並行 run が互いの返信を取りこぼさないこと（mailbox の run 単位分離） | 未実施。続報9 が名指しで「目視確認未了」としたもののうち、U2 の完了後に残る 1 件。消化の枠は v0.5.8 の項目 5（→ §4） |
 | U5 | クラッシュ / 再起動後の resume Y/N バナー（5.0.1） | **2026-07-30、macOS で実施**。`smoke` 実行中にアプリを再起動したところ、「前回のワークフロー run『smoke』が途中で中断されています。再開しますか？」のバナーが出ることを確認し、**再開後に run が `Succeeded`（step `a` / `b` とも `Succeeded`）まで到達するところまでスクリーンショットで確認**。中断からの復帰が実際に完走することの実証。再起動後のパネルは永続化された中断前の状態を表示するため（`error` は wire フィールドとして残るが `deferred_since_ms` は `#[serde(skip)]` のため復元されない）、ペインが 1 枚しかない状態でも `9/9 occupied` のような古い理由が見えることがある（矛盾ではない）。**U5 は完了**（詳細 §6.7） |
 | U6 | host モード（Phase 4.2）の Claude Code 実機検証（spec-claude-teams-panes §10.3 の手順） | 実装は入っているが実機手順は未消化。macOS 必須 / Linux はベストエフォート |
 | U7 | Linux 実機での常用 | build / `.deb` / AppImage は Ubuntu 22.04 CI で検証済み（Phase 3.9）。実機常用は beta 表記のまま |
@@ -153,7 +154,8 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
   実際に閉じる、(3) `workflow-state` で WorkflowPanel が追随、(4) resume Y/N バナー（U5）が出る。
 - 続けてハードニング固有の挙動（U3 / U4）を実機で見る。`joinOn: reply` / `condition:` /
   `handoffTo` / `retry:` を使う workflow は `smoke` が通ってから別途 1 本ずつ。straggler の
-  pane kill（U2）と U4 は v0.5.8 の合成 workflow / 並行 run の回で消す（項目と順序は §4）。
+  pane kill（U2）は v0.5.8 の合成 workflow の回で消えたので、この枠に残るのは U4（並行 run）
+  だけになった（項目と順序は §4）。
 - 実走で分かったことは CONTRACT.md の続報として追記し、§6 に日付つきで残す。
 
 ### P2. 未タグ成果のリリース（次のタグ）— 完了
@@ -229,6 +231,14 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 - **`feat/terminal-copy-paste` が push 未・PR 未**: ターミナルのコピー & ペースト（→ §4 の v0.5.8
   項目 7）はローカルのブランチにしか無い。push と PR を出し、U13 の残り 4 点を消す
+- **`fanOut` を持つ step を root に置けない**: `spawn_workflow` の root ループは全コピーに枝番なしの
+  同じ `step_id` を付ける一方、`spawn_ready` 経由のコピーだけが `race#0` のような枝番を持つ。パネルの
+  step 一覧は `stepId` をキーにした keyed each なので、root fan-out だと同一キーが並ぶ。
+  `example/measure-parallelism` では sleep なしの `gate` step を 1 段挟んで回避したが、これは設定側の
+  工夫であって修正ではない（2026-07-31 に判明、未修正 → §6.11）
+- **cancel された straggler は workflow の `autoClose` ではなく agent の `close_on_exit` に従う**:
+  kill 時に `outcome.session_id` が消えるので frontend が workflow 所属を判定できなくなるため。
+  2026-07-31 の設定では偶然それが望みどおりだったが、意図した挙動ではない（未修正 → §6.11）
 - **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P6）までの間は
   [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の ❌ 表記を維持する
 - **`orchestrator.rs` のコード内コメントの「phase 5.0.5」表記**: 整理コミットで削除する
@@ -326,15 +336,38 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
    出し分け。ブランチ側のコミットは `63af84f` と `8931464`。**前提の訂正**: Ollama v0.14.0 以降と LM Studio が Anthropic Messages API
    互換になったため、旧設計が想定していた translation 層（coderouter を挟む）は不要になった。
    lib 402 → 419、統合 14 不変、svelte-check 122 files 0/0。
-2. **計測フィールドの追加**（additive）。`orchestrator.rs` の `StepOutcome` は `started_at_ms` しか
-   持たず step 単位の終了時刻が無く、`deferred_since_ms` は `#[serde(skip)]` で persist されないため、
-   **fan-out の各コピーの所要と、ペイン待ちに使った時間が事後に出せない**。並列化の効きを測るのに
-   これが要る。Phase 5.5.1 の前段。
-3. **合成 workflow を 3 本用意**（直列版 / 項目ごとの鎖に分割した版 / fan-out + `joinOn: any`）。
-   エージェントを `sh -c 'sleep N'` に置き換え、think time を排除して orchestration の効き
-   （tick 間隔・spawn コスト・9 面上限の待ち・依存の解け方）だけを測る。**同じ回で U2（straggler
-   協調キャンセルのペイン kill）を消す**。
-4. **cold start の実測**（同一 step を、既存ペインを再利用する場合と毎回 spawn する場合で比較）。
+2. **計測フィールドの追加**（additive）— **実装済み + 実測済み**（`9442758`）。`orchestrator.rs` の
+   `StepOutcome` は `started_at_ms` しか持たず step 単位の終了時刻が無く、`deferred_since_ms` は
+   `#[serde(skip)]` で persist されないため、**fan-out の各コピーの所要と、ペイン待ちに使った時間が
+   事後に出せない**状態だった。`ended_at_ms`（Option、終端到達時に 1 度だけ押す）と
+   `waited_for_pane_ms`（累積。再 spawn をまたいで残る）を additive 追加し、所要と待ちを別々に出す。
+   下の項目 3 で実機の数字が取れたので、**この 2 フィールドが実機で機能することは裏づけ済み**。
+   Phase 5.5.1 の前段。
+3. **合成 workflow**（`sh -c 'sleep N'` でエージェントを置き換え、think time を排除して orchestration
+   の効き = tick 間隔・spawn コスト・9 面上限の待ち・依存の解け方だけを測る）— **実装済み + 実測済み**
+   （`af723ca`。`example/measure-parallelism/ptygrid.yml`）。当初「3 本」としていたが、9 面上限の待ちを
+   測る版を分けたので **実際は 4 本**（`measure-1-serial` / `measure-2-split` / `measure-3-pane-queue` /
+   `measure-4-join-any`）。2026-07-31 に macOS 実機で実測（各回スクリーンショットで確認済み。詳細と
+   時刻は §6.11、U2 の消化は §2）:
+   - `measure-1-serial`: run は 31 秒（理想 30 秒）。step の所要は先頭 5.2 秒・残り 5 つが 5.1 秒。
+     依存エッジ 5 本に対しオーバーヘッド 1 秒 = **1 エッジあたり 0.2 秒**で、これは driver tick
+     （200ms）ちょうど 1 回分にあたる。
+   - `measure-2-split`: step の所要は 5.2 / 5.1 / 5.2 / 5.1 / 5.2 / 5.1 秒で **直列版と変わらない**。
+     同時 3 枚でも spawn は重くならない。（run 全体の壁時計はスクリーンショットに写っておらず**未記録**）
+   - `measure-3-pane-queue`: `gate` 0.2 秒、`wave-a#0`〜`#5` が各 5.1 秒、`wave-b#0`〜`#5` が各
+     5.1 秒（**待ち 8.2 秒**）。サンプルの予測値は待ち約 8.0 秒だった。
+   - **結論**: orchestration のコストは 1 依存あたり 200ms、spawn は 0.1 秒程度。実タスクの workflow が
+     遅いとすれば**原因はここではない**（→ §3 P5 の実タスク測定へ）。
+   - `measure-4-join-any` の 3 回で **U2（straggler 協調キャンセルのペイン kill）を消した**（→ §2）。
+     その過程で **frontend の誤バナーを 1 件修正**（`58e9c95`）: 敗者 kill のたびに「ペインの停止に
+     失敗しました (kill_pty #N): session N not found」が出ていた。`cancel_stragglers` が
+     `outcome.session_id` を `None` にする（kill 済みペインは再利用も回収もしない）ため、その id で
+     workflow 所属を判定している `autoCloseModeFor` が所属を見失い、agent の `close_on_exit: always`
+     にフォールバックして 3 秒後に `closePane` → `kill_pty` を呼ぶが、backend ではスロットが既に無い、
+     という経路。`check_timeouts` も同じく `session_id` を消すので同じ潜在経路を持っていた。修正は
+     **`session N not found` だけを握り潰す**（`kill failed: …` は本物の孤児プロセスなので従来どおり
+     バナーに出す = BUG-5 の意図を維持）。
+4. **（次はここ）cold start の実測**（同一 step を、既存ペインを再利用する場合と毎回 spawn する場合で比較）。
    ここだけは実エージェントが必要（測る対象が inbox / pins の読み直し時間なので）。**この結果で次の
    機能の本命が決まる**: cold start 支配なら常駐ワーカー（`mode: serve`）、think time 支配なら
    ストリーミング依存（`onEach: reply`）。spec 執筆は §3 P5。
@@ -685,6 +718,51 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   Option、それ以外は Shift」と書き分けた。**運用上の事実**: JS 側の依存が 1 つ増えたので、この断面を
   取り込む側は `npm install` が要る。実機でこれを踏み、`vite` が
   `Failed to resolve import "@tauri-apps/plugin-clipboard-manager"` で落ちた（→ §4 のリリース手順）。
+
+### 6.11 2026-07-31: 5.0.6（案）の計測フィールドと合成 workflow、U2 の消化
+
+詳細な経緯。現在地は §1・§2（U2）・§4。
+
+- 入ったもの: 3 コミット。`9442758` = `StepOutcome` への計測フィールド追加（`ended_at_ms` は終端到達
+  時に 1 度だけ押し、再 spawn では `started_at_ms` の上書きと対で `None` に戻す / `waited_for_pane_ms`
+  はペイン待ちの累積で再 spawn をまたいで残る。所要と待ちを別々の数として出す）。`af723ca` =
+  合成 workflow 一式（`example/measure-parallelism/ptygrid.yml`。エージェントを `sh -c 'sleep N'` に
+  置き換えた `measure-1-serial` / `measure-2-split` / `measure-3-pane-queue` / `measure-4-join-any` の
+  4 本）。`58e9c95` = 敗者 kill 時の誤バナー修正（`App.svelte` の `closePane` が `session N not found`
+  **だけ**を握り潰す。`kill failed: …` は本物の孤児プロセスなので従来どおりバナーに出す = BUG-5 の意図を
+  維持）。ブランチ `feat/step-timing-5.0.6` は `main` から分岐し、**push も PR も未**。
+- 当時の検証: すべて macOS 実機、スクリーンショットで確認済み。
+  - `measure-1-serial`: run は 03:02:09 開始 → 03:02:40 終了で **31 秒**（理想 30 秒）。step の所要は
+    先頭 5.2 秒、残り 5 つが 5.1 秒。依存エッジ 5 本に対しオーバーヘッドは 1 秒、すなわち
+    **1 エッジあたり 0.2 秒**で、これは driver tick（200ms）ちょうど 1 回分にあたる。
+  - `measure-2-split`: step の所要は 5.2 / 5.1 / 5.2 / 5.1 / 5.2 / 5.1 秒で、**直列版と変わらない**。
+    同時 3 枚でも spawn は重くならないことが分かった。run 全体の壁時計はスクリーンショットに写って
+    おらず**未記録**。
+  - `measure-3-pane-queue`: `gate` 0.2 秒、`wave-a#0`〜`#5` が各 5.1 秒、`wave-b#0`〜`#5` が各
+    **5.1 秒（待ち 8.2 秒）**。サンプルに書いておいた予測値は待ち約 8.0 秒だったので、ほぼ予測どおり。
+    これは `waited_for_pane_ms` が実機で機能することの裏づけでもある。
+  - `measure-4-join-any`: **3 回**実行（03:05:30 / 03:06:11 / 03:07:18）。3 回とも `race#0` が
+    SUCCEEDED（5.1〜5.3 秒）、`race#1` / `race#2` が **CANCELLED**（同 5.1〜5.3 秒）。敗者は 45 秒
+    sleep に入っていたので **`[race] loser end` の行が 1 度も出ていない**。これが kill が実際に
+    起きたことの直接証拠になる。敗者ペインはグリッドから消え、最終状態は gate / 勝者 / report の
+    3 枚（フッター `3/9 ペイン`）。`report` は勝者の終了直後に spawn され、run 全体は SUCCEEDED。
+    これで U2 を完了とした。
+  - **計測の結論**: orchestration のコストは 1 依存あたり 200ms、spawn は 0.1 秒程度。実タスクの
+    workflow が遅いとすれば、原因はここではない。
+- 当時の注記: 誤バナーの経路は「`cancel_stragglers` が敗者を kill して `outcome.session_id` を `None`
+  にする（kill 済みペインは再利用も回収もしないため）→ frontend の `autoCloseModeFor` はその session id
+  を持つ step があるかで workflow 由来かを判定しているので、**id が消えた瞬間に workflow 所属と分から
+  なくなり**、agent の `close_on_exit: always` にフォールバックして 3 秒後に `closePane` → `kill_pty` を
+  呼ぶ → backend ではスロットが既に消えているので `session N not found` が返る」というもの。中身は
+  成功しているのに失敗に見える表示だった。`check_timeouts` も同じく `session_id` を消すので同じ潜在
+  経路を持っていた。**今回の作業で分かったが直していないもの**が 2 件あり、§3 の継続ウォッチ /
+  バックログへ回した: (1) `fanOut` を持つ step を root に置けない（`spawn_workflow` の root ループは
+  全コピーに枝番なしの同じ `step_id` を付ける一方、`spawn_ready` 経由のコピーだけが `race#0` のような
+  枝番を持つ。パネルの step 一覧は `stepId` をキーにした keyed each なので root fan-out だと同一キーが
+  並ぶ。`example/measure-parallelism` では sleep なしの `gate` step を 1 段挟んで回避したが、これは
+  設定側の工夫であって修正ではない）、(2) cancel された straggler は workflow の `autoClose` ではなく
+  agent の `close_on_exit` に従う（上記のとおり `session_id` が消えるため。今回の設定では偶然それが
+  望みどおりだった）。
 
 ---
 
