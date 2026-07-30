@@ -3015,4 +3015,143 @@ agents:
              error was: {err}"
         );
     }
+
+    // ---- example/ configs actually parse ----
+
+    /// `example/measure-parallelism/ptygrid.yml` is the synthetic (sleep-only)
+    /// fixture used to measure orchestration overhead by hand, so nothing but a
+    /// real load exercises it — an operator finds out it is malformed only when
+    /// the app refuses the config mid-measurement. `include_str!` pins the file
+    /// into this test binary so `parse_config` (serde shape + the whole of
+    /// `validate_workflows`: agent references, pattern shapes, `fanOut`/`joinOn`
+    /// combinations, name length) runs against the exact bytes shipped in the
+    /// repo.
+    ///
+    /// The assertions below are deliberately about the SHAPE the sample's
+    /// comments promise a reader, not just "it parsed": the four workflows,
+    /// their patterns, the fan-out copy counts the 9-pane cap arithmetic is
+    /// built on (6 + 6 = 12 > `WORKFLOW_SESSION_CAP`), and the `joinOn: any`
+    /// that makes the straggler-cancellation demo a straggler-cancellation
+    /// demo. Editing the sample's numbers without editing its documentation
+    /// fails here.
+    #[test]
+    fn example_measure_parallelism_config_parses() {
+        let text = include_str!("../../example/measure-parallelism/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/measure-parallelism must parse");
+
+        // Every workflow step references an `agents:` entry (validate_workflows
+        // enforces it, so a parse success already proves it); assert the count
+        // so a dropped definition is not silently compensated for elsewhere.
+        assert_eq!(
+            cfg.agents.len(),
+            11,
+            "6 work units + 1 gate + 2 waves + 2 race roles"
+        );
+        assert!(
+            cfg.agents.iter().all(|a| a.autostart != Some(true)),
+            "loading a measurement fixture must not fill the grid on its own"
+        );
+
+        let workflows = cfg.workflows.as_ref().expect("workflows: block");
+        assert_eq!(workflows.len(), 4);
+
+        // 1. serial chain: six steps, each depending on the previous one.
+        let serial = &workflows["measure-1-serial"];
+        assert_eq!(serial.pattern, WorkflowPattern::Pipeline);
+        assert_eq!(serial.steps.len(), 6);
+        assert_eq!(
+            serial
+                .steps
+                .iter()
+                .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                .count(),
+            1,
+            "a chain has exactly one root"
+        );
+
+        // 2. same six units, split into three independent two-step chains.
+        let split = &workflows["measure-2-split"];
+        assert_eq!(split.pattern, WorkflowPattern::Pipeline);
+        assert_eq!(split.steps.len(), 6);
+        assert_eq!(
+            split
+                .steps
+                .iter()
+                .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+                .count(),
+            3,
+            "three items means three roots"
+        );
+        // The two workflows must move the SAME total amount of work, which is
+        // what makes their ideal durations (30s vs 10s) comparable at all.
+        let agents_of = |wf: &WorkflowDef| {
+            let mut v: Vec<String> = wf.steps.iter().map(|s| s.agent.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(agents_of(serial), agents_of(split));
+
+        // Neither fan-out workflow may declare `fanOut` on a ROOT step:
+        // `spawn_workflow`'s root loop gives every copy the bare step id
+        // (see `orchestrator::base_id`), while `spawn_ready` mints `id#k`
+        // per copy — only the latter is separately readable in the panel,
+        // which is where every number this sample is about gets read.
+        let root_fan_out = |wf: &WorkflowDef| {
+            wf.steps.iter().any(|s| {
+                s.fan_out.is_some() && s.depends_on.as_deref().unwrap_or(&[]).is_empty()
+            })
+        };
+
+        // 3. pane-cap queue: two sibling fan-out steps, 6 + 6 > the 9-pane cap,
+        // so the second one is deferred rather than spawned.
+        let queue = &workflows["measure-3-pane-queue"];
+        assert_eq!(queue.pattern, WorkflowPattern::FanOut);
+        assert_eq!(queue.auto_close, Some(AutoCloseMode::Success));
+        assert!(!root_fan_out(queue));
+        let copies: u32 = queue.steps.iter().filter_map(|s| s.fan_out).sum();
+        assert_eq!(copies, 12);
+        assert!(
+            copies as usize > crate::orchestrator::WORKFLOW_SESSION_CAP,
+            "the queue only forms when the two waves cannot both fit on the grid"
+        );
+        let waves: Vec<&WorkflowStep> =
+            queue.steps.iter().filter(|s| s.fan_out.is_some()).collect();
+        assert!(
+            waves
+                .iter()
+                .all(|s| s.depends_on.as_deref() == Some(["gate".to_string()].as_slice())),
+            "the waves hang off the same gate and not off each other; a \
+             dependency between them would serialise them for the wrong \
+             reason and the measured wait would mean nothing"
+        );
+
+        // 4. joinOn: any + straggler cancellation.
+        let race = &workflows["measure-4-join-any"];
+        assert_eq!(race.pattern, WorkflowPattern::FanOut);
+        assert_eq!(race.auto_close, None, "winner/report panes stay readable");
+        assert!(!root_fan_out(race));
+        let candidate = race
+            .steps
+            .iter()
+            .find(|s| s.id == "race")
+            .expect("the racing step");
+        assert_eq!(candidate.fan_out, Some(3));
+        assert_eq!(candidate.join_on, Some(JoinOn::Named(JoinOnName::Any)));
+        assert!(
+            race.steps
+                .iter()
+                .any(|s| s.depends_on.as_deref() == Some(["race".to_string()].as_slice())),
+            "a dependent is what proves the join released downstream work"
+        );
+        // The losers are killed, not left to exit on their own, so the pane
+        // must be closed by the AGENT-level rule: `cancel_stragglers` clears
+        // the outcome's `session_id`, which takes the pane out of the run the
+        // frontend's `autoCloseModeFor` looks up first.
+        let loser = cfg
+            .agents
+            .iter()
+            .find(|a| a.name == candidate.agent)
+            .expect("the fan-out step's agent is defined");
+        assert_eq!(loser.close_on_exit, Some(AutoCloseMode::Always));
+    }
 }

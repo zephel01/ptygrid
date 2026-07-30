@@ -1,0 +1,448 @@
+# measure-parallelism — workflow 並列化の「効き」を決定論的に測るための計測用サンプル
+#
+# ============================================================================
+# 何のための設定か
+# ============================================================================
+# 実エージェント（claude / codex / grok）で workflow を流すと、所要時間の大半が
+# LLM の思考時間になり、そのばらつきに orchestration 自体のコスト
+# （200ms の driver tick・PTY spawn・9面上限の待ち行列・依存の解け方）が
+# 完全に埋もれてしまう。
+#
+# そこで全エージェントを `sh -c 'sleep N; echo ...'` に置き換える。1 step の
+# 所要時間が秒単位で確定するので、
+#
+#     実測 − 理想（sleep の合計から暗算できる値） = orchestration のオーバーヘッド
+#
+# がそのまま読める。ここに入っている 4 本は「同じ仕事量を違う組み方で流す」
+# ためのもので、上から順に流して比較する。
+#
+# ============================================================================
+# 4本の構成と理想所要（暗算値）
+# ============================================================================
+# 1単位 = sleep 5 秒（agents: unit-1 … unit-6 が全く同じ 5 秒の仕事をする）。
+#
+#   measure-1-serial       unit-1→2→3→4→5→6 の直列鎖      理想 5×6 = 30 秒
+#   measure-2-split        同じ6単位を2段×3項目に分割      理想 5×2 = 10 秒
+#   measure-3-pane-queue   6枚+6枚=12枚を9面上限にぶつける  理想（上限なし）5 秒 /
+#                                                         上限ありの期待値 約13 秒
+#   measure-4-join-any     fanOut:3 + joinOn:any の敗者kill 勝者 5 秒 + report 3 秒
+#                                                         = 約 8 秒
+#
+# 1 と 2 は「同じ総量の仕事」（sleep 5 秒 × 6 = 30 秒ぶん）を、直列に鎖で繋いだ
+# ものと、項目ごとの独立した鎖に割ったもので流す。理想所要の差 30−10 = 20 秒が
+# 並列化の取り分。実測がそれぞれ 30 秒 / 10 秒からどれだけ膨らんだかが
+# orchestration のオーバーヘッド。
+#
+# ============================================================================
+# 使い方（1本ずつ。まとめて流さない）
+# ============================================================================
+#   1. このフォルダを ptygrid のディレクトリ指定欄に入れて読み込む
+#      （またはこのファイルを自分のプロジェクトルートへ ptygrid.yml としてコピー）。
+#   2. **グリッドを空にする**。終了済みペインも 9 面の枠を消費するため
+#      （orchestrator::pane_budget → PtyManager::occupied_pane_count は Exited を
+#      含めて数える）、前の run のペインが残ったまま次を流すと待ち行列が
+#      解けずに step が FAIL する。
+#   3. Workflows パネルで 1 本だけ ▶ 実行する。
+#   4. 終わったらパネルとペインの数字を読む（下記）。
+#   5. **全ペインを閉じてから**次の1本を流す。
+#
+# ============================================================================
+# どこの数字を読むか
+# ============================================================================
+# ● Workflows パネルの step 行の右端（Phase 5.0.6）
+#     「5.0s（待ち 8.0s）」のように出る。この2つは**別物で、足してはいけない**。
+#       - 所要   = ended_at_ms − started_at_ms。その step が spawn されてから
+#                  終わるまで。ペイン待ちの時間は入っていない。
+#       - 待ち   = waited_for_pane_ms。9面上限が空くのを待った累計時間。
+#                  spawn される前の待ち行列時間で、再 spawn をまたいで累積する。
+#     待ちが 0 の step には「待ち」表示自体が出ない。
+#
+# ● run 全体の所要（パネルは run の開始時刻しか出さない）
+#     各ペインが `[unit-N] start HH:MM:SS` / `[unit-N] end HH:MM:SS` を出すので、
+#     最初の step の start と最後の step の end の差が run 全体の実測値になる。
+#     理想値（30秒 / 10秒）との差がオーバーヘッド。
+#     measure-3 だけはペインが自動で閉じるのでこの読み方が使えない。あちらは
+#     パネルの「待ち」を読む（そのために autoClose を入れている。下記）。
+#
+# ● 期待されるオーバーヘッドの内訳
+#     driver は 200ms 周期のポーリング（orchestrator::DRIVER_TICK_MS）なので、
+#     依存が1本解けるごとに「最大 200ms の検出遅れ + PTY spawn 数十 ms」が乗る。
+#     measure-1-serial は依存エッジが 5 本なので +1〜2 秒、
+#     measure-2-split は 1 本なので +0.2〜0.5 秒 程度が素の期待値。
+#     これより大きく膨らむなら、そこが調べる価値のある差分。
+#
+# ============================================================================
+# 数字の選び方（なぜこの値か）
+# ============================================================================
+# ● sleep = 5 秒
+#     driver tick が 200ms、PTY spawn が数十 ms。1 step 1 秒だと 1 tick の
+#     ずれが 20% を占めてノイズに埋もれる。逆に 30 秒にすると直列版だけで
+#     3 分かかり検証が退屈になる。5 秒ならオーバーヘッドは 1 step あたり
+#     4〜8% で「見えるが支配しない」。かつ 5×6=30、5×2=10 と暗算できる。
+# ● 同時に使うペイン枚数
+#     「上限に当てない素の並列」と「上限に当てて待ち行列を測る」を別の
+#     workflow に分けてある。
+#       - measure-1 は同時 1 枚、measure-2 は同時 3 枚。終了ペインを残したままでも
+#         合計 6 枚で 9 面に触れない → 待ち行列ゼロの素の並列コストが出る
+#         （パネルに「待ち」が出たら、それはグリッドを空にし忘れたということ）。
+#       - measure-3 だけが 6+6=12 枚で意図的に上限を超える。fan-out の spawn は
+#         all-or-nothing（orchestrator::spawn_ready）なので、6 枚必要な wave-b は
+#         2〜3 枚しか空いていない間は 1 枚も spawn されず Pending のまま待つ。
+#       - measure-4 は最大同時 5 枚（gate + 候補3枚 + report）。上限には触れない。
+#
+# ============================================================================
+# autoClose / close_on_exit の方針（本ごとに逆になる。理由も含めて下記）
+# ============================================================================
+# ● measure-1 / measure-2 : autoClose 指定なし（= never）
+#     測定後にペインの start / end 時刻を読みたいので、ペインを消さない。
+#     代償として run 後に手で全ペインを閉じる必要がある（終了ペインも枠を
+#     食うため）。
+# ● measure-3 : autoClose: success
+#     ここだけは閉じないと測定そのものが成立しない。終了済みペインが 9 面の
+#     枠を握ったままだと wave-b は永遠に spawn されず、
+#     WORKFLOW_DEFER_MAX_MS（300 秒）で FAIL する。読むべき数字はパネル側の
+#     「所要」と「待ち」なので、ペインを残す必要がない。`always` ではなく
+#     `success` にしてあるのは、事故で失敗したペインだけは画面に残して
+#     中身を読めるようにするため。
+# ● measure-4 : workflow は autoClose 指定なし（= never）／
+#               敗者エージェントだけ close_on_exit: always
+#     勝者と report のペインは残して読みたいが、敗者のペインは「実際に
+#     閉じること」を目視したい（方針が逆）。これは実装の性質を使い分けている：
+#     cancel_stragglers は敗者を kill したあと outcome.session_id を None に
+#     落とすので、敗者ペインは「どの run にも属さないペイン」になる。
+#     フロントの autoCloseModeFor（App.svelte）は run 側を先に引くため、
+#       - 勝者ペイン → run に属する → workflow の autoClose（never）→ 残る
+#       - 敗者ペイン → run から外れる → agents[].close_on_exit（always）→ 閉じる
+#     という振り分けになる。
+#
+# ============================================================================
+# 前提・注意
+# ============================================================================
+# - POSIX sh 専用。Windows では shell_wrap が powershell になるため動かない。
+# - autostart は全て false。読み込んだだけでペインが埋まらないようにしてある。
+# - kickoff は一切使わない。sh は inbox を読まないし、kickoff 配送のコストを
+#   測定に混ぜたくないため（step 完了判定は route 1 = PTY exit だけを使う）。
+# - agent_status のパターン表はエージェント定義名で引かれる。ここの名前
+#   （unit-N / gate / wave-* / race-*）はどの組み込みルールセットにも一致しない
+#   ので、route 2（セマンティック done 検出）は発火しない。完了判定は PTY の
+#   exit だけ = 決定論的。
+# - fanOut を持つ step は必ず root ではなく gate の下に置いてある。理由は
+#   agents: gate のコメントを参照（root の fan-out コピーは step_id に枝番が
+#   付かず、パネルで 1 行ずつ読めなくなる）。
+# ============================================================================
+
+project: measure-parallelism
+
+queen:
+  # 計測から変数を1つ減らすために OFF。Queen MCP サーバを立てず、
+  # QUEEN_URL / QUEEN_TOKEN の注入もしないので、ここで測る spawn コストは
+  # 純粋に PTY の spawn コストになる。workflow の駆動自体は Queen サーバに
+  # 依存しない（kickoff を使う場合だけ inbox が要る）。
+  enabled: false
+
+agents:
+  # --------------------------------------------------------------------------
+  # 仕事の単位。unit-1 … unit-6 は全く同じ 5 秒の仕事をする 6 つの定義で、
+  # measure-1-serial と measure-2-split の**両方が同じこの6つを使う**。
+  # 「同じ総量の仕事を、違う組み方で流す」ことが設定の形として保証される。
+  #
+  # 各ペインが start / end の壁時計時刻を出すので、パネルの所要値とペインの
+  # 実時刻を突き合わせられる。
+  # --------------------------------------------------------------------------
+  - name: unit-1
+    cmd: >-
+      sh -c 'echo "[unit-1] start $(date +%T)";
+      sleep 5;
+      echo "[unit-1] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: unit-2
+    cmd: >-
+      sh -c 'echo "[unit-2] start $(date +%T)";
+      sleep 5;
+      echo "[unit-2] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: unit-3
+    cmd: >-
+      sh -c 'echo "[unit-3] start $(date +%T)";
+      sleep 5;
+      echo "[unit-3] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: unit-4
+    cmd: >-
+      sh -c 'echo "[unit-4] start $(date +%T)";
+      sleep 5;
+      echo "[unit-4] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: unit-5
+    cmd: >-
+      sh -c 'echo "[unit-5] start $(date +%T)";
+      sleep 5;
+      echo "[unit-5] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: unit-6
+    cmd: >-
+      sh -c 'echo "[unit-6] start $(date +%T)";
+      sleep 5;
+      echo "[unit-6] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  # --------------------------------------------------------------------------
+  # fan-out を使う 2 本（measure-3 / measure-4）の起点。仕事はしない（sleep 0）。
+  #
+  # 【なぜこの1段が要るか】fanOut を持つ step を root に置くと、
+  # spawn_workflow の root ループは全コピーに**同じ step_id をそのまま**付ける
+  # （orchestrator::base_id のコメント「root fan-out copies intentionally keep
+  # the bare id」）。一方 spawn_ready 経由で spawn されたコピーだけが
+  # `race#0` / `race#1` … と枝番を持つ。パネルの step 一覧は stepId を key に
+  # した keyed each なので、枝番の無い同名コピーが並ぶと行が区別できない。
+  # fanOut の step を root にせず、この gate に dependsOn させることで
+  # コピーごとに独立した行として読めるようにしている。
+  #
+  # sleep を入れていないので、gate の所要はほぼそのまま
+  # 「PTY spawn + 依存1本ぶんの tick 検出遅れ」= 素のオーケストレーション
+  # コストの実測値になる（0.2〜0.4 秒程度のはず）。
+  # --------------------------------------------------------------------------
+  - name: gate
+    cmd: >-
+      sh -c 'echo "[gate] start $(date +%T) — 仕事はしない。fan-out を root から
+      1段下げるためだけの step"'
+    cwd: "."
+    autostart: false
+
+  # --------------------------------------------------------------------------
+  # measure-3-pane-queue 用。1 step = fanOut 6 枚。wave-a と wave-b は互いに
+  # 依存しないので、上限が無ければ 12 枚が同時に走って 5 秒で終わる。
+  # 実際には 9 面上限に当たって wave-b が待たされる。
+  # --------------------------------------------------------------------------
+  - name: wave-a
+    cmd: >-
+      sh -c 'echo "[wave-a] start $(date +%T)";
+      sleep 5;
+      echo "[wave-a] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  - name: wave-b
+    cmd: >-
+      sh -c 'echo "[wave-b] start $(date +%T)";
+      sleep 5;
+      echo "[wave-b] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+  # --------------------------------------------------------------------------
+  # measure-4-join-any 用の候補。
+  #
+  # 【調査結果】fanOut のコピーは全て同じ agents: 定義を指すため、設定として
+  # コピーごとに別のコマンドを与えることはできない（orchestrator::copies_for が
+  # 返すのは枚数だけで、spawn_step は毎回同じ step.agent を resolve する。
+  # コピー番号を渡す env も無い）。同一 sleep のまま 3 枚流すと 3 枚が同じ
+  # tick で exit するので、勝者が決まった時点で敗者はもう Running ではなく、
+  # straggler cancellation が「何もしない」経路に落ちて U2 の確認にならない。
+  #
+  # そこで**コマンド自体は同一のまま、実行時に先着1名を決める**ことで差を作る。
+  # mkdir はアトミックなので、3 枚のうち mkdir に成功した 1 枚だけが勝者
+  # （5 秒で正常終了）、残りは敗者（45 秒 sleep）になる。勝者は 1 秒後に
+  # ロックを外すので次回の run も同じように走る（3 枚の mkdir 競争は spawn 直後の
+  # 数十 ms で決着するため、1 秒待てば安全に外せる）。
+  #
+  # ロックが残ってしまったとき（run 開始 1 秒以内に手で Cancel した場合など）は
+  #     rmdir /tmp/ptygrid-measure-join-any.lock
+  # で戻す。復旧しなくても「勝者なし＝3枚とも45秒」になるだけで詰まりはしない。
+  #
+  # close_on_exit: always の理由は先頭コメントの autoClose 方針を参照。
+  # 敗者ペインが kill 後 3 秒で消えること自体が観測対象。
+  # --------------------------------------------------------------------------
+  - name: race-candidate
+    cmd: >-
+      sh -c 'd=/tmp/ptygrid-measure-join-any.lock;
+      if mkdir "$d" 2>/dev/null; then
+      echo "[race] WINNER  start $(date +%T) — 5 秒で正常終了する";
+      sleep 1; rmdir "$d"; sleep 4;
+      echo "[race] WINNER  end   $(date +%T)";
+      else
+      echo "[race] loser   start $(date +%T) — 45 秒 sleep に入る。kill されればここで止まる";
+      sleep 45;
+      echo "[race] loser   end   $(date +%T) ← これが出たら straggler cancellation が効いていない";
+      fi'
+    cwd: "."
+    autostart: false
+    close_on_exit: always
+
+  - name: race-report
+    cmd: >-
+      sh -c 'echo "[report] start $(date +%T) — joinOn:any が満たされた直後に spawn されたはず";
+      sleep 3;
+      echo "[report] end   $(date +%T)"'
+    cwd: "."
+    autostart: false
+
+workflows:
+  # ==========================================================================
+  # 1. 直列版 — 全 step が前の step に依存する鎖。
+  #
+  #   unit-1 → unit-2 → unit-3 → unit-4 → unit-5 → unit-6
+  #
+  # 理想所要: 5 秒 × 6 = 30 秒。
+  # 同時ペインは常に 1 枚（終了ペインは残るので run 終了時点で 6 枚占有）。
+  # 依存エッジが 5 本あるので、実測 − 30 秒 ≒ 5 ×（tick 検出遅れ + spawn コスト）。
+  # これが「1 依存あたりのオーケストレーションコスト」の実測値になる。
+  # ==========================================================================
+  measure-1-serial:
+    pattern: pipeline
+    steps:
+      - id: s1
+        agent: unit-1
+      - id: s2
+        agent: unit-2
+        dependsOn: [s1]
+      - id: s3
+        agent: unit-3
+        dependsOn: [s2]
+      - id: s4
+        agent: unit-4
+        dependsOn: [s3]
+      - id: s5
+        agent: unit-5
+        dependsOn: [s4]
+      - id: s6
+        agent: unit-6
+        dependsOn: [s5]
+
+  # ==========================================================================
+  # 2. 項目分割版 — measure-1-serial と**全く同じ6単位の仕事**を、項目ごとの
+  #    独立した鎖に割ったもの。
+  #
+  #   項目A: unit-1 → unit-2
+  #   項目B: unit-3 → unit-4
+  #   項目C: unit-5 → unit-6
+  #
+  # 項目Aの2段目が走っている間に項目B・Cの1段目が走れる（依存が項目内で閉じて
+  # いるため）。理想所要: 5 秒 × 2 段 = 10 秒。
+  # measure-1 の理想 30 秒との差 20 秒が並列化の取り分。
+  # 同時ペインは最大 3 枚、run 終了時点の占有は 6 枚（9 面上限には触れない）。
+  #
+  # pattern: pipeline は「step ごとの dependsOn が最大 1 本」であることだけを
+  # 要求する（config.rs の pipeline 検証）。root が複数あってもよいので、
+  # 独立した3本の鎖はこのパターンでそのまま表現できる。
+  # ==========================================================================
+  measure-2-split:
+    pattern: pipeline
+    steps:
+      - id: a1
+        agent: unit-1
+      - id: a2
+        agent: unit-2
+        dependsOn: [a1]
+      - id: b1
+        agent: unit-3
+      - id: b2
+        agent: unit-4
+        dependsOn: [b1]
+      - id: c1
+        agent: unit-5
+      - id: c2
+        agent: unit-6
+        dependsOn: [c1]
+
+  # ==========================================================================
+  # 3. 9面上限の待ち行列を測る版（1・2 とは目的が違うので分けてある）。
+  #
+  #   gate → wave-a: fanOut 6
+  #        → wave-b: fanOut 6（wave-a とは互いに独立）
+  #
+  # 合計 12 枚 > 9 面。gate が終わった tick で spawn_ready が両方を spawn
+  # しようとするが、grid の空き枚数を一度だけ取ってから順に配るので、
+  # wave-a に 6 枚渡した時点で残りは 2 枚（gate の終了ペインが 1 枚を握っている）。
+  # wave-b は 6 枚必要で、fan-out の spawn は all-or-nothing なので 1 枚も
+  # spawn されず、「waiting for a free pane slot (N/9 occupied)」を error に
+  # 載せた Pending のまま待つ。
+  #
+  # 期待されるタイムライン（gate は sleep 0 なのでほぼ t=0 で終わる）:
+  #   t=0.3  wave-a の 6 枚が spawn。wave-b は Pending（待ち行列に入る）
+  #   t=3    gate の終了ペインが autoClose で閉じる（空き 3 枚。まだ足りない）
+  #   t=5.3  wave-a の 6 枚が exit
+  #   t=8.3  wave-a のペインが閉じて枠が空く → wave-b の 6 枚が spawn
+  #   t=13.3 wave-b が exit → run 完了
+  #
+  # 読む数字:
+  #   - 9面上限が無ければ理想 5 秒（12 枚が同時に走る）。実測はおよそ 13 秒。
+  #     差の約 8 秒が上限の代金で、その内訳は
+  #     「先発の 5 秒 + 終了ペインが閉じるまでの autoClose 3 秒」。
+  #   - wave-b#0 … wave-b#5 の step 行の「待ち」が **約 8.0 秒**、
+  #     「所要」が **約 5.0 秒**になるはず。所要と待ちが別々に出ること、
+  #     そして待ちが所要に含まれないことの確認そのものでもある。
+  #   - autoClose を never にすると wave-b は永遠に枠を得られず、300 秒
+  #     （WORKFLOW_DEFER_MAX_MS）後に FAIL する。終了ペインも枠を食うという
+  #     性質の確認になるが、待つのが長いので既定では success にしてある。
+  # ==========================================================================
+  measure-3-pane-queue:
+    pattern: fan-out
+    autoClose: success
+    steps:
+      - id: gate
+        agent: gate
+      - id: wave-a
+        agent: wave-a
+        fanOut: 6
+        dependsOn: [gate]
+      - id: wave-b
+        agent: wave-b
+        fanOut: 6
+        dependsOn: [gate]
+
+  # ==========================================================================
+  # 4. fan-out + joinOn: any の敗者協調キャンセル（straggler cancellation）を
+  #    実機で確認するための1本。U2 の確認用。
+  #
+  #   gate → race: fanOut 3, joinOn: any → report（race に依存）
+  #
+  # race-candidate の 3 枚は同じコマンドを実行するが、起動直後の mkdir 競争で
+  # 先着1名だけが勝者（5 秒で exit 0）になり、残り 2 枚は 45 秒 sleep に入る
+  # （詳細は agents: race-candidate のコメント）。
+  #
+  # 期待されるタイムライン（gate は sleep 0 なのでほぼ t=0 で終わる）:
+  #   t=0.3  3 枚 spawn。1 枚が WINNER、2 枚が loser と表示される
+  #   t=5.3  勝者が exit 0 → その tick で joinOn:any が満たされる。同じ tick で
+  #          cancel_stragglers が敗者 2 枚を kill_pty し、spawn_ready が report を
+  #          spawn する（advance_run の実行順: 完了検出 → straggler → spawn）
+  #   t=5.3  敗者ペインに「— exited (code …) —」が出る。45 秒 sleep の途中で
+  #          止まったので "[race] loser end" の行は**絶対に出ない**
+  #   t=8.3  敗者ペインがグリッドから消える（close_on_exit: always）。
+  #          gate / 勝者 / report のペインは残る
+  #   t=8.3  report が終わって run 全体が succeeded になる
+  #
+  # 読むところ:
+  #   - パネルの race#0 / race#1 / race#2 のうち 1 つが succeeded、
+  #     残り 2 つが cancelled。cancelled 行の ⚠ にカーソルを当てると
+  #     "cancelled: this step's join was already satisfied by a sibling copy"
+  #     が出る（cancel_stragglers が書く固定文言）。
+  #   - run 全体は failed ではなく **succeeded**。敗者の cancel は「レースに
+  #     負けただけ」として無害判定される（orchestrator の mod verdict）。
+  #   - 敗者ペインが 45 秒後ではなく 5 秒時点で exited になり、3 秒後に消える
+  #     こと。これが「協調キャンセルでペインが実際に kill されている」証拠。
+  # ==========================================================================
+  measure-4-join-any:
+    pattern: fan-out
+    steps:
+      - id: gate
+        agent: gate
+      - id: race
+        agent: race-candidate
+        fanOut: 3
+        joinOn: any
+        dependsOn: [gate]
+      - id: report
+        agent: race-report
+        dependsOn: [race]
