@@ -399,6 +399,34 @@ export type InitScanReport = {
   existing: ExistingConfig | null;
 };
 
+/** init_probe_llm が `GET /v1/models` の応答を得たローカルエンドポイント 1 つ
+ * （5.0.2 追補）。ディスクには触らず、127.0.0.1 以外にも接続しない。 */
+export type LocalLlmEndpoint = {
+  /** 応答したポート */
+  port: number;
+  /** `GET /v1/models` の data[].id。受け取った順（backend 側で 20 件に打ち切り） */
+  models: string[];
+  /** Anthropic Messages API 互換であることの確証。
+   * true=確証あり（現状 Ollama v0.14.0 以上のみ）/ false=確証をもって非対応 /
+   * null=不明（OpenAI 互換の応答があっただけ。`/v1/messages` は未確認）。
+   * Rust 側は `Option<bool>` で skip_serializing_if を付けていないため、
+   * None は欠落ではなく JSON の null として届く。 */
+  anthropic: boolean | null;
+  /** 表示用ラベル。名乗りが取れたときだけ製品名が入る
+   * （例: `Ollama 0.14.3` / `127.0.0.1:1234 (OpenAI 互換の応答)`）。 */
+  label: string;
+};
+
+/** init_probe_llm の戻り値。応答が無いことはエラーではなく endpoints が空になる。 */
+export type InitProbeReport = {
+  /** 実際に当たったポート（既定 3 本 + 追加分を重複除去・昇順） */
+  probedPorts: number[];
+  /** 応答があったものだけ。ポート昇順 */
+  endpoints: LocalLlmEndpoint[];
+  /** 全体予算（3 秒）を使い切って残りを打ち切ったか */
+  timedOut: boolean;
+};
+
 /** init_preview の戻り値（生成 + 自己検査。ディスクには書かない）。 */
 export type InitPreview = {
   content: string;
