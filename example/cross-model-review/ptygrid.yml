@@ -1,0 +1,549 @@
+# cross-model-review — 実装1体 → 別モデル2体が並行レビュー → 突き合わせ
+#
+# ============================================================================
+# 何のためのサンプルか
+# ============================================================================
+# 「1体に実装させ、**別々のモデル**2体に同じ変更を同時にレビューさせ、最後に
+# その2本を突き合わせて可否を決める」という、いちばん需要のある形を
+# **設定ファイルだけで書けるところまで**書いたもの。
+#
+# 動く順番はこの4段:
+#
+#     implement（root, 1枚）
+#         ├─→ review-a（claude・別モデル / 専用 worktree）
+#         └─→ review-b（codex          / 専用 worktree）
+#                          ↓ 両方が返信したら
+#                        verdict（突き合わせ・判定）
+#
+# ペインは同時に4枚。上限は9枚（WORKFLOW_SESSION_CAP）なので余裕はあるが、
+# **終了済みのペインも枠を食う**ので、流す前にグリッドは空にしておくこと。
+#
+# ● pattern: supervisor を使う理由
+#     「1つの root から複数の子が生えて、最後に合流する」形をそのまま書ける
+#     唯一のパターン。fan-out は使えない: `fanOut: 2` は**同じ step を2枚
+#     複製する**だけで agent（= cmd）も同じになるため、クロスモデルには
+#     ならない（orchestrator::copies_for）。**違うモデルを並べたいなら
+#     fanOut ではなく兄弟 step**、つまりこの supervisor の形になる。
+#
+# ● supervisor の直感に反する制約（load 時に弾かれる）
+#     root はちょうど1つ、**root 以外の step は全員 root を dependsOn に
+#     含めなければならない**（config.rs の validate_workflows）。だから下の
+#     `verdict` は
+#
+#         dependsOn: [implement, review-a, review-b]
+#
+#     と3本書いてある。`implement` を外して `[review-a, review-b]` にすると
+#     `supervisor step 'verdict' must dependOn root step 'implement'` で
+#     読み込みごと失敗する。冗長に見えるが必須。
+#     なお `ready_steps` は dependsOn を**全部**満たすまで spawn しないので、
+#     root を足したことで verdict が早く走り出すことはない。
+#
+# ============================================================================
+# 前提条件（どれか1つでも欠けると途中で止まる）
+# ============================================================================
+# (A) **Queen の MCP 登録が済んでいること。**
+#     kickoff は durable inbox に置かれるだけで、ペインには何も打ち込まれない
+#     （orchestrator::deliver_kickoff は send_inbox を呼ぶだけ）。登録が
+#     済んでいないとエージェントは inbox を読むツール自体を持たず、
+#     1段目が永久に Running のまま止まる。
+#
+#     **これは今日時点で手作業**（登録代行は未実装）。ツールバーの Queen
+#     バッジからコマンドをコピーして、各 CLI に自分で貼ること。既定ポート 39237:
+#
+#         claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+#         # Codex は ~/.codex/config.toml の [mcp_servers.queen] に url を追記
+#
+#     登録名を `queen` 以外にした人は、下の `mcp__queen__` を読み替えること
+#     （素のツール名 `await` / `reply_inbox` は変わらない）。
+#     Claude Code から見た完全名は `mcp__<登録名>__<ツール名>`。
+#     **Codex 側のツール名の見え方はこのリポジトリからは確認できていない**ので、
+#     自分の CLI が出すツール一覧で確かめること。
+#
+# (B) **グリッドの空き。** この run は4枚使う。上限は9枚だが、
+#     `occupied_pane_count` は**終了済みのペインも数える**ので、前の run の
+#     残骸が5枚あると4枚目が待ち行列に入る。待ちは最大 300 秒
+#     （WORKFLOW_DEFER_MAX_MS）で、解けなければその step は Failed。
+#
+# (C) **返信規約をエージェントに教えること。** `joinOn: reply` は設定側の
+#     1行だが、**返信しない限り step は完了しない**。返信の作法（どの mailbox を
+#     await して、どのツールを、どの引数で呼ぶか）は agents: の `cmd` に埋めた
+#     ブートストラップと各 step の `kickoff` の両方に書いてある。冗長ではなく
+#     保険で、長いセッションで最初の指示が流れても直近のメッセージ本文に
+#     同じ指示が入っている。
+#
+# (D) **各 CLI の初回セットアップと MCP ツールの承認を済ませておくこと。**
+#     ログインやテーマ選択の TUI、あるいは初回の MCP 承認ダイアログで止まると
+#     「起動はしたが返信は来ない」という一番読みにくい失敗になる。
+#     Claude Code なら settings の permissions.allow に
+#     `mcp__queen__await` と `mcp__queen__reply_inbox` を入れておくと確実。
+#
+# (E) **リポジトリが git 管理下で、コミットできる状態にあること。**
+#     この構成は「implementer が**コミットする**」ことを前提に組んである（後述）。
+#
+# ============================================================================
+# 【重要】今日時点で設定だけでは書けないこと
+# ============================================================================
+# **2つのレビュー結果を1つの step に自動で運び込むことは、設定ではできない。**
+# 出口が2つとも塞がっている:
+#
+#   1. `handoffTo` は**ターゲット1つにつき本文1本しか運ばない。**
+#      `orchestrator::handoff_bodies` は `if bodies.contains_key(target) { continue; }`
+#      で、**設定に先に書いたほうが勝つ**。review-a と review-b の両方に
+#      `handoffTo: verdict` と書いた YAML は **parse を通ってしまい**、
+#      2本目のレビュー本文は**警告もエラーも無しに捨てられる**。
+#      検証側にこれを止める規則が無いので、気づく手段が無い。
+#      → **だからこのサンプルは handoffTo を1つも使っていない。**
+#
+#   2. `condition:` で「両方 ACCEPT なら進む」も書けない。
+#      `condition` は `depends_on` の**先頭1本しか見ない**
+#      （orchestrator::condition_targets）ため、検証側が
+#      「dependsOn はちょうど1本」を課している。3本依存の verdict に
+#      condition を足すと
+#      `step 'verdict' condition requires exactly one dependsOn (found 3)`
+#      で読み込みが失敗する。
+#
+#   3. 迂回路も塞がっている。`reply_inbox` は返信先を元メッセージの sender に
+#      固定するので、workflow の返信は run 専用 mailbox
+#      `queen:workflow/<name>/<run_id>` に戻る。verdict は run id を知らないので
+#      その mailbox を読めない。
+#
+# **結論: 中身の受け渡しはファイル経由にする。**
+# レビュアーはレビュー本文を共有ディレクトリのファイルに書き、
+# **返信（reply）は「書き終わった」という合図としてだけ使う**。
+# workflow が同期に使うのは「2体とも返信した」という事実だけ、という切り分け。
+# verdict はそのファイルを自分で読む。
+#
+#     共有ディレクトリ: /tmp/ptygrid-cross-model-review
+#       review-a.md ← review-a が書く
+#       review-b.md ← review-b が書く
+#
+#   ● なぜリポジトリ内ではなく /tmp なのか
+#       レビュアーは worktree（別ディレクトリ）で動くので、リポジトリ相対の
+#       パスに書くと verdict からは見えない。ツリーの外の**絶対パス**である
+#       必要がある。加えてリポジトリに書くと作業ツリーが汚れ、レビュー文が
+#       誤ってコミットに混ざる。
+#   ● パスを変えるときは**9か所**同時に直すこと。reviewer-a / reviewer-b /
+#       judge それぞれについて
+#         (1) agents: の env の `PTYGRID_REVIEW_DIR`
+#         (2) agents: の cmd に埋めたブートストラップ本文
+#         (3) workflows: の kickoff 本文
+#       の3つ。エージェントが実際に読むのは (2)(3) の本文で、env は
+#       シェルから触るとき用の控え。テストが
+#         - 3つの env 値が一致していること
+#         - 絶対パスであること
+#         - 各 kickoff がその env 値と自分のファイル名を含むこと
+#       を検査しているので、直し漏れは cargo test で落ちる。
+#   ● Windows で使うなら `/tmp` は書き換えること（このサンプルは POSIX 前提）。
+#   ● run の前にこのディレクトリの中身を消すこと。**前回のレビューが
+#     残っていると、片方が書けなくても verdict が古いファイルを読んでしまう。**
+#     これが唯一の実質的な落とし穴。
+#
+# ============================================================================
+# 判定を「人間がやる」か「verdict step にやらせる」か
+# ============================================================================
+# 両方できる。使い分けの基準は**判定の間違いをその場で誰が拾えるか**。
+#
+# ● verdict step にやらせる（このファイルの既定）
+#     向くのは、判定基準が機械的に書ける場合。
+#       - 「どちらか一方でも FAIL なら FAIL」のような合成規則
+#       - 大量のレビューを流して、人間は FAIL だけ見たい
+#     利点は run が緑/赤で終わること、判定の根拠がペインに残ること。
+#     欠点は**判定役もモデルなので3体目の誤りが増えること**。判定役には
+#     コードを直させず、2つのレビュー文と diff の突き合わせだけをさせること。
+#
+# ● 人間がやる（verdict step を消す）
+#     向くのは、レビュー内容が食い違ったときの判断に文脈が要る場合
+#     ——つまり本番のコードレビューのほとんど。
+#     やり方: 下の `verdict` step を丸ごと削除する。残る3 step は
+#     supervisor の条件（root 1つ + 全員 root 依存）をそのまま満たすので、
+#     他は何も直さなくてよい。run は2体が返信した時点で succeeded になり、
+#     人間は /tmp/ptygrid-cross-model-review の2ファイルを読んで決める。
+#     この形なら判定役のペイン1枚ぶん枠も浮く。
+#
+# ============================================================================
+# 失敗したらどうなるか（onFailure の実態を含む）
+# ============================================================================
+# ● 片方のレビュアーが timeout / 失敗した場合
+#     もう片方は**走り続ける**（in-flight の兄弟は止められない）。一方
+#     `verdict` はまだ Pending なので `failfast_targets` に拾われて
+#     **Skipped** になる。run は Failed で終わり、生き残ったほうの
+#     レビューファイルは残るので、人間がそれを読んで判断すればよい。
+#
+# ● `onFailure:` はこのファイルに**書いていない**。理由:
+#     `WorkflowDef.on_failure` は config.rs に**存在するがパースされるだけ**で、
+#     orchestrator.rs からは一度も参照されていない（`fail-fast` / `continue` の
+#     どちらを書いても上の挙動になる）。効かないものを書いて効くように
+#     見せない。
+#
+# ● `retry:` も書いていない。理由:
+#     retry は失敗した step を**最初からやり直す**。レビュアーを retry すると
+#     レビューファイルを二度書きに行き、implementer を retry すると同じ変更を
+#     二度コミットしに行く。**この構成の仕事は冪等ではない**ので、自動再試行
+#     より人間が run をやり直すほうが安全。
+#
+# ● `autoClose` / `close_on_exit` も書いていない（= never）。
+#     4枚のペインが run のあとも残る。レビューの根拠を画面で読みたいのと、
+#     step が timeout で kill されたときに何を見て止まったのかを残したいため。
+#     **代償: run のあと手でペインを閉じること。** 閉じ忘れると次の run で
+#     枠を食う（前提条件 (B)）。
+#
+# ============================================================================
+# 【落とし穴】route 3 は「最初の返信」を答えとみなす
+# ============================================================================
+# `detect_reply_completions` は、その step の kickoff スレッドに届いた
+# **最初の返信で step を完了させる**。「了解、見ます」→「PASS です」と
+# 2通に分けると1通目で step が Succeeded になり、verdict が
+# **まだ書かれていないレビューファイル**を読みに行く。
+# だから各 kickoff は「**ファイルを書き切ってから、1回だけ返信しろ**」と
+# 順序を明示している。ここを崩さないこと。
+
+project: cross-model-review
+
+queen:
+  # 必須。kickoff の配送も reply の受け取りも inbox 経由。
+  enabled: true
+  port: 39237
+
+agents:
+  # ==========================================================================
+  # implementer — 実装役。**worktree を使わない**（意図的）。
+  #
+  # 【なぜ実装役だけ worktree 無しなのか。これがこの構成の要】
+  # `worktree.enabled: true` は spawn のたびに
+  #   git worktree add --lock -b ptygrid/<agent>/<乱数> <別ディレクトリ> <base>
+  # を実行する（worktree.rs の prepare_at）。つまり**新しいブランチが
+  # 乱数付きの名前で生える**。
+  #
+  # レビュアー側は `base: HEAD` を使う。この HEAD は**メインの作業ツリーの
+  # HEAD** で、しかも**レビュアーが spawn される瞬間に**解決される
+  # （prepare_at は spawn ごとに走る）。したがって:
+  #
+  #     implementer がメインツリーでコミットする
+  #       → review-a / review-b が spawn される
+  #       → その時点の HEAD = implementer のコミット
+  #       → 2体の worktree はどちらもそのコミットから生える
+  #
+  # という受け渡しが成立する。もし implementer にも worktree を付けると、
+  # 変更は `ptygrid/implementer/<乱数>` という**名前を誰も知らないブランチ**に
+  # 入り、メインツリーの HEAD は動かない。レビュアーの `base: HEAD` は
+  # 変更前のコミットを指し、**2体とも空の diff をレビューする**ことになる。
+  # ブランチ名の乱数部分は設定に書けないので、これは回避できない。
+  #
+  # → **implementer はメインツリーで作業し、必ずコミットする。**
+  #    kickoff にそう書いてあるのはそのため。飾りではない。
+  #
+  # 【cmd に長いプロンプトを埋めてある理由】
+  # kickoff はペインに打ち込まれない（durable inbox に置かれるだけ）。素の
+  # `claude` を起動すると空のプロンプトで待つだけで、自分から inbox を
+  # 見にいかない。「起動直後に await を呼べ」という一発目の指示は CLI の
+  # 起動引数で渡すしかない。
+  #
+  # cmd は /bin/sh -c に渡される（session.rs の LaunchSpec.shell_wrap: true）。
+  # プロンプト中でシェルに解釈される文字（" ` $ \）を使わないこと。
+  # 引用は「」を使っている。
+  #
+  # 【ツール名は queen.rs で確認したもの】
+  #   await       … mailbox を watch して待つ。AwaitInboxRequest の引数は
+  #                 mailbox / afterId / includeAcknowledged / limit / timeoutMs
+  #                 （timeoutMs の既定 30000、有効範囲 1..300000。範囲外は
+  #                 invalid_params で即エラー）
+  #   reply_inbox … 元メッセージに相関する返信を作り、同時に ack する。
+  #                 ReplyInboxRequest の引数は id / sender / body。
+  #                 **sender は元メッセージの recipient と完全一致が必要**で、
+  #                 recipient は step の `agent` 名（= mailbox 名）。
+  #                 ここでは `implementer`。
+  # ==========================================================================
+  - name: implementer
+    # 【モデル指定について】`claude --model <名前>` で選べる（このリポジトリの
+    # example/adaptive-orchestration も同じ書き方をしている）。ただし**選べる
+    # モデル名は時期と契約で変わる**ので、ここでは指定していない。固定したい
+    # 人は `claude --model <自分の環境で有効な名前>` にすること
+    # （有効な名前は `claude --help` か自分のアカウントの設定で確認する）。
+    cmd: >-
+      claude
+      "あなたは実装担当です。次のループを回してください。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=implementer, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) 返ってきた messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。
+      (3) 指示に従って実装する。**作業が完全に終わったら必ず git commit する。**
+      コミットしない限り、後続のレビュアーはあなたの変更を見られません。
+      (4) コミットが済んでから、queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=そのメッセージのid, sender=implementer,
+      body=実装の要約とコミットハッシュ で**1回だけ**呼ぶ。
+      途中経過を先に返信してはいけません。最初の返信が答えとみなされます。
+      (5) 返信したらすぐ (1) に戻り、次のメッセージを待つ。
+      返信して終わりではなく、await で待ち続けるのが仕事です。"
+    cwd: "."
+    # ここは必ずメインの作業ツリー。worktree は書かない（上の理由）。
+    # 読み込んだだけでペインが生えないように autostart は false。
+    autostart: false
+
+  # ==========================================================================
+  # reviewer-a — レビュー役その1（Claude、実装役とは別モデル）
+  #
+  # 【worktree を付けている理由】
+  # 2体のレビュアーは**同時に**テストを回す。同じ作業ツリーを共有すると
+  # ビルド成果物・ロックファイル・テスト用ポート・生成物を奪い合い、
+  # 「レビューの指摘」と「相方の踏み荒らし」が区別できなくなる。
+  # `worktree.enabled: true` にすると ptygrid が各エージェント専用の
+  # linked worktree（ロック付き）を作るので、2体は完全に独立した
+  # ディレクトリでテストを回せる。
+  #
+  # WorktreeConfig のフィールドは **enabled / base / setup の3つだけ**
+  # （config.rs）。既定は enabled=false, base="HEAD"。
+  #   - base: HEAD … spawn 時点のメインツリーの HEAD から生やす。
+  #                   implementer のコミットを拾うのはこの1行（上の説明を参照）。
+  #                   ブランチ名やコミットハッシュも書けるが、**ここで
+  #                   `main` などを指定すると implementer の変更が入らない**。
+  #   - setup   … worktree 作成直後に1回だけ走るコマンド。依存の取得を書く。
+  #               新しいツリーにはビルドキャッシュが無いので、これを省くと
+  #               レビューのたびにフルビルドになる（正しさには影響しない）。
+  #               **setup が失敗すると worktree もブランチもロールバックされ、
+  #               spawn 自体が失敗する**（worktree.rs で検証済み）ので、
+  #               確実に成功するコマンドだけを書くこと。
+  #               リポジトリごとに違うので既定ではコメントアウトしてある。
+  # ==========================================================================
+  - name: reviewer-a
+    # 実装役と**別のモデル**にすることがこのサンプルの主眼。ここも
+    # `--model` は環境依存なので指定していない。実際に使うときは
+    # implementer と違うモデルを明示すること（同じモデル2体では
+    # クロスモデルにならない）。
+    cmd: >-
+      claude
+      "あなたはレビュー担当Aです。コードは直しません。次のループを回してください。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=reviewer-a, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) 返ってきた messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。
+      (3) あなたは専用の作業ツリーにいます。HEAD が実装済みのコミットです。
+      git show HEAD で変更を読み、必要ならテストを回してレビューする。
+      (4) レビュー本文を /tmp/ptygrid-cross-model-review/review-a.md に
+      **書き切る**。1行目は VERDICT: PASS または VERDICT: FAIL だけにする。
+      (5) ファイルを書き終えてから、queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=そのメッセージのid, sender=reviewer-a,
+      body=VERDICT行と1文の要約 で**1回だけ**呼ぶ。
+      **順序が重要です。** 先に返信するとファイルが空のまま次の担当が読みます。
+      (6) 返信したらすぐ (1) に戻り、次のメッセージを待つ。"
+    cwd: "."
+    env:
+      # レビュー本文の置き場所。**reviewer-b / judge と同じ値**にすること。
+      # `${VAR}` 形式にすると未設定時に空文字へ潰れる（expand_vars は
+      # std::env::var の結果をそのまま使い、無ければ空になる）ので、
+      # ここは実値をそのまま書いている。
+      PTYGRID_REVIEW_DIR: "/tmp/ptygrid-cross-model-review"
+    worktree:
+      enabled: true
+      base: HEAD
+      # setup: "npm ci"        # 例。自分のリポジトリの依存取得に置き換える
+    autostart: false
+
+  # ==========================================================================
+  # reviewer-b — レビュー役その2（別ベンダの CLI）
+  #
+  # ここを別ベンダにすることで「同じ癖で同じ見落としをする2体」を避ける。
+  #
+  # 【確認できていないこと（断定しない）】
+  #   - **codex がプロンプトを位置引数で受け取るか**は、このリポジトリからは
+  #     確認できていない（既存の example は素の `codex` だけを書いている）。
+  #     `codex --help` で確かめること。受け取らない場合は、下のブートストラップ
+  #     本文をペインに手で貼るか、reviewer-b も claude にして
+  #     `--model` で実装役・reviewer-a と違うモデルにすること。
+  #   - **codex のモデル指定方法**も未確認。環境に合わせて変えること。
+  #   - **codex から MCP ツールがどんな名前で見えるか**も未確認。
+  #     素のツール名は `await` / `reply_inbox` で変わらないので、
+  #     自分の CLI が出す一覧に合わせて `mcp__queen__` の部分を読み替えること。
+  # ==========================================================================
+  - name: reviewer-b
+    cmd: >-
+      codex
+      "あなたはレビュー担当Bです。コードは直しません。次のループを回してください。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=reviewer-b, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) 返ってきた messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。
+      (3) あなたは専用の作業ツリーにいます。HEAD が実装済みのコミットです。
+      git show HEAD で変更を読み、必要ならテストを回してレビューする。
+      (4) レビュー本文を /tmp/ptygrid-cross-model-review/review-b.md に
+      **書き切る**。1行目は VERDICT: PASS または VERDICT: FAIL だけにする。
+      (5) ファイルを書き終えてから、queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=そのメッセージのid, sender=reviewer-b,
+      body=VERDICT行と1文の要約 で**1回だけ**呼ぶ。
+      **順序が重要です。** 先に返信するとファイルが空のまま次の担当が読みます。
+      (6) 返信したらすぐ (1) に戻り、次のメッセージを待つ。"
+    cwd: "."
+    env:
+      PTYGRID_REVIEW_DIR: "/tmp/ptygrid-cross-model-review"
+    worktree:
+      enabled: true
+      base: HEAD
+      # setup: "npm ci"
+    autostart: false
+
+  # ==========================================================================
+  # judge — 突き合わせ役。**worktree を付けない**（意図的）。
+  #
+  # 理由は2つ:
+  #   1. 判定役は2つのレビューファイルと diff を読むだけで、テストを回さない。
+  #      奪い合うものが無いので隔離する意味が無い。
+  #   2. メインツリーにいれば HEAD が implementer のコミットそのものなので、
+  #      git show HEAD がそのまま「レビュー対象」になる。
+  # ==========================================================================
+  - name: judge
+    cmd: >-
+      claude
+      "あなたは判定担当です。コードは直しません。次のループを回してください。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=judge, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) 返ってきた messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。
+      (3) /tmp/ptygrid-cross-model-review/review-a.md と review-b.md を両方読む。
+      **片方が無い、または空なら、その事実をそのまま報告して判定しないこと。**
+      古いファイルを読んでいる可能性があるので、内容が今回の変更と噛み合わない
+      場合もその旨を書く。
+      (4) 2本の指摘を突き合わせる。両方が挙げた指摘、片方だけが挙げた指摘、
+      互いに矛盾する指摘の3つに分けて整理する。
+      (5) 結論を1行目に PASS または FAIL で書き、queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=そのメッセージのid, sender=judge,
+      body=結論と根拠 で**1回だけ**呼ぶ。
+      (6) 返信したらすぐ (1) に戻る。"
+    cwd: "."
+    env:
+      PTYGRID_REVIEW_DIR: "/tmp/ptygrid-cross-model-review"
+    autostart: false
+
+  # ==========================================================================
+  # 【代替: ローカル LLM に差し替える（Ollama の Anthropic 互換エンドポイント）】
+  #
+  # 料金をかけずに形だけ試したい人向け。上のどれかを丸ごとコメントアウトして、
+  # 下のブロックのコメントを外す（**name は元のままにすること**。workflows 側を
+  # 書き換えずに差し替えられる）。
+  #
+  # Ollama は Anthropic Messages API 互換の /v1/messages を持つので、
+  # ANTHROPIC_BASE_URL を向けるだけで Claude Code がそのまま繋がる。
+  # ANTHROPIC_AUTH_TOKEN は必須だが値は無視される。
+  #
+  # このサンプル固有の注意:
+  #   - ローカルモデルは指示追従が弱く、(5)(6) の「ファイルを書いてから
+  #     1回だけ返信し、await に戻る」を守らないことがある。守らないと
+  #     step が完了しないか、空のレビューファイルを掴まされる。
+  #     **ツール呼び出しとファイル書き込みに強いモデルを選ぶこと。**
+  #   - クロスモデルの主眼は「違う癖の2体」なので、2体とも同じローカル
+  #     モデルにすると意味が薄れる。少なくとも片方は別モデルにすること。
+  #   - env だけに頼らない手もある。Claude Code は ~/.claude/settings.json や
+  #     .claude/settings.json の env ブロックも読み、バージョンによっては
+  #     そちらがプロセス env に勝つ。確実にしたい場合は
+  #     example/team-preset/router.settings.json のような設定ファイルを用意し、
+  #     cmd を `claude --settings router.settings.json "..."` にする
+  #     （--settings は CLI 引数スコープなので project/user 設定より上位）。
+  # --------------------------------------------------------------------------
+  # - name: reviewer-a
+  #   cmd: >-
+  #     claude "（上と同じ本文をそのまま使う）"
+  #   cwd: "."
+  #   env:
+  #     ANTHROPIC_BASE_URL: "http://127.0.0.1:11434"
+  #     ANTHROPIC_AUTH_TOKEN: "ollama"   # 必須だが値は無視される
+  #     PTYGRID_REVIEW_DIR: "/tmp/ptygrid-cross-model-review"
+  #   worktree:
+  #     enabled: true
+  #     base: HEAD
+  #   autostart: false
+
+workflows:
+  # ==========================================================================
+  # implement（root）→ review-a / review-b（並行）→ verdict（合流）
+  #
+  # ● 全 step が joinOn: reply
+  #     プロセスの exit ではなく**エージェントの返信**で完了させる。既定の
+  #     `all`（route 1 = PTY exit 待ち）だと、対話 CLI のペインは走り続ける
+  #     ので永久に完了しない。route 3（reply）は run 専用 mailbox
+  #     `queen:workflow/<name>/<run_id>` に届いた返信を kickoff スレッドの
+  #     root id で相関させて拾う。
+  #
+  #     `joinOn: reply` は **kickoff が空だと load 時に弾かれる**
+  #     （返信すべきスレッドが存在せず永久に完了しないため）。だから4つとも
+  #     kickoff が書いてある。空白だけの kickoff も同じく弾かれる。
+  #
+  # ● handoffTo は1つも使っていない
+  #     冒頭「設定だけでは書けないこと」の 1. を参照。review-a と review-b の
+  #     両方に handoffTo: verdict を書くと parse は通るが**2本目が黙って
+  #     捨てられる**。中身はファイル経由で渡し、返信は同期の合図だけに使う。
+  #
+  # ● condition も使っていない
+  #     3本依存の step には書けない（同 2.）。
+  #
+  # ● timeoutMs は「詰まりの脱出装置」であって測定値ではない
+  #     どの値も `await` 1ラウンド 55 秒の2倍（110 秒）より十分大きい。
+  #     正常時は kickoff が既に inbox にあるので await は即返り、55 秒を
+  #     待つことはない。それでも「1回空振りして await し直した」ケースを
+  #     誤爆させないための下限としてこれを満たしておく。
+  #     上限側は仕事量で決めている（実装 > レビュー > 判定）。
+  #     なお measure-coldstart と違って、ここは
+  #     WORKFLOW_DEFER_MAX_MS（300 秒 = ペイン待ちの上限）より**大きい**。
+  #     実際のレビューは5分では終わらないので分けようがない。パネルの
+  #     「待ち」は step 所要とは別欄に出るので、前提条件 (B)（グリッドを
+  #     空にする）を守っていれば読み違えない。
+  # ==========================================================================
+  cross-model-review:
+    pattern: supervisor
+    # autoClose は書かない（= never）。理由は冒頭の「失敗したらどうなるか」参照。
+    steps:
+      - id: implement
+        agent: implementer
+        joinOn: reply
+        timeoutMs: 1800000        # 30分
+        kickoff: >-
+          実装タスクをここに書き換えてください（例: docs/spec/... の仕様に沿って
+          X を実装し、テストを追加する）。**作業が終わったら必ず git commit
+          してから**、reply_inbox（id=このメッセージのid, sender=implementer,
+          body=実装の要約とコミットハッシュ）で1回だけ返信すること。
+          コミットしないと後続の2体のレビュアーはあなたの変更を見られません。
+          途中経過を先に返信しないこと（最初の返信が答えとみなされます）。
+
+      - id: review-a
+        agent: reviewer-a
+        dependsOn: [implement]
+        joinOn: reply
+        timeoutMs: 1200000        # 20分
+        kickoff: >-
+          直前のコミット（あなたの作業ツリーの HEAD）をレビューしてください。
+          git show HEAD で変更を読み、必要ならテストを回す。コードは直さない。
+          レビュー本文を /tmp/ptygrid-cross-model-review/review-a.md に
+          書き切ってから、reply_inbox（id=このメッセージのid, sender=reviewer-a,
+          body=VERDICT行と1文の要約）で1回だけ返信すること。
+          ファイルの1行目は VERDICT: PASS か VERDICT: FAIL だけにする。
+          **先に返信するとファイルが空のまま判定役に読まれます。順序を守ること。**
+
+      - id: review-b
+        agent: reviewer-b
+        dependsOn: [implement]
+        joinOn: reply
+        timeoutMs: 1200000        # 20分
+        kickoff: >-
+          直前のコミット（あなたの作業ツリーの HEAD）をレビューしてください。
+          git show HEAD で変更を読み、必要ならテストを回す。コードは直さない。
+          レビュー本文を /tmp/ptygrid-cross-model-review/review-b.md に
+          書き切ってから、reply_inbox（id=このメッセージのid, sender=reviewer-b,
+          body=VERDICT行と1文の要約）で1回だけ返信すること。
+          ファイルの1行目は VERDICT: PASS か VERDICT: FAIL だけにする。
+          **先に返信するとファイルが空のまま判定役に読まれます。順序を守ること。**
+
+      # dependsOn に implement を含めているのは冗長ではなく**必須**。
+      # supervisor は root 以外の全 step に root への依存を要求する
+      # （外すと `must dependOn root step 'implement'` で読み込み失敗）。
+      # ready_steps は3本すべてが満たされるまで spawn しないので、
+      # root を足したことで早く走り出すことはない。
+      - id: verdict
+        agent: judge
+        dependsOn: [implement, review-a, review-b]
+        joinOn: reply
+        timeoutMs: 600000         # 10分
+        kickoff: >-
+          /tmp/ptygrid-cross-model-review/review-a.md と review-b.md を両方読み、
+          2本のレビューを突き合わせてください。片方が存在しない・空・今回の
+          変更と噛み合わない場合は、判定せずにその事実を報告すること。
+          両方が挙げた指摘 / 片方だけの指摘 / 互いに矛盾する指摘 の3つに分け、
+          結論を1行目に PASS か FAIL で書いて、reply_inbox（id=このメッセージのid,
+          sender=judge, body=結論と根拠）で1回だけ返信すること。
+          コードは直さない。判定だけを返す。

@@ -3288,4 +3288,281 @@ agents:
              distinguishable in the panel"
         );
     }
+
+    /// `example/cross-model-review/ptygrid.yml` — same contract as the two
+    /// measurement fixtures above: the shipped bytes must load, and the SHAPE
+    /// the file's comments promise must be the shape that is actually there.
+    ///
+    /// This sample is mostly a document about a limitation, so most of what is
+    /// asserted here is the absence of things:
+    ///
+    /// * no `handoffTo` anywhere. `orchestrator::handoff_bodies` keeps only one
+    ///   body per target (`if bodies.contains_key(target) { continue; }`), so
+    ///   two reviewers both declaring `handoffTo: verdict` would PARSE clean and
+    ///   then silently drop the second review. The file's whole design — reviews
+    ///   go through files, replies are only the join signal — exists to route
+    ///   around that, and a future edit that "helpfully" adds a handoff would
+    ///   re-introduce the exact bug the sample warns about.
+    /// * no `condition`. `validate_workflows` requires exactly one `dependsOn`
+    ///   for a conditional step (because `orchestrator::condition_targets` reads
+    ///   `depends_on.first()` only), so it cannot express "both reviews passed"
+    ///   on the three-way join below.
+    /// * no `fanOut`. Copies of one step all share its `agent`, hence its `cmd`,
+    ///   hence its model — the opposite of cross-model.
+    #[test]
+    fn example_cross_model_review_config_parses() {
+        let text = include_str!("../../example/cross-model-review/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/cross-model-review must parse");
+
+        // 1 implementer + 2 reviewers + 1 judge = 4 panes, comfortably inside
+        // `WORKFLOW_SESSION_CAP`. The alternates in the file are commented out
+        // and must stay that way, or loading the sample opens more panes than
+        // its preconditions section budgets for.
+        assert_eq!(cfg.agents.len(), 4, "implementer + 2 reviewers + judge");
+        assert!(
+            cfg.agents.iter().all(|a| a.autostart != Some(true)),
+            "loading the sample must not fill the grid before the run starts"
+        );
+        let agent = |name: &str| {
+            cfg.agents
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap_or_else(|| panic!("agents: must define '{name}'"))
+        };
+
+        // The bootstrap prompt is load-bearing, exactly as in measure-coldstart:
+        // `orchestrator::deliver_kickoff` only calls `send_inbox`, so nothing is
+        // typed into the pane and a bare CLI would sit at its prompt forever.
+        // `reply_inbox`'s `sender` must equal the original recipient, which is
+        // the step's `agent` name — i.e. the definition name, which is also the
+        // mailbox to await on.
+        for name in ["implementer", "reviewer-a", "reviewer-b", "judge"] {
+            let def = agent(name);
+            for needle in ["await", "reply_inbox", &format!("mailbox={name}")] {
+                assert!(
+                    def.cmd.contains(needle),
+                    "'{name}' bootstrap prompt must name {needle:?}: {}",
+                    def.cmd
+                );
+            }
+            assert!(
+                def.cmd.contains(&format!("sender={name}")),
+                "'{name}' must reply as itself; reply_inbox rejects any other \
+                 sender than the original recipient"
+            );
+        }
+
+        // Worktree isolation: ONLY the two reviewers get one, and both from
+        // `HEAD`.
+        //
+        // `worktree::prepare_at` runs per spawn and does
+        // `git worktree add -b ptygrid/<agent>/<random> <dir> <base>`, so a
+        // reviewer spawned after `implement` succeeded branches off whatever the
+        // MAIN tree's HEAD is at that moment — which is the implementer's commit
+        // only because the implementer works in the main tree. Giving the
+        // implementer a worktree too would park the change on a randomly named
+        // branch nobody can reference from config, and both reviewers would
+        // review an empty diff. The judge needs no isolation (it runs no tests)
+        // and wants the main tree (HEAD is the reviewed commit).
+        for name in ["reviewer-a", "reviewer-b"] {
+            let wt = agent(name)
+                .worktree
+                .as_ref()
+                .unwrap_or_else(|| panic!("'{name}' needs its own tree to run tests in"));
+            assert!(
+                wt.effective_enabled(),
+                "'{name}': a worktree block that is not enabled isolates nothing"
+            );
+            assert_eq!(
+                wt.effective_base(),
+                "HEAD",
+                "'{name}': any other base misses the implementer's commit"
+            );
+        }
+        for name in ["implementer", "judge"] {
+            assert!(
+                agent(name)
+                    .worktree
+                    .as_ref()
+                    .is_none_or(|wt| !wt.effective_enabled()),
+                "'{name}' must stay in the main tree"
+            );
+        }
+
+        // The reviews are handed over through files, so every participant has to
+        // agree on ONE absolute directory — the reviewers cannot use a
+        // repo-relative path (they are in a different tree) and the judge could
+        // not find it if they did. Assert the three declarations agree AND that
+        // the value is echoed in the kickoffs that name the files, because the
+        // agents read the path out of the message body, not out of `env`.
+        let review_dir = agent("judge")
+            .env
+            .as_ref()
+            .and_then(|e| e.get("PTYGRID_REVIEW_DIR"))
+            .expect("judge must know where the reviews are")
+            .clone();
+        assert!(
+            review_dir.starts_with('/'),
+            "the shared review dir must be absolute: {review_dir}"
+        );
+        for name in ["reviewer-a", "reviewer-b"] {
+            assert_eq!(
+                agent(name)
+                    .env
+                    .as_ref()
+                    .and_then(|e| e.get("PTYGRID_REVIEW_DIR")),
+                Some(&review_dir),
+                "'{name}' writes where the judge reads, or the join carries nothing"
+            );
+        }
+
+        let workflows = cfg.workflows.as_ref().expect("workflows: block");
+        assert_eq!(workflows.len(), 1);
+        let wf = &workflows["cross-model-review"];
+        assert_eq!(
+            wf.pattern,
+            WorkflowPattern::Supervisor,
+            "one root fanning out to differently-modelled siblings and joining \
+             again is the supervisor shape; fan-out would clone one agent"
+        );
+        assert_eq!(
+            wf.auto_close, None,
+            "the panes are the review's evidence and must survive the run"
+        );
+        assert_eq!(
+            wf.on_failure, None,
+            "`on_failure` parses but is never read by the orchestrator; writing \
+             it would promise a policy the driver does not implement"
+        );
+        assert_eq!(wf.steps.len(), 4, "implement + 2 reviews + verdict");
+
+        let step = |id: &str| {
+            wf.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("steps: must define '{id}'"))
+        };
+
+        // Exactly one root, and it is the implementer — `validate_workflows`
+        // enforces the count, this pins WHICH step it is.
+        let roots: Vec<&str> = wf
+            .steps
+            .iter()
+            .filter(|s| s.depends_on.as_deref().unwrap_or(&[]).is_empty())
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(roots, vec!["implement"], "the implementation is the root");
+
+        // The two reviews are siblings hanging off the root only — that is what
+        // makes them run at the same time.
+        for id in ["review-a", "review-b"] {
+            assert_eq!(
+                step(id).depends_on.as_deref(),
+                Some(["implement".to_string()].as_slice()),
+                "'{id}' must depend on the root alone so the two reviews overlap"
+            );
+        }
+        assert_ne!(
+            step("review-a").agent,
+            step("review-b").agent,
+            "same agent on both reviews means the same cmd, hence the same \
+             model — there is nothing cross about that"
+        );
+
+        // The join. Three dependencies, and the root is one of them: a
+        // supervisor step that does not `dependsOn` the root is rejected at load
+        // (`must dependOn root step`), so the seemingly redundant `implement`
+        // entry is mandatory. `ready_steps` requires ALL of them, so listing the
+        // root does not let the judge start early.
+        let verdict_deps = step("verdict").depends_on.as_deref().unwrap_or(&[]);
+        assert_eq!(
+            verdict_deps.len(),
+            3,
+            "the judge joins the root and both reviews"
+        );
+        for dep in ["implement", "review-a", "review-b"] {
+            assert!(
+                verdict_deps.iter().any(|d| d == dep),
+                "verdict must dependOn '{dep}'"
+            );
+        }
+
+        for s in &wf.steps {
+            assert_eq!(
+                s.join_on,
+                Some(JoinOn::Named(JoinOnName::Reply)),
+                "step '{}': an interactive CLI's pane never exits, so route 1 \
+                 can never complete it — only a reply join can",
+                s.id
+            );
+            // `validate_workflows` pairs `joinOn: reply` with a non-empty
+            // kickoff; `parse_config` succeeding above already proves it. Assert
+            // it anyway so a future edit cannot quietly drop the kickoff and
+            // re-derive the error this sample exists to explain.
+            let kickoff = s
+                .kickoff
+                .as_deref()
+                .filter(|k| !k.trim().is_empty())
+                .unwrap_or_else(|| panic!("step '{}': joinOn: reply needs a kickoff", s.id));
+            assert!(
+                kickoff.contains(&format!("sender={}", s.agent)),
+                "step '{}': the kickoff must restate the reply contract — \
+                 without a reply the step never completes",
+                s.id
+            );
+
+            assert!(
+                s.handoff_to.is_none(),
+                "step '{}': handoffTo carries only ONE body per target, so a \
+                 second reviewer's review would be dropped without a warning; \
+                 this sample deliberately passes bodies through files instead",
+                s.id
+            );
+            assert!(
+                s.condition.is_none(),
+                "step '{}': condition is limited to a single dependsOn and \
+                 cannot express 'both reviews passed'",
+                s.id
+            );
+            assert!(
+                s.fan_out.is_none(),
+                "step '{}': fan-out copies share one agent and one model",
+                s.id
+            );
+            assert!(
+                s.retry.is_none(),
+                "step '{}': re-running a step would re-commit or re-write a \
+                 review file; this work is not idempotent",
+                s.id
+            );
+
+            // Every step must clear two full 55s `await` rounds so one spurious
+            // re-await cannot fail a healthy step. Unlike measure-coldstart these
+            // bounds intentionally exceed `WORKFLOW_DEFER_MAX_MS` — real review
+            // work does not fit in five minutes — which the file says out loud.
+            let timeout = s
+                .timeout_ms
+                .unwrap_or_else(|| panic!("step '{}': needs a stuck-run escape hatch", s.id));
+            assert!(
+                timeout > 2 * 55_000,
+                "step '{}': a timeout at or below two await rounds false-fires",
+                s.id
+            );
+        }
+
+        // The three steps that touch the review files must spell the shared
+        // directory out in their kickoff: the body is what the agent actually
+        // reads, `env` is only a convenience for the shell.
+        for (id, needle) in [
+            ("review-a", "review-a.md"),
+            ("review-b", "review-b.md"),
+            ("verdict", "review-a.md"),
+        ] {
+            let kickoff = step(id).kickoff.as_deref().expect("checked above");
+            assert!(
+                kickoff.contains(&review_dir) && kickoff.contains(needle),
+                "step '{id}': the kickoff must name {review_dir}/{needle}"
+            );
+        }
+    }
 }

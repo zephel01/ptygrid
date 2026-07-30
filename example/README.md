@@ -17,6 +17,7 @@
 | [teammates/](teammates/ptygrid.yml) | Claude Code の subagent/teammate をペインで観測（Phase 4.0/4.1） |
 | [team-preset/](team-preset/ptygrid.yml) | ローカルLLM主体 + クラウド standby のチームを 👥 で一括起動（Phase 4.3） |
 | [adaptive-orchestration/](adaptive-orchestration/ptygrid.yml) | タスクを分類して worker を事前選抜し、Verifier 合格まで反復させる（Phase 5.7.0）。router + routing_hints 表 + plan-build-verify + 総当たり bakeoff |
+| [cross-model-review/](cross-model-review/ptygrid.yml) | 実装1体 → **別モデル2体が並行レビュー** → 突き合わせ（`pattern: supervisor`）。レビュアーは worktree で分離し、レビュー本文は `handoffTo` ではなく**ファイル経由**で渡す（`handoffTo` はターゲット1つにつき本文1本しか運ばず、2体目が黙って捨てられるため）。`joinOn: reply` は「2体とも返信した」という同期にだけ使う |
 | [measure-parallelism/](measure-parallelism/ptygrid.yml) | 計測用。エージェントを `sleep` に置き換えた合成 workflow 4本で、並列化の効きと orchestration のコスト（tick・spawn・9面上限の待ち・joinOn: any の敗者kill）を決定論的に測る |
 | [measure-coldstart/](measure-coldstart/ptygrid.yml) | 計測用。同じ agent を3段並べた pipeline（1段目=spawn / 2・3段目=同じペインの再利用）で、エージェントを毎回 spawn し直す代金（プロセス起動 + CLIブート + Queen接続 + inbox読み直し）を `1段目 − 2段目` の引き算で実測する。`joinOn: reply` + 返信極小。ローカルLLM代替あり |
 
