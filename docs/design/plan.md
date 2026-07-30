@@ -246,6 +246,25 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 - **cancel された straggler は workflow の `autoClose` ではなく agent の `close_on_exit` に従う**:
   kill 時に `outcome.session_id` が消えるので frontend が workflow 所属を判定できなくなるため。
   2026-07-31 の設定では偶然それが望みどおりだったが、意図した挙動ではない（未修正 → §6.11）
+- **2 体レビューの「突き合わせ」を設定で書けない（cross-model review）**: 「実装 → 別モデル 2 体が
+  並行レビュー → 結果を突き合わせて判定」のうち、**並行レビューまでは今日の実装で書ける**
+  （`pattern: supervisor` の制約は root ちょうど 1 つ + 他は全員 root 依存だけなので、レビュー 2 体を
+  並べ、判定 step を `dependsOn: [root, reviewA, reviewB]` の 3 本依存にしても root を含む限り通る
+  = `config.rs:971-999`）。書けないのは突き合わせのほうで、原因は 2 つ。(1) `handoff_bodies` は
+  ターゲット 1 つにつき本文 1 本しか運ばない（`orchestrator.rs:1906-1926` の
+  `if bodies.contains_key(target) { continue; }`）ため、レビュアー 2 体が両方 `handoffTo: verdict` を
+  宣言しても、設定に先に書いたほうの本文だけが判定 step の kickoff に前置され、もう 1 本は
+  エラーにも警告にもならず捨てられる。(2) `condition_targets` は `depends_on.first()` しか見ない
+  （`orchestrator.rs:2075-2093`）ので、依存が複数ある step に `condition:` を書いても評価対象は
+  1 本目だけで、「両方が ACCEPT なら進む」を `condition` で表現できない。**今日できる回避策**:
+  workflow 上は `joinOn: reply` で「2 体とも返信した」ことだけを同期に使い、中身の受け渡しは
+  固定名の mailbox（`send_inbox`）かファイル経由にする — `reply_inbox` は返信の宛先を元メッセージの
+  sender に固定する（`queen_store.rs:838` の `original.sender`）ため workflow の返信は
+  `queen:workflow/<name>/<runId>` に戻り、run id を知らない判定 step からは読めない。**直すなら**
+  (1) は `HashMap<String, String>` を `HashMap<String, Vec<String>>` にして kickoff に連結する話、
+  (2) は「全依存の AND を許すか」という設計判断が要る。どちらも
+  [spec-oneach-reply-5.0.7.md](../spec/spec-oneach-reply-5.0.7.md) と同じ層（依存と完了判定の
+  表現力）なので、着手するならまとめて検討する。v0.5.9 以降の候補（2026-07-31 に調査、未修正）
 - **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P6）までの間は
   [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の ❌ 表記を維持する
 - **`orchestrator.rs` のコード内コメントの「phase 5.0.5」表記**: 整理コミットで削除する
