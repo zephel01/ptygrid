@@ -126,6 +126,8 @@ deferral 時に `outcome.error = Some(format!("waiting for a free pane slot ({li
 
 上限判定を全面的に `state != Exited` に統一する。**Exited ペインは自動 reap しない**（`EofAction::Exit { remove: manual_kill }` は意図的設計で、frontend の終了コード表示と `restart_session` の復帰を支えている。`handle_eof` の 3 フェーズとレースするため外部からの割り込みも危険）。カウント側を `live_session_id` に合わせることで 2 箇所の不一致が解消する。
 
+**2026-07-30 追記: 実機検証で上記の判断を反転した。** 8 面埋まった状態で `smoke` の step `a`(t1) が 9 枚目を占有し、`close_on_exit` 未指定のため自然終了後も `Exited` のままセルを占有し続けた → 次 step の判定は「`state != Exited` の数」で live=8 と見て空きありと誤認し spawn → frontend は `ui.panes.length`（グリッドの全セル数）でしか描画できず「ペイン上限のため表示できません」を出し、セッションは headless のまま走った(詳細は plan.md §6.6)。**占有判定を `occupied_pane_count()`（全 state、`Exited` 含む＝グリッドの全セル数）へ変更し、`live_session_count()` は削除した**。本節冒頭の「Exited を自動 reap しない」判断は維持している。reuse 判定 `live_session_id`（`state != Exited`）も無変更。CONTRACT.md 続報10 に訂正+追記あり。
+
 ### A-8 `timeout_ms` の意味論（決定）
 
 **待機中は進まない**。`check_timeouts` は `Running` かつ `started_at_ms != 0` のみを見る現行のままで既に正しい（変更ゼロ）。理由: `timeout_ms` はエージェントの実行時間であり、キュー待ちを含めると grid 占有状況で成否が変わり再現性を失う。待ちの有界性は `WORKFLOW_DEFER_MAX_MS` が別に持つ。doc comment に明記する。

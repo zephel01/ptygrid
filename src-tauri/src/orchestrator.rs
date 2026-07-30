@@ -36,10 +36,10 @@ use crate::session::{PtyManager, SessionState};
 /// scheduler defers it (it stays `Pending`, see
 /// `StepOutcome::deferred_since_ms`) and retries on later ticks. `spawn_step`
 /// therefore no longer knows about this constant at all; every one of its
-/// call sites budgets against it first. Occupancy is counted as
-/// "sessions whose state is not `Exited`", matching `live_session_id` — an
-/// exited pane is a reclaimable slot, and is never auto-reaped
-/// (`EofAction::Exit { remove: manual_kill }` keeps it visible on the grid).
+/// call sites budgets against it first. Occupancy is counted as GRID CELLS
+/// (`PtyManager::occupied_pane_count`), i.e. every session slot including
+/// `Exited` ones — see `pane_budget` for why that is not
+/// `live_session_id`'s rule.
 pub const WORKFLOW_SESSION_CAP: usize = 9;
 
 /// Upper bound on how long a step may sit deferred waiting for a free pane
@@ -442,7 +442,25 @@ fn spawn_step<R: Runtime>(
 }
 
 /// Free pane slots on the grid right now: `WORKFLOW_SESSION_CAP` minus the
-/// sessions that are not `Exited`.
+/// cells the grid already has occupied (`occupied_pane_count`, which counts
+/// every session slot — **`Exited` included**).
+///
+/// 2026-07-30: this used to subtract `live_session_count()` (non-`Exited`
+/// only), per decision A-7 in `docs/design/refactor-pane-cap-5.0.5.md`, which
+/// explicitly accepted the divergence from the frontend's `ui.panes.length`.
+/// A real-device run proved that divergence is not acceptable: with 8 panes up,
+/// a workflow's step `a` took the 9th cell, its agent exited (no
+/// `close_on_exit`, so the pane stayed on the grid tagged "exited"), and the
+/// next step then saw live = 8, spawned `t2`, and the frontend could only
+/// report "Queen started 't2' but the pane limit (9) prevents showing it" while
+/// the session kept running headless. The cap now means what the operator sees:
+/// cells. So the `N` in `pane_wait_reason`'s "N/9 occupied" is a grid-cell
+/// count, not a live-session count — a step can legitimately wait on panes
+/// whose processes are all dead, and the fix is to close them.
+///
+/// Reuse is deliberately NOT counted this way: `live_session_id` /
+/// `slots_needed` still require `state != Exited`, because a step can only
+/// adopt a pane that is still alive.
 ///
 /// Every scheduler entry point takes this ONCE per tick and then decrements
 /// a local copy as it commits spawns, rather than re-reading the manager per
@@ -451,7 +469,7 @@ fn spawn_step<R: Runtime>(
 /// Saturating, because nothing prevents panes spawned outside any workflow
 /// (`spawn_agent`, `start_team`) from putting occupancy past the cap.
 fn pane_budget(manager: &PtyManager) -> usize {
-    WORKFLOW_SESSION_CAP.saturating_sub(manager.live_session_count())
+    WORKFLOW_SESSION_CAP.saturating_sub(manager.occupied_pane_count())
 }
 
 /// Slots a step costs against the budget. A singular step that will adopt an
@@ -477,6 +495,11 @@ fn slots_needed(
 /// verbatim on the `workflow-state` event, so an operator watching a step sit
 /// in `Pending` can see it is queued for a pane rather than stuck on a
 /// dependency. `error` is an existing wire field — no schema change.
+///
+/// Wording unchanged since 5.0.5, but `occupied` is now the number of GRID
+/// CELLS in use (`pane_budget`), so it can include panes whose agent has
+/// already exited and is still displayed. That is the intended reading:
+/// closing an exited pane is what frees the slot.
 fn pane_wait_reason(occupied: usize) -> String {
     format!("waiting for a free pane slot ({occupied}/{WORKFLOW_SESSION_CAP} occupied)")
 }
@@ -5783,17 +5806,20 @@ workflows:
 
     /// Kill one pane and wait for the reader thread to actually reap it.
     /// `kill_pty` only signals; occupancy drops asynchronously, so polling
-    /// (rather than a fixed sleep) is what keeps this deterministic.
+    /// (rather than a fixed sleep) is what keeps this deterministic. A MANUAL
+    /// kill is what frees a cell — the slot is removed from the map
+    /// (`EofAction::Exit { remove: true }`), unlike a natural exit which stays
+    /// as `Exited` and keeps occupying the grid.
     fn free_one_slot(manager: &PtyManager, id: u32) {
         manager.kill_pty(id).expect("filler pane should be killable");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if manager.live_session_count() < WORKFLOW_SESSION_CAP {
+            if manager.occupied_pane_count() < WORKFLOW_SESSION_CAP {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        panic!("killed pane never left the live count");
+        panic!("killed pane never left the occupancy count");
     }
 
     fn drain_grid(manager: &PtyManager) {
@@ -5811,7 +5837,7 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
 
         occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
-        assert_eq!(manager.live_session_count(), WORKFLOW_SESSION_CAP);
+        assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP);
 
         // 5.0.5: capacity is the scheduler's business. `spawn_step` itself is
         // now unconditional — it spawns even past the cap, which is exactly
@@ -5852,7 +5878,7 @@ workflows:
         );
 
         assert!(changed, "the FIRST deferral is worth emitting: it is new information");
-        assert_eq!(manager.live_session_count(), WORKFLOW_SESSION_CAP, "nothing spawned");
+        assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP, "nothing spawned");
         // The placeholder is the only proof the step still exists; the old
         // unconditional `retain` deleted it here and wedged the run.
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
@@ -5906,7 +5932,7 @@ workflows:
         );
 
         assert_eq!(
-            manager.live_session_count(),
+            manager.occupied_pane_count(),
             fillers,
             "a fan-out that does not fit takes ZERO panes, never the 2 that fit: \
              `dep_unsatisfiable` and `cancel_stragglers` both assume every copy \
@@ -6039,7 +6065,7 @@ workflows:
         assert_eq!(run.steps[0].session_id, None);
         assert!(run.steps[0].deferred_since_ms.is_some());
         assert_eq!(
-            manager.live_session_count(),
+            manager.occupied_pane_count(),
             WORKFLOW_SESSION_CAP,
             "no root pane was taken"
         );
@@ -6098,7 +6124,7 @@ workflows:
             !is_terminal(&run.steps[0]),
             "a postponed retry must keep the run alive for finalize_state"
         );
-        assert_eq!(manager.live_session_count(), WORKFLOW_SESSION_CAP);
+        assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP);
 
         // Further ticks inside the budget keep postponing, silently and
         // without ever touching `attempts`.
@@ -6172,7 +6198,7 @@ workflows:
             error.contains(&format!("{}ms", WORKFLOW_DEFER_MAX_MS + 1)),
             "{error}"
         );
-        assert_eq!(manager.live_session_count(), WORKFLOW_SESSION_CAP);
+        assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP);
 
         drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6229,7 +6255,7 @@ workflows:
              attempts={} max={max}",
             run.steps[0].attempts
         );
-        assert_eq!(manager.live_session_count(), WORKFLOW_SESSION_CAP, "never spawned");
+        assert_eq!(manager.occupied_pane_count(), WORKFLOW_SESSION_CAP, "never spawned");
 
         drain_grid(&manager);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6354,6 +6380,145 @@ workflows:
             cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
         let second = cancelled.steps.iter().find(|o| o.step_id == "second").unwrap();
         assert_eq!(second.state, StepState::Cancelled);
+        assert_eq!(second.error, None);
+        assert_eq!(second.deferred_since_ms, None);
+
+        drain_grid(&manager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Take one cell with a pane that exits on its own and STAYS on the grid
+    /// as `Exited` — the exact shape of the 2026-07-30 device bug: no
+    /// `close_on_exit`, so `EofAction::Exit { remove: false }` keeps the slot
+    /// in the map and the frontend keeps rendering the cell with an "exited"
+    /// tag. Anonymous (name `None`) so no step can reuse it. Polls rather than
+    /// sleeps: the reader thread applies the exit asynchronously.
+    /// A filler pane whose process is already gone. `/bin/echo`, which exits at once and
+    /// exists on both macOS and Linux — unlike `/bin/true`, which macOS keeps in
+    /// `/usr/bin` (CI runs these tests on both platforms). `spawn_shell` takes a
+    /// program path, not a shell line, so it must be a single executable.
+    fn occupy_with_exited_pane(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        manager: &PtyManager,
+    ) -> u32 {
+        let id = manager
+            .spawn_shell(handle.clone(), 80, 24, Some("/bin/echo".to_string()), None)
+            .expect("short-lived filler pane should spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let exited = manager
+                .session_states()
+                .into_iter()
+                .any(|s| s.id == id && s.state == SessionState::Exited);
+            if exited {
+                return id;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("naturally exited pane never reached Exited");
+    }
+
+    /// The 2026-07-30 regression (reverses decision A-7): a naturally exited
+    /// pane still holds its grid cell, so it must still consume pane budget.
+    /// Counting live sessions only made the backend spawn a step the frontend
+    /// had no cell for, and the operator got
+    /// "Queen started 't2' but the pane limit (9) prevents showing it" while
+    /// the session ran headless. The step must wait instead — and closing the
+    /// dead pane must be what releases it.
+    #[test]
+    fn spawn_ready_counts_an_exited_pane_against_the_budget() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(CHAIN_YAML);
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let now = 1_000_000u64;
+
+        occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP - 1);
+        let exited = occupy_with_exited_pane(&handle, &manager);
+
+        assert_eq!(
+            manager.occupied_pane_count(),
+            WORKFLOW_SESSION_CAP,
+            "the grid is full: 8 running cells + 1 cell held by an exited pane"
+        );
+        let live = manager
+            .session_states()
+            .into_iter()
+            .filter(|s| s.state != SessionState::Exited)
+            .count();
+        assert_eq!(
+            live,
+            WORKFLOW_SESSION_CAP - 1,
+            "…while only 8 sessions are live: this divergence is the whole point, \
+             live-only accounting would think there is room"
+        );
+
+        let mut run = mk_run(
+            "chain",
+            vec![
+                mk_outcome("first", None, StepState::Succeeded),
+                mk_outcome("second", None, StepState::Pending),
+            ],
+        );
+        let changed = spawn_ready(
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80,
+            24,
+        );
+
+        assert!(changed, "the first deferral is new information");
+        let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(
+            second.state,
+            StepState::Pending,
+            "a step must not spawn into a cell an exited pane still owns"
+        );
+        assert_eq!(second.session_id, None);
+        assert_eq!(second.deferred_since_ms, Some(now));
+        assert_eq!(
+            second.error.as_deref(),
+            Some(
+                format!(
+                    "waiting for a free pane slot \
+                     ({WORKFLOW_SESSION_CAP}/{WORKFLOW_SESSION_CAP} occupied)"
+                )
+                .as_str()
+            ),
+            "the wait reason counts cells, exited panes included"
+        );
+        assert_eq!(
+            manager.occupied_pane_count(),
+            WORKFLOW_SESSION_CAP,
+            "nothing spawned"
+        );
+        assert!(
+            !manager
+                .session_states()
+                .into_iter()
+                .any(|s| s.name.as_deref() == Some("b")),
+            "no headless session for the deferred step may exist"
+        );
+
+        // Closing the dead pane is what frees the cell (a natural exit alone
+        // never does): the same step then spawns on the next tick.
+        free_one_slot(&manager, exited);
+        let changed = spawn_ready(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &dir,
+            "chain",
+            TEST_RUN_ID,
+            &wf,
+            &mut run,
+            now + 1_000,
+            80,
+            24,
+        );
+        assert!(changed, "the freed cell is a real state change");
+        let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
+        assert_eq!(second.state, StepState::Running);
+        assert!(second.session_id.is_some());
         assert_eq!(second.error, None);
         assert_eq!(second.deferred_since_ms, None);
 
