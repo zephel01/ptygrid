@@ -1,7 +1,8 @@
 # ptygrid 作業計画 (plan.md)
 
-更新日: 2026-07-30 / 実装基準: `main` = `4e9afb3`（PR #10 マージ済み / 2026-07-30 14:18 +0900）。
-作業中のブランチは `feat/init-llm-probe-5.0.2`（`release/v0.5.7` から分岐、origin に push 済み）。
+更新日: 2026-07-31 / 実装基準: `main`（PR #10 のあと PR #11 / #12 = `17860e0` / `b8300a4` が
+マージされ、`.gitignore` 追加の `89411b9` が直接コミットされている）。作業中のブランチは
+`feat/terminal-copy-paste`（`main` から分岐、**origin へ push 未・PR 未作成**）。
 最新タグは `v0.5.7`（2026-07-30 作成）、次のタグは `v0.5.8`（未作成）。作業ツリーの
 `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の 3 ファイルはいずれも
 `0.5.7` だが、**タグ `v0.5.7` が指すコミットはそうではない**（→ §4）。
@@ -42,12 +43,13 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 4.4.2 | アプリ外通知（セッション終了・blocked/done エッジを OS 通知 / Slack / Mattermost / Discord / Telegram へ中継、`notifications:`） | ✅ | v0.4.6 | 記録なし |
 | 4.4.3 | ssh 接続先表示（`session-resources.foreground.detail?` を additive 追加）+ フォアグラウンド名解決の汎用化 | ✅ | v0.4.8 / v0.4.9 | 済（macOS） |
 | （UI 横断） | UI 多言語化 en/ja（型付き辞書 `i18n.svelte.ts` + ⚙ 設定メニュー、既定は OS 言語追従） | ✅ | v0.4.7 | 記録なし |
+| （UI 横断） | ターミナルのコピー & ペースト（macOS 限定のアプリメニュー App / Edit / Window + `tauri-plugin-clipboard-manager`、コピーは macOS が Cmd+C・それ以外が Ctrl+Shift+C で選択が無いときは介入せず PTY へ、貼り付けは macOS がネイティブ経路・Ctrl+Shift+V が自前ハンドラで `term.paste()` 経由、右クリックメニュー、`macOptionClickForcesSelection: true`） | 🚧 | v0.5.8（予定） | 一部済（U13、2026-07-31。残り 4 点） |
 | （UX トラック） | Phase 4 期に計画外で入った UX 改善: `mterm.yml` → `ptygrid.yml` リネームと用途別サンプル（`da40cb0`）、一括 cd（`cf42ced` / `77d0271`）、作業フォルダと設定探索の分離 + origin バッジ（`acbed94`）、設定なしフォールバック（`0530e3b`）、フォルダサジェスト（`a3a769a`）、終了ペインの明示と一括クローズ（`d8a3d8e`） | ✅ | v0.4.2 | 記録なし |
 | （安定化） | docs/inside のバグ / セキュリティ調査への対応: backend 純バグ 12 件（`c6f31ad`）、frontend 純バグ 8 件（`7505bbe`）、S1 Queen `/mcp` の token + Host/Origin 認証（`3159263`）、S2/S4 autostart 信頼境界 + CSP（`f18bae6`）、手打ち claude の lead 帰属修正（`9c4ab67`）、認証トークン永続化（`0af8de4`） | ✅ | v0.4.3 | 記録なし |
 | 5.0.0 | MVO: `workflows:` スキーマ + 検証 / `orchestrator.rs`（spawn + DAG 進行ドライバ、fail-fast、fan-out fresh-spawn）/ Queen MCP tools 22 本 / WorkflowPanel + 🔀 チップ / `close_on_exit`・`autoClose` | 🚧 | v0.5.0（`b1b4f1f`） | pipeline 実走 済（U1、2026-07-30）/ fan-out は未（U2） |
 | 5.0.1 | Workflow Resume: `workflow_runs` 永続化（`user_version` 2→3）+ write-through、`workflow-resume-pending` イベント + Y/N バナー、`resume_workflow` / `abandon_workflow` | ✅ | v0.5.1（`ac1b94b`） | 済（U5、2026-07-30） |
 | 5.0.2 | `ptygrid init`: `ptygrid.yml` の自動生成（環境検出 → テンプレート生成 → 自己検査 → 既存ファイルがある場合は sidecar で差分提示）。backend（`init.rs` + Tauri command 3 本）と frontend（`InitPanel.svelte` + 入口 2 つ + i18n）が実装済みで自動テストは通過。2026-07-30、macOS 実機で全経路を確認済み（→ §2 U11）。spec: [spec-init-5.0.2.md](../spec/spec-init-5.0.2.md)（→ 脚注※）。ローカル LLM プローブの追補は次行 | ✅ | v0.5.7 | 済（U11、2026-07-30） |
-| 5.0.2 追補 | ローカル LLM プローブ: `init_probe_llm`（4 本目の Tauri command）で既定 3 ポート + 手入力最大 4 本に `GET /v1/models` を当て、Anthropic Messages API 互換の確証が取れたときだけ有効な agent 定義を出す（それ以外はコメント行）。モデル選択 `<select>`・検出行への反映・`ANTHROPIC_AUTH_TOKEN` の出し分けを含む。実装済み・PR 未作成（ブランチ `feat/init-llm-probe-5.0.2`） | 🚧 | v0.5.8（予定） | 一部済（U12、2026-07-30。残り 3 点） |
+| 5.0.2 追補 | ローカル LLM プローブ: `init_probe_llm`（4 本目の Tauri command）で既定 3 ポート + 手入力最大 4 本に `GET /v1/models` を当て、Anthropic Messages API 互換の確証が取れたときだけ有効な agent 定義を出す（それ以外はコメント行）。モデル選択 `<select>`・検出行への反映・`ANTHROPIC_AUTH_TOKEN` の出し分けを含む。ブランチ `feat/init-llm-probe-5.0.2` は `main` にマージ済み（→ §4） | 🚧 | v0.5.8（予定） | 一部済（U12、2026-07-30。残り 3 点） |
 | 5.0.3 | Queen MCP 登録の代行（バッジからコピペしている `claude mcp add` 等を ptygrid が代行。claude は CLI を代行実行、codex / grok は TOML を `toml_edit` で値単位編集。差分承認・冪等・登録解除を含む）。spec: [spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)（→ 脚注※） | ⬜ | — | 該当なし |
 | 5.0.4 | Orchestrator 実行層: `joinOn: reply` 完了判定 / `condition:` 評価 / `handoffTo` チェイン / `retry:` 再試行 / `timeoutMs` 強制 / supervisor・handoff の spawn ゲート撤去。続けて `fanOut` 黙殺による false green の解消と straggler（`any` / `N` join の敗者）協調キャンセル | 🚧 | v0.5.7（`5d3c1b5` → `3bd9833` = PR #1、`52de433` = PR #3 に同梱） | 基本の実走 済（U1）/ 5.0.4 固有機能は未（U2） |
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | v0.5.7（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
@@ -88,7 +90,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 > 番号が決まるまで本表の行は「（案）」表記のままとする（v0.5.8 のタグ内容そのものは §4 に書いてあり、
 > patch 番号の確定を待たない）。
 
-**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了した。同日さらにローカル LLM プローブの追補が入り実機 1 回目を通したため 🚧 は 7 行。残る理由は個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）、プローブ追補の残り 3 点（U12）。未タグ成果へのタグ付けは v0.5.7 で一度消化し、次は v0.5.8（→ §4）。
+**いま特に効く読み方**: 2026-07-30 に `smoke` を実機で流し切ったことで、**「workflow は一度も実走していない」という一括の未知は消えた**（U1 完了）。続けて同日中に U3（pane 上限待ち）と U5（resume バナー）も実機で完了した。同日さらにローカル LLM プローブの追補が入り実機 1 回目を通し、翌 2026-07-31 にターミナルのコピー & ペーストが入って実機 1 回目を通したため 🚧 は 8 行。残る理由は個別機能ごとに分かれている: fan-out と straggler キャンセル（U2）、mailbox 分離（U4）、host モード（U6）、Linux 常用（U7）、5.5.0 の実機記録なし（U10）、プローブ追補の残り 3 点（U12）、コピー & ペーストの残り 4 点（U13）。未タグ成果へのタグ付けは v0.5.7 で一度消化し、次は v0.5.8（→ §4）。
 
 **補足: 主要モジュールの所在**（状態は上表を見ること）
 
@@ -129,6 +131,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
 | U11 | `ptygrid init`（5.0.2）の実機検証 | **2026-07-30、macOS で実施**（すべてスクリーンショットで確認済み）。(1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て、検出結果（opencode/claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定なし）が実環境と一致することを確認、(2) 通常生成で `ptygrid.yml`（2,060 バイト）が生成され agents チップ 7 体が並び、生成物は autostart 全 false のため trust プロンプトは出ずペインも自動起動しないことを確認、(4) 既存設定ありの状態では副入口の書き込み先が `ptygrid.init.yml` に切り替わり、書き込み後も既存 `ptygrid.yml` は mtime・内容とも無変更であることを確認（上書き禁止の実測裏付け）、(5) 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが二重に出る競合を実測（spec §9 で推測としていた箇所が確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` + 3 秒窓）を別コミットで修正済み）。(3) プレビューを手編集して `autostart: true` にしてから書き込むと**今度は trust プロンプトが出て**、「信頼して起動」で当該エージェントが実際に起動することを確認（`init_write` → `loadConfig` → `maybeAutostart` の順序の実証）。**U11 は完了**。Global 選択時の `~/.ptygrid/` 作成のみ今回の範囲外（必要になった時点で確認する）。詳細な経緯は §6.4 |
 | U12 | ローカル LLM プローブ（5.0.2 追補）の実機検証 | **2026-07-30、macOS で 1 回目を実施**（スクリーンショットで確認済み）。検出フォルダ `~/works/tmp/ptygrid`、PATH 上の CLI 7 体（opencode / claude / codex / gemini / qwen / grok / aider）、プロジェクト種別 npm、git リポジトリあり、既存設定ありのため書き込み先が `ptygrid.init.yml` に切り替わることを確認。プローブは 1234 / 3456 / 11434 を叩き、3456 は無応答、**11434 で `Ollama 0.32.1` が応答して「Anthropic API 確証あり」バッジが出てモデル 20 件を取得**（先頭は `x/flux2-klein:latest`）。**まだ確認していないことが 3 点**: (1) モデル選択 `<select>` の実機動作（実装は 2 つ目のコミット `8931464` で入ったが押していない）、(2) 生成された `local-11434` の定義で実際に Claude Code が起動するか、(3) LM Studio を上げたときに未確証の分岐（コメント行出力）へ落ちるか。**U12 は一部済**（この 3 点が残る）。詳細な経緯は §6.9 |
+| U13 | ターミナルのコピー & ペーストの実機検証 | **2026-07-31、macOS で 1 回目を実施**（下記はすべてスクリーンショットで確認済み）。(1) **ペインをまたいだコピー & ペースト**: 1 枚目のペインでファイル名を範囲選択 → Cmd+C → 2 枚目の zsh ペインで Cmd+V し、同じ文字列が入ることを確認。(2) **右クリックメニューの 2 状態**: 選択があるときは「コピー ⌘C」「貼り付け ⌘V」がどちらも有効、**選択が無いときはコピーが無効表示**になり、ツールチップに「選択範囲がありません — ドラッグで選択してください / TUI がマウスを使っている間は macOS なら Option ドラッグ、それ以外は Shift ＋ドラッグ」が出ることを確認。**まだ確認していないことが 4 点**: (1) TUI（Claude Code や vim）がマウスレポートを有効にしている状態での Option ドラッグ選択、(2) 複数行の貼り付けが bracketed paste 対応シェルで Enter を押すまで実行されないこと、(3) Linux / Windows の Ctrl+Shift+C / Ctrl+Shift+V（U7 / U8 の範囲）、(4) macOS のメニューバーに Edit メニューが実際に出ていること（貼り付けが動いた以上は出ている可能性が高いが、**目視の記録は無い**ので未確認扱い）。**U13 は一部済**（この 4 点が残る）。詳細な経緯は §6.10 |
 
 ---
 
@@ -178,7 +181,8 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 - 5.0.2 `ptygrid init`（[spec-init-5.0.2.md](../spec/spec-init-5.0.2.md): 環境検出 → テンプレート生成 →
   自己検査 → 既存ファイルがある場合は sidecar で差分提示）は backend（`init.rs` + Tauri command 3 本）と
   frontend（`InitPanel.svelte` + 入口 2 つ + i18n）を実装済み。実機での操作確認（U11）も消化済みで、
-  残っているのは追補（ローカル LLM プローブ）側の U12 の 3 点と、そのブランチの PR 作成のみ。
+  追補（ローカル LLM プローブ）のブランチも `main` にマージ済み（→ §4）なので、残っているのは
+  U12 の 3 点のみ。
 - 5.0.3（Queen MCP 登録の代行）は spec のみ（[spec-registration-5.0.3.md](../spec/spec-registration-5.0.3.md)）
   で実装は未着手。claude は CLI を代行実行、codex / grok は `toml_edit` で値単位編集し、差分承認・冪等・
   登録解除までを含む。**着手前の gate として「docs と実装の食い違いの確定」がある**（README / userguide
@@ -223,6 +227,8 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 いずれも「優先度は P1〜P7 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
 
+- **`feat/terminal-copy-paste` が push 未・PR 未**: ターミナルのコピー & ペースト（→ §4 の v0.5.8
+  項目 7）はローカルのブランチにしか無い。push と PR を出し、U13 の残り 4 点を消す
 - **`arena: true` が実装を伴わない**: 誤解を招くので、Arena 実装（P6）までの間は
   [ptygrid-yml-guide.md](../guide/ptygrid-yml-guide.md) §1 の ❌ 表記を維持する
 - **`orchestrator.rs` のコード内コメントの「phase 5.0.5」表記**: 整理コミットで削除する
@@ -311,13 +317,13 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
 **実装項目（この順序で進める）**。順序の根拠は「決定論的なものから」「安いものから」「あとの判断を
 分岐させるものを先に」:
 
-1. **5.0.2 追補: ローカル LLM プローブ**（実装済み・PR 待ち）。`init_probe_llm`（4 本目の Tauri
+1. **5.0.2 追補: ローカル LLM プローブ**（**PR #11 / #12 でマージ済み**。`main` に `17860e0` /
+   `b8300a4`）。`init_probe_llm`（4 本目の Tauri
    command。既定 11434 / 1234 / 3456 + 手入力最大 4 本に `GET /v1/models`、1 ポート 1 秒・全体 3 秒・
    応答 64KB・モデル 20 件上限）、確証は `GET /api/version` が 0.14.0 以上のときだけ、確証ありは有効な
    agent 定義・それ以外はコメント行、`autostart` は常に false、モデル選択の `<select>`（既定は
    埋め込み/画像/音声/再ランクらしい名前を除いた先頭）、検出行への反映、`ANTHROPIC_AUTH_TOKEN` の
-   出し分け。コミットは `63af84f` と `8931464`、ブランチ `feat/init-llm-probe-5.0.2`（origin に
-   push 済み、PR 未作成）。**前提の訂正**: Ollama v0.14.0 以降と LM Studio が Anthropic Messages API
+   出し分け。ブランチ側のコミットは `63af84f` と `8931464`。**前提の訂正**: Ollama v0.14.0 以降と LM Studio が Anthropic Messages API
    互換になったため、旧設計が想定していた translation 層（coderouter を挟む）は不要になった。
    lib 402 → 419、統合 14 不変、svelte-check 122 files 0/0。
 2. **計測フィールドの追加**（additive）。`orchestrator.rs` の `StepOutcome` は `started_at_ms` しか
@@ -334,10 +340,42 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
    ストリーミング依存（`onEach: reply`）。spec 執筆は §3 P5。
 5. **U4 の消化**（同名 workflow の並行 run が互いの返信を取りこぼさないこと）。2 つの構成を同時に
    流して比較する場合の前提になる。
-6. **リリース雑務**: `.gitignore` に `src-tauri/target-basemain/`（2.2GB）と `ptygrid.yml-20260729`
-   を追加。**version ファイルの食い違いの記録**: タグ `v0.5.7` が指すコミット（`4e9afb3`）では 3 つの
-   version ファイルが `0.5.6` のままで、`0.5.7` に上げたリリースコミット（`27ecd90`）はブランチ側に
-   残っていた。**公開済みタグは動かさない**方針とし、`v0.5.8` は version を揃えたコミットに打つ。
+6. **リリース雑務 — version ファイルの食い違いの記録**: タグ `v0.5.7` が指すコミット（`4e9afb3`）
+   では 3 つの version ファイルが `0.5.6` のままで、`0.5.7` に上げたリリースコミット（`27ecd90`）は
+   ブランチ側に残っていた。**公開済みタグは動かさない**方針とし、`v0.5.8` は version を揃えた
+   コミットに打つ。（`.gitignore` への `src-tauri/target-basemain/`（2.2GB）と `ptygrid.yml-20260729`
+   の追加は、ユーザーが `89411b9` で `main` に直接コミット済みのため本項目からは落とした。）
+7. **（後から入った実装済みの項目）ターミナルのコピー & ペースト**。上の 1〜6 は依存関係の順に
+   並んでいるが、本項目はその並びが決まったあとに入った成果で、先行項目の前提にも依存先にも
+   なっていないため末尾に置く。**背景**: ターミナルペインで範囲選択したテキストをコピーできず
+   貼り付けもできなかった。原因は 4 つで、(a) 選択自体は阻害されていなかった（`user-select: none`
+   は toolbar / dock / statusbar / pane-header のみで、xterm は自前の選択モデルを持つ）が、
+   (b) `terminals.ts` の xterm 生成がテーマ・フォント・scrollback しか渡しておらず、キーハンドラも
+   右クリックメニューもクリップボード呼び出しも無かった（xterm の選択は DOM の選択ではないので
+   WebView の Cmd+C にはコピー対象が見えない）、(c) `src-tauri` にメニューが 1 つも定義されておらず、
+   macOS の WKWebView では Edit メニューが無いと Cmd+V が `paste` イベントにならない、(d) TUI が
+   マウスレポートを有効にすると選択できず逃げ道も無かった。**入ったもの**: macOS 限定
+   （`#[cfg(target_os = "macos")]`）のアプリメニュー（App / Edit / Window。Edit に標準の Undo /
+   Redo / Cut / Copy / Paste / Select All）/ `tauri-plugin-clipboard-manager`（Rust 2.3.2 /
+   JS 2.3.2、capability の許可は **`clipboard-manager:allow-read-text` の 1 つだけ**。書き込みは
+   既存の `navigator.clipboard.writeText` 経路をそのまま使うので足していない）/ コピーは macOS が
+   Cmd+C・それ以外が Ctrl+Shift+C で、**選択が無いときは介入せず PTY へ流す**（素の Ctrl+C の
+   SIGINT を壊さない）/ 貼り付けは **macOS ではネイティブ経路に一本化**（メニューのアクセラレータが
+   keydown より先に Cmd+V を食うことがあり、発火済みのアクセラレータは `preventDefault` で
+   取り消せないため、自前でも読むと二重に入る）、Ctrl+Shift+V はネイティブ `paste` が出ないので
+   自前ハンドラが唯一の経路 / 貼り付けは `term.paste()` を通す（bracketed paste は xterm 任せ、
+   `ignoreBracketedPasteMode` は既定の false のまま）/ 右クリックメニュー（コピー / 貼り付け。
+   選択が無いときコピーは無効表示 + 理由のツールチップ、Esc / 外側 mousedown / window blur で閉じ、
+   リスナは全て一緒に外れる）/ `macOptionClickForcesSelection: true`。コミット `8a83032`、ブランチ
+   `feat/terminal-copy-paste`（`main` から分岐、**push 未・PR 未**）、13 ファイル。**仕様どおりに
+   できなかった点**: ユーザーは「TUI 中の選択は Option ドラッグ」を選んだが、**xterm.js の実装では
+   Option ドラッグは macOS 限定**で、バンドルの実物が `isMac ? altKey && macOptionClickForcesSelection
+   : shiftKey` になっている。**Linux と Windows では Shift ドラッグ固定**でオプションでは変えられない
+   ため、UI のヒントとコメントは「macOS は Option、それ以外は Shift」と書いてある。**自動テストの
+   実測**: lib 419 / 統合 14 は不変、clippy は既存の `config.rs:834` の `nonminimal_bool` 1 件のみ、
+   svelte-check 136 files 0 errors 0 warnings、`npm run build` 成功（メニューは macOS 限定で
+   この作業環境の Linux では `cfg` で落ちるため、一時的に `cfg(all())` へ書き換えて実際にコンパイルと
+   lint を通してから元に戻している）。実機検証は U13（一部済）。
 
 **タグの内容には数えないもの**: 実タスクでのベースライン測定と改良構成の比較、`onEach: reply` /
 `mode: serve` の spec 執筆（どちらも §3 P5。後者は項目 4 の結果を見てから、実装は v0.5.9 以降）。
@@ -346,7 +384,10 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
 
 1. `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の `version` を一致させて
    更新（`Cargo.lock` は `cargo check` で追従）
-2. 全チェック（`cargo test` / `clippy` / `npm run check` / `npm run build`）通過を確認
+2. 全チェック（`cargo test` / `clippy` / `npm run check` / `npm run build`）通過を確認。
+   **v0.5.8 断面の注意**: 項目 7（ターミナルのコピー & ペースト）で JS 側の依存が 1 つ増えたので、
+   この断面を取り込んだら**チェックの前に `npm install` が必要**（未実行だと `vite` が
+   `Failed to resolve import "@tauri-apps/plugin-clipboard-manager"` で落ちる。実機で実際に踏んだ）
 3. `git tag -a vX.Y.Z -m "<リリース概要>"` → push（annotated タグのみ。軽量タグは使わない）
 4. 変更履歴は当面 CHANGELOG.md を作らず「タグメッセージ + `git log` + 本文書の表」で代替。License は
    `d3eac32` で MIT 確定済みなので、本格的な公開に踏み切るタイミングで CHANGELOG.md 化を再検討する
@@ -603,6 +644,47 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   経由の git がロックファイルを削除できず（デバイスブリッジ側の制約）、`_to_delete/gitlocks-20260730/`
   へ退避して作業を続けた。実機の残り 3 点（`<select>` の実操作、生成された `local-11434` 定義での
   Claude Code 起動、LM Studio での未確証分岐）は U12 に未消化として残る。
+
+### 6.10 2026-07-31: ターミナルのコピー & ペースト
+
+詳細な経緯。現在地は §1・§2（U13）・§4。
+
+- 入ったもの: ターミナルペインのコピー & ペースト一式を 1 コミット（`8a83032`、13 ファイル）で実装。
+  ブランチ `feat/terminal-copy-paste` は `main` から分岐し、**push も PR も未**。着手時に切り分けた
+  原因は 4 つ。(a) 選択自体は阻害されていなかった（`user-select: none` は toolbar / dock /
+  statusbar / pane-header のみで、xterm は自前の選択モデルを持つ）、(b) `terminals.ts` の xterm
+  生成がテーマ・フォント・scrollback しか渡しておらず、キーハンドラも右クリックメニューも
+  クリップボード呼び出しも無かった（xterm の選択は DOM の選択ではないので WebView の Cmd+C には
+  コピー対象が見えない）、(c) `src-tauri` にメニューが 1 つも定義されておらず、macOS の WKWebView
+  では Edit メニューが無いと Cmd+V が `paste` イベントにならない、(d) TUI がマウスレポートを
+  有効にすると選択できず逃げ道も無かった。これに対して、macOS 限定
+  （`#[cfg(target_os = "macos")]`）のアプリメニュー（App / Edit / Window。Edit に標準の Undo /
+  Redo / Cut / Copy / Paste / Select All）、`tauri-plugin-clipboard-manager`（Rust 2.3.2 /
+  JS 2.3.2。capability の許可は `clipboard-manager:allow-read-text` の 1 つだけで、書き込みは既存の
+  `navigator.clipboard.writeText` 経路をそのまま使うため足していない）、コピー（macOS = Cmd+C /
+  それ以外 = Ctrl+Shift+C。**選択が無いときは介入せず PTY へ流し**、素の Ctrl+C の SIGINT を
+  壊さない）、貼り付け（`term.paste()` 経由。bracketed paste は xterm に任せ
+  `ignoreBracketedPasteMode` は既定の false のまま）、右クリックメニュー（コピー / 貼り付け。
+  選択が無いときコピーは無効表示 + 理由のツールチップ、Esc / 外側 mousedown / window blur で閉じ、
+  リスナは全て一緒に外れる）、`macOptionClickForcesSelection: true` を入れた。
+- 当時の検証: lib 419 / 統合 14 は不変、clippy は既存の `config.rs:834` の `nonminimal_bool` 1 件
+  のみ、svelte-check 136 files 0 errors / 0 warnings、`npm run build` 成功。メニューは macOS 限定で
+  この作業環境の Linux では `cfg` により落ちてしまうため、担当が一時的に `cfg(all())` へ書き換えて
+  実際にコンパイルと lint を通してから元に戻している。実機（macOS）1 回目では、1 枚目のペインで
+  ファイル名を範囲選択 → Cmd+C → 2 枚目の zsh ペインで Cmd+V し同じ文字列が入ること、右クリック
+  メニューが選択の有無で 2 状態（選択ありは「コピー ⌘C」「貼り付け ⌘V」がどちらも有効、選択なしは
+  コピーが無効表示 + 理由のツールチップ）になることをスクリーンショットで確認した。残りは U13。
+- 当時の注記: **二重貼り付けの回避**として、macOS では貼り付けをネイティブ経路に一本化する判断を
+  した。メニューのアクセラレータが keydown より先に Cmd+V を食うことがあり、発火済みの
+  アクセラレータは `preventDefault` で取り消せないため、自前でもクリップボードを読むと同じ内容が
+  2 回入る。Ctrl+Shift+V は逆にネイティブの `paste` イベントが出ないので、自前ハンドラが唯一の
+  経路になる。**仕様どおりにできなかった点**: ユーザーは「TUI 中の選択は Option ドラッグ」を選んだ
+  が、xterm.js の実装では Option ドラッグは **macOS 限定**で、バンドルの実物が
+  `isMac ? altKey && macOptionClickForcesSelection : shiftKey` になっている。Linux と Windows は
+  **Shift ドラッグ固定**でオプションでは変えられないため、UI のヒントとコメントは「macOS は
+  Option、それ以外は Shift」と書き分けた。**運用上の事実**: JS 側の依存が 1 つ増えたので、この断面を
+  取り込む側は `npm install` が要る。実機でこれを踏み、`vite` が
+  `Failed to resolve import "@tauri-apps/plugin-clipboard-manager"` で落ちた（→ §4 のリリース手順）。
 
 ---
 
