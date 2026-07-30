@@ -1,0 +1,367 @@
+# measure-coldstart — エージェント1体の「毎回 spawn し直す代金」を実測する計測用サンプル
+#
+# ============================================================================
+# 何を測るためのものか
+# ============================================================================
+# workflow の step ごとにエージェントを spawn し直すと、step あたり
+#
+#     プロセス起動 + CLI のブート + Queen(MCP)への接続 + inbox / pins の読み直し
+#
+# を毎回やり直すことになる。これが何秒なのかを1つの数字にする。
+#
+# orchestration 自体のコストは合成 workflow（example/measure-parallelism）で
+# 既に測ってあり、**1 依存あたり 200ms（driver tick 1 回分）+ spawn の事務処理
+# 0.1 秒程度**。つまり実エージェントで観測される残りは全部エージェント側の
+# 立ち上がり時間で、それがここで欲しい数字。
+#
+# この数字で次に作る機能が決まる:
+#   - cold start が支配的（数秒以上） → 常駐ワーカー（`mode: serve`）が本命
+#   - cold start が小さい             → ストリーミング依存（`onEach: reply`）が本命
+#
+# ============================================================================
+# 測定の原理（実装で確認済みの事実。推測ではない）
+# ============================================================================
+# 1. kickoff は spawn でも再利用でも**同じ durable inbox 経由**で届く
+#    （orchestrator::deliver_kickoff → QueenStore::send_inbox）。配送機構が同じ
+#    なので、1段目と2段目の差から「配送のコスト」は打ち消されて消える。
+#
+# 2. `spawn_step` は **pipeline の単数 step のとき、同名 agent の生きている
+#    ペインを再利用する**（`reuse_existing` が真のとき `live_session_id` が
+#    Exited 以外のセッションを拾う）。fan-out のコピーだけは常に fresh spawn。
+#
+# 3. したがって**同じ agent を使う step を1本の pipeline に並べると、
+#    1段目は spawn、2段目以降は再利用**になる。
+#
+#        s1-cold の所要 − s2-warm の所要 = cold start のコスト
+#        s2-warm と s3-warm の差         = ばらつき（ノイズ）の目安
+#
+# 4. 差し引きが素直に効くのは、2段目の start が1段目の end とほぼ同時刻だから。
+#    `advance_run` は 1 tick の中で
+#      detect_reply_completions（1段目を Succeeded にする）
+#        → … → spawn_ready（2段目を spawn/再利用して kickoff を配送）
+#    の順に走るので、s1 の ended_at_ms と s2 の started_at_ms は同じ tick 内。
+#    2つの所要時間は隣接していて、間に穴が無い。
+#
+# 5. `await` は busy poll ではなく mailbox 単位の watch
+#    （QueenStore::await_inbox が `subscribe_mailbox` してから select! する）。
+#    2段目の kickoff が着いた瞬間に await が返るので、s2-warm の所要に
+#    「ポーリング間隔ぶんの待ち」は混ざらない。
+#
+# ============================================================================
+# どう読むか（実機での手順）
+# ============================================================================
+#   1. 【必須】グリッドを空にする。理由は下の「前提条件」の (E) を読むこと。
+#      ここを飛ばすと1段目まで warm になり、測定値が 0 に潰れる。
+#   2. このフォルダを ptygrid のディレクトリ指定欄に入れて読み込む
+#      （またはこのファイルを自分のプロジェクトルートへ ptygrid.yml としてコピー）。
+#   3. Workflows パネルで `measure-coldstart` を ▶ 実行する。
+#   4. ペインが1枚だけ開き、3往復して run が succeeded になる。
+#   5. パネルの step 行の右端に出る「所要」を3つ読む（0.1 秒刻み）。
+#
+#        s1-cold   12.4s     ← spawn + CLI ブート + Queen 接続 + 1往復
+#        s2-warm    1.3s     ← 1往復だけ（同じペインを再利用）
+#        s3-warm    1.2s     ← 同上。s2 との差がばらつき
+#
+#        cold start = 12.4 − 1.3 = 11.1 秒
+#
+#      「待ち（waited_for_pane_ms）」は 9 面上限の待ち行列時間で**別物**。
+#      ここでは1枚しか使わないので出ないはずで、出たらグリッドを
+#      空にし忘れている。
+#   6. 読み終わったらペインを手で閉じる。閉じないと次の run の1段目が
+#      そのペインを再利用してしまう（(E) と同じ話）。
+#
+# ============================================================================
+# 数字の選び方（なぜこの値か）
+# ============================================================================
+# ● エージェントにさせる仕事 = 「ok と返信するだけ」
+#     **料金がかかる測定**なので、思考も調査もファイル読みもさせない。
+#     測りたいのは立ち上がりであって推論速度ではない。仕事量を極小に固定
+#     すると、s2/s3 の所要がほぼ「1往復の下駄」だけになり、s1 との差が
+#     そのまま cold start になる。
+#
+# ● `await` の `timeoutMs: 55000`（kickoff 文中で指定）
+#     Queen の `await` ツール自身の既定は 30000ms、有効範囲は 1..300000ms
+#     （queen.rs の `AwaitInboxRequest` / `await_inbox`。範囲外は
+#     invalid_params で即エラー）。ここを長く取りたい理由は、
+#     待っている間の再ループが1回増えるたびにモデルのターンが1回増えて
+#     トークンを食うから。逆に長すぎると MCP クライアント側のツール
+#     タイムアウトに当たる危険がある（Claude Code の既定は環境で変わる）。
+#     **55 秒**は「保守的に見て 60 秒のクライアント側上限より内側」かつ
+#     「既定の 30 秒より長い」の両立点。なお 2段目の kickoff は
+#     `await` の watch で即座に起こされるので、正常時にこのタイムアウトが
+#     効くことはない。効くのは run が終わったあとの空回りのときだけ。
+#
+# ● step の `timeoutMs: 120000`（2分）
+#     これは測定値ではなく**詰まりの脱出装置**。値の根拠は2つ:
+#       - 下限側: await 1 ラウンド 55 秒の**2倍（110 秒）より大きい**。
+#         正常時は kickoff が既に inbox にあるので await は即返り、
+#         55 秒を待つことはない。それでも「1回空振りして await し直した」
+#         病的なケースまで誤爆させないために 110 秒より上に置く。
+#       - 上限側: `WORKFLOW_DEFER_MAX_MS`（300 秒 = ペイン待ちの上限）より
+#         十分小さい。2つの別々の待ちが同じオーダーだと、パネルに出た
+#         失敗がどちらの上限なのか読めなくなる。
+#     3 step とも同じ値にしてあるのは、1段目だけ甘くすると「1段目は
+#     通ったが2段目で固まった」ときに切り分けが1つ増えるため。
+#
+# ============================================================================
+# autoClose / ペインを残す方針
+# ============================================================================
+# workflow に `autoClose` を書いていない（= `never`）。理由は3つ:
+#
+#   1. 測定後に画面を読みたい。3往復ぶんのやりとりがペインに残るので、
+#      「2段目でエージェントが何を見ていたか」を後から確認できる。
+#   2. 失敗したときの証拠を残したい。`autoClose` は**セッションが exited に
+#      なったペインにしか効かない**（App.svelte の close ループが
+#      `s.state !== "exited"` で弾く）ので、正常に走っている間はどのみち
+#      何も起きない。効くのは step timeout や Cancel でペインが kill された
+#      後だけで、そこで閉じられると一番読みたい画面が消える。
+#   3. 代償: run のあと**手でペインを閉じる必要がある**。閉じ忘れると次の
+#      run の1段目が同じペインを再利用して cold start が測れない（(E)）。
+#
+# ============================================================================
+# 前提条件（どれか1つでも欠けると1段目から完了しない）
+# ============================================================================
+# (A) **Queen の MCP 登録が済んでいること。** 済んでいないとエージェントは
+#     inbox を読むツール自体を持たないので、1段目が永久に Running のまま。
+#     ツールバーの Queen バッジからコマンドをコピーできる。既定ポートは 39237:
+#
+#         claude mcp add -s user --transport http queen http://127.0.0.1:39237/mcp
+#
+#     登録名を `queen` 以外にした人は、下の kickoff 文中の `mcp__queen__` を
+#     読み替えること（素のツール名 `await` / `reply_inbox` は変わらない）。
+#
+# (B) **queen.enabled: true**（下でそう書いてある）。measure-parallelism は
+#     計測から変数を減らすために Queen を切っていたが、こちらは inbox が
+#     測定対象そのものなので必須。
+#
+# (C) **エージェント CLI が初回セットアップを終えていること。** ログインや
+#     テーマ選択の TUI で止まると、1段目は「起動はしたが返信は来ない」
+#     という一番読みにくい失敗になる。一度手で起動して抜けておくこと。
+#
+# (D) **MCP ツールの承認プロンプトを事前に通しておくこと。** Claude Code は
+#     初回の MCP ツール実行で承認を求める。そこで止まると 1段目が
+#     Blocked のまま timeout する。一度手で承認しておくか、settings の
+#     `permissions.allow` に `mcp__queen__await` と `mcp__queen__reply_inbox`
+#     を入れておく。
+#
+# (E) **グリッドを空にしてから流すこと。** これは測定の正しさに直結する。
+#     `spawn_workflow` の root ループも `reuse_existing = true` で
+#     `spawn_step` を呼ぶ（run が始まった時点では他の step がペインを
+#     握っていないため）。つまり `coldstart` という名前の生きたペインが
+#     残っていると、**1段目すら再利用されて cold start が 0 に潰れる**。
+#     `autostart: false` にしてあるのも同じ理由。
+#     9 面上限の話ではない（ここは1枚しか使わない）。
+#
+# (F) **`agent_status` に `done` パターンを足していないこと。** 組み込みの
+#     `claude` ルールセットは `done: []`（空）なので route 2（セマンティック
+#     done 検出）は発火せず、完了判定は route 3（reply）だけになる。
+#     もし `"*"` ルールセットにシェルプロンプト等の `done` を足していると、
+#     エージェントが返信する前に step が Succeeded になって測定が壊れる。
+#
+# ============================================================================
+# 失敗モード（特に「2段目が完了しない」）
+# ============================================================================
+# この設定の一番の山は **2段目**。1段目のエージェントは既に走っていて、
+# 返信したあと CLI がプロンプトに戻って何も見ていなければ、2段目の kickoff が
+# inbox に届いても誰も気づかない。だから1段目の kickoff に
+# **「返信したあとも await に戻って次のメッセージを待ち続けろ」**と書いてある
+# （agents: の `cmd` に埋めたブートストラップと、3本の kickoff の両方に書いて
+# あるのは冗長ではなく保険。長いセッションで最初の指示が流れても、直近の
+# メッセージ本文に同じ指示が入っている）。
+#
+# それでも2段目が完了しないことはある。そのとき何が起きるか:
+#
+#   ● 症状: `s2-warm` が **Running のまま**動かない。パネルの s2 行には
+#     所要が出ない（`stepTiming` は `endedAtMs` が付くまで何も出さない）。
+#     ペインは生きているが画面が動かない。
+#   ● 放置した場合: 120 秒後に `check_timeouts` が発火し、
+#       - ペインを `kill_pty` する（プロセスは死ぬが**ペインはグリッドに
+#         残る**。`autoClose` を書いていないため。画面はそのまま読める）
+#       - s2 を Failed にして `timed out after 120000ms` を error に載せる
+#       - s3-warm は fail-fast で Skipped、run 全体は Failed で終わる
+#     つまり**放っておいても勝手に終わる**。永久に Running のまま残ることは
+#     ない（`timeoutMs` を消すとそうなる。消さないこと）。
+#   ● 人間が先に打ち切る場合: Workflows パネルの Cancel、または Queen tool
+#     `cancel_workflow`。挙動は timeout とほぼ同じで、Running の step が
+#     Cancelled になりペインが kill される。ペインは残るので画面は読める。
+#   ● 切り分け方（ペインを読む）:
+#       - CLI がプロンプトに戻っている → ループ指示が守られていない。
+#         モデルを指示追従の強いものに替えるか、kickoff をさらに短く強くする。
+#       - MCP の承認ダイアログで止まっている → 前提条件 (D)。
+#       - `await` がエラーを返している → `timeoutMs` が 1..300000 の外か、
+#         mailbox 名が定義名と食い違っている（mailbox は **agents の name**
+#         そのもの。ここでは `coldstart`）。
+#   ● 2段目がどうしても安定しないときの退避: 1段目の所要だけでも
+#     「spawn + ブート + 1往復」の上限値としては読める。往復ぶんを差し引く
+#     基準が欲しければ example/measure-parallelism の合成 workflow で
+#     orchestration 側のコスト（1 依存あたり 200ms + spawn 0.1 秒）を
+#     取っておくこと。
+#
+# 【もう1つの落とし穴】route 3 は**最初の返信を答えとみなす**
+# （`detect_reply_completions` の PROTOCOL 注記）。「了解」→「できました」の
+# 2通に分けて返すと1通目で step が完了する。ここでは本文を `ok` の1通だけに
+# 固定しているので問題にならないが、この設定を流用するときは注意すること。
+# ============================================================================
+
+project: measure-coldstart
+
+queen:
+  # 必須。inbox（kickoff の配送と reply の受け取り）が測定対象そのもの。
+  # 既定ポート。変えたら (A) の mcp add のポートも合わせること。
+  enabled: true
+  port: 39237
+
+agents:
+  # --------------------------------------------------------------------------
+  # 計測対象は**この1体だけ**。3つの step が全部この定義を指すことで、
+  # 1段目は fresh spawn / 2段目以降は同じペインの再利用になる。
+  #
+  # 【cmd に長いプロンプトを埋めてある理由】
+  # kickoff は durable inbox に置かれるだけで、ペインには何も打ち込まれない
+  # （`deliver_kickoff` は `send_inbox` を呼ぶだけ）。素の `claude` を起動すると
+  # 空のプロンプトで待つだけで、自分から inbox を見にいかない。だから
+  # 「起動直後に await を呼べ」という一発目の指示は CLI の起動引数で渡す。
+  # この起動引数の処理時間も cold start の一部なので、測定対象として正しい。
+  #
+  # cmd は `/bin/sh -c` に渡される（session.rs の LaunchSpec.shell_wrap: true）。
+  # プロンプト中でシェルに解釈される文字（" ` $ \）を使わないこと。
+  # 引用は「」を使っている。
+  #
+  # 【ツール名は queen.rs から確認したもの】
+  #   await       … mailbox を watch して待つ（AwaitInboxRequest:
+  #                 mailbox / afterId / includeAcknowledged / limit / timeoutMs）
+  #   reply_inbox … 元メッセージに相関する返信を作り、同時に ack する
+  #                 （ReplyInboxRequest: id / sender / body）
+  #                 sender は**元メッセージの recipient と完全一致**が必要。
+  #                 recipient は step の agent 名なので、ここでは `coldstart`。
+  # Claude Code から見た完全名は `mcp__<登録名>__<ツール名>`。
+  # --------------------------------------------------------------------------
+  - name: coldstart
+    cmd: >-
+      claude "あなたは計測用のセッションです。仕事はしません。考えず、調べず、
+      ファイルも読まず、次のループだけを最短で回してください。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=coldstart, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) 返ってきた messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。
+      (3) 受け取ったメッセージ1件ごとに、queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=そのメッセージのid, sender=coldstart,
+      body=ok で呼ぶ。本文は ok の2文字だけ。要約も感想も書かない。
+      (4) 返信したら**すぐに (1) へ戻る**。これを繰り返す。返信して終わりでは
+      なく、次のメッセージが来るまで await で待ち続けるのが仕事です。
+      (5) (1) が2回続けて timedOut を返したら、その時点で待つのをやめてよい。
+      この往復にかかった時間そのものを人間が計測しています。最短で応答すること。"
+    cwd: "."
+    # (E) の理由でこれは必ず false。読み込んだだけでペインが生えると、
+    # 次の run の1段目が再利用になって cold start が測れなくなる。
+    autostart: false
+    # close_on_exit も書かない（= never）。timeout / Cancel で kill された
+    # あともペインを残して画面を読むため。
+
+  # --------------------------------------------------------------------------
+  # 【代替定義: ローカル LLM（Ollama の Anthropic 互換エンドポイント）】
+  # 料金をかけずに測りたい人向け。上の `coldstart` を丸ごとコメントアウトし、
+  # 下のブロックのコメントを外す（**name は同じ `coldstart` のまま**にすること。
+  # workflows 側を書き換えずに差し替えられる）。
+  #
+  # Ollama は v0.14.0 以降 Anthropic Messages API 互換の /v1/messages を持つので、
+  # ANTHROPIC_BASE_URL を向けるだけで Claude Code がそのまま繋がる。
+  # ANTHROPIC_AUTH_TOKEN は必須だが値は無視される。
+  #
+  # 【この測定に固有の注意】
+  #   - ローカルモデルの1発目にはモデルの VRAM ロードが乗る。つまり
+  #     s1-cold には「CLI の cold start」に加えて「モデルの初回ロード」が
+  #     入り、差し引きが過大に出る。先に別のペインで1回投げてモデルを
+  #     温めてから流すか、s1 にロード時間が入っていることを承知で読むこと
+  #     （Ollama の keep_alive が切れると再ロードされる点も同じ）。
+  #   - ローカルモデルは指示追従が弱く、上の (4)「返信したら await に戻る」を
+  #     守らないことがある。守らないと2段目が完了しない（失敗モードの節）。
+  #     ツール呼び出しに強いモデルを選ぶこと。
+  #   - env だけに頼らない手もある。Claude Code は ~/.claude/settings.json や
+  #     .claude/settings.json の env ブロックも読み、バージョンによっては
+  #     そちらがプロセス env に勝つ。確実にしたい場合は
+  #     example/team-preset/router.settings.json のような設定ファイルを用意し、
+  #     cmd を `claude --settings router.settings.json "..."` にする
+  #     （--settings は CLI 引数スコープなので project/user 設定より上位）。
+  # --------------------------------------------------------------------------
+  # - name: coldstart
+  #   cmd: >-
+  #     claude "あなたは計測用のセッションです。（上と同じ本文をそのまま使う）"
+  #   cwd: "."
+  #   env:
+  #     ANTHROPIC_BASE_URL: "http://127.0.0.1:11434"
+  #     ANTHROPIC_AUTH_TOKEN: "ollama"   # 必須だが無視される
+  #   autostart: false
+
+workflows:
+  # ==========================================================================
+  # 同じ agent を3段並べた pipeline 1本。
+  #
+  #   s1-cold（spawn）→ s2-warm（再利用）→ s3-warm（再利用）
+  #
+  #   s1 − s2 = cold start のコスト
+  #   s2 と s3 の差 = ばらつきの目安（差が s1−s2 と同じオーダーなら、
+  #                   その測定は cold start を測れていないので読み捨てる）
+  #
+  # ● pattern: pipeline
+  #     `spawn_step` の再利用は「pipeline の単数 step」でしか起きない。
+  #     fan-out のコピーは常に fresh spawn になるので、この測定には使えない。
+  #     pipeline の検証条件は「各 step の dependsOn が最大1本」だけ
+  #     （config.rs の validate_workflows）。3段の直鎖はそのまま通る。
+  #
+  # ● joinOn: reply（3段とも）
+  #     **プロセスの exit ではなくエージェントの返信で完了させる。**
+  #     ここが `all`（既定 = route 1 の PTY exit 待ち）だと、再利用側の
+  #     ペインは走り続けているので2段目以降は永久に完了しない。
+  #     route 3 は `detect_reply_completions` が run 専用 mailbox
+  #     `queen:workflow/<name>/<run_id>` に届いた返信を kickoff スレッドの
+  #     root id で相関させて拾う。
+  #
+  # ● kickoff（3段とも必須）
+  #     `joinOn: reply` は kickoff が無いと config.rs の validate_workflows が
+  #     load 時に弾く（返信すべきスレッドが存在しないので永久に完了しない）。
+  #     空白だけの kickoff も同様に弾かれる。
+  #     本文にはどの段でも同じループ指示を短く再掲してある（保険。上記参照）。
+  #
+  # ● dependsOn を1本ずつ張って直列にしてある理由
+  #     並列にすると `agent_claimed_by_other_step` が効いて再利用が起きない
+  #     （同じ agent のペインを別の step が握っている間は、2つの step が
+  #     1つのセッションを共有しないように fresh spawn 側に倒れる）。
+  #     直列なら前段は Succeeded で `holds_a_pane` が false になり、
+  #     次段が同じペインを再利用できる。
+  # ==========================================================================
+  measure-coldstart:
+    pattern: pipeline
+    # autoClose は書かない（= never）。理由は先頭の autoClose の節を参照。
+    steps:
+      - id: s1-cold
+        agent: coldstart
+        joinOn: reply
+        timeoutMs: 120000
+        kickoff: >-
+          ping 1/3。body を ok だけにして reply_inbox（id=このメッセージのid,
+          sender=coldstart, body=ok）で即返信し、返信したらすぐ
+          await（mailbox=coldstart, afterId=0, timeoutMs=55000）に戻って
+          次のメッセージを待つこと。考えない。調べない。
+
+      - id: s2-warm
+        agent: coldstart
+        dependsOn: [s1-cold]
+        joinOn: reply
+        timeoutMs: 120000
+        kickoff: >-
+          ping 2/3。body を ok だけにして reply_inbox（id=このメッセージのid,
+          sender=coldstart, body=ok）で即返信し、返信したらすぐ
+          await（mailbox=coldstart, afterId=0, timeoutMs=55000）に戻って
+          次のメッセージを待つこと。考えない。調べない。
+
+      - id: s3-warm
+        agent: coldstart
+        dependsOn: [s2-warm]
+        joinOn: reply
+        timeoutMs: 120000
+        kickoff: >-
+          ping 3/3。body を ok だけにして reply_inbox（id=このメッセージのid,
+          sender=coldstart, body=ok）で即返信すること。これが最後なので、
+          返信後は await が2回タイムアウトした時点で待つのをやめてよい。
+          考えない。調べない。

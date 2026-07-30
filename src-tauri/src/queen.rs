@@ -1513,4 +1513,76 @@ mod tests {
             ]
         );
     }
+
+    /// `example/measure-coldstart/ptygrid.yml` instructs a paid agent, in
+    /// prose, to call Queen tools by name. Prose is not type-checked: rename
+    /// `await` or `reply_inbox` here and the sample keeps parsing, keeps
+    /// launching, and fails only on a real machine after the operator has
+    /// already spent a spawn — as a step that sits `Running` until its
+    /// `timeoutMs`, which is the single hardest failure in that file to
+    /// diagnose.
+    ///
+    /// So bind the two together. This lives in `queen.rs` rather than beside
+    /// the sample's parse test in `config.rs` because `tool_router()` is the
+    /// authority on what actually exists, and it is reachable here.
+    ///
+    /// Deliberately checks membership, not spelling: the point is "the sample
+    /// names tools this server really exposes", so a rename must be reflected
+    /// in the sample, and a tool that quietly disappears must fail here.
+    #[test]
+    fn example_measure_coldstart_names_only_real_queen_tools() {
+        let sample = include_str!("../../example/measure-coldstart/ptygrid.yml");
+        let exposed: Vec<String> = QueenServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+
+        // The waiting tool and the answering tool: the sample's whole protocol
+        // is these two in a loop, and both the agent's bootstrap `cmd` and every
+        // step's `kickoff` spell them out.
+        for name in ["await", "reply_inbox"] {
+            assert!(
+                exposed.iter().any(|t| t == name),
+                "the cold-start sample tells an agent to call '{name}', which \
+                 this server no longer exposes; update \
+                 example/measure-coldstart/ptygrid.yml before renaming it"
+            );
+            assert!(
+                sample.contains(name),
+                "example/measure-coldstart/ptygrid.yml must name the '{name}' \
+                 tool in its bootstrap prompt and kickoffs"
+            );
+        }
+
+        // `await`'s bounded wait is the one argument the sample hard-codes a
+        // number for, and `await_inbox` rejects anything outside 1..=300_000
+        // with `invalid_params`. An out-of-range value would not fail at load:
+        // it is prose inside a prompt, so the agent would dutifully send it and
+        // spend its step budget looping on an error instead of waiting. Pull
+        // every `timeoutMs=<n>` the sample actually asks for and range-check it.
+        let asked: Vec<u64> = sample
+            .match_indices("timeoutMs=")
+            .map(|(at, needle)| {
+                sample[at + needle.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .expect("timeoutMs= must be followed by a number")
+            })
+            .collect();
+        assert!(
+            !asked.is_empty(),
+            "the sample pins an explicit await round rather than relying on the \
+             30000ms default; if that changed, say so here"
+        );
+        for ms in asked {
+            assert!(
+                (1..=300_000).contains(&ms),
+                "the sample asks await for {ms}ms, which await_inbox rejects as \
+                 invalid_params (accepted range is 1..=300000)"
+            );
+        }
+    }
 }

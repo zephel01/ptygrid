@@ -3154,4 +3154,138 @@ agents:
             .expect("the fan-out step's agent is defined");
         assert_eq!(loser.close_on_exit, Some(AutoCloseMode::Always));
     }
+
+    /// `example/measure-coldstart/ptygrid.yml` — the v0.5.8 item-4 cold-start
+    /// fixture — must load through the real `parse_config`, same as the
+    /// parallelism sample above and for the same reason: it is committed to the
+    /// repo and read by a human who then runs it against paid agents, so a
+    /// config that only fails at load time would waste their run.
+    ///
+    /// The assertions are about the SHAPE the sample's comments promise, and in
+    /// particular about the three properties the measurement is built on:
+    ///
+    /// 1. every step names the SAME agent — that is what makes step 1 a fresh
+    ///    `spawn_step` and steps 2/3 a `live_session_id` reuse, and the
+    ///    difference between their durations the cold start;
+    /// 2. the steps form one linear chain — parallel siblings would trip
+    ///    `orchestrator::agent_claimed_by_other_step` and every step would
+    ///    spawn fresh, measuring nothing;
+    /// 3. every step declares `joinOn: reply` WITH a non-empty `kickoff`. The
+    ///    join is what lets a reused (still-running) pane complete at all, and
+    ///    the kickoff is what `validate_workflows` demands alongside it — this
+    ///    test is the actual proof that the sample clears that check rather
+    ///    than a claim that it does.
+    #[test]
+    fn example_measure_coldstart_config_parses() {
+        let text = include_str!("../../example/measure-coldstart/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/measure-coldstart must parse");
+
+        // Exactly one definition: the measurement compares one agent against
+        // itself, and a second live definition would only add a pane that the
+        // "empty the grid first" precondition then has to talk about.
+        assert_eq!(cfg.agents.len(), 1, "one agent, measured against itself");
+        let agent = &cfg.agents[0];
+        assert_ne!(
+            agent.autostart,
+            Some(true),
+            "autostart would leave a live pane behind, and `spawn_workflow`'s \
+             root loop reuses a live same-name pane — step 1 would be warm too \
+             and the measurement would read ~0"
+        );
+        assert_eq!(
+            agent.close_on_exit, None,
+            "a killed pane must stay on the grid so a wedge can be read"
+        );
+        // The bootstrap prompt is not decoration: kickoffs are delivered to the
+        // durable inbox only (`orchestrator::deliver_kickoff` just calls
+        // `send_inbox`), nothing is typed into the pane, so a bare CLI would sit
+        // at its prompt and step 1 would never complete. The loop instruction is
+        // what makes steps 2/3 possible at all.
+        for needle in ["await", "reply_inbox", "mailbox=coldstart"] {
+            assert!(
+                agent.cmd.contains(needle),
+                "the bootstrap prompt must name {needle:?}: {}",
+                agent.cmd
+            );
+        }
+
+        let workflows = cfg.workflows.as_ref().expect("workflows: block");
+        assert_eq!(workflows.len(), 1, "one workflow, run once and read");
+        let wf = &workflows["measure-coldstart"];
+        assert_eq!(
+            wf.pattern,
+            WorkflowPattern::Pipeline,
+            "reuse only happens for a singular pipeline step; a fan-out copy \
+             always takes a fresh pane"
+        );
+        assert_eq!(
+            wf.auto_close, None,
+            "the panes are the measurement's transcript and must survive it"
+        );
+        assert_eq!(wf.steps.len(), 3, "1 cold + 2 warm");
+
+        assert!(
+            wf.steps.iter().all(|s| s.agent == agent.name),
+            "all three steps must name the one agent, or steps 2/3 are not warm"
+        );
+
+        // A single chain: one root, and every later step depends on exactly the
+        // step before it.
+        assert_eq!(
+            wf.steps[0].depends_on.as_deref().unwrap_or(&[]).len(),
+            0,
+            "the first step is the chain's root"
+        );
+        for pair in wf.steps.windows(2) {
+            assert_eq!(
+                pair[1].depends_on.as_deref(),
+                Some([pair[0].id.clone()].as_slice()),
+                "step '{}' must hang off '{}' alone",
+                pair[1].id,
+                pair[0].id
+            );
+        }
+
+        for step in &wf.steps {
+            assert_eq!(
+                step.join_on,
+                Some(JoinOn::Named(JoinOnName::Reply)),
+                "step '{}': a reused pane never exits, so route 1 can never \
+                 complete it — only a reply join can",
+                step.id
+            );
+            // The `joinOn: reply` + kickoff pairing rule lives in
+            // `validate_workflows`; `parse_config` succeeding above is what
+            // proves the sample satisfies it. Assert the kickoff is really
+            // there so a future edit cannot quietly drop it and re-derive the
+            // error this test exists to prevent.
+            assert!(
+                step.kickoff.as_deref().is_some_and(|k| !k.trim().is_empty()),
+                "step '{}': joinOn: reply requires a non-empty kickoff",
+                step.id
+            );
+            assert_eq!(
+                step.timeout_ms,
+                Some(120_000),
+                "step '{}': the escape hatch is documented as 2 minutes",
+                step.id
+            );
+            assert!(step.fan_out.is_none(), "step '{}': no fan-out", step.id);
+        }
+
+        // The two bounds the file's "why this number" section reasons about.
+        // The step timeout must clear two full 55s `await` rounds (so a single
+        // spurious re-await cannot fail a healthy step) and stay well under the
+        // pane-wait bound (so a timeout in the panel is unambiguous).
+        let step_timeout = wf.steps[0].timeout_ms.expect("checked above");
+        assert!(
+            step_timeout > 2 * 55_000,
+            "a step timeout at or below two await rounds would false-fire"
+        );
+        assert!(
+            step_timeout < crate::orchestrator::WORKFLOW_DEFER_MAX_MS,
+            "the execution bound and the pane-wait bound must stay \
+             distinguishable in the panel"
+        );
+    }
 }
