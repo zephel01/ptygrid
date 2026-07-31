@@ -1,0 +1,158 @@
+# review-starter — 実装 → レビュー → ジャッジ を「3か所だけ埋めれば」回せる雛形
+#
+# このファイルで書き換えるのは kickoff の中の TODO 行だけ。3か所ある:
+#   (1/3) implement の kickoff — 実装役に何をさせるか
+#   (2/3) review    の kickoff — レビュー役に何をチェックさせるか
+#   (3/3) judge     の kickoff — ジャッジ役が何を基準に可否を決めるか
+# それ以外(返信の作法・mailbox 名・ツール名・worktree・タイムアウト・
+# 成果物の受け渡し)は埋めてあるので、触らなくても動く。
+#
+# 使い方と、うまくいかないときの対処は同じフォルダの README.md を読むこと。
+# workflows の文法・落とし穴の詳しい解説は docs/guide/ptygrid-yml-guide.md にある。
+#
+# 前提(README.md「前提」に詳細):
+#   - 使う CLI 側に Queen MCP を登録済みであること。未登録だと 1 段目が進まない
+#   - 作業フォルダが git リポジトリであること(レビュー役が worktree を作るため)
+#
+# この workflow が使うペインは 3 枚(1 段につき 1 枚)。結果を見るシェルを 1 枚
+# 開いても 4 枚で、ペイン上限の 9 枚に対して余裕がある。
+# なお autostart はどれも false なので、読み込んだだけではペインは増えない。
+
+project: review-starter
+
+queen:
+  enabled: true
+  port: 39237
+
+# ---------------------------------------------------------------------------
+# エージェント3体
+#
+# 既定は 3 体とも素の `claude`。初心者が確実に持っているのは claude だけで、
+# codex / grok が無い環境でもそのまま起動できるようにするため。役割はモデルでは
+# なく cmd に埋めたプロンプト(= 起動直後の最初の指示)で分けている。
+#
+# 別モデル・別 CLI にしたくなったら、そのエージェントの cmd だけ差し替える:
+#   - モデルを変える : claude --model <モデル名> "...(プロンプトはそのまま)..."
+#     有効なモデル名は時期によって変わるので、ここにはあえて書いていない。
+#     手元の claude で使える名前を確認してから書くこと。
+#   - 別 CLI にする  : codex "..." / grok "..." など。その CLI 側にも Queen MCP の
+#     登録が別途必要(README.md「前提」を参照)。
+#
+# env の REVIEW_DIR は 3 体で同じ値。レビュー役だけ worktree(別ディレクトリ)で
+# 動くので、リポジトリ内の相対パスでは 3 者が同じファイルを見られない。
+# ${VAR} が展開されるのは agents[].env の値だけ(kickoff では展開されない)。
+# cmd の中の $REVIEW_DIR は起動シェルが展開して実パスになる。
+# ---------------------------------------------------------------------------
+agents:
+  - name: implementer
+    cmd: >-
+      claude
+      "あなたは実装担当です。あなたの mailbox 名は implementer。
+      手順: (1) Queen MCP の await ツールを mailbox=implementer,
+      timeoutMs=300000 で呼び、届いた指示メッセージを受け取る(その id を控える)。
+      届かなければ同じ呼び出しを繰り返す。(2) 着手前に git rev-parse HEAD で
+      開始コミットを控え、指示に従って実装する。ビルドやテストが通らない状態で
+      中断しない。終わったら必ず git commit する(コミットしないとレビュー役が
+      差分を見られない)。(3) mkdir -p $REVIEW_DIR してから
+      $REVIEW_DIR/changes.md に、開始コミットと最終コミットのハッシュ・
+      変更ファイル一覧・やったことの要約を書く。(4) 最後に reply_inbox を
+      id=(1)で控えた id, sender=implementer, body=要約 で 1 回だけ呼ぶ。
+      reply_inbox を呼ばないと次の step が始まらない。最初の返信がそのまま
+      回答として扱われるので、了解だけ先に返してはいけない。"
+    cwd: "."
+    env:
+      REVIEW_DIR: "${HOME}/.ptygrid-review"
+    autostart: false
+
+  - name: reviewer
+    cmd: >-
+      claude
+      "あなたはレビュー担当です。あなたの mailbox 名は reviewer。
+      あなたのペインは専用の worktree で動くので、カレントディレクトリは
+      実装役のものとは別です。手順: (1) Queen MCP の await ツールを
+      mailbox=reviewer, timeoutMs=300000 で呼び、届いたチェック観点を受け取る
+      (その id を控える)。届かなければ同じ呼び出しを繰り返す。
+      (2) $REVIEW_DIR/changes.md を読み、そこに書かれたコミット範囲を
+      git log と git diff で確認する。(3) 指摘を $REVIEW_DIR/review.md に書く。
+      1件につき ファイル:行 / 何が問題か / どう直すか の3点を書く。指摘が無ければ
+      無い旨を書く。コードは自分で直さない。(4) 最後に reply_inbox を
+      id=(1)で控えた id, sender=reviewer, body=指摘件数と要約 で 1 回だけ呼ぶ。
+      reply_inbox を呼ばないと次の step が始まらない。最初の返信がそのまま
+      回答として扱われるので、了解だけ先に返してはいけない。"
+    cwd: "."
+    env:
+      REVIEW_DIR: "${HOME}/.ptygrid-review"
+    autostart: false
+    # worktree はレビュー役だけに付ける。実装役に付けるとコミットが worktree 側の
+    # ブランチに入ってメインの HEAD が動かず、レビュー役が空の diff を見ることになる。
+    worktree:
+      enabled: true
+      base: HEAD
+
+  - name: judge
+    cmd: >-
+      claude
+      "あなたはジャッジ担当です。あなたの mailbox 名は judge。
+      手順: (1) Queen MCP の await ツールを mailbox=judge, timeoutMs=300000 で
+      呼び、届いた判定基準を受け取る(その id を控える)。届かなければ同じ
+      呼び出しを繰り返す。(2) $REVIEW_DIR/changes.md と $REVIEW_DIR/review.md を
+      読む。必要なら git log と git diff も自分で確認する。(3) 判定を
+      $REVIEW_DIR/verdict.md に書く。1行目は必ず {\"verdict\":\"ACCEPT\"} または
+      {\"verdict\":\"REVISE\",\"reason\":\"<差し戻す理由>\"} のどちらかにし、
+      2行目以降に根拠を書く。マージはしない。(4) 最後に reply_inbox を
+      id=(1)で控えた id, sender=judge, body=1行目と同じ判定 で 1 回だけ呼ぶ。
+      最初の返信がそのまま回答として扱われるので、了解だけ先に返してはいけない。"
+    cwd: "."
+    env:
+      REVIEW_DIR: "${HOME}/.ptygrid-review"
+    autostart: false
+
+# ---------------------------------------------------------------------------
+# workflow: implement → review → judge の一直線(pipeline)
+#
+# joinOn: reply は「エージェントが自分の kickoff に reply_inbox で返信したら
+# その step を完了扱いにする」指定。対話 CLI は作業が終わっても自然終了しない
+# ので、この指定が無いと完了を検知できない。返信の作法は各 agent の cmd に
+# 書いてあるので、ここで書くことは無い。
+#
+# 段の間の受け渡しは handoffTo ではなく $REVIEW_DIR のファイルで行う。
+# handoffTo は本文を 1 本しか運べず、2 本目以降は黙って捨てられるため。
+# ---------------------------------------------------------------------------
+workflows:
+  review-loop:
+    pattern: pipeline
+    # `onFailure:` はここに書けてしまうが、orchestrator が一度も読んでいない
+    # （config.rs に定義があるだけ）。書くと効くように見えるので書かない。
+    # 実際の挙動: 途中の step が失敗すると、後続の step は Skipped になる。
+    steps:
+      - id: implement
+        agent: implementer
+        joinOn: reply
+        timeoutMs: 3600000    # 60分。超えたらこの step は失敗になる
+        # ▼▼▼ ここを書き換える (1/3): 実装役への指示 ▼▼▼
+        kickoff: >-
+          TODO: ここに「何を作ってほしいか」を書く。対象ファイルや関数、
+          満たすべき条件、テストの有無まで具体的に書くほど安定する。
+        # ▲▲▲ ここまで書き換える (1/3) ▲▲▲
+
+      - id: review
+        agent: reviewer
+        dependsOn: [implement]
+        joinOn: reply
+        timeoutMs: 1800000    # 30分
+        # ▼▼▼ ここを書き換える (2/3): レビュー役へのチェック観点 ▼▼▼
+        kickoff: >-
+          TODO: ここに「何をチェックしてほしいか」を書く。観点を箇条書きで
+          並べる(例: 仕様どおりか / エラー処理の抜け / 既存テストの破壊)。
+        # ▲▲▲ ここまで書き換える (2/3) ▲▲▲
+
+      - id: judge
+        agent: judge
+        dependsOn: [review]
+        joinOn: reply
+        timeoutMs: 1800000    # 30分
+        # ▼▼▼ ここを書き換える (3/3): ジャッジ役の判定基準 ▼▼▼
+        kickoff: >-
+          TODO: ここに「どうなっていたら通すか」を書く。ACCEPT の条件と
+          REVISE にする条件を、判断に迷わない粒度で書く。
+        # ▲▲▲ ここまで書き換える (3/3) ▲▲▲

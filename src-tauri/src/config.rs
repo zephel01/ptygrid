@@ -3310,6 +3310,77 @@ agents:
     /// * no `fanOut`. Copies of one step all share its `agent`, hence its `cmd`,
     ///   hence its model — the opposite of cross-model.
     #[test]
+    fn example_review_starter_config_parses() {
+        const STARTER: &str = include_str!("../../example/review-starter/ptygrid.yml");
+        let config = parse_config(STARTER).expect("review-starter example must parse");
+
+        let workflow = config
+            .workflows
+            .as_ref()
+            .and_then(|w| w.get("review-loop"))
+            .expect("review-loop workflow");
+        let ids: Vec<&str> = workflow.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["implement", "review", "judge"]);
+
+        // Every step completes on an inbox reply (an interactive CLI pane never
+        // exits on its own), so every step must also carry the non-empty
+        // kickoff `validate_workflows` demands for that join.
+        for step in &workflow.steps {
+            assert!(
+                matches!(step.join_on, Some(JoinOn::Named(JoinOnName::Reply))),
+                "step '{}' must declare joinOn: reply",
+                step.id
+            );
+            let kickoff = step.kickoff.as_deref().unwrap_or_default();
+            assert!(
+                kickoff.starts_with("TODO:"),
+                "step '{}' must ship an obvious placeholder kickoff, got: {kickoff}",
+                step.id
+            );
+            assert!(
+                !kickoff.contains('▼') && !kickoff.contains('▲'),
+                "step '{}' kickoff swallowed a marker comment: {kickoff}",
+                step.id
+            );
+        }
+
+        // Three roles, one pane each — plus a shell the operator opens to read
+        // the verdict, that is 4 of the 9-cell grid.
+        let names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["implementer", "reviewer", "judge"]);
+
+        // Only the reviewer is isolated: a worktree on the implementer would
+        // keep its commits off the main HEAD the reviewer diffs against.
+        let worktree_enabled: Vec<&str> = config
+            .agents
+            .iter()
+            .filter(|a| a.worktree.as_ref().is_some_and(|w| w.effective_enabled()))
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(worktree_enabled, ["reviewer"]);
+
+        // The handoff between steps is a file under a shared absolute path, not
+        // `handoffTo` (which carries a single body and drops the rest), so the
+        // reviewer's separate worktree cwd cannot break it.
+        for agent in &config.agents {
+            assert_eq!(
+                agent
+                    .env
+                    .as_ref()
+                    .and_then(|e| e.get("REVIEW_DIR"))
+                    .map(String::as_str),
+                Some("${HOME}/.ptygrid-review"),
+                "agent '{}' must share the same REVIEW_DIR",
+                agent.name
+            );
+        }
+        assert!(
+            workflow.steps.iter().all(|s| s.handoff_to.is_none()),
+            "the starter passes results through files, not handoffTo"
+        );
+    }
+
+    #[test]
     fn example_cross_model_review_config_parses() {
         let text = include_str!("../../example/cross-model-review/ptygrid.yml");
         let cfg = parse_config(text).expect("example/cross-model-review must parse");
