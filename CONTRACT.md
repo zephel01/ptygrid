@@ -2213,6 +2213,103 @@ team_presets:
 > 本断面のスコープ外で、未解消のままである。
 >
 
+> ---
+>
+> 追記（2026-08-04、続報11）: **`onEach: reply` / `joinOn: stream` — 上流の返信 1 本ごとに
+> 下流を 1 つ起こす（Phase 5.0.7）。** 仕様は
+> [docs/spec/spec-oneach-reply-5.0.7.md](docs/spec/spec-oneach-reply-5.0.7.md)。
+> **本追記は完全に additive** で、`StepOutcome` の JSON 形すら変わらない（下記 (7)）。
+>
+> **(1) 意味の定義。** `joinOn: stream`（上流）を宣言した step は、**生き続けたまま自分の
+> kickoff スレッドへ何度も返信する**。返信 1 本が **unit** であり、`onEach: reply`（下流）を
+> 宣言した step は unit 1 本につきコピーを 1 つ持つ。**番兵 `[[end]]` は wire protocol の
+> 一部である**: trim 後の本文が `[[end]]` と**完全一致**する返信だけが stream の終了宣言で、
+> 部分一致・contains は採らない（unit 本文が番兵に言及しただけで閉じるのは事故）。番兵自身は
+> unit ではなくコピーを生まない。`joinOn` の既存 4 値（`all` / `any` / `n` / `reply`）の意味は
+> 一切変わらない。
+>
+> **(2) 採番。** コピーの `stepId` は既存の fan-out と同じ `"<id>#<k>"` 規約に乗る。`k` は
+> **unit の到着順の 0 始まり連番**で、run 内の当該 step について単調増加・欠番なし・再利用なし。
+> fan-out と違い **コピーが 1 つでも `#0` を付ける**: 素の id 行とコピー行が混在すると
+> `run.steps` 内で「プレースホルダかコピーか」が判別できなくなり、frontend の
+> `{#each run.steps as step (step.stepId)}` のキー一意性も崩れるため。`base_id` は不変。
+>
+> **(3) stream が閉じる条件（2 層）。** 第 1 層は番兵。第 2 層（backstop）は**上流 step が
+> どの経路であれ終端に達したこと**（PTY exit / セマンティック done / `timeoutMs` / `cancel`）で、
+> これは新しい規則ではなく実装からの帰結である — `detect_reply_completions` は `Running` の
+> outcome からしかスレッド root を集めないため、終端に達した step の返信は以後 1 本も
+> 相関されない。これに伴い **`dep_satisfied` と `all_terminal` は `onEach` を持つ step に対し
+> 「stream が閉じていること」を追加要求する**（コピー 2 つが成功しただけで下流の summary step が
+> 走り出すのを防ぐ）。**unit が 1 本も来ないまま閉じたときは `onEach` step を `Failed`** にする
+> （`Skipped` は `finalize_state` に対して中立なので、下流が 1 度も動かなかった run が green に
+> なってしまう。`condition:` の決定A と同じ判断）。
+>
+> **(4) tick の順序は 10 段 → 12 段。** 続報7 (2) の順序を差し替える:
+> `detect_reply_completions` → **`mint_stream_copies`（新）** → `detect_completions` →
+> `check_timeouts` → `cancel_stragglers` → `fire_due_retries` → `arm_retry_backoff` →
+> `condition_targets` → `failfast_targets` → **`close_stream_targets`（新）** → `spawn_ready` →
+> `arm_retry_backoff`(2回目) → `finalize_state`。`mint_stream_copies` が
+> `detect_reply_completions` の**直後**なのは、同じ tick で切り出した unit を同じ tick で行に
+> するため。**unit の ack は行を作ってから**行う（ack が先だとクラッシュ窓で unit が永久に
+> 失われる。逆順なら次回の再走査で済む）。`close_stream_targets` が `failfast_targets` の**後**
+> なのは、fail-fast で潰れた step に閉じの理由文字列を上書きしないため。
+>
+> **(5) `WORKFLOW_DEFER_MAX_MS` の適用条件が変わる。** 従来は「5 分待ったら失敗」で無条件
+> だったが、**その step の兄弟コピーが 1 つでも `Running` の間は適用しない**。この定数の doc
+> comment は「外部がグリッドを占有し続ける wedge から run を守る」ものだと明記しており
+> 「a run that owns no pane always has the full budget available」を前提にしているが、`onEach`
+> では**その run 自身のコピーが 9 面を埋める**ため、行列が正常に流れているだけで失敗する。
+> 兄弟が 1 つも `Running` でない場合（＝グリッドは他人が握っている）は従来どおり 5 分で失敗する。
+> `onEach` 以外の step ではこの述語は構造上つねに false なので、**既存の挙動は変わらない**。
+> 併せて新定数 **`STREAM_MAX_UNITS = 64`**（1 つの stream step が生む unit 総数の上限。超過分は
+> unit にせず **stream step を `Failed`** にして stream を閉じる。`INBOX_REPLY_SCAN_LIMIT` /
+> `REGISTRY_TERMINAL_CAP` と同じ posture で、**数字そのものは根拠の弱い初期値**）と
+> **`STREAM_END_TOKEN = "[[end]]"`**。
+>
+> **(6) load 時検証 V1〜V10（すべて `validate_workflows`、エラーは workflow 名と step 名を含む）。**
+> V1 `onEach` step は `dependsOn` をちょうど 1 件持つ／V2 その唯一の依存は `joinOn: stream` を
+> 宣言していなければならない（`reply` は最初の返信で走査対象から外れるため 2 本目以降が誰にも
+> 見られない — **実装由来の制約を load で固定する**）／V3 `joinOn: stream` の step は非空の
+> `kickoff:` を持つ／V4 `onEach` + `fanOut` 拒否／V5 `onEach` + `condition` 拒否、および
+> `condition` の依存が `joinOn: stream` であることを拒否／V6 `onEach` step・stream step が
+> `handoffTo` を持つこと、および `handoffTo` の**宛先**が `onEach` step であることを拒否／
+> V7 `onEach` step の `joinOn` は `all`（未宣言含む）か `reply` のみ／V8 は**規則を置かない**
+> （stream step への素の `dependsOn` は「全 unit が終わってから 1 度だけ動く summary」として正当）
+> ／V9 `pattern: handoff` に `onEach` / `joinOn: stream` が現れることを拒否／V10 `joinOn: stream`
+> の step が `onEach` の依存として一度も使われていない場合を拒否。**さらに resume 時の拒否**:
+> `resume_workflow` は対象 run の workflow 定義に `onEach` を持つ step があれば
+> `Err("workflow '<name>' contains an onEach step and cannot be resumed; …")` を返す。
+>
+> **(7) 非回帰宣言。** `StepOutcome` は**フィールドの増減なし**（unit 本文は
+> `#[serde(skip)] stream_body` として内部簿記に留まる。`reply_body` / `kickoff_root_msg_id` /
+> `next_retry_at_ms` / `deferred_since_ms` と同じ扱い）。`WorkflowRun` の形も不変で、
+> `steps[]` が run の途中で増える頻度が上がるだけ（件数は `STREAM_MAX_UNITS` で有界）。
+> `workflow-state` に**新規イベントは無い**。Tauri commands / Queen MCP tools は**無変更**。
+> frontend は**無変更で成立する**（`stepId` キーの一意性は (2) の `#0` 規約が保証する）。
+> したがって 5.0.6 以前に永続化された `steps_json` の deserialize も影響を受けない。
+> `ptygrid.yml` は `onEach`（新規キー）と `joinOn: stream`（既存キーの新しい値）の 2 つだけで、
+> **既存設定はバイト単位で同じ意味**。
+>
+> **実装と自動テストの実測。** `config.rs`（`JoinOnName::Stream` / `OnEach` / V1〜V10）と
+> `orchestrator.rs`（`detect_reply_completions` の unit 切り出し、`mint_stream_copies`、
+> `close_stream_targets`、`stream_closed_for`、`spawn_ready` の 1 コピー 1 スロット spawn、
+> `fire_due_retries` の unit 再配送）。`queen_store.rs` / `queen.rs` / frontend は無変更。
+> lib **434 → 459 passed / 0 failed**（新規 25 本 = config 12 + orchestrator 13）、統合 14 不変。
+> `cargo clippy --all-targets` は既存の `nonminimal_bool` **1 件のみ**で本作業起因の新規警告は
+> ゼロ（V3 の判定を `is_none_or` で書いたのはそのため）。frontend は無変更だが実測した: `npm run check`（svelte-check）**136 files / 0 errors / 0 warnings**、`npm run build` **成功**。
+>
+> **解除されないもの（既知の限界）。** (a) **`onEach` を含む run は resume できない** —
+> `resume_workflow` は `Running` の step を base id 単位でコピーごと全部捨てて 1 本の `Pending` に
+> 畳むため完了済みコピーの記録が消え、`kickoff_root_msg_id` が `#[serde(skip)]` なので上流の
+> スレッドも相関し直せない。中途半端に resume するより明示的に拒否して `abandon_workflow` に
+> 落とす。(b) **unit の ack とコピー行の永続化の間にクラッシュ窓が残る** — 順序を入れ替えて
+> 窓は狭めたが `persist_run` は tick の末尾なので完全には塞がらない。(c) **番兵で完了した
+> stream step のペインは exit しないので `autoClose` が効かない**（route 3 の既知の性質）。
+> (d) **実機検証は未実施** — 本追記の裏づけは自動テストのみで、「エージェントが 1 単位ごとに
+> 自発的に返信を刻む」挙動自体がモデル依存であり未確認。手順は spec §7.2、実施状況は
+> plan.md §2 に U 番号として登録する。
+>
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
