@@ -1075,6 +1075,24 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                         ));
                     }
                 }
+                // V11 (added with the per-copy mailbox). A copy awaits on
+                // `wf/<run_id>/<step_id>#<k>`, which has to fit queen_store's
+                // 128-byte mailbox budget: 3 for the prefix, 28 for a run id,
+                // 1 separator and up to 3 for the `#k` suffix leave 93.
+                // Bounded at 64 — comfortably inside, and a round number is
+                // easier to state than a derived one. Caught here rather than
+                // as an inscrutable `send_inbox` failure on every copy of a
+                // run that is already holding panes.
+                if step.id.len() > 64 {
+                    return Err(format!(
+                        "{ctx}: onEach step id '{}' is {} bytes; must be <= 64 \
+                         (each copy awaits on its own mailbox \
+                         'wf/<run_id>/<step_id>#<k>', which must fit queen_store's \
+                         128-byte mailbox budget)",
+                        step.id,
+                        step.id.len()
+                    ));
+                }
                 // V2. The whole feature rests on the upstream staying
                 // `Running` across many replies, and only `joinOn: stream`
                 // does that — `reply` succeeds on the first one and is never
