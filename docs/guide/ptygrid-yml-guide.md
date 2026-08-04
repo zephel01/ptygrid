@@ -64,6 +64,8 @@
 | `retry:` | 各 step | ✅(2026-07-24 追加。`RetryPolicy { max, backoffMs }`。`max` 1..=10 必須、`backoffMs` 指定時 <=60000) | ✅ | ~~`orchestrator.rs` は `retry` を一切参照しないため再試行は起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効。2026-07-25 追記(docs 同期、work-tree 未コミット): 同ブランチ作業ツリー上で `apply_retry_policy` が実装され `advance_run` に配線された(backoff 経過後に同一 step を `restart_session` または新規 `spawn_step` で再起動)。**未解決の既知ギャップ**: `restart_session` 経路は `deliver_kickoff` を呼ばない(新規 spawn 経路のみ再配送)ため、`kickoff` を書いた step が retry で再起動すると空の inbox で起動しうる。未コミット・未マージ・unit test 0 本・実機未検証でもあり、上記 ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `arm_retry_backoff`(期限を張る)と `fire_due_retries`(期限到来分を再起動)に分割して配線された。**続報3 が挙げた既知ギャップは解消**: in-place restart 経路でも `deliver_kickoff` を再実行するため、`kickoff` を書いた step が空 inbox で再起動することはなくなった。なお `condition:` が評価不能で `Failed` になった step は `attempts == 0` ガードにより再 spawn されない。コンパイル・実機検証は未実施。 |
 | `condition:` | 各 step | ✅(2026-07-24 追加。有効な正規表現であること・`dependsOn` を厳密に1件持つこと・同一 step の `fanOut` と併用不可・その唯一の依存先が `fanOut` step でないこと、をバリデーション) | ✅ | ~~`orchestrator.rs` は `condition` を評価しないため、マッチの有無に関わらず step は通常どおり進む。スキーマとロード時バリデーションのみ(未コミット)。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: `condition_targets` が評価する。**3 分岐で、3 番目に注意**: ①マッチ→通常どおり spawn。②非マッチ→`Skipped`(宣言どおり降りたブランチ。`Skipped` は run 終了判定に対して**中立**になったので run は green のまま)。③依存先が返信を残さず完了(`kickoff:` が無い、または `kickoff:` はあるが agent が返信せず exit / `done` で終わった)→**`Failed`**。評価そのものが行われていないため skip 扱いにはしない。`condition:` は依存先が返信を出す構成でのみ意味を持つ。 |
 | `handoffTo:` | 各 step | ✅(2026-07-24 追加。同一 workflow 内の既知 step id を指すこと・自己参照禁止、をバリデーション) | ✅ | ~~`orchestrator.rs` は `handoffTo` を読まないため reply body のチェイニングは起きない。スキーマとロード時バリデーションのみが `track/e-orch-5.0.4` 作業ツリー上に存在(未コミット)。なお `pattern: handoff` の DAG 形状バリデーション(鎖の循環検出・全 step カバー要求など)は §1 上の行に追記済み — この行の対象はフィールド単体の存在チェックのみ。2026-07-24 追記(docs 同期): commit `6bad859` でコミット済み(未コミットは解消)。実行系配線は未完了のため ❌ は変わらず有効~~(この記述は 5.0.4 で失効。取り消し線のまま残置)。**2026-07-25 追記(docs 同期、work-tree 未コミット、CONTRACT.md 続報7)**: reply body のチェイニングが実際に効く(kickoff 合成)。**新規則2件**: 同一 step での `fanOut` との併用はロード時エラー。「次段が直前 step のみを `dependsOn` する」逆辺要求が `handoff` 限定から**全パターン**へ拡大された(従来 pipeline / fan-out / supervisor では `handoffTo` が検証を素通りして実行時に無効化していた)。 |
+| `joinOn: stream` | 各 step | ✅(2026-08-04 追加。非空の `kickoff:` 必須・`fanOut`/`handoffTo`/`condition` 併用不可・`pattern: handoff` 不可・`onEach` の依存として一度も使われていない場合は拒否) | ✅ | 実装済み(5.0.7)。**step が生き続けたまま何度も返信し、返信1本が下流の1コピーになる**。閉じ方は2層: (1) trim 後の本文が `[[end]]` と**完全一致**する返信1通(番兵。部分一致では閉じない。番兵自身はコピーを生まない)、(2) backstop として上流 step の終端(PTY exit / セマンティック done / `timeoutMs` / cancel)。**`timeoutMs` を強く推奨** — 番兵を送り忘れたエージェントを待ち続けないための唯一の脱出装置。1 run あたりの unit 総数は 64 が上限で、超過すると stream step が `Failed` になって閉じる |
+| `onEach: reply` | 各 step | ✅(2026-08-04 追加。`dependsOn` ちょうど1件・その依存が `joinOn: stream` であること必須・`fanOut`/`condition`/`handoffTo` 併用不可・自身の `joinOn` は `all`/`reply` のみ・`pattern: handoff` 不可) | ✅ | 実装済み(5.0.7)。**上流の返信1本ごとにコピーを1つ spawn する**。コピーの step_id は `<id>#<k>`(到着順、**1本しか来なくても `#0`**)、unit 本文は `handoffTo` と同じ合成規則で kickoff の前半に載る。`timeoutMs` / `retry` はコピーごとに独立して効く(再試行時は unit 本文が再配送される)。9面上限は既存の待ち行列に乗り、**兄弟コピーが1つでも走っている間は 5 分の打ち切りが適用されない**。unit が1本も来ないまま stream が閉じたら `Failed`(`Skipped` は run が green になるため採らない)。**この step を含む run は resume できない**(再開バナーは失敗表示になる) |
 | `onFailure: fail-fast` / `continue` | workflow 直下 | ✅ | ✅ | 実装済み。既定 `fail-fast` |
 | `kickoff` | 各 step | ✅ | ✅ | 実装済み。spawn 直後に inbox へ配送 |
 | `arena: true` | workflow 直下 | ✅(パースは通る) | ❌ | Arena UI 自体が未実装(S7 前半、別 Phase)。書いても何も開かない |
@@ -118,13 +120,14 @@ workflows:
         agent: <agents: の定義名>         # 必須。processes: は不可
         dependsOn: [<先行 step id>, ...] # 任意。pipeline は最大1件、省略でルート
         fanOut: <N>                      # fan-out パターンのみ、>= 2
-        joinOn: all | any | <N> | reply  # fan-out の集約規則。既定 all。reply は kickoff 必須(§1/§3.3)
+        joinOn: all | any | <N> | reply | stream  # 集約規則。既定 all。reply / stream は kickoff 必須(§1/§3.3)
         timeoutMs: <ミリ秒>              # 超過で kill+Failed。5.0.4 で enforce(§1)
         retry:                           # 任意。5.0.4 で実行系配線済み(§1)
           max: <1..=10>
           backoffMs: <0..=60000>         # 任意、既定 0
         condition: "<正規表現>"          # 任意。5.0.4 で評価される。dependsOn 1件必須・返信必須(§1)
         handoffTo: <別 step id>          # 任意。5.0.4 で kickoff へ合成される。fanOut 併用不可(§1)
+        onEach: reply                    # 任意。5.0.7。依存(joinOn: stream)の返信1本ごとに1コピー(§1)
         kickoff: "<inbox に投函する初回メッセージ>"  # 任意だが強く推奨(§3.3)
 ```
 
