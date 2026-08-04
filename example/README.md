@@ -19,6 +19,7 @@
 | [adaptive-orchestration/](adaptive-orchestration/ptygrid.yml) | タスクを分類して worker を事前選抜し、Verifier 合格まで反復させる（Phase 5.7.0）。router + routing_hints 表 + plan-build-verify + 総当たり bakeoff |
 | [review-starter/](review-starter/ptygrid.yml) | 実装 → レビュー → ジャッジの3段 workflow。指示 / チェック観点 / 判定基準の**3か所だけ**埋めれば動く雛形（[README](review-starter/README.md)） |
 | [cross-model-review/](cross-model-review/ptygrid.yml) | 実装1体 → **別モデル2体が並行レビュー** → 突き合わせ（`pattern: supervisor`）。レビュアーは worktree で分離し、レビュー本文は `handoffTo` ではなく**ファイル経由**で渡す（`handoffTo` はターゲット1つにつき本文1本しか運ばず、2体目が黙って捨てられるため）。`joinOn: reply` は「2体とも返信した」という同期にだけ使う |
+| [review-as-you-go/](review-as-you-go/ptygrid.yml) | 上流が1件書き終えるたびに下流を1体ずつ起こす（`joinOn: stream` + `onEach: reply`、Phase 5.0.7）。実装1体の返信1本ごとに reviewer#k が生え、番兵 `[[end]]` で締める。削れるのは spawn のコストではなく「上流が全部終わるまで下流が待つ」工程まるごとの待ち時間 |
 | [measure-parallelism/](measure-parallelism/ptygrid.yml) | 計測用。エージェントを `sleep` に置き換えた合成 workflow 4本で、並列化の効きと orchestration のコスト（tick・spawn・9面上限の待ち・joinOn: any の敗者kill）を決定論的に測る |
 | [measure-coldstart/](measure-coldstart/ptygrid.yml) | 計測用。同じ agent を3段並べた pipeline（1段目=spawn / 2・3段目=同じペインの再利用）で、エージェントを毎回 spawn し直す代金（プロセス起動 + CLIブート + Queen接続 + inbox読み直し）を `1段目 − 2段目` の引き算で実測する。`joinOn: reply` + 返信極小。ローカルLLM代替あり |
 

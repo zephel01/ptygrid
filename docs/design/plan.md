@@ -1,9 +1,11 @@
 # ptygrid 作業計画 (plan.md)
 
-更新日: 2026-07-31 / 実装基準: `main`（PR #10 のあと PR #11 / #12 = `17860e0` / `b8300a4` が
-マージされ、`.gitignore` 追加の `89411b9` が直接コミットされている）。作業中のブランチは
-`feat/step-timing-5.0.6` と `feat/terminal-copy-paste`（どちらも `main` から分岐、**origin へ
-push 未・PR 未作成**）。
+更新日: 2026-08-04 / 実装基準: `main`（PR #10 のあと PR #11 / #12 = `17860e0` / `b8300a4` が
+マージされ、`.gitignore` 追加の `89411b9` が直接コミットされている）。**2026-08-04 時点の訂正**:
+`feat/terminal-copy-paste` は PR #13 として `main` にマージ済み（`main` = `5c43019`）、
+`feat/step-timing-5.0.6` は origin へ push 済みで `main` より 9 コミット先行（PR は未マージ）。
+本文中に残る「push 未・PR 未作成」の記述はこの日より前のもので、§4 項目 1 / 項目 7 と
+§6.10 / §6.11 に該当箇所がある。作業中のブランチは `feat/step-timing-5.0.6`。
 最新タグは `v0.5.7`（2026-07-30 作成）、次のタグは `v0.5.8`（未作成）。作業ツリーの
 `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の 3 ファイルはいずれも
 `0.5.7` だが、**タグ `v0.5.7` が指すコミットはそうではない**（→ §4）。
@@ -56,6 +58,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.0.4 追補 | Orchestrator ハードニング: pane 上限の待ち行列化 / driver tick 軽量化（`session_states()`・registry evict）/ inbox mailbox の run 単位分離。wire 契約は無変更 | 🚧 | v0.5.7（`2dc5e40`、PR #3 = `4c02cbb`） | U3 済（2026-07-30）/ U4 未 |
 | 5.0.5 | **Arena view**（`arena.rs` + `Arena.svelte`、`arena-open` イベント、`arena.vote` / `arena.list_votes`）。`arena: true` は現状パースだけ通り、書いても何も開かない | ⬜ | — | 該当なし |
 | 5.0.6（案） | Orchestrator の計測とパイプライン化: `StepOutcome` に step 単位の終了時刻とペイン待ち時間を additive 追加 / 合成 workflow（直列・鎖分割・9 面待ち・fan-out + `joinOn: any` の 4 本）で orchestration の効きだけを測る / cold start（ペイン再利用 vs 毎回 spawn）の実測。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | 🚧 | v0.5.8（予定） | 合成 workflow 4 本の実走と実測 済（2026-07-31、同じ回で U2 も消化）/ cold start 実測 済（2026-07-31、`example/measure-coldstart`）/ U4 は未 |
+| 5.0.7（案） | ストリーミング依存 `onEach: reply` / `joinOn: stream`: 上流が生き続けたまま返信 1 本ごとに「unit」を送り、下流はその 1 本ごとにコピー `<id>#<k>` を 1 つ spawn する。番兵 `[[end]]` と上流終端の 2 層で stream を閉じ、unit 0 本は `Failed`、`STREAM_MAX_UNITS` = 64 で暴走を止める。load 時検証 V1〜V10 と resume 拒否。`StepOutcome` の wire は不変（unit 本文は `#[serde(skip)]`）で frontend も無変更。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2。5.0.6 が確定するまで 5.0.7 も確定しない） | 🚧 | 未定（→ §4） | 未（U14）。自動テストのみ（lib 459 / 統合 14） |
 | 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
 | 5.5.2 | Cost 計算 + `agent-cost` イベント | ⬜ | — | 該当なし |
@@ -128,11 +131,12 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U6 | host モード（Phase 4.2）の Claude Code 実機検証（spec-claude-teams-panes §10.3 の手順） | 実装は入っているが実機手順は未消化。macOS 必須 / Linux はベストエフォート |
 | U7 | Linux 実機での常用 | build / `.deb` / AppImage は Ubuntu 22.04 CI で検証済み（Phase 3.9）。実機常用は beta 表記のまま |
 | U8 | Windows | [porting.md](porting.md) の「Windows 対応チェックリスト」が全項目未着手。`process_name()` が `None` を返すため foreground 名解決 / agent-status / ssh 接続先表示が機能しない |
-| U9 | frontend チェック（`svelte-check` / `npm run build`） | 本作業環境に `node_modules` が無く**未実測**。`src/` は v0.5.1 の `ac1b94b` 以降変更されておらず `v0.5.6..main` の diff も 0 件なので v0.5.1 時点の「0 errors」から変わっていない**はず**だが、これは推測であって実測ではない |
+| U9 | frontend チェック（`svelte-check` / `npm run build`） | **2026-08-04、実測済み**。`npm install` からやり直して `npm run check` = **136 files / 0 errors / 0 warnings**、`npm run build` = **成功**。これで「v0.5.1 時点の 0 errors から変わっていないはず」という推測は実測に置き換わった。なお実行環境は Linux コンテナなので、macOS 限定のメニュー定義（`#[cfg(target_os = "macos")]`）はこのチェックの対象外である |
 | U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
 | U11 | `ptygrid init`（5.0.2）の実機検証 | **2026-07-30、macOS で実施**（すべてスクリーンショットで確認済み）。(1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て、検出結果（opencode/claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定なし）が実環境と一致することを確認、(2) 通常生成で `ptygrid.yml`（2,060 バイト）が生成され agents チップ 7 体が並び、生成物は autostart 全 false のため trust プロンプトは出ずペインも自動起動しないことを確認、(4) 既存設定ありの状態では副入口の書き込み先が `ptygrid.init.yml` に切り替わり、書き込み後も既存 `ptygrid.yml` は mtime・内容とも無変更であることを確認（上書き禁止の実測裏付け）、(5) 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが二重に出る競合を実測（spec §9 で推測としていた箇所が確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` + 3 秒窓）を別コミットで修正済み）。(3) プレビューを手編集して `autostart: true` にしてから書き込むと**今度は trust プロンプトが出て**、「信頼して起動」で当該エージェントが実際に起動することを確認（`init_write` → `loadConfig` → `maybeAutostart` の順序の実証）。**U11 は完了**。Global 選択時の `~/.ptygrid/` 作成のみ今回の範囲外（必要になった時点で確認する）。詳細な経緯は §6.4 |
 | U12 | ローカル LLM プローブ（5.0.2 追補）の実機検証 | **2026-07-30、macOS で 1 回目を実施**（スクリーンショットで確認済み）。検出フォルダ `~/works/tmp/ptygrid`、PATH 上の CLI 7 体（opencode / claude / codex / gemini / qwen / grok / aider）、プロジェクト種別 npm、git リポジトリあり、既存設定ありのため書き込み先が `ptygrid.init.yml` に切り替わることを確認。プローブは 1234 / 3456 / 11434 を叩き、3456 は無応答、**11434 で `Ollama 0.32.1` が応答して「Anthropic API 確証あり」バッジが出てモデル 20 件を取得**（先頭は `x/flux2-klein:latest`）。**まだ確認していないことが 3 点**: (1) モデル選択 `<select>` の実機動作（実装は 2 つ目のコミット `8931464` で入ったが押していない）、(2) 生成された `local-11434` の定義で実際に Claude Code が起動するか、(3) LM Studio を上げたときに未確証の分岐（コメント行出力）へ落ちるか。**U12 は一部済**（この 3 点が残る）。詳細な経緯は §6.9 |
 | U13 | ターミナルのコピー & ペーストの実機検証 | **2026-07-31、macOS で 1 回目を実施**（下記はすべてスクリーンショットで確認済み）。(1) **ペインをまたいだコピー & ペースト**: 1 枚目のペインでファイル名を範囲選択 → Cmd+C → 2 枚目の zsh ペインで Cmd+V し、同じ文字列が入ることを確認。(2) **右クリックメニューの 2 状態**: 選択があるときは「コピー ⌘C」「貼り付け ⌘V」がどちらも有効、**選択が無いときはコピーが無効表示**になり、ツールチップに「選択範囲がありません — ドラッグで選択してください / TUI がマウスを使っている間は macOS なら Option ドラッグ、それ以外は Shift ＋ドラッグ」が出ることを確認。**まだ確認していないことが 4 点**: (1) TUI（Claude Code や vim）がマウスレポートを有効にしている状態での Option ドラッグ選択、(2) 複数行の貼り付けが bracketed paste 対応シェルで Enter を押すまで実行されないこと、(3) Linux / Windows の Ctrl+Shift+C / Ctrl+Shift+V（U7 / U8 の範囲）、(4) macOS のメニューバーに Edit メニューが実際に出ていること（貼り付けが動いた以上は出ている可能性が高いが、**目視の記録は無い**ので未確認扱い）。**U13 は一部済**（この 4 点が残る）。詳細な経緯は §6.10 |
+| U14 | **`onEach: reply` / `joinOn: stream`（5.0.7）の実機検証** | 未実施。実装と自動テスト（lib 459 / 統合 14）は 2026-08-04 に入ったが、**実機では一度も流していない**。手順は [spec-oneach-reply-5.0.7.md](../spec/spec-oneach-reply-5.0.7.md) §7.2 の 4 項目: (1) `example/review-as-you-go` を流し、**上流が 3 本目の返信を送る前に 1 人目の reviewer が動き出していること**をスクリーンショットで確認（＝直列でないことの目視証拠）、(2) 同じ課題を `onEach` 無し（直列）と有りで**各 2 回ずつ**流してrun の壁時計を比べる（実エージェントの所要はばらつくので 1 回では差が判定できない）、(3) 番兵を送り忘れる指示文へわざと差し替え、`timeoutMs` で run が終端に到達すること、(4) unit を 12 本出させ、9 面上限で待ち行列ができ**5 分を超えても待ちが失敗にならない**こと。**最大の未確認はモデル依存**: 「走り続けているエージェントが 2 通目・3 通目の kickoff を拾える」ことは §6.12 で確認済みだが、**「1 単位ごとに自発的に返信を刻む」挙動は未確認**である |
 
 ---
 
@@ -209,8 +213,11 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
   全部終わるまで下流が待つ」という工程まるごとの待ち時間で、実タスクなら数分単位になる。orchestration
   自体は 1 依存あたり 200ms しか食っていない（→ §6.11）ので、削るべきは待ち時間のほう。**`mode: serve`
   を捨てるわけではなく順番が後**で、常駐が実機で成立すること自体は同じ回で確認できている（→ §6.12）。
-  文脈の読み直しコストを別途測ってから改めて判断してもよい。spec は `docs/spec/` に起こす（本文書は
-  ファイル名を決め打ちしない）。実装は v0.5.9 以降。
+  文脈の読み直しコストを別途測ってから改めて判断してもよい。**spec は起こし済み**
+  （[spec-oneach-reply-5.0.7.md](../spec/spec-oneach-reply-5.0.7.md)、2026-07-31）、**実装も入った**
+  （2026-08-04、→ §6.13）。当初「実装は v0.5.9 以降」と書いていたが前倒しになったので、**どのタグに
+  載せるかは §4 の判断待ち**。この項目に残っているのは**実タスクでのベースライン測定**のほうで、
+  それには U4（同名 workflow の並行 run）と U14（5.0.7 の実機検証）が前提になる。
 
 ### P6. 未着手フェーズ（着手順の案）
 
@@ -457,9 +464,20 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
    この作業環境の Linux では `cfg` で落ちるため、一時的に `cfg(all())` へ書き換えて実際にコンパイルと
    lint を通してから元に戻している）。実機検証は U13（一部済）。
 
-**タグの内容には数えないもの**: 実タスクでのベースライン測定と改良構成の比較、`onEach: reply` /
-`mode: serve` の spec 執筆（どちらも §3 P5。順序は項目 4 の実測で `onEach: reply` 先行に決まった。
-実装は v0.5.9 以降）。
+**タグの内容には数えないもの**: 実タスクでのベースライン測定と改良構成の比較、`mode: serve` の
+spec 執筆（どちらも §3 P5。順序は項目 4 の実測で `onEach: reply` 先行に決まった）。
+
+**（2026-08-04 追記）`onEach: reply` の実装が前倒しで入った。** 上の一文はもともと「`onEach: reply` /
+`mode: serve` の spec 執筆」を数えないものとして並べ、実装を v0.5.9 以降に置いていた。実際には spec
+（[spec-oneach-reply-5.0.7.md](../spec/spec-oneach-reply-5.0.7.md)）に続いて実装・自動テスト・CONTRACT
+先行追記・`example/review-as-you-go` まで一度に入っている（→ §6.13）。**これを v0.5.8 に含めるか、
+v0.5.9 として切るかはユーザー判断**であり、本文書はどちらとも決めない。判断材料は 2 つだけ:
+
+- **含める場合**: v0.5.8 は「計測して、その結果で決めた機能まで」という 1 本の筋になる。ただし
+  **実機検証（U14）が未消化のまま**タグに入ることになり、v0.5.7 までの「タグには実機で見たものを
+  入れる」運びとは食い違う。
+- **分ける場合**: v0.5.8 は計測とターミナルのコピー & ペーストで閉じ、5.0.7 は U14 を消してから
+  v0.5.9 として切れる。項目 5（U4 の消化）は依然 v0.5.8 の残作業として残る。
 
 ### リリース手順（タグ付けの作法）
 
@@ -843,6 +861,48 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   まるごとの待ち時間（実タスクなら数分単位）だから。合成 workflow の実測で orchestration 自体は
   1 依存あたり 200ms しか食っていないことが分かっている（→ §6.11）ので、削るべきは待ち時間のほう。
   `mode: serve` を捨てるわけではなく順番が後で、文脈の読み直しコストを別途測ってから判断してもよい。
+
+### 6.13 2026-08-04: `onEach: reply` / `joinOn: stream` の実装（5.0.7 案）
+
+詳細な経緯。現在地は §1・§2（U14）・§4。
+
+- 入ったもの: `config.rs`（`JoinOnName::Stream` の 1 値追加、`WorkflowStep::on_each: Option<OnEach>`、
+  検証 V1〜V10）と `orchestrator.rs`（`detect_reply_completions` の unit 切り出し、新設の
+  `mint_stream_copies` / `close_stream_targets` / `stream_closed_for`、`spawn_ready` の 1 コピー
+  1 スロット spawn、`fire_due_retries` の unit 再配送、`defer_step` の打ち切り条件、
+  `resume_workflow` の拒否）。CONTRACT.md に**先行追記**（続報11）、
+  `example/review-as-you-go` を 1 本追加、`docs/guide/ptygrid-yml-guide.md` §1 に 2 行追加。
+  `queen_store.rs` / `queen.rs` / frontend は**無変更**。
+- **設計上、いちばん危なかった箇所**（いずれも spec §3.6 / §3.4.4 が名指ししていたもの）:
+  - **ペイン再利用**: `agent_claimed_by_other_step` は `base_id(o.step_id) != step.id` で判定するため
+    **同じ step の兄弟コピーを「他の step」に数えない**。既存の `copies == 1` 経路にそのまま載せると、
+    2 つ目のコピーが 1 つ目のペインを黙って引き取り、1 つの session を 2 つの outcome が追跡し、
+    `slots_needed` が 0 を返して 9 面上限を踏み越える。**黙って壊れる**種類の不具合なので、
+    `reuse_existing: false` を固定したうえで回帰テスト
+    （`on_each_copies_each_take_their_own_pane`）を置いた。
+  - **`WORKFLOW_DEFER_MAX_MS`（5 分）の意味**: この定数の doc comment は「外部がグリッドを占有し
+    続ける wedge から run を守る」ものだと明記しており、「run 自身はつねに全予算を使える」を前提に
+    している。`onEach` はその前提を内側から壊す（自分のコピーが 9 面を埋める）ので、**兄弟コピーが
+    1 つでも `Running` の間は打ち切らない**ことにした。`onEach` 以外では同じ述語が構造上つねに
+    false なので既存挙動は変わらない。
+  - **完了判定**: コピーが全部成功しても上流がまだ `Running` なら次の unit が来うるため、
+    `dep_satisfied` / `all_terminal` に「stream が閉じていること」を足した。これが無いと、
+    レビュー 2 件が返ってきた時点で `summary` step が走り出す。
+- 当時の検証: **自動テストのみ**。lib **434 → 459 passed / 0 failed**（新規 25 本 = config 12 +
+  orchestrator 13）、統合 **14 不変**、`cargo clippy --all-targets` は既存の `config.rs` の
+  `nonminimal_bool` **1 件のみ**（V3 の判定を `is_none_or` で書いたのは、素直に
+  `!…is_some_and(…)` と書くとその警告が 2 件になるため）。frontend は無変更だが**この回で初めて実測した**:
+  `npm run check`（svelte-check）**136 files / 0 errors / 0 warnings**、`npm run build` **成功**
+  （U9 が「本作業環境に `node_modules` が無く未実測」としていた項目。今回は `npm install` から通した）。
+  **実機検証は未実施**で U14 として登録した。
+- 当時の注記: **番兵 `[[end]]` は完全一致**で判定する。部分一致にすると unit 本文が番兵に言及した
+  だけで stream が閉じるため、テスト（`stream_end_token_must_be_the_whole_message`）でそれを固定した。
+  **unit の ack はコピー行を作ってから**行う（逆順だとクラッシュ窓で unit が永久に失われる。この順序に
+  しても `persist_run` は tick 末尾なので窓は完全には塞がらず、そのぶんは resume 拒否で受けている）。
+  **今回やっていないこと**: 実タスクでの取り分の測定（spec §1.2 の「実タスクなら分単位」は合成
+  workflow と cold start からの**外挿であって未測定**）、`onEach` を含む run の resume、unit ごとの
+  `condition:`、`mode: serve`。`STREAM_MAX_UNITS = 64` は**数字そのものの根拠が弱い初期値**で、
+  実タスク測定（§3 P5）のあとに見直す。
 
 ---
 

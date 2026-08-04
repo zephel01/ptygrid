@@ -582,6 +582,40 @@ pub enum JoinOnName {
     /// `kickoff:` on the same step — validated below, because without a thread
     /// to reply on the step could never complete.
     Reply,
+    /// Phase 5.0.7: the step stays alive and sends MANY replies on its own
+    /// kickoff thread, one per unit of work, and declares the end of the
+    /// stream by replying with a body that is exactly the sentinel
+    /// `[[end]]` (`orchestrator::STREAM_END_TOKEN`).
+    ///
+    /// The difference from `reply` is which reply counts: `reply` treats the
+    /// FIRST reply as the answer and completes the step there, so a second
+    /// reply is never even scanned for (`detect_reply_completions` only looks
+    /// at `Running` steps). `stream` keeps the step `Running` across every
+    /// reply, hands each one to the downstream `onEach: reply` step as a unit,
+    /// and only completes on the sentinel — or, as a backstop, when the step
+    /// terminates by any other route (PTY exit, semantic `done`, `timeoutMs`,
+    /// cancel), which is why a `timeoutMs` is strongly recommended on one.
+    ///
+    /// Only meaningful with a downstream consumer: a `stream` step nobody
+    /// declares `onEach: reply` against is rejected at load (rule V10 below),
+    /// because the sentinel protocol it asks its agent to follow would have no
+    /// reader.
+    Stream,
+}
+
+/// Phase 5.0.7: streaming dependency, declared on the DOWNSTREAM step.
+/// `onEach: reply` spawns one copy of this step — `"<id>#<k>"`, k in unit
+/// arrival order — per reply ("unit") sent by its single upstream
+/// `joinOn: stream` dependency, instead of waiting for that dependency to
+/// finish. See docs/spec/spec-oneach-reply-5.0.7.md.
+///
+/// A one-variant enum on purpose: the shape leaves room for a future
+/// `onEach: line` (or similar) without changing the key, exactly as `JoinOn`
+/// is an untagged enum so `all` and `3` can share `joinOn`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnEach {
+    Reply,
 }
 
 /// Phase 5.0: one workflow declaration. See docs/spec/spec-phase5-0.md §2.1.
@@ -682,6 +716,17 @@ pub struct WorkflowStep {
     /// prepended to the target step's `kickoff` (see `orchestrator::handoff`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_to: Option<String>,
+    /// Phase 5.0.7: spawn one copy of this step per reply sent by its single
+    /// `dependsOn` dependency, which must declare `joinOn: stream`. The unit's
+    /// body is prepended to this step's own `kickoff` exactly the way a
+    /// `handoffTo` carry is (`orchestrator::handoff::compose_kickoff`).
+    ///
+    /// Requires exactly one `dependsOn` entry, and is mutually exclusive with
+    /// `fanOut`, `condition` and `handoffTo` (rules V1/V4/V5/V6 in
+    /// `validate_workflows`). Additive: omitting it leaves a step behaving
+    /// exactly as it did before 5.0.7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_each: Option<OnEach>,
 }
 
 /// Longest workflow name whose run mailbox still fits `queen_store`'s
@@ -822,6 +867,20 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                             step.id, dep_step.id
                         ));
                     }
+                    // Rule V5, second half (5.0.7). Same reasoning as the
+                    // fan-out rejection directly above: `condition_targets`
+                    // evaluates the dependency's `reply_body` exactly once,
+                    // and a `joinOn: stream` step's `reply_body` is only ever
+                    // "the most recent unit" — which unit the operator's regex
+                    // was meant to test is undefined.
+                    if matches!(dep_step.join_on, Some(JoinOn::Named(JoinOnName::Stream))) {
+                        return Err(format!(
+                            "{ctx}: step '{}' condition depends on joinOn: stream step '{}'; \
+                             not supported (a stream step's reply body is whichever unit \
+                             arrived last, so there is no single body to match against)",
+                            step.id, dep_step.id
+                        ));
+                    }
                 }
             }
             // Phase 5.0.4: `joinOn: reply` completes ONLY on an inbox reply to
@@ -894,6 +953,173 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                         step.id, target, target, step.id
                     ));
                 }
+                // Rule V6, target side (5.0.7). An `onEach` copy already uses
+                // the carried half of `compose_kickoff` for its own unit body,
+                // so a handoff carry aimed at it would have to share one slot
+                // with a different piece of text per copy — and
+                // `handoff_bodies` is a per-STEP map that cannot express that.
+                if wf
+                    .steps
+                    .iter()
+                    .find(|s| &s.id == target)
+                    .is_some_and(|s| s.on_each.is_some())
+                {
+                    return Err(format!(
+                        "{ctx}: step '{}' handoffTo '{}', which declares onEach; not supported \
+                         (an onEach copy already carries its own unit body into its kickoff)",
+                        step.id, target
+                    ));
+                }
+            }
+            // ---- Phase 5.0.7: `joinOn: stream` (upstream) and `onEach`
+            // (downstream). Rules V1-V7 of spec-oneach-reply-5.0.7.md §4.2;
+            // V8 is deliberately no rule at all, V9 lives in the `handoff`
+            // pattern arm below and V10 in the workflow-level pass after this
+            // loop.
+            if matches!(step.join_on, Some(JoinOn::Named(JoinOnName::Stream))) {
+                // V3. Same reasoning as `joinOn: reply` directly above, and
+                // it bites harder here: without a kickoff thread the agent
+                // has nothing to reply on, so the stream produces no units
+                // AND never sees its sentinel.
+                //
+                // Spelled `is_none_or` rather than mirroring the `reply`
+                // check's `!…is_some_and(…)` on purpose: the negated form is
+                // what earns this file its one standing `nonminimal_bool`
+                // clippy warning, and a second copy of it would be a new one.
+                if step
+                    .kickoff
+                    .as_deref()
+                    .is_none_or(|k| k.trim().is_empty())
+                {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares joinOn: stream but has no kickoff; \
+                         a stream sends its units as replies on its own kickoff thread, \
+                         so without one it can neither emit a unit nor end",
+                        step.id
+                    ));
+                }
+                if step.fan_out.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both fanOut and joinOn: stream; not supported \
+                         (which copy's replies would be the units is undefined)",
+                        step.id
+                    ));
+                }
+                if step.handoff_to.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both joinOn: stream and handoffTo; \
+                         not supported (a stream has many reply bodies and handoffTo carries one)",
+                        step.id
+                    ));
+                }
+                if step.condition.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both joinOn: stream and condition; \
+                         not supported",
+                        step.id
+                    ));
+                }
+            }
+            if step.on_each.is_some() {
+                let deps = step.depends_on.as_deref().unwrap_or(&[]);
+                // V1. "Per each reply of A *and* of B" has no defined product,
+                // so onEach is single-dependency like `condition`.
+                if deps.len() != 1 {
+                    return Err(format!(
+                        "{ctx}: step '{}' onEach requires exactly one dependsOn (found {})",
+                        step.id,
+                        deps.len()
+                    ));
+                }
+                // V4. `#k` already means "unit number" for an onEach step;
+                // letting fanOut mint copies too would overload one id space.
+                if step.fan_out.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both fanOut and onEach; not supported \
+                         (both mint '<id>#k' copies, so the suffix would mean two things)",
+                        step.id
+                    ));
+                }
+                // V5, first half.
+                if step.condition.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both condition and onEach; not supported \
+                         (condition is evaluated once, onEach spawns per unit)",
+                        step.id
+                    ));
+                }
+                // V6, source side.
+                if step.handoff_to.is_some() {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares both onEach and handoffTo; not supported \
+                         (which copy's reply would be carried is undefined)",
+                        step.id
+                    ));
+                }
+                // V7. `all` (the default) and `reply` both apply per copy.
+                // `any`/`n` do not: `n` is range-checked at load against the
+                // pattern's copy count, which for onEach is not known until
+                // the units arrive, and `any` would have `cancel_stragglers`
+                // kill the sibling units — which are independent work items,
+                // not racers.
+                match step.join_on {
+                    None
+                    | Some(JoinOn::Named(JoinOnName::All))
+                    | Some(JoinOn::Named(JoinOnName::Reply)) => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "{ctx}: step '{}' declares onEach with a joinOn other than \
+                             all/reply; not supported (onEach copies are independent units, \
+                             so any/n would cancel work and stream would nest streams)",
+                            step.id
+                        ));
+                    }
+                }
+                // V2. The whole feature rests on the upstream staying
+                // `Running` across many replies, and only `joinOn: stream`
+                // does that — `reply` succeeds on the first one and is never
+                // scanned again, `all`/`any`/`n` never complete on a reply at
+                // all, so the stream could only ever be closed by `timeoutMs`.
+                let dep_is_stream = wf
+                    .steps
+                    .iter()
+                    .find(|s| s.id == deps[0])
+                    .is_some_and(|s| {
+                        matches!(s.join_on, Some(JoinOn::Named(JoinOnName::Stream)))
+                    });
+                if !dep_is_stream {
+                    return Err(format!(
+                        "{ctx}: step '{}' declares onEach but its dependency '{}' does not \
+                         declare joinOn: stream; only a stream step keeps running across \
+                         several replies, so nothing else can produce more than one unit",
+                        step.id, deps[0]
+                    ));
+                }
+            }
+        }
+        // V10 (5.0.7): a `joinOn: stream` step with no `onEach` reader. The
+        // sentinel/one-reply-per-unit protocol is something the operator has
+        // to write into the agent's kickoff, so a stream nobody consumes is a
+        // config that asks for work and then discards it — the same "declared
+        // but inert" failure the `handoffTo` back-edge rule exists to catch.
+        for step in &wf.steps {
+            if !matches!(step.join_on, Some(JoinOn::Named(JoinOnName::Stream))) {
+                continue;
+            }
+            let has_reader = wf.steps.iter().any(|s| {
+                s.on_each.is_some()
+                    && s.depends_on
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .any(|d| d == &step.id)
+            });
+            if !has_reader {
+                return Err(format!(
+                    "{ctx}: step '{}' declares joinOn: stream but no step declares \
+                     onEach: reply on it; the stream's units would have no reader",
+                    step.id
+                ));
             }
         }
         // dependsOn references must be known step ids.
@@ -1025,6 +1251,24 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
                             "{ctx}: handoff step '{}' declares fanOut; fanOut only has \
                              meaning under pattern: fan-out — express handoff \
                              parallelism via a different pattern instead",
+                            step.id
+                        ));
+                    }
+                }
+                // Rule V9 (5.0.7). `handoff` demands that every step sits on
+                // one root->terminal chain linked by `handoffTo`, and both
+                // 5.0.7 roles are barred from declaring `handoffTo` (V6) — so
+                // either one would be a step the chain cannot reach, which
+                // the coverage check below would report as a confusing
+                // "chain covers N of M steps" instead of the real cause.
+                for step in &wf.steps {
+                    if step.on_each.is_some()
+                        || matches!(step.join_on, Some(JoinOn::Named(JoinOnName::Stream)))
+                    {
+                        return Err(format!(
+                            "{ctx}: handoff step '{}' declares onEach or joinOn: stream; \
+                             neither can carry a handoffTo edge, so it cannot be part of \
+                             the single chain handoff requires",
                             step.id
                         ));
                     }
@@ -3636,4 +3880,319 @@ agents:
             );
         }
     }
+
+    // ---- Phase 5.0.7: `onEach: reply` / `joinOn: stream` load-time rules
+    // (spec-oneach-reply-5.0.7.md §4.2, V1-V10). Each rule gets a rejection
+    // and, where the rule is about a combination rather than a typo, the
+    // adjacent acceptance that proves it is not over-broad.
+
+    /// The shape every rule below is a deviation from: a stream upstream and
+    /// one `onEach` consumer. Parametrised so a test can vary exactly one
+    /// line and leave the rest known-good.
+    fn stream_yaml(coder_extra: &str, reviewer_extra: &str) -> String {
+        format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n\
+             \x20     - id: coder\n        agent: a\n        joinOn: stream\n\
+             \x20       kickoff: one reply per module\n{coder_extra}\
+             \x20     - id: reviewer\n        agent: b\n        dependsOn: [coder]\n\
+             \x20       onEach: reply\n{reviewer_extra}"
+        )
+    }
+
+    #[test]
+    fn workflow_stream_and_on_each_minimal_pair_is_accepted() {
+        let yaml = stream_yaml("", "");
+        assert!(
+            parse_config(&yaml).is_ok(),
+            "the canonical stream/onEach pair must load: {:?}",
+            parse_config(&yaml).err()
+        );
+    }
+
+    /// V1. "Per each reply of A *and* of B" has no defined product, so an
+    /// `onEach` step is single-dependency exactly like a `condition` step.
+    #[test]
+    fn workflow_on_each_requires_exactly_one_dependency() {
+        // `supervisor` rather than `pipeline` because pipeline rejects a
+        // second dependency on linearity grounds first, which would prove
+        // nothing about this rule.
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: root\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: other\n        agent: c\n        dependsOn: [root]\n      - id: reviewer\n        agent: b\n        dependsOn: [root, other]\n        onEach: reply\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("onEach requires exactly one dependsOn"),
+            "error was: {err}"
+        );
+    }
+
+    /// V2, and the most important of the ten: it pins an implementation fact.
+    /// `detect_reply_completions` only scans `Running` steps, and
+    /// `joinOn: reply` succeeds on its FIRST reply — so an `onEach` hung off
+    /// a `reply` upstream could never see a second unit. Rejecting it turns a
+    /// workflow that silently reviews only the first file into a load error.
+    #[test]
+    fn workflow_on_each_rejects_a_non_stream_upstream() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n      - id: coder\n        agent: a\n        joinOn: reply\n        kickoff: go\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("does not declare joinOn: stream"),
+            "error was: {err}"
+        );
+    }
+
+    /// V3. A stream sends its units as replies on its own kickoff thread, so
+    /// without a kickoff it can neither emit one nor deliver its sentinel.
+    #[test]
+    fn workflow_stream_without_a_kickoff_is_rejected() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("joinOn: stream but has no kickoff"),
+            "error was: {err}"
+        );
+    }
+
+    /// V4. Both `fanOut` and `onEach` mint `"<id>#k"` rows, so together the
+    /// suffix would mean two different things in one id space.
+    #[test]
+    fn workflow_on_each_with_fan_out_is_rejected() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: fan-out\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n        fanOut: 3\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("both fanOut and onEach"),
+            "error was: {err}"
+        );
+    }
+
+    /// V5, both halves: `condition` is evaluated once against one reply body,
+    /// which neither an `onEach` step (many copies) nor a stream dependency
+    /// (many bodies, only the last retained) can supply.
+    #[test]
+    fn workflow_condition_and_stream_do_not_mix() {
+        // Either half of V5 can fire first here: rule V2 already forces an
+        // `onEach` step's only dependency to be a stream, so this config
+        // trips both. What matters is that it is refused, not which sentence
+        // does the refusing.
+        let same_step = stream_yaml("", "        condition: \"ok\"\n");
+        let err = parse_config(&same_step).unwrap_err();
+        assert!(
+            err.contains("both condition and onEach")
+                || err.contains("condition depends on joinOn: stream step"),
+            "condition on the onEach step itself must be rejected; error was: {err}"
+        );
+
+        let downstream_of_stream = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n      - id: gated\n        agent: c\n        dependsOn: [coder]\n        condition: \"ok\"\n"
+        );
+        assert!(
+            parse_config(&downstream_of_stream)
+                .unwrap_err()
+                .contains("condition depends on joinOn: stream step"),
+            "a condition reading a stream's reply body must be rejected too"
+        );
+    }
+
+    /// V6, all three directions. `handoff_bodies` is a per-STEP map, so it
+    /// cannot express "a different body per copy" — and an `onEach` copy is
+    /// already using the carried half of its kickoff for its own unit.
+    #[test]
+    fn workflow_handoff_to_and_stream_roles_do_not_mix() {
+        let from_stream = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n        handoffTo: reviewer\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n"
+        );
+        assert!(
+            from_stream.contains("handoffTo"),
+            "fixture sanity: the source declares handoffTo"
+        );
+        let err = parse_config(&from_stream).unwrap_err();
+        assert!(
+            err.contains("both joinOn: stream and handoffTo")
+                || err.contains("which declares onEach"),
+            "error was: {err}"
+        );
+
+        let into_on_each = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: mid\n        agent: c\n        dependsOn: [coder]\n        handoffTo: reviewer\n      - id: reviewer\n        agent: b\n        dependsOn: [coder, mid]\n        onEach: reply\n"
+        );
+        let err = parse_config(&into_on_each).unwrap_err();
+        assert!(
+            err.contains("onEach requires exactly one dependsOn")
+                || err.contains("which declares onEach"),
+            "error was: {err}"
+        );
+    }
+
+    /// V7. `all` and `reply` apply per copy and are allowed; `any` would have
+    /// `cancel_stragglers` kill sibling units that are independent work, and
+    /// `n` cannot be range-checked at load because the copy count is not
+    /// known until the units arrive.
+    #[test]
+    fn workflow_on_each_join_is_limited_to_all_and_reply() {
+        assert!(
+            parse_config(&stream_yaml("", "        joinOn: reply\n        kickoff: review\n"))
+                .is_ok(),
+            "joinOn: reply on an onEach step is the documented pairing"
+        );
+        for bad in ["any", "stream"] {
+            let yaml = stream_yaml("", &format!("        joinOn: {bad}\n        kickoff: r\n"));
+            let err = parse_config(&yaml).unwrap_err();
+            assert!(
+                err.contains("joinOn other than all/reply") || err.contains("no step declares"),
+                "joinOn: {bad} error was: {err}"
+            );
+        }
+        let counted = stream_yaml("", "        joinOn: 2\n");
+        let err = parse_config(&counted).unwrap_err();
+        assert!(
+            err.contains("joinOn other than all/reply") || err.contains("effective copy count"),
+            "error was: {err}"
+        );
+    }
+
+    /// V8 is the one rule that is deliberately no rule: a step may depend on
+    /// a stream WITHOUT `onEach`, which is how "summarise the whole stream
+    /// once it is over" is written.
+    #[test]
+    fn workflow_plain_dependency_on_a_stream_is_allowed() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: supervisor\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n      - id: summary\n        agent: c\n        dependsOn: [coder]\n"
+        );
+        assert!(
+            parse_config(&yaml).is_ok(),
+            "a plain dependsOn on a stream step must stay legal: {:?}",
+            parse_config(&yaml).err()
+        );
+    }
+
+    /// V9. `handoff` requires every step to sit on one `handoffTo` chain, and
+    /// V6 bars both 5.0.7 roles from declaring `handoffTo` — so either one
+    /// would be a step the chain cannot reach.
+    #[test]
+    fn workflow_handoff_pattern_rejects_stream_and_on_each() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: handoff\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n        handoffTo: reviewer\n      - id: reviewer\n        agent: b\n        dependsOn: [coder]\n        onEach: reply\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("joinOn: stream") || err.contains("onEach"),
+            "error was: {err}"
+        );
+    }
+
+    /// V10. A stream nobody consumes asks its agent to follow the
+    /// unit-and-sentinel protocol and then throws the units away — the same
+    /// "declared but inert" failure the `handoffTo` back-edge rule exists to
+    /// catch.
+    #[test]
+    fn workflow_stream_with_no_on_each_reader_is_rejected() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n      - id: coder\n        agent: a\n        joinOn: stream\n        kickoff: go\n      - id: after\n        agent: b\n        dependsOn: [coder]\n"
+        );
+        let err = parse_config(&yaml).unwrap_err();
+        assert!(
+            err.contains("no step declares onEach: reply on it"),
+            "error was: {err}"
+        );
+    }
+
+    /// Additive means additive: a config written before 5.0.7 parses to the
+    /// same thing, and neither new key appears in what we serialize back.
+    #[test]
+    fn on_each_is_absent_from_configs_that_do_not_declare_it() {
+        let yaml = format!(
+            "{WF_AGENTS}workflows:\n  wf:\n    pattern: pipeline\n    steps:\n      - id: only\n        agent: a\n        kickoff: go\n"
+        );
+        let cfg = parse_config(&yaml).expect("a pre-5.0.7 config must still load");
+        let step = &cfg.workflows.unwrap()["wf"].steps[0];
+        assert!(step.on_each.is_none());
+        assert!(step.join_on.is_none());
+        let round_tripped = serde_norway::to_string(step).unwrap();
+        assert!(
+            !round_tripped.contains("onEach"),
+            "skip_serializing_if must keep the key out: {round_tripped}"
+        );
+    }
+
+
+    /// `example/review-as-you-go/ptygrid.yml` — the 5.0.7 sample — must load
+    /// through the real `parse_config`, same as the samples above and for the
+    /// same reason: it is committed to the repo and read by a human who then
+    /// runs it against paid agents.
+    ///
+    /// The assertions are the four properties the feature does not work
+    /// without, and each one is a rule the sample would otherwise be free to
+    /// drift away from:
+    ///
+    /// 1. the upstream declares `joinOn: stream` WITH a `timeoutMs` — the
+    ///    sample's own precondition (C), and the only escape from an agent
+    ///    that forgets its sentinel;
+    /// 2. the consumer declares `onEach: reply` on exactly that upstream;
+    /// 3. the upstream's kickoff actually teaches the protocol — one reply per
+    ///    unit, and the sentinel as its own message. ptygrid implements the
+    ///    protocol but cannot make an agent follow it; that is the config's
+    ///    job, and a sample that quietly stopped saying so would produce a run
+    ///    with zero units and no visible cause;
+    /// 4. `queen.enabled` is on, without which no unit is delivered at all.
+    #[test]
+    fn example_review_as_you_go_config_parses() {
+        let text = include_str!("../../example/review-as-you-go/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/review-as-you-go must parse");
+
+        assert_eq!(
+            cfg.queen.as_ref().and_then(|q| q.enabled),
+            Some(true),
+            "units travel through the durable inbox; with queen off nothing arrives"
+        );
+
+        let wf = cfg
+            .workflows
+            .as_ref()
+            .expect("workflows block")
+            .get("review-as-you-go")
+            .expect("the sample's workflow");
+
+        let coder = wf.steps.iter().find(|s| s.id == "coder").unwrap();
+        assert!(
+            matches!(coder.join_on, Some(JoinOn::Named(JoinOnName::Stream))),
+            "the upstream must be a stream, or nothing produces units"
+        );
+        assert!(
+            coder.timeout_ms.is_some(),
+            "precondition (C): a stream with no timeoutMs has no escape from a \
+             missing sentinel"
+        );
+        let kickoff = coder.kickoff.as_deref().expect("a stream needs a kickoff");
+        assert!(
+            kickoff.contains("reply_inbox"),
+            "the kickoff has to name the tool the agent calls per unit"
+        );
+        assert!(
+            kickoff.contains(crate::orchestrator::STREAM_END_TOKEN),
+            "the kickoff has to teach the sentinel, or the stream only ever \
+             closes on timeoutMs"
+        );
+
+        let reviewer = wf.steps.iter().find(|s| s.id == "reviewer").unwrap();
+        assert_eq!(reviewer.on_each, Some(OnEach::Reply));
+        assert_eq!(
+            reviewer.depends_on.as_deref(),
+            Some(&["coder".to_string()][..]),
+            "onEach is single-dependency, and that dependency is the stream"
+        );
+
+        // And the closing shape: a step with a PLAIN dependency on the
+        // consumer, which is what "summarise once the whole stream is done"
+        // looks like — rule V8's allowance, exercised.
+        let summary = wf.steps.iter().find(|s| s.id == "summary").unwrap();
+        assert!(summary.on_each.is_none());
+        assert_eq!(summary.depends_on.as_deref(), Some(&["reviewer".to_string()][..]));
+    }
+
 }
