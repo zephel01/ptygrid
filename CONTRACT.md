@@ -2280,6 +2280,31 @@ team_presets:
 > `resume_workflow` は対象 run の workflow 定義に `onEach` を持つ step があれば
 > `Err("workflow '<name>' contains an onEach step and cannot be resumed; …")` を返す。
 >
+> **(6b) 追記（2026-08-05、実機 1 回目のあと）: `onEach` のコピーは copy ごとの
+> mailbox を持つ。** 当初の実装はコピーの kickoff を**agent 定義名**の mailbox へ
+> 配っていた。コピーは全部が同じ agent 定義から起動するので、これは N 個のペインが
+> 1 つの mailbox を奪い合う形になる。実機で確認された症状（2026-08-05、5 unit の run）:
+> あるレビュアーのペインが「待機で 3 件届いたので、いちばん新しい id=341 を選び」と
+> 報告した。返信は thread root で相関されるため 5 行とも正しく完了したが、
+> **どのペインがどの unit を担当するかは到着タイミング次第**であり、2 つのペインが
+> 同じ unit を取って別の unit が `timeoutMs` に落ちる余地が残っていた。
+>
+> 是正: kickoff の**宛先を copy ごとに分ける**。`onEach` を持つ step のコピーは
+> `wf/<run_id>/<step_id>` を宛先とし（`run_id` を含めるのは、同名 workflow の並行 run が
+> どちらも `reviewer#0` を持つため）、それ以外の step は従来どおり **agent 定義名のまま**。
+> `detect_reply_completions` が返信の送り主に要求する名前も同じ規則で決まり、
+> `reply_inbox` が「sender は元メッセージの recipient と完全一致」を要求するので、
+> 両者は構成上つねに一致する。**`onEach` 以外の挙動は 1 バイトも変わらない**
+> （送り主の照合も、従来どおり outcome に記録された agent 名のままである）。
+>
+> ペインが自分の mailbox 名を知る手段として、**`PTYGRID_MAILBOX` 環境変数**を
+> workflow が起動する全セッションに注入する（kickoff 本文では渡せない — エージェントは
+> kickoff が届く前に await していなければならないため）。`onEach` 以外では値は agent
+> 定義名そのものなので、`mailbox=$PTYGRID_MAILBOX` という 1 つの書き方が全役割で使える。
+> `cmd` は `/bin/sh -c` に渡されるのでシェルが展開する。**新しい load 時規則 V11**:
+> `onEach` step の id は 64 バイト以下（`wf/<run_id>/<step_id>#<k>` が queen_store の
+> 128 バイト上限に収まること）。
+>
 > **(7) 非回帰宣言。** `StepOutcome` は**フィールドの増減なし**（unit 本文は
 > `#[serde(skip)] stream_body` として内部簿記に留まる。`reply_body` / `kickoff_root_msg_id` /
 > `next_retry_at_ms` / `deferred_since_ms` と同じ扱い）。`WorkflowRun` の形も不変で、
@@ -2294,7 +2319,7 @@ team_presets:
 > `orchestrator.rs`（`detect_reply_completions` の unit 切り出し、`mint_stream_copies`、
 > `close_stream_targets`、`stream_closed_for`、`spawn_ready` の 1 コピー 1 スロット spawn、
 > `fire_due_retries` の unit 再配送）。`queen_store.rs` / `queen.rs` / frontend は無変更。
-> lib **434 → 459 passed / 0 failed**（新規 25 本 = config 12 + orchestrator 13）、統合 14 不変。
+> lib **434 → 461 passed / 0 failed**（新規 27 本 = config 12 + orchestrator 15）、統合 14 不変。
 > `cargo clippy --all-targets` は既存の `nonminimal_bool` **1 件のみ**で本作業起因の新規警告は
 > ゼロ（V3 の判定を `is_none_or` で書いたのはそのため）。frontend は無変更だが実測した: `npm run check`（svelte-check）**136 files / 0 errors / 0 warnings**、`npm run build` **成功**。
 >
@@ -2307,7 +2332,12 @@ team_presets:
 > stream step のペインは exit しないので `autoClose` が効かない**（route 3 の既知の性質）。
 > (d) **実機検証は未実施** — 本追記の裏づけは自動テストのみで、「エージェントが 1 単位ごとに
 > 自発的に返信を刻む」挙動自体がモデル依存であり未確認。手順は spec §7.2、実施状況は
-> plan.md §2 に U 番号として登録する。
+> plan.md §2 に U 番号として登録する。**(d) は 2026-08-05 に一部解除**: `u14-streaming`
+> を macOS 実機で流し、5 unit → `reviewer#0`〜`#4`（欠番なし）→ 番兵で `coder` が
+> Succeeded → 全コピー終端のあと `summary` が 1 度だけ、という一連が SUCCEEDED まで
+> 到達することを確認した。同じ回で上の (6b) が見つかっている。残るのは
+> 「上流が 3 本目を送る前に 1 人目が動いている」瞬間の目視証拠と、`u14-no-sentinel` /
+> `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）

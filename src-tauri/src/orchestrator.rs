@@ -461,11 +461,13 @@ fn root_steps(wf: &WorkflowDef) -> Vec<&WorkflowStep> {
 /// `fire_due_retries` via `respawn_fresh`) must budget against
 /// `WORKFLOW_SESSION_CAP` BEFORE calling this; calling it unguarded
 /// silently disables the cap.
+#[allow(clippy::too_many_arguments)]
 fn spawn_step<R: Runtime>(
     app: &AppHandle<R>,
     manager: &PtyManager,
     config: &ConfigManager,
     step: &WorkflowStep,
+    recipient: &str,
     reuse_existing: bool,
     cols: u16,
     rows: u16,
@@ -504,9 +506,19 @@ fn spawn_step<R: Runtime>(
             stream_body: None,
         };
     }
-    let spawn = config
-        .resolve_def(&agent)
-        .and_then(|(def, dir)| manager.spawn_agent(app.clone(), &def, &dir, cols, rows));
+    let spawn = config.resolve_def(&agent).and_then(|(mut def, dir)| {
+        // Phase 5.0.7: tell the pane which mailbox is its own. Written after
+        // `resolve_def` cloned the definition, so the operator's `env:` block
+        // is not mutated and a second spawn of the same agent under a
+        // different step gets its own value. Deliberately overrides a
+        // hand-written `PTYGRID_MAILBOX` — the orchestrator is the only thing
+        // that knows a copy's identity, and a stale literal here would send
+        // the pane to await a mailbox nothing is delivered to.
+        def.env
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(MAILBOX_ENV.to_string(), recipient.to_string());
+        manager.spawn_agent(app.clone(), &def, &dir, cols, rows)
+    });
     match spawn {
         Ok(id) => StepOutcome {
             step_id: step.id.clone(),
@@ -855,6 +867,51 @@ fn workflow_mailbox(workflow_name: &str, run_id: &str) -> String {
     format!("queen:workflow/{workflow_name}/{run_id}")
 }
 
+/// The inbox mailbox a step's kickoff is DELIVERED to, and therefore the one
+/// its pane must `await` on and reply as (phase 5.0.7).
+///
+/// For everything except an `onEach` copy this is the agent's definition name,
+/// exactly as it has been since 5.0.0 — one pane per step, one mailbox per
+/// agent, nothing to disambiguate.
+///
+/// `onEach` broke that, and it broke it silently. Every copy of an `onEach`
+/// step runs the SAME agent definition, so under the old rule all of them
+/// awaited one mailbox and each pane simply took whichever unit was still
+/// unacknowledged. Observed on hardware 2026-08-05: with five units in flight,
+/// one reviewer pane reported "three arrived, I picked the newest" — the run
+/// still finished correctly, because a reply is correlated by thread root and
+/// not by which pane sent it, so five replies still completed five rows. But
+/// which pane did which unit was decided by timing, two panes could take one
+/// unit and leave another for a `timeoutMs` to clean up, and a copy's recorded
+/// duration described somebody else's work.
+///
+/// Giving each copy its own mailbox removes the choice: `await` on this name
+/// returns that copy's kickoff and nothing else. Scoped by `run_id` as well as
+/// step id because two concurrent runs of one workflow both have a
+/// `reviewer#0`, and sharing a mailbox between them would reintroduce the same
+/// race one level up.
+///
+/// The pane learns this name from `PTYGRID_MAILBOX`, injected into its
+/// environment by `spawn_step` — it cannot come from the kickoff body, because
+/// the agent has to be awaiting before the kickoff can arrive.
+fn kickoff_recipient(step: &WorkflowStep, step_id: &str, run_id: &str) -> String {
+    if step.on_each.is_some() {
+        format!("wf/{run_id}/{step_id}")
+    } else {
+        step.agent.clone()
+    }
+}
+
+/// Environment variable carrying `kickoff_recipient`'s answer into the pane.
+///
+/// Set on every workflow-spawned session, not just `onEach` copies, so one
+/// prompt shape works everywhere: an agent writes `mailbox=$PTYGRID_MAILBOX`
+/// and gets its definition name in the ordinary case and its per-copy mailbox
+/// when it is a copy. `cmd` is shell-wrapped (`/bin/sh -c`), so the expansion
+/// happens before the CLI sees it — this is the one place a `$` in a `cmd:`
+/// prompt is deliberate rather than a quoting accident.
+const MAILBOX_ENV: &str = "PTYGRID_MAILBOX";
+
 /// Deliver a step's kickoff message to its agent's inbox via the durable
 /// Queen store, same path team_presets uses.
 ///
@@ -870,6 +927,7 @@ fn deliver_kickoff(
     workflow_name: &str,
     run_id: &str,
     step: &WorkflowStep,
+    recipient: &str,
     carried: Option<&str>,
 ) -> Result<Option<i64>, String> {
     let Some(body) = handoff::compose_kickoff(step.kickoff.as_deref(), carried) else {
@@ -879,7 +937,7 @@ fn deliver_kickoff(
         .send_inbox(
             project_dir,
             workflow_mailbox(workflow_name, run_id),
-            step.agent.clone(),
+            recipient.to_string(),
             format!("workflow:{workflow_name} step:{} kickoff", step.id),
             body,
         )
@@ -1110,15 +1168,36 @@ pub fn spawn_workflow<R: Runtime>(
             // Roots have no upstream, so nothing is ever carried in here;
             // `handoff_to` bodies only reach dependents, via `spawn_ready`.
             let carried = None;
-            let mut outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
+            // A root can never be `onEach` (that needs a dependency), so this
+            // always resolves to the agent's own name — routed through the
+            // helper anyway so there is one answer to "where does a kickoff
+            // go" rather than two that have to be kept in step.
+            let recipient = kickoff_recipient(step, &step.id, &run_id);
+            let mut outcome = spawn_step(
+                app,
+                manager,
+                config,
+                step,
+                &recipient,
+                reuse_existing,
+                cols,
+                rows,
+            );
             // Kickoff delivery is best-effort — a failure does NOT flip the
             // step to Failed (the pane is already alive; the agent can still
             // work via manual instruction), it is surfaced on `outcome.error`.
             // Same posture team_presets uses. `attach_kickoff_result` holds the
             // one exception, `joinOn: reply`, which has no such fallback.
             if outcome.state == StepState::Running {
-                let delivered =
-                    deliver_kickoff(store, &project_dir, workflow_name, &run_id, step, carried);
+                let delivered = deliver_kickoff(
+                    store,
+                    &project_dir,
+                    workflow_name,
+                    &run_id,
+                    step,
+                    &recipient,
+                    carried,
+                );
                 attach_kickoff_result(step, &mut outcome, delivered);
             }
             outcomes.push(outcome);
@@ -2697,6 +2776,9 @@ fn detect_reply_completions(
     }
 
     let mut changed = false;
+    // Cloned up front: the loop below borrows `run.steps` mutably, and
+    // `kickoff_recipient` needs the run id to rebuild a copy's mailbox.
+    let run_id = run.run_id.clone();
     // Every id matched this tick, so two outcomes cannot claim one message.
     let mut consumed: Vec<i64> = Vec::new();
     // The subset acked before this function returns. Stream UNITS are the one
@@ -2713,6 +2795,29 @@ fn detect_reply_completions(
         let Some(root_id) = outcome.kickoff_root_msg_id else {
             continue;
         };
+        // Fan-out and `onEach` copies carry `"<id>#<k>"`, so the declared step
+        // has to be looked up through `base_id` — a raw `==` would silently
+        // never match a copy. Hoisted above the match filter (5.0.7) because
+        // the expected sender depends on it.
+        let declared = wf
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == base_id(&outcome.step_id));
+        // Who is allowed to complete this step: whoever the kickoff was
+        // addressed to. For an `onEach` copy that is its private mailbox, not
+        // the shared agent name — `reply_inbox` refuses any other sender
+        // (`queen_store` checks `original.recipient == sender`), so this is the
+        // same string on both sides by construction.
+        // Narrowed to `onEach` on purpose. Everywhere else the authority
+        // stays what it has been since 5.0.4 — the agent recorded on the
+        // OUTCOME, not the one currently declared on the step — so a config
+        // edited under a live run cannot hand a step to a different agent
+        // mid-flight, and the existing regression that an operator answering
+        // by hand cannot complete a step keeps its exact meaning.
+        let expected_sender = declared
+            .filter(|step| step.on_each.is_some())
+            .map(|step| kickoff_recipient(step, &outcome.step_id, &run_id))
+            .unwrap_or_else(|| outcome.agent.clone());
         // Correlate on the thread root, and require the reply to come from
         // the step's own agent: an operator answering the thread by hand
         // must not be able to complete the step on the agent's behalf.
@@ -2736,7 +2841,7 @@ fn detect_reply_completions(
             .filter(|m| {
                 m.root_message_id == root_id
                     && m.in_reply_to_id.is_some()
-                    && m.sender == outcome.agent
+                    && m.sender == expected_sender
                     && !consumed.contains(&m.id)
             })
             .map(|m| (m.id, m.body.as_str()))
@@ -2744,15 +2849,6 @@ fn detect_reply_completions(
         if matched.is_empty() {
             continue;
         }
-
-        // Fan-out copies carry `"<id>#<k>"`, so the declared step must be
-        // looked up through `base_id` — a raw `==` would silently never match
-        // a reply-joined fan-out copy. Hoisted above the merge (5.0.7) because
-        // a stream step must NOT have its replies merged in the first place.
-        let declared = wf
-            .steps
-            .iter()
-            .find(|s| s.id.as_str() == base_id(&outcome.step_id));
 
         // ---- Phase 5.0.7: `joinOn: stream`. One row per reply, in send
         // order, until the sentinel.
@@ -3176,7 +3272,9 @@ fn spawn_ready<R: Runtime>(
                 let carried = run.steps[index].stream_body.clone();
                 settle_pane_wait(&mut run.steps[index], now);
                 let banked = run.steps[index].waited_for_pane_ms;
-                let mut outcome = spawn_step(app, manager, config, step, false, cols, rows);
+                let recipient = kickoff_recipient(step, &copy_id, run_id);
+                let mut outcome =
+                    spawn_step(app, manager, config, step, &recipient, false, cols, rows);
                 outcome.step_id = copy_id;
                 outcome.waited_for_pane_ms = banked;
                 outcome.stream_body = carried.clone();
@@ -3187,6 +3285,7 @@ fn spawn_ready<R: Runtime>(
                         workflow_name,
                         run_id,
                         step,
+                        &recipient,
                         carried.as_deref(),
                     );
                     attach_kickoff_result(step, &mut outcome, delivered);
@@ -3241,14 +3340,31 @@ fn spawn_ready<R: Runtime>(
             } else {
                 step.id.clone()
             };
-            let mut outcome = spawn_step(app, manager, config, step, reuse_existing, cols, rows);
+            let recipient = kickoff_recipient(step, &step_id, run_id);
+            let mut outcome = spawn_step(
+                app,
+                manager,
+                config,
+                step,
+                &recipient,
+                reuse_existing,
+                cols,
+                rows,
+            );
             outcome.step_id = step_id;
             // Every copy inherits the same wait: they were all held back by
             // the one placeholder, and a fan-out's copies are minted together.
             outcome.waited_for_pane_ms = carried_wait;
             if outcome.state == StepState::Running {
-                let delivered =
-                    deliver_kickoff(store, project_dir, workflow_name, run_id, step, carried);
+                let delivered = deliver_kickoff(
+                    store,
+                    project_dir,
+                    workflow_name,
+                    run_id,
+                    step,
+                    &recipient,
+                    carried,
+                );
                 attach_kickoff_result(step, &mut outcome, delivered);
             }
             run.steps.push(outcome);
@@ -3368,7 +3484,11 @@ fn respawn_fresh<R: Runtime>(
     cols: u16,
     rows: u16,
 ) -> StepOutcome {
-    let mut fresh = spawn_step(app, manager, config, step, false, cols, rows);
+    // The same mailbox the first attempt used: an `onEach` copy keeps its
+    // identity across retries, so the fresh pane awaits where its redelivered
+    // unit is actually sent (5.0.7).
+    let recipient = kickoff_recipient(step, step_id, run_id);
+    let mut fresh = spawn_step(app, manager, config, step, &recipient, false, cols, rows);
     fresh.step_id = step_id.to_string();
     fresh.attempts = prev_attempts + 1;
     fresh.waited_for_pane_ms = prev_waited_for_pane_ms;
@@ -3382,7 +3502,15 @@ fn respawn_fresh<R: Runtime>(
         // survive, or `detect_reply_completions` would keep correlating against
         // a thread this attempt never sent. `attach_kickoff_result` guarantees
         // that on both arms.
-        let delivered = deliver_kickoff(store, project_dir, workflow_name, run_id, step, carried);
+        let delivered = deliver_kickoff(
+            store,
+            project_dir,
+            workflow_name,
+            run_id,
+            step,
+            &recipient,
+            carried,
+        );
         attach_kickoff_result(step, &mut fresh, delivered);
     }
     fresh
@@ -3558,8 +3686,15 @@ fn fire_due_retries<R: Runtime>(
                     // On failure `attach_kickoff_result` drops the old root id
                     // rather than leaving route 3 correlating against a thread
                     // this attempt never opened.
-                    let delivered =
-                        deliver_kickoff(store, project_dir, workflow_name, run_id, step, carried);
+                    let delivered = deliver_kickoff(
+                        store,
+                        project_dir,
+                        workflow_name,
+                        run_id,
+                        step,
+                        &kickoff_recipient(step, &outcome.step_id, run_id),
+                        carried,
+                    );
                     attach_kickoff_result(step, outcome, delivered);
                     changed = true;
                 }
@@ -5649,10 +5784,10 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let view = StatusView::new();
 
-        let root_a = deliver_kickoff(&store, &dir, "replykick", RUN_A, first, None)
+        let root_a = deliver_kickoff(&store, &dir, "replykick", RUN_A, first, &first.agent, None)
             .unwrap()
             .unwrap();
-        let root_b = deliver_kickoff(&store, &dir, "replykick", RUN_B, first, None)
+        let root_b = deliver_kickoff(&store, &dir, "replykick", RUN_B, first, &first.agent, None)
             .unwrap()
             .unwrap();
         assert_ne!(root_a, root_b, "each run opens its own kickoff thread");
@@ -5704,18 +5839,18 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let second = wf.steps.iter().find(|s| s.id == "second").unwrap();
 
-        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, None)
+        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, &first.agent, None)
             .expect("send should succeed")
             .expect("a declared kickoff yields a thread root");
         assert!(root > 0);
 
         assert_eq!(
-            deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, second, None).unwrap(),
+            deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, second, &second.agent, None).unwrap(),
             None,
             "a step with no kickoff and no carried body sends nothing"
         );
         assert!(
-            deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, second, Some("carried ctx"))
+            deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, second, &second.agent, Some("carried ctx"))
                 .unwrap()
                 .is_some(),
             "a carried body alone is enough to send"
@@ -5731,7 +5866,7 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let view = StatusView::new();
 
-        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, None)
+        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, &first.agent, None)
             .unwrap()
             .unwrap();
         let mut run = mk_run(
@@ -5781,7 +5916,7 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let view = StatusView::new();
 
-        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, None)
+        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, &first.agent, None)
             .unwrap()
             .unwrap();
         // Same thread, but the outcome claims a different agent owns the step,
@@ -5810,7 +5945,7 @@ workflows:
 
         // `polish` has the default `all` join, so its reply must be recorded
         // (condition/handoff read it) but must NOT complete the step.
-        let root = deliver_kickoff(&store, &dir, "handwf", TEST_RUN_ID, polish, None)
+        let root = deliver_kickoff(&store, &dir, "handwf", TEST_RUN_ID, polish, &polish.agent, None)
             .unwrap()
             .unwrap();
         let mut run = mk_run("handwf", vec![mk_kicked("polish", "b", root)]);
@@ -5836,7 +5971,7 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let view = StatusView::new();
 
-        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, None)
+        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, &first.agent, None)
             .unwrap()
             .unwrap();
         let mut run = mk_run("replykick", vec![mk_kicked("first", "a", root)]);
@@ -6740,7 +6875,7 @@ workflows:
         // 5.0.5: capacity is the scheduler's business. `spawn_step` itself is
         // now unconditional — it spawns even past the cap, which is exactly
         // why every call site has to budget first.
-        let outcome = spawn_step(&handle, &manager, &config, first, false, 80, 24);
+        let outcome = spawn_step(&handle, &manager, &config, first, &first.agent, false, 80, 24);
         assert_eq!(
             outcome.state,
             StepState::Running,
@@ -8088,7 +8223,7 @@ workflows:
         let (config, store, dir) = harness(yaml);
         let wf = parse_wf(yaml, "stream");
         let coder = wf.steps.iter().find(|s| s.id == "coder").unwrap();
-        let root = deliver_kickoff(&store, &dir, "stream", TEST_RUN_ID, coder, None)
+        let root = deliver_kickoff(&store, &dir, "stream", TEST_RUN_ID, coder, &coder.agent, None)
             .unwrap()
             .unwrap();
         let mut steps = vec![mk_kicked("coder", "a", root)];
@@ -8434,20 +8569,32 @@ workflows:
         }
 
         // And each copy was told about its own unit, carried into the kickoff
-        // exactly the way a handoff body is.
-        let inbox = store
-            .list_inbox(&dir, "b".to_string(), 0, false, 50)
-            .unwrap();
-        let bodies: Vec<&str> = inbox.iter().map(|m| m.body.as_str()).collect();
+        // exactly the way a handoff body is — in ITS OWN mailbox. This is the
+        // isolation the shared-mailbox version did not have: with both
+        // kickoffs addressed to the agent name, whichever pane called `await`
+        // first could take either one.
         assert!(
-            bodies.iter().any(|b| b.contains("src/one.rs"))
-                && bodies.iter().any(|b| b.contains("src/two.rs")),
-            "each copy's kickoff carries its own unit: {bodies:?}"
+            store
+                .list_inbox(&dir, "b".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "an onEach copy is never addressed by the bare agent name"
         );
-        assert!(
-            bodies.iter().all(|b| b.contains("review what was just named")),
-            "the declared kickoff is still appended: {bodies:?}"
-        );
+        for (copy, unit) in [("reviewer#0", "src/one.rs"), ("reviewer#1", "src/two.rs")] {
+            let mailbox = format!("wf/{TEST_RUN_ID}/{copy}");
+            let inbox = store.list_inbox(&dir, mailbox.clone(), 0, false, 50).unwrap();
+            assert_eq!(inbox.len(), 1, "{mailbox} holds exactly its own kickoff");
+            assert!(
+                inbox[0].body.contains(unit),
+                "{mailbox} carries {unit}: {}",
+                inbox[0].body
+            );
+            assert!(
+                inbox[0].body.contains("review what was just named"),
+                "the declared kickoff is still appended: {}",
+                inbox[0].body
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8593,8 +8740,9 @@ workflows:
             &handle, &manager, &config, &store, &dir, "stream", TEST_RUN_ID, &wf, &mut run,
             TEST_NOW, 80, 24,
         );
+        let mailbox = format!("wf/{TEST_RUN_ID}/reviewer#0");
         let first_delivery = store
-            .list_inbox(&dir, "b".to_string(), 0, false, 50)
+            .list_inbox(&dir, mailbox.clone(), 0, false, 50)
             .unwrap()
             .len();
         assert_eq!(first_delivery, 1);
@@ -8623,10 +8771,12 @@ workflows:
             Some("wrote src/only.rs"),
             "the unit survives a wholesale row replacement"
         );
-        let inbox = store
-            .list_inbox(&dir, "b".to_string(), 0, false, 50)
-            .unwrap();
-        assert_eq!(inbox.len(), 2, "the retry got its own kickoff");
+        let inbox = store.list_inbox(&dir, mailbox, 0, false, 50).unwrap();
+        assert_eq!(
+            inbox.len(),
+            2,
+            "the retry got its own kickoff, on the same per-copy mailbox"
+        );
         assert!(
             inbox[1].body.contains("src/only.rs"),
             "and it names the same unit: {}",
@@ -8683,7 +8833,7 @@ workflows:
         let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
         let view = StatusView::new();
 
-        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, None)
+        let root = deliver_kickoff(&store, &dir, "replykick", TEST_RUN_ID, first, &first.agent, None)
             .unwrap()
             .unwrap();
         let mut run = mk_run(
@@ -8715,6 +8865,121 @@ workflows:
             "minting with no units is a no-op"
         );
         assert_eq!(run.steps.len(), 2, "no rows appeared");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// The per-copy mailbox rule, stated as a pure function so the two sides
+    /// that have to agree on it — where `deliver_kickoff` sends, and who
+    /// `detect_reply_completions` accepts a reply from — cannot drift apart.
+    #[test]
+    fn kickoff_recipient_is_per_copy_only_for_on_each() {
+        let wf = parse_wf(STREAM_YAML, "stream");
+        let coder = wf.steps.iter().find(|s| s.id == "coder").unwrap();
+        let reviewer = wf.steps.iter().find(|s| s.id == "reviewer").unwrap();
+
+        assert_eq!(
+            kickoff_recipient(coder, "coder", TEST_RUN_ID),
+            "a",
+            "an ordinary step is still addressed by its agent name — this is \
+             what keeps every pre-5.0.7 config working unchanged"
+        );
+        assert_eq!(
+            kickoff_recipient(reviewer, "reviewer#2", TEST_RUN_ID),
+            format!("wf/{TEST_RUN_ID}/reviewer#2")
+        );
+        assert_ne!(
+            kickoff_recipient(reviewer, "reviewer#0", TEST_RUN_ID),
+            kickoff_recipient(reviewer, "reviewer#1", TEST_RUN_ID),
+            "siblings must not share a mailbox — that sharing is the whole bug"
+        );
+        assert_ne!(
+            kickoff_recipient(reviewer, "reviewer#0", "wfr_other"),
+            kickoff_recipient(reviewer, "reviewer#0", TEST_RUN_ID),
+            "nor may two concurrent runs of one workflow share one"
+        );
+    }
+
+    /// End to end: a reply on one copy's mailbox completes THAT copy and
+    /// leaves its sibling running.
+    ///
+    /// Before the per-copy mailbox this could not be asserted at all, because
+    /// both kickoffs were addressed to the agent name and both panes awaited
+    /// there — which pane answered which unit was decided by timing. Observed
+    /// on hardware 2026-08-05, where one reviewer pane reported picking "the
+    /// newest of three" waiting for it.
+    #[test]
+    fn a_copy_completes_only_on_a_reply_to_its_own_mailbox() {
+        let (_config, store, dir, wf, mut run, root) = stream_harness(STREAM_YAML);
+        let view = StatusView::new();
+        let reviewer = wf.steps.iter().find(|s| s.id == "reviewer").unwrap();
+
+        for body in ["unit one", "unit two"] {
+            store
+                .reply_inbox(&dir, root, "a".to_string(), body.to_string())
+                .unwrap();
+        }
+        pump_stream(&store, &dir, &view, &wf, &mut run);
+
+        // Stand the two copies up the way `spawn_ready` would, each on its own
+        // mailbox, without needing a PTY.
+        let mut roots = Vec::new();
+        for copy_id in ["reviewer#0", "reviewer#1"] {
+            let mailbox = kickoff_recipient(reviewer, copy_id, TEST_RUN_ID);
+            let msg_root =
+                deliver_kickoff(&store, &dir, "stream", TEST_RUN_ID, reviewer, &mailbox, None)
+                    .unwrap()
+                    .unwrap();
+            roots.push((copy_id.to_string(), mailbox, msg_root));
+            let outcome = run
+                .steps
+                .iter_mut()
+                .find(|o| o.step_id == copy_id)
+                .expect("the copy row exists");
+            outcome.state = StepState::Running;
+            outcome.session_id = Some(90);
+            outcome.kickoff_root_msg_id = Some(msg_root);
+        }
+
+        // Only the second copy answers.
+        let (_, mailbox_one, root_one) = &roots[1];
+        store
+            .reply_inbox(&dir, *root_one, mailbox_one.clone(), "reviewed".to_string())
+            .expect("a copy replies as the mailbox its kickoff was sent to");
+        assert!(pump_stream(&store, &dir, &view, &wf, &mut run));
+
+        let state_of = |run: &WorkflowRun, id: &str| {
+            run.steps
+                .iter()
+                .find(|o| o.step_id == id)
+                .map(|o| o.state)
+                .unwrap()
+        };
+        assert_eq!(state_of(&run, "reviewer#1"), StepState::Succeeded);
+        assert_eq!(
+            state_of(&run, "reviewer#0"),
+            StepState::Running,
+            "the sibling is untouched: its own mailbox still holds an unanswered kickoff"
+        );
+
+        // And the bare agent name is not a route into either of them.
+        let stray = store
+            .send_inbox(
+                &dir,
+                "someone".to_string(),
+                "b".to_string(),
+                "stray".to_string(),
+                "done".to_string(),
+            )
+            .expect("sending to the agent name is still allowed, it just does nothing here");
+        assert!(stray.root_message_id > 0);
+        pump_stream(&store, &dir, &view, &wf, &mut run);
+        assert_eq!(
+            state_of(&run, "reviewer#0"),
+            StepState::Running,
+            "traffic on the shared agent mailbox cannot complete a copy"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

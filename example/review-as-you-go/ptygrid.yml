@@ -45,6 +45,9 @@
 # (B) 上流の `kickoff:` に**返信の作法を書くのは operator の責任**である。
 #     ptygrid はプロトコルを実装するが、エージェントにそれを教えるのは設定側。
 #     下の coder の kickoff がその定型文で、削ると unit が1本も出ない。
+#     **agents[].cmd の起動プロンプトも同じ理由で必須**（下の囲みを読むこと）。
+#     kickoff はペインに打ち込まれないので、cmd を素の `claude` にすると
+#     エージェントは起動画面のまま何もせず、step は Running のまま止まる。
 #
 # (C) **`joinOn: stream` の step には `timeoutMs` を必ず書く。** 番兵を送り
 #     忘れたエージェントを1時間待ち続けないための唯一の脱出装置。
@@ -86,19 +89,80 @@ queen:
   enabled: true          # (A) 必須
   port: 39237
 
+# ============================================================================
+# 【cmd に長いプロンプトを埋めてある理由】ここを削ると何も起きない
+# ============================================================================
+# kickoff は durable inbox に置かれるだけで、**ペインには何も打ち込まれない**
+# （deliver_kickoff は send_inbox を呼ぶだけ）。素の claude を起動しても空の
+# プロンプトで待つだけで、自分から inbox を見にいかない。だから「起動直後に
+# await を呼べ」という一発目の指示は CLI の起動引数で渡す。
+# example/measure-coldstart / example/cross-model-review も同じ形をしている。
+#
+# cmd は /bin/sh -c に渡される（session.rs の LaunchSpec.shell_wrap: true）。
+# プロンプト中でシェルに解釈される文字（" ` \）は使わない。引用は「」。
+# $ だけは例外で、下の PTYGRID_MAILBOX にかぎり展開させるために使う。
+#
+# 【mailbox は $PTYGRID_MAILBOX から取る — onEach 固有の事情】
+# onEach のコピーは全部が同じ agent 定義から起動するので、素直に作ると
+# mailbox も全部同じ（reviewer）になり、どのペインがどの unit を取るかが
+# 早い者勝ちになる。5.0.7 ではコピーごとに専用の mailbox
+# （wf/<run_id>/<step_id>）へ kickoff を配り、その名前を環境変数
+# PTYGRID_MAILBOX でペインに渡している。await も reply_inbox の sender も
+# この値を使うこと（reply_inbox は sender が元メッセージの recipient と
+# 完全一致することを要求する）。
+# onEach でない step では PTYGRID_MAILBOX の値は agent 定義名そのものなので、
+# 全エージェントで同じ書き方が使える。
+# cmd は /bin/sh -c に渡されるので $PTYGRID_MAILBOX はシェルが展開する。
+# プロンプト中で $ を使ってよいのはここだけ（他の $ ` " \ は避ける）。
+# ============================================================================
+
 agents:
   - name: coder
-    cmd: "claude"
+    cmd: >-
+      claude "あなたはワークフローの実装役です。仕事はこのループだけです。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=$PTYGRID_MAILBOX, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。この mailbox にはあなた宛の kickoff しか
+      入らないので、どれを選ぶか迷う必要はない。
+      (3) そのメッセージの id を控える。本文があなたへの指示書なので、
+      そこに書かれたとおりに作業する。返信は queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=控えた id, sender=$PTYGRID_MAILBOX,
+      body=本文 で呼ぶ。sender は必ずこの環境変数の値にすること。
+      (4) 指示書が何度も返信しろと言っている場合は、同じ id に何度でも返信してよい。
+      指示書の作業を全部終えたら、待つのをやめてよい。"
     cwd: "."
     autostart: false
 
   - name: reviewer
-    cmd: "claude"
+    cmd: >-
+      claude "あなたはワークフローのレビュー役です。仕事はこのループだけです。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=$PTYGRID_MAILBOX, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。この mailbox にはあなた宛の kickoff しか
+      入らないので、どれを選ぶか迷う必要はない。
+      (3) そのメッセージの id を控える。本文があなたへの指示書なので、
+      そこに書かれたとおりに作業する。返信は queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=控えた id, sender=$PTYGRID_MAILBOX,
+      body=本文 で呼ぶ。sender は必ずこの環境変数の値にすること。
+      (4) 返信は 1 回だけ。返信したら待つのをやめて終了してよい。"
     cwd: "."
     autostart: false
 
   - name: summarizer
-    cmd: "claude"
+    cmd: >-
+      claude "あなたはワークフローのまとめ役です。仕事はこのループだけです。
+      (1) queen の await ツール（mcp__queen__await）を
+      mailbox=$PTYGRID_MAILBOX, afterId=0, timeoutMs=55000 で呼ぶ。
+      (2) messages が空（timedOut が true）なら (1) をもう一度呼ぶ。
+      空でなければ (3) へ。この mailbox にはあなた宛の kickoff しか
+      入らないので、どれを選ぶか迷う必要はない。
+      (3) そのメッセージの id を控える。本文があなたへの指示書なので、
+      そこに書かれたとおりに作業する。返信は queen の reply_inbox ツール
+      （mcp__queen__reply_inbox）を id=控えた id, sender=$PTYGRID_MAILBOX,
+      body=本文 で呼ぶ。sender は必ずこの環境変数の値にすること。
+      (4) 返信は 1 回だけ。返信したら終了してよい。"
     cwd: "."
     autostart: false
 
