@@ -2303,7 +2303,9 @@ team_presets:
 > 定義名そのものなので、`mailbox=$PTYGRID_MAILBOX` という 1 つの書き方が全役割で使える。
 > `cmd` は `/bin/sh -c` に渡されるのでシェルが展開する。**新しい load 時規則 V11**:
 > `onEach` step の id は 64 バイト以下（`wf/<run_id>/<step_id>#<k>` が queen_store の
-> 128 バイト上限に収まること）。
+> 128 バイト上限に収まること）。**2026-08-05、macOS 実機で確認済み**: reviewer のペインが
+> `sender=wf/wfr_.../reviewer#2` / `#3` と自分専用の mailbox 名で返信し、修正前に出ていた
+> 「N 件届いたので新しいものを選んだ」という報告が消えた。
 >
 > **(7) 非回帰宣言。** `StepOutcome` は**フィールドの増減なし**（unit 本文は
 > `#[serde(skip)] stream_body` として内部簿記に留まる。`reply_body` / `kickoff_root_msg_id` /
