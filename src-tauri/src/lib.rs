@@ -114,6 +114,31 @@ pub fn run() {
                 let menu = build_app_menu(app.handle())?;
                 let _previous = app.set_menu(menu)?;
             }
+            // Put the running version in the title bar ("ptygrid 0.5.7").
+            //
+            // Set here rather than baked into `tauri.conf.json`'s `title`
+            // because this repo already has three files that must agree on the
+            // version (package.json / Cargo.toml / tauri.conf.json) and has
+            // already been bitten once by them drifting apart — the v0.5.7 tag
+            // points at a commit where all three still said 0.5.6 (plan.md §4).
+            // A fourth copy, in a string nobody would think to grep, is the
+            // last thing that list needs. `package_info().version` is the one
+            // Cargo compiled, so the title cannot lie about what is running,
+            // which is the whole reason to show it: an operator reporting a
+            // problem, or checking that a rebuild actually replaced the binary
+            // they were looking at, needs the version of the process in front
+            // of them and not of the source tree beside it.
+            //
+            // Best effort: a missing main window is not a reason to refuse to
+            // start, and every other platform surface (the About panel, the
+            // bundle metadata) still carries the version.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(&format!(
+                    "{} {}",
+                    app.package_info().name,
+                    app.package_info().version
+                ));
+            }
             let app_data = app.path().app_data_dir()?;
             // Load (or first-time generate) the persisted auth tokens before the
             // Queen server binds, so both the /mcp token and the hook Bearer are
