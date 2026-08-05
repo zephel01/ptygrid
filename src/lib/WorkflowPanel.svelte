@@ -10,7 +10,12 @@
   import { ui } from "./stores.svelte";
   import { formatDurationMs, msg } from "./i18n.svelte";
   import { invokeCmd, isTauri } from "./tauri";
-  import type { StepOutcome, WorkflowDef, WorkflowRun } from "./types";
+  import type {
+    ScheduleView,
+    StepOutcome,
+    WorkflowDef,
+    WorkflowRun,
+  } from "./types";
 
   const DEFAULT_COLS = 80;
   const DEFAULT_ROWS = 24;
@@ -20,6 +25,12 @@
   /** Same pattern the other panels use: reading it in the template tracks the
    * locale setting, so a language switch re-renders these labels. */
   let m = $derived(msg());
+
+  /** Phase 5.0.8. Polled rather than pushed: the only field that moves on its
+   * own is the countdown, and that changes by the minute. A `schedule-state`
+   * event would be a new wire contract for something a 60s poll answers. */
+  let schedules = $state<ScheduleView[]>([]);
+  const SCHEDULE_POLL_MS = 60_000;
 
   let launchingName = $state<string | null>(null);
   let cancellingRunId = $state<string | null>(null);
@@ -45,6 +56,52 @@
       .slice(0, MAX_RECENT_ENDED);
     return [...active, ...ended].sort((a, b) => b.startedAtMs - a.startedAtMs);
   });
+
+  let scheduleByName = $derived(
+    new Map(schedules.map((s) => [s.name, s] as const)),
+  );
+
+  /** The one line under a scheduled workflow's name.
+   *
+   * Ordered by what an operator needs first when they ask why nothing
+   * happened: stopped beats skipped beats the countdown, because a stopped
+   * schedule has no countdown worth reading. The last run's outcome is always
+   * appended — a "last run: 3 days ago" next to a healthy-looking "next 09:00"
+   * is how a closed laptop shows up here, and there is no other signal for it
+   * (nothing is caught up on launch, by design). */
+  function scheduleLine(s: ScheduleView): string {
+    const parts: string[] = [s.summary];
+    if (!s.enabled) {
+      parts.push(m.wfScheduleDisabled);
+    } else if (s.stoppedReason) {
+      parts.push(s.stoppedReason);
+    } else if (s.lastSkipReason) {
+      parts.push(s.lastSkipReason);
+    } else if (s.nextFireAtMs !== undefined) {
+      parts.push(m.wfScheduleNext(fmtTime(s.nextFireAtMs), untilLabel(s.nextFireAtMs)));
+    }
+    if (s.lastFireAtMs !== undefined) {
+      parts.push(
+        m.wfScheduleLast(fmtStamp(s.lastFireAtMs), s.lastResult ?? m.wfScheduleRunning),
+      );
+    }
+    return parts.join(" · ");
+  }
+
+  /** "in 3h 20m" — rounded to the minute, which is the resolution the
+   * schedule vocabulary has. */
+  function untilLabel(atMs: number): string {
+    const left = Math.max(0, atMs - Date.now());
+    return formatDurationMs(left) ?? "0s";
+  }
+
+  function fmtStamp(ms: number): string {
+    try {
+      return new Date(ms).toLocaleString();
+    } catch {
+      return String(ms);
+    }
+  }
 
   function stepCountLabel(def: WorkflowDef): string {
     const n = def.steps.length;
@@ -149,8 +206,22 @@
     }
   }
 
+  async function refreshSchedules(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      schedules = await invokeCmd<ScheduleView[]>("list_schedules");
+    } catch {
+      // Same posture as `refresh`: a failed poll leaves the last known state
+      // on screen rather than blanking a row that was telling the operator
+      // something.
+    }
+  }
+
   onMount(() => {
     void refresh();
+    void refreshSchedules();
+    const timer = setInterval(() => void refreshSchedules(), SCHEDULE_POLL_MS);
+    return () => clearInterval(timer);
   });
 </script>
 
@@ -166,6 +237,11 @@
             <span class="wf-def-name" title={defTitle(name, def)}>
               {name}
               <span class="wf-def-meta">{def.pattern} · {stepCountLabel(def)}</span>
+              {#if scheduleByName.get(name)}
+                <span class="wf-def-schedule">
+                  🕒 {scheduleLine(scheduleByName.get(name) as ScheduleView)}
+                </span>
+              {/if}
             </span>
             <button
               class="wf-btn wf-btn-run"
@@ -308,6 +384,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .wf-def-schedule {
+    display: block;
+    font-size: 0.75rem;
+    opacity: 0.75;
+    margin-top: 1px;
   }
 
   .wf-def-meta {

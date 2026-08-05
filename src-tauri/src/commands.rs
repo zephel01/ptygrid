@@ -223,6 +223,24 @@ pub fn cancel_workflow(
     crate::orchestrator::cancel_workflow(&manager, &config, &store, &registry, &run_id)
 }
 
+/// Phase 5.0.8: read the workflow schedules and their runtime state.
+///
+/// Read-only, and deliberately the only new command this feature adds. A
+/// schedule is declared in `ptygrid.yml` and nowhere else; there is no
+/// "create schedule" call, because a config the app writes back is a config
+/// the operator no longer owns.
+///
+/// The panel polls this. What it needs is not the next fire time on its own —
+/// that alone cannot distinguish a healthy schedule from one that has not run
+/// since Friday — but the whole shape: when it last fired, how that ended, why
+/// the last due time produced nothing, and whether it has stopped itself.
+#[tauri::command]
+pub fn list_schedules(
+    schedules: State<'_, crate::orchestrator::ScheduleRegistry>,
+) -> Vec<crate::orchestrator::ScheduleView> {
+    schedules.view()
+}
+
 /// Phase 5.0.1: resume a workflow run left `running` in the Queen DB from
 /// before a crash/restart. Steps that were `Running` when the app died are
 /// reset to `Pending` (their PTY is gone) so the existing 5.0.0.c driver
