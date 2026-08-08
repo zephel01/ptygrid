@@ -1320,6 +1320,90 @@ pub fn list_resumable_workflow_runs(
         .collect())
 }
 
+/// The one thing `resume_workflow` cannot rebuild: a step-to-step carry that
+/// has already happened.
+///
+/// `StepOutcome::reply_body` is `#[serde(skip)]`, so a step that succeeded
+/// before the crash comes back with `reply_body: None` even though its *state*
+/// is preserved. Nothing downstream can tell that apart from "the upstream
+/// finished without ever replying", and the two readers of a reply body treat
+/// that case very differently:
+///
+/// - `condition_targets` maps a missing dependency reply to `Failed` with a
+///   "give '<dep>' a kickoff:" reason — so a resumed run goes RED on a branch
+///   that would have been taken (or cleanly skipped) had the app not died, and
+///   the reason names a misconfiguration that is not the actual cause;
+/// - `handoff_bodies` yields no entry, so `compose_kickoff` falls back to the
+///   declared `kickoff` alone and the downstream agent starts without the
+///   context the workflow promised it. No error, no warning.
+///
+/// Both only bite when the PRODUCER is already terminal in the persisted
+/// snapshot and the CONSUMER has not run yet. If the producer is itself being
+/// collapsed back to `Pending` it re-runs and mints a fresh reply; if the
+/// consumer already ran, the carry is spent. That is why this reads the
+/// collapsed `steps` and not just `wf`: the same workflow definition is
+/// resumable or not depending on where the crash landed, so refusing on the
+/// definition alone (the way the `onEach` gate has to) would give up resume
+/// for runs that are perfectly recoverable.
+///
+/// A producer with no `kickoff:` is excluded on purpose: with no inbox thread
+/// to reply on it never carried anything, so a resumed run behaves exactly
+/// like an uninterrupted one. Refusing those would be a false positive.
+///
+/// Returns the first blocker in declaration order, so the message is stable
+/// across runs. The real fix is to persist the carried body with the step;
+/// until then refusing beats resuming into a wrong answer.
+fn lost_carry_blocker(wf: &WorkflowDef, steps: &[StepOutcome]) -> Option<String> {
+    let produced_before_restart = |id: &str| -> bool {
+        let Some(def) = wf.steps.iter().find(|s| s.id == id) else {
+            return false;
+        };
+        if def
+            .kickoff
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return false;
+        }
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Succeeded)
+    };
+    let awaiting = |id: &str| -> bool {
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Pending)
+    };
+
+    for step in &wf.steps {
+        if step.condition.is_some() && awaiting(&step.id) {
+            if let Some(dep) = step.depends_on.as_deref().unwrap_or(&[]).first() {
+                if produced_before_restart(dep) {
+                    return Some(format!(
+                        "step '{}' has a condition: on '{dep}', which already completed before \
+                         the restart — its reply is not persisted, so the condition would be \
+                         evaluated against nothing and fail the run",
+                        step.id
+                    ));
+                }
+            }
+        }
+        if let Some(target) = step.handoff_to.as_deref() {
+            if awaiting(target) && produced_before_restart(&step.id) {
+                return Some(format!(
+                    "step '{}' declares handoffTo: '{target}' and already completed before the \
+                     restart — its reply is not persisted, so '{target}' would start without the \
+                     handed-off context",
+                    step.id
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Resume a run left `running` in the Queen DB from before a crash/restart
 /// (Phase 5.0.1 "再開"). Succeeded/failed/skipped/cancelled steps are kept
 /// exactly as persisted. Any step with a still-`Running` copy lost its PTY
@@ -1445,6 +1529,17 @@ pub fn resume_workflow<R: Runtime>(
             .position(|s| s.id == base_id(&o.step_id))
             .unwrap_or(usize::MAX)
     });
+
+    // Same refusal-over-bad-resume rule as the `onEach` gate above, but for a
+    // loss that only some runs of a workflow suffer, so it is decided on the
+    // COLLAPSED snapshot rather than on the definition alone (§ see
+    // `lost_carry_blocker`).
+    if let Some(reason) = lost_carry_blocker(&wf, &steps) {
+        return Err(format!(
+            "workflow '{}' cannot be resumed: {reason}; discard this run and start it again",
+            row.name
+        ));
+    }
 
     let run = WorkflowRun {
         run_id: row.run_id.clone(),
@@ -5491,6 +5586,192 @@ workflows:
         assert_eq!(repeat.steps.len(), resumed.steps.len());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Persist an arbitrary crash shape straight into the store, so a resume
+    /// test can start from "the app died exactly here" without having to
+    /// drive a live workflow into that state first.
+    fn persist_snapshot(
+        store: &QueenStore,
+        dir: &std::path::Path,
+        name: &str,
+        steps: &[StepOutcome],
+    ) {
+        store
+            .upsert_workflow_run(
+                dir,
+                TEST_RUN_ID,
+                name,
+                "running",
+                0,
+                None,
+                &serde_json::to_string(steps).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn mk_persisted(step_id: &str, agent: &str, state: StepState) -> StepOutcome {
+        let mut outcome = mk_outcome(step_id, None, state);
+        outcome.agent = agent.to_string();
+        outcome
+    }
+
+    #[test]
+    fn resume_refuses_when_a_condition_lost_its_upstream_reply() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Crash shape: `gate` replied and succeeded, `apply` never started.
+        // `reply_body` did not survive the restart, so evaluating the
+        // condition now would report the branch as un-evaluable and fail a
+        // run that was on its way to green.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be resumed"), "{err}");
+        assert!(err.contains("condition:"), "{err}");
+        assert!(err.contains("gate"), "reason should name the producer: {err}");
+        assert!(
+            registry.get(TEST_RUN_ID).is_none(),
+            "a refused resume must not register the run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_when_a_handoff_carry_was_lost() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(HANDOFF_CHAIN_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `draft` handed off to `polish` and succeeded; `polish` never ran.
+        // Resuming would start `polish` on its declared kickoff alone —
+        // silently, which is the worse half of this bug.
+        persist_snapshot(
+            &store,
+            &dir,
+            "handwf",
+            &[
+                mk_persisted("draft", "a", StepState::Succeeded),
+                mk_persisted("polish", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("handoffTo"), "{err}");
+        assert!(err.contains("polish"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_producer_is_itself_being_replayed() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `gate` was still Running at crash time, so the collapse puts it
+        // back to Pending: it re-runs and mints a fresh reply, and the
+        // condition has something to match against after all.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Running),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let resumed = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a producer that will re-run is not a blocker");
+        let gate = resumed.steps.iter().find(|o| o.step_id == "gate").unwrap();
+        assert_eq!(gate.state, StepState::Pending);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_carry_was_already_spent() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Both sides are terminal: the condition was evaluated before the
+        // crash, so nothing downstream still needs the lost reply.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Succeeded),
+            ],
+        );
+
+        resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a spent carry is not a blocker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lost_carry_blocker_ignores_a_producer_that_never_had_a_thread() {
+        // No `kickoff:` on `gate` means no inbox thread, so it never carried
+        // anything and a resumed run behaves exactly like an uninterrupted
+        // one. Refusing here would be a false positive.
+        let wf = parse_wf(
+            "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  condwf:
+    pattern: pipeline
+    steps:
+      - id: gate
+        agent: a
+      - id: apply
+        agent: b
+        dependsOn: [gate]
+        condition: APPROVED
+",
+            "condwf",
+        );
+        let steps = vec![
+            mk_persisted("gate", "a", StepState::Succeeded),
+            mk_persisted("apply", "b", StepState::Pending),
+        ];
+        assert_eq!(lost_carry_blocker(&wf, &steps), None);
     }
 
     #[test]

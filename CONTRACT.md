@@ -2342,6 +2342,47 @@ team_presets:
 > `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
 
+> 追記（2026-08-07、続報12）: **`resume_workflow` は「すでに起きた step 間の受け渡し」を
+> 失った run も拒否する。** 続報11 (a) が `onEach` について書いた拒否と同じ判断を、
+> `condition:` と `handoffTo:` にも広げる。原因は同じ 1 点で、`StepOutcome::reply_body` が
+> `#[serde(skip)]` であること — 再起動をまたぐと、**state は `Succeeded` のまま残るのに
+> 返信本文だけが消える**。下流の 2 か所はこれを「上流が返信せずに終わった」と区別できない:
+>
+> - `condition_targets` は依存の返信が無い場合を `Failed`（理由は「`<dep>` に kickoff: を
+>   付けろ」）に落とす。**中断が無ければ通っていた（あるいは素直に `Skipped` になっていた）
+>   分岐で、resume した run だけが赤くなる**。しかも理由文は真因を指していない。
+> - `handoff_bodies` はエントリを出さず、`compose_kickoff` が宣言された `kickoff` だけに
+>   フォールバックする。**下流エージェントは約束された文脈を持たずに起動し、エラーも警告も
+>   出ない**。こちらが悪質なほう。
+>
+> **判定は定義ではなく collapse 後のスナップショットで行う**（`onEach` の門は定義だけを見る
+> が、こちらは同じ定義でもクラッシュ地点によって復旧可否が変わるため）。拒否するのは
+> 「生産側が永続スナップショット上ですでに終端」かつ「消費側がまだ走っていない」ときだけ:
+> 生産側自身が `Pending` へ畳まれるなら再実行して返信を作り直すので問題にならず、消費側が
+> すでに走っていれば受け渡しは消費済みである。**非空の `kickoff:` を持たない生産側は対象外**
+> — inbox スレッドが無い以上もともと何も運んでおらず、中断の有無で挙動が変わらないため
+> （偽陽性の除外）。エラーは
+> `Err("workflow '<name>' cannot be resumed: <理由>; discard this run and start it again")` で、
+> 理由は宣言順で最初の 1 件だけを返す（メッセージを安定させるため）。
+>
+> **wire 契約は無変更**。`resume_workflow` の引数・返り値は不変で、増えたのは失敗ケースだけ。
+> frontend は既存の resume 失敗パスにそのまま落ちる（`onEach` の拒否で通っている経路と同じ）。
+> `StepOutcome` の serialize されるフィールドも不変。**恒久対策は「運ばれた本文を step と
+> 一緒に永続化する」ことで、それは別 patch**（→ docs/design/next-implementation-2026-08.md
+> の 5.6.1）。それまでは、誤った答えに resume するより拒否するほうがましという続報11 と
+> 同じ判断を採る。
+>
+> 検証: `cargo test` **lib 466（461 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `resume_refuses_when_a_condition_lost_its_upstream_reply` /
+> `resume_refuses_when_a_handoff_carry_was_lost` /
+> `resume_still_works_when_the_producer_is_itself_being_replayed` /
+> `resume_still_works_when_the_carry_was_already_spent` /
+> `lost_carry_blocker_ignores_a_producer_that_never_had_a_thread`）。
+> `cargo clippy --all-targets --all-features` は既存の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。**実機検証は未実施**（→ plan.md §2 に
+> U 番号を立てる。手順は「`condition:` を持つ run を gate 完了後に落として再起動し、
+> 再開バナーが失敗表示になること」）。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
