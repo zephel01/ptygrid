@@ -1825,6 +1825,63 @@ mod handoff {
         clip(&joined, MAX_HANDOFF_BODY_BYTES)
     }
 
+    /// Join what SEVERAL `handoffTo` sources carried into one target, in the
+    /// order the sources are declared in `ptygrid.yml`.
+    ///
+    /// Separate from `merge_reply_bodies` because of how the byte cap has to be
+    /// spent. That function joins one step's own replies chronologically, so
+    /// clipping the tail is the natural loss. Here the entries come from
+    /// DIFFERENT steps, and clipping the join would let whoever is declared
+    /// first eat the whole budget and delete the others outright — a two-model
+    /// review where the first reviewer happens to be verbose would hand the
+    /// judge one opinion and no sign that a second ever existed. Silent, and
+    /// exactly the failure this function was written to end.
+    ///
+    /// So the cap is divided instead. Nothing is clipped at all while the
+    /// bodies fit; past that every source is guaranteed an equal share, and
+    /// whatever the short ones leave unused is handed back to the long ones
+    /// (one pass, which covers the usual "one essay plus a one-line verdict"
+    /// shape without pretending to be an allocator). `clip` returns empty for a
+    /// share too small to hold its own marker, so a pathological number of
+    /// sources degrades to dropping bodies rather than to overshooting the cap;
+    /// at 48 KiB that needs upwards of 1,900 of them.
+    ///
+    /// A single source takes the `merge_reply_bodies` path unchanged, so the
+    /// overwhelmingly common case is byte-for-byte what it was before.
+    pub fn merge_carried_bodies(bodies: &[&str]) -> String {
+        let kept: Vec<&str> = bodies
+            .iter()
+            .map(|body| body.trim())
+            .filter(|body| !body.is_empty())
+            .collect();
+        if kept.len() <= 1 {
+            return merge_reply_bodies(&kept);
+        }
+        // The blank line between each pair is part of what has to fit.
+        let budget = MAX_HANDOFF_BODY_BYTES.saturating_sub(2 * (kept.len() - 1));
+        if kept.iter().map(|body| body.len()).sum::<usize>() <= budget {
+            return kept.join("\n\n");
+        }
+        let equal = budget / kept.len();
+        let under: usize = kept
+            .iter()
+            .map(|body| body.len())
+            .filter(|len| *len <= equal)
+            .sum();
+        let over = kept.iter().filter(|body| body.len() > equal).count();
+        // `over == 0` is unreachable here (the total exceeds the budget, so
+        // someone is above the mean), but falling back to the equal share
+        // keeps the arithmetic total rather than relying on that argument.
+        let share = budget
+            .saturating_sub(under)
+            .checked_div(over)
+            .unwrap_or(equal);
+        let clipped: Vec<String> = kept.iter().map(|body| clip(body, share)).collect();
+        let refs: Vec<&str> = clipped.iter().map(String::as_str).collect();
+        // Backstop: re-applies the hard cap and drops anything `clip` emptied.
+        merge_reply_bodies(&refs)
+    }
+
     /// The single kickoff body to deliver to a step, given what it declared
     /// (`kickoff:`) and what a `handoffTo` predecessor carried into it.
     /// `None` means "send nothing at all", preserving `deliver_kickoff`'s
@@ -2250,33 +2307,47 @@ fn dep_unsatisfiable(dep_step: &WorkflowStep, outcomes: &[StepOutcome]) -> bool 
 ///
 /// `config.rs` fixes the semantics: the reply body of the step declaring
 /// `handoffTo: X` is prepended to X's own `kickoff`. Validation guarantees
-/// `handoffTo` targets are singular (never fan-out), so the first copy
-/// carrying a non-blank `reply_body` wins; a target claimed by two sources
-/// keeps the first in declaration order rather than concatenating, which
-/// would make the carried context order-dependent on tick timing.
+/// a `handoffTo` SOURCE is never a fan-out, so the first copy carrying a
+/// non-blank `reply_body` wins for any one source.
+///
+/// A target claimed by SEVERAL sources gets all of them, joined in the order
+/// the sources are declared. Until 2026-08-07 it got only the first, and the
+/// rest were dropped with no error and no warning — which is what made
+/// "implement, have two models review in parallel, then judge both verdicts"
+/// unwritable: the judge saw one reviewer and had no way to tell the other had
+/// been discarded. Validation never objected to the second `handoffTo`, so the
+/// config read as if it worked. Declaration order is the author's, not the
+/// tick's, so the carried context stays reproducible across runs.
 ///
 /// Steps whose upstream produced no reply yield no entry — `compose_kickoff`
 /// then falls back to the declared `kickoff` alone.
 fn handoff_bodies(wf: &WorkflowDef, run: &WorkflowRun) -> HashMap<String, String> {
-    let mut bodies: HashMap<String, String> = HashMap::new();
+    // Declaration order matters and `HashMap` has none, so the bodies are
+    // gathered per target in `wf.steps` order first and merged after.
+    let mut collected: Vec<(&str, Vec<&str>)> = Vec::new();
     for step in &wf.steps {
         let Some(target) = step.handoff_to.as_deref() else {
             continue;
         };
-        if bodies.contains_key(target) {
-            continue;
-        }
         let carried = run
             .steps
             .iter()
             .filter(|o| base_id(&o.step_id) == step.id.as_str())
             .find_map(|o| o.reply_body.as_deref())
             .filter(|body| !body.trim().is_empty());
-        if let Some(body) = carried {
-            bodies.insert(target.to_string(), body.to_string());
+        let Some(body) = carried else {
+            continue;
+        };
+        match collected.iter_mut().find(|(id, _)| *id == target) {
+            Some((_, bodies)) => bodies.push(body),
+            None => collected.push((target, vec![body])),
         }
     }
-    bodies
+    collected
+        .into_iter()
+        .map(|(target, bodies)| (target.to_string(), handoff::merge_carried_bodies(&bodies)))
+        .filter(|(_, merged)| !merged.is_empty())
+        .collect()
 }
 
 /// `true` when some *other* step of this run currently holds a live pane for
@@ -6520,6 +6591,141 @@ workflows:
             ],
         );
         assert!(handoff_bodies(&wf, &run).is_empty());
+    }
+
+    /// Two reviewers hand their verdicts to one judge — the shape plan.md
+    /// listed as unwritable while `handoff_bodies` kept only the first.
+    const TWO_REVIEWERS_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+  - name: c
+    cmd: /bin/cat
+workflows:
+  crossreview:
+    pattern: supervisor
+    steps:
+      - id: implement
+        agent: a
+        joinOn: reply
+        kickoff: implement it
+      - id: reviewA
+        agent: b
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it
+      - id: reviewB
+        agent: c
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it too
+      - id: verdict
+        agent: a
+        dependsOn: [implement, reviewA, reviewB]
+        kickoff: decide
+";
+
+    #[test]
+    fn handoff_bodies_joins_every_source_that_claims_one_target() {
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let mut review_b = mk_outcome("reviewB", Some(2), StepState::Succeeded);
+        review_b.reply_body = Some("B: REVISE".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                review_b,
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+
+        let bodies = handoff_bodies(&wf, &run);
+        assert_eq!(
+            bodies.get("verdict").map(String::as_str),
+            Some("A: ACCEPT\n\nB: REVISE"),
+            "both reviewers reach the judge, in the order the steps are declared"
+        );
+        assert_eq!(bodies.len(), 1, "keyed by target, so the two sources merge");
+    }
+
+    #[test]
+    fn handoff_bodies_carries_the_one_source_that_replied() {
+        // The second reviewer finished without a reply (route 1/2). The judge
+        // should still get the first one rather than nothing.
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                mk_outcome("reviewB", Some(2), StepState::Succeeded),
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+        assert_eq!(
+            handoff_bodies(&wf, &run).get("verdict").map(String::as_str),
+            Some("A: ACCEPT"),
+            "a single surviving source is carried unchanged"
+        );
+    }
+
+    #[test]
+    fn merge_carried_bodies_leaves_the_bodies_alone_while_they_fit() {
+        assert_eq!(
+            handoff::merge_carried_bodies(&["first", "second", "third"]),
+            "first\n\nsecond\n\nthird"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["only one"]),
+            "only one",
+            "a single source is the merge_reply_bodies path unchanged"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["  ", "kept"]),
+            "kept",
+            "a blank source is dropped rather than joined as pure separator"
+        );
+        assert_eq!(handoff::merge_carried_bodies(&[]), "");
+    }
+
+    #[test]
+    fn merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others() {
+        // The whole point of the split: clipping the JOIN would cut the short
+        // verdict off the end entirely, and nothing downstream would show that
+        // a second reviewer had ever spoken.
+        let essay = "x".repeat(handoff::MAX_HANDOFF_BODY_BYTES + 12_000);
+        let verdict = "B: ACCEPT";
+        let merged = handoff::merge_carried_bodies(&[essay.as_str(), verdict]);
+
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "the hard cap still holds: {}",
+            merged.len()
+        );
+        assert!(
+            merged.ends_with(verdict),
+            "the short source survives in full at the end"
+        );
+        assert!(
+            merged.contains(handoff::TRUNCATION_MARKER),
+            "the long source is the one that gets cut"
+        );
+        // The short body used far less than its equal share, so the essay got
+        // the remainder back rather than being held to half the cap.
+        assert!(
+            merged.len() > handoff::MAX_HANDOFF_BODY_BYTES / 2,
+            "unused share is handed back to the long source: {}",
+            merged.len()
+        );
     }
 
     #[test]

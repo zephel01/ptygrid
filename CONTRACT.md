@@ -2383,6 +2383,40 @@ team_presets:
 > U 番号を立てる。手順は「`condition:` を持つ run を gate 完了後に落として再起動し、
 > 再開バナーが失敗表示になること」）。
 
+> 追記（2026-08-07、続報13）: **1 つの target を複数の `handoffTo:` が指したとき、本文を
+> 全部運ぶようになった。** 従来は `handoff_bodies` が `if bodies.contains_key(target) { continue; }`
+> で宣言順の最初の 1 本だけを採り、**2 本目以降をエラーにも警告にもせず捨てていた**。
+> `config.rs` の `handoffTo` 検証は「同一 target を複数 source が指す」を止めないので、
+> 設定は通り、レビュー 2 体を並べた workflow は**判定 step が片方の意見しか受け取らず、
+> もう片方が捨てられたことを知る手段も無い**という形で静かに壊れていた（plan.md §3
+> バックログ「2 体レビューの突き合わせ（cross-model review）」の原因 (1)）。
+>
+> 是正: target ごとに本文を集めて連結する。**順序は `ptygrid.yml` の宣言順**（`run.steps` の
+> 到着順ではない）なので、同じ設定なら run をまたいで同じ並びになる。連結は
+> `handoff::merge_carried_bodies` を新設して行う — 既存の `merge_reply_bodies` を使わないのは
+> **バイト上限の使い方が違う**ため。後者は同一 step の返信を時系列で連ねるので末尾を切るのが
+> 自然だが、こちらは別々の step の意見なので join を切ると**宣言順で先の source が予算を
+> 食い尽くして後続を丸ごと消す**（= 直そうとしている症状そのもの）。よって
+> `MAX_HANDOFF_BODY_BYTES`（48 KiB）は分配する: 収まるうちは 1 バイトも切らず、超えたら
+> 全 source に均等枠を保証し、短い source が使い残した分は 1 パスで長い source へ返す。
+> **source が 1 本の場合は従来の `merge_reply_bodies` 経路そのままで、バイト単位で不変**。
+>
+> **wire 契約は無変更**。`handoff_bodies` の型（`HashMap<String, String>`、target 別に
+> 連結済み）も呼び出し側 2 か所（`spawn_ready` / `fire_due_retries`）も変えていない。
+> `compose_kickoff` の合成規則（carried を宣言 `kickoff` の前に置き、間は空行）も不変。
+> **残る半分は未着手**: `condition_targets` が `depends_on.first()` しか見ず、かつ
+> `config.rs:850-856` が `condition` の `dependsOn` を 1 本に制限しているため、
+> 「両方が ACCEPT なら進む」は依然として書けない（→ docs/design/next-implementation-2026-08.md
+> の 5.6.3）。今回入ったのは**突き合わせる材料が判定 step に届くところまで**である。
+>
+> 検証: `cargo test` **lib 470（466 + 新規 4）/ 統合 14、いずれも 0 failed**
+> （`handoff_bodies_joins_every_source_that_claims_one_target` /
+> `handoff_bodies_carries_the_one_source_that_replied` /
+> `merge_carried_bodies_leaves_the_bodies_alone_while_they_fit` /
+> `merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others`）。
+> `cargo clippy --all-targets --all-features` は既存の `nonminimal_bool` **1 件のみ**。
+> frontend 無変更。**実機検証は未実施**（→ plan.md §2 U16）。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
