@@ -2920,7 +2920,12 @@ team_presets:
 > 時計跳びの閾値も**実測ではない**。
 >
 
-> 追記（2026-08-13、続報20）: **`ScheduleView` の wire が変わった（続報18 (6) の上書き）。**
+> 追記（2026-08-13、続報20）: **`ScheduleView` の wire が変わった（続報18 (6) と
+> 続報19 (G) の上書き）。** 続報19 (G) は「`ScheduleView` のフィールドは 1 つも増減して
+> いない」「`lastSkipReason` は既に自由文字列だったので契約の変更ではない」と書いたが、
+> 本項で `summary` が消え `every` / `at` / `maxConsecutiveFailures` が増え、3 つの理由
+> フィールドが文字列から enum になったので、**その 2 文はどちらも本項の時点で偽**である
+> （上書き宣言の漏れ。2026-08-13 の最終レビュー指摘 9 で補った）。
 > 新しい Phase ではなく 5.0.8 の修正（レビュー指摘 M5）。経緯は
 > [plan.md](docs/design/plan.md) §6.21、仕様は
 > [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md) §6.1。
@@ -2984,6 +2989,83 @@ team_presets:
 > **未実測。** 実機で画面を見た確認は**していない**（→ plan.md §2 U20）。日本語の
 > 文言が例文どおりに出ることは i18n テーブルと `scheduleLine` の読みからの帰結であって、
 > スクリーンショットでの確認ではない。
+>
+
+> 追記（2026-08-13、続報21）: **5.0.8 の最終レビューで出た 11 件の是正。wire は 1 バイトも
+> 動いていない。** 新しい Phase ではなく 5.0.8 の修正。経緯は
+> [plan.md](docs/design/plan.md) §6.22、仕様は
+> [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md)（§3.1.1 / §3.1.2 / §3.5 /
+> §3.7 / §4.1 / §6.1 に追記）。`ScheduleView` / `list_schedules` / `ptygrid.yml` スキーマ /
+> `StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools はすべて不変で、
+> frontend も無変更。**`schedule:` を書かない設定への影響は引き続きゼロ。**
+>
+> **(A) 続報19 (B) が確率的に破れていた（最も重い 1 件）。** 続報19 (B) は「自動停止の
+> 解除はその workflow / agent の宣言の変更でだけ起きる。**無関係な workflow の編集では
+> 解除されない**」と書いたが、宣言の fingerprint は `Debug` 表現をハッシュしており、
+> `AgentDef` の `env` は `HashMap` である。Rust の `HashMap` はインスタンスごとに違う
+> ハッシュキーを使うので、**同じバイト列を読み直しただけで `Debug` の並び順が変わる**
+> （env 2 キー以上で発現。レビュー担当の実測で 20 回中 19 回）。したがって自動停止した
+> schedule は、**まったく無関係な workflow を保存しただけで、およそ 6 回に 5 回の確率で
+> 解除されていた**（連続失敗カウンタも 0 に戻り、次回時刻も切り直されるので、続報19 (B) の
+> 副次効果「無関係な保存が due だった発火を捨てるのを解消した」も同時に破れる）。
+> 発現条件は `env:` を 2 個以上持つ agent — **`ptygrid init` が自分で生成する形**
+> （`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`）であり、`example/adaptive-orchestration`
+> も該当する。既存テストが捕まえなかったのは fixture が全部 `cmd:` だけの agent だった
+> ため。是正: `serde_json::to_value()` を通してからハッシュする（`serde_json::Map` は
+> `preserve_order` 無効時 `BTreeMap`。`to_string()` を struct に直接かけると `HashMap` を
+> そのまま辿るので直らない）。続報19 (B) は**是正後に初めて真になった**。
+>
+> **(B) 春の DST の日、正当に due な発火が消えていた（続報19 (E) の穴）。** 続報19 (E) の
+> TZ 変更の再アンカーはオフセットを見るので、**DST の遷移で必ず発動する**（巻き戻し側は
+> UTC 単調なので発動しない）。`America/New_York` の `{ every: day, at: "02:30" }` は
+> 2026-03-08 に 02:30 が存在しないため 03:00 EDT に着地するが、その瞬間がオフセットの
+> 変わり目なので、「オフセットが動いた」と「due である」が同じ tick で成立し、再アンカーが
+> 先に走ってその日の発火が消えていた。`lastSkipReason` も立たないので理由が 1 文字も
+> 出ない。`every: hour` でも春の飛びの直後の 1 回が同じ理由で消えていた。spec は §3.1.2 で
+> 「**前方向の跳びは扱わない。ここで再アンカーすると正当に due な発火まで飲み込む**」と
+> 自分で書いており、TZ 側にそれを適用し忘れていた形である。是正: 再アンカーは
+> `next_fire_at > now` の行だけを対象にし、すでに due の行は続報19 (A) の猶予判定に渡す。
+>
+> **(C) 続報18 (d) は失効している（escalation は配線済み）。** 続報18 の既知の限界 (d)
+> 「通知が無い — 外部へ知らせる経路は P3 の担当で**未配線のまま**」は、続報18 が
+> 2026-08-05 時点の記述として移設されたことによる残存で、escalation は
+> **続報16（Stage A-4、2026-08-13）で配線済み**である。**本項が (d) を上書きする。**
+> 正しくは「**`retry:` を使い切った step の失敗は外へ出る。`retry:` を書いていない step の
+> 失敗は出ない**」であり、加えてペイン異常終了由来の通知は 4.4.2 の経路から別に出るので、
+> 「このスケジューラは失敗を静かに溜める側に倒れうる」は二重に不正確だった。
+> `docs/guide/ptygrid-yml-guide.md` の同じ表で `schedule:` 行と escalation 行が矛盾して
+> いたのも同時に直した。
+>
+> **(D) 残る 7 件（いずれも文言・定数・端数）。** (1) `SCHEDULE_GRACE_HOURLY_MS` は
+> `WORKFLOW_DEFER_MAX_MS` と同じ数字の**別リテラル**で、続報19 (A) の「再利用」は
+> コード上は嘘だった → 定数そのものを参照するようにした。(2) `lateMinutes` が切り捨てで、
+> 見送りが起きる最小の遅れ（猶予 +1ms）が「15」と出ていた → 切り上げ。(3)
+> `current_arc()` が誰も使わない `PathBuf` を毎秒クローンしており、続報19 (F) /
+> spec §8.2 の「`Arc` のクローン 1 回と整数の比較 1 回」が厳密には偽だった → 返り値から
+> 外した。(4) `CLOCK_STEP_TOLERANCE_MS` の根拠が「driver tick 25 回ぶん」のままで、
+> 続報19 (F) の「1 秒に 1 回」適用後は 5 標本ぶんが正しい（結論は不変）。(5) spec §4.1 の
+> `Schedule` スニペットに `deny_unknown_fields` が無く、同じ文書の §4.2 S8 と矛盾していた。
+> (6) 続報20 の上書き宣言に**続報19 (G) が抜けていた**（(G) の 2 文は続報20 で両方とも
+> 偽になっている） → 続報20 の冒頭を補った。(7) `example/scheduled-review/ptygrid.yml` の
+> 画面例の日時スタンプは `toLocaleString(undefined, …)` すなわちシステムロケール依存なので
+> 例文と 1 字一致させることが原理的にできない → 例文に注記を足し、plan.md U20 (9) の
+> 1 字一致の対象から日時部分を外した。
+>
+> **実測。** lib **523 → 530 passed / 0 failed**（追加 7 本。うち **5 本は親コミットで
+> 実際に落ちることを確認済み**: `the_same_declaration_hashes_to_the_same_fingerprint_every_time`
+> は 20 回ループ — 1 回では 6 回に 1 回の確率で通ってしまうため —、
+> `editing_an_unrelated_workflow_does_not_restart_a_stopped_one_with_env`、
+> `saving_the_same_file_again_moves_nothing_in_the_table`、
+> `a_fire_due_in_the_very_tick_the_offset_moves_still_happens`、
+> `the_grace_window_is_closed_at_the_top_and_reports_a_whole_minute`。残る 2 本
+> `deleting_the_schedule_block_removes_the_row` /
+> `the_hour_that_happens_twice_loses_one_fire_and_never_gains_one` は既に正しかった挙動を
+> tick 経由で固定するもの）。統合 **14 不変**。`cargo clippy --all-targets` は既存の
+> `config.rs` の `nonminimal_bool` **1 件のみ**で新規警告ゼロ。`svelte-check`
+> **136 files 0 errors 0 warnings**。
+>
+> **未実測。** 実機検証は依然として**未実施**（→ plan.md §2 U20）。猶予の 2 つの数字も
+> 時計跳びの閾値も実測ではないという続報19 (h) はそのまま生きている。
 >
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）

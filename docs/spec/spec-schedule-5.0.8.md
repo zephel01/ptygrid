@@ -143,6 +143,9 @@ ptygrid はデスクトップアプリであってデーモンではない。ノ
 - 猶予は間隔より十分に短くなければならない。そうでないと遅れた発火が次の発火に重なる。
 - **5 分**は、このファイルが既に「起きているべきことをどれだけ待つか」に使っている値
   （`WORKFLOW_DEFER_MAX_MS`）の再利用である。同じ問いに 2 つ目の答えを作らない。
+  **2026-08-13 追記**: 初出の実装は同じ数字の別リテラル（`5 * 60 * 1000`）で、
+  「再利用」はコード上は嘘だった。`SCHEDULE_GRACE_HOURLY_MS = WORKFLOW_DEFER_MAX_MS`
+  に直してあり、片方を動かせばもう片方も動く。
 - **15 分**は日次にその 3 倍を取ったもので、間隔の 1% 強に収まり、`at: "09:00"` と書いた
   人が「9 時の回」と呼ぶ範囲の内側である。
 
@@ -165,10 +168,23 @@ ptygrid はデスクトップアプリであってデーモンではない。ノ
   なる。8.2 は「`chrono::Local` が実行中の TZ 変更を拾うか未確認」とだけ書いていたが、
   拾っても拾わなくても 1 回はずれる。
 
-閾値は**巻き戻し 5 秒**（driver tick 200ms の 25 回ぶん。ntpd はずれが 128ms を超えると
-slew ではなく step するので、通常の補正はここに届かない）。**前方向の跳びは扱わない**——
-前方向の跳びとサスペンドからの復帰は観測上まったく同じで、そちらは 3.1.1 の猶予の担当で
-ある。ここで再アンカーすると、正当に due な発火まで飲み込む。
+閾値は**巻き戻し 5 秒**（`last_tick_ms` を書くのは `tick_schedules` だけで、それは 3.7 の
+とおり 1 秒に 1 回なので、5 秒は連続 5 標本ぶんのずれにあたる。ntpd はずれが 128ms を
+超えると slew ではなく step するので、通常の補正はここに届かない）。**前方向の跳びは
+扱わない**——前方向の跳びとサスペンドからの復帰は観測上まったく同じで、そちらは 3.1.1 の
+猶予の担当である。ここで再アンカーすると、正当に due な発火まで飲み込む。
+
+**2026-08-13 追記（すでに due の行は再アンカーしない）。** 上の一文は巻き戻し側にしか
+効いていなかった。巻き戻しの判定は `timestamp_millis()`（UTC で単調）なので DST では
+絶対に発動しないが、**TZ 変更の判定はオフセットを見ているので DST の遷移で必ず発動する**。
+`America/New_York` で `{ every: day, at: "02:30" }` を書くと、2026-03-08 の 02:30 は
+存在しないため次回時刻は 3.4 の規則で **03:00 EDT に着地**する。ところが 03:00 EDT が
+**まさにオフセットが変わる瞬間**なので、その tick で「オフセットが動いた」と「due である」が
+同時に成立し、再アンカーが先に走ってその日の発火が消えていた（`lastSkipReason` も立たない
+ので、1.3 が「絶対に作らない」と言っている形そのもの）。`every: hour` でも春の飛びの直後の
+1 回が同じ理由で消えていた。是正: **再アンカーは `next_fire_at_ms > now` の行だけを対象と
+する。** すでに due の行は 3.1.1 の猶予判定に渡り、正当なら発火し、遅すぎれば理由の付いた
+見送りになる。前方向の跳びをこの層で扱わないのと同じ理由づけを、TZ 側にも適用しただけである。
 
 ### 3.2 書き方（論点 1）
 
@@ -307,6 +323,18 @@ S2 が落とす。**この 3 つ以外を書けないことが、この設計の
 だった発火」を巻き添えで捨てることも無くなる（3.9 の strictly-after は、宣言が変わった
 スケジュールにだけ適用される）。
 
+**2026-08-13 追記（fingerprint は正規化してから取る）。** 初出の実装は宣言の `Debug` 表現を
+ハッシュしていたが、`AgentDef` には `env: Option<HashMap<String, String>>` があり、Rust の
+`HashMap` は**インスタンスごとに違うハッシュキー**を使う。`ptygrid.yml` を読み直すたびに
+別インスタンスになるので、**同じバイト列を 2 回パースしただけで `Debug` の並び順が変わる**
+（env 2 キー以上で発現。`ptygrid init` が自分で書く `ANTHROPIC_BASE_URL` +
+`ANTHROPIC_AUTH_TOKEN` がまさにこれ）。結果、上の「逆向き」——関係の無い workflow を編集
+しても解除しない——が**確率的に破れて**いた。是正: `serde_json::to_value()` を通してから
+文字列化してハッシュする（`serde_json::Map` は `preserve_order` 無効時 `BTreeMap` なので
+キー順が確定する。**`serde_json::to_string()` を struct に直接かけると `HashMap` をその
+まま辿るので直らない**）。シリアライズ失敗時は `Debug` に落とす——広めに倒す側なので、
+上の「誤って解除したときの代償のほうが安い」という判断と整合する。
+
 ### 3.6 通知（論点 5）
 
 **決定: 本書は escalation を実装しない。ただし `schedule` は escalation を前提とする
@@ -351,7 +379,12 @@ driver_loop（200ms）
    スケジュール側からは 1 秒と 200ms の区別がつかない。1 秒より粗くはしない——発火は
    即時に見えるべきで、1 秒は人が「9 時ちょうど」と読む範囲の内側である。
 2. **`ConfigManager::current_arc()`** を足し、tick は `Arc<Config>` を借りるだけにする。
-   `current()` は無変更なので既存の呼び出し側に影響は無い。
+   `current()` は無変更なので既存の呼び出し側に影響は無い。**2026-08-13 追記**: 初出の
+   `current_arc()` は設定ディレクトリ（`PathBuf`）も返しており、唯一の呼び出し側である
+   tick はそれを捨てていた。1 秒に 1 回パス文字列を割り当てるだけなので実害は無いが、
+   「`Arc` のクローン 1 回と整数の比較 1 回」という上の主張が厳密には成り立っていなかった。
+   返り値から `PathBuf` を外し、主張のほうを実装に合わせた（`None` の意味は不変で、
+   設定が読めていなければ従来どおり `None`）。
 3. **`ConfigManager` に世代カウンタ**を持たせる。tick はまず整数を 1 回比べ、一致すれば
    fingerprint を 1 本も組み立てずに due 判定へ進む。宣言の照合は設定が実際に差し替わった
    ときだけ行う。
@@ -404,7 +437,10 @@ driver_loop（200ms）
 pub schedule: Option<Schedule>,          // YAML: schedule
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+// `deny_unknown_fields` はこの struct だけの例外（→ §4.2 S8）。リポジトリ全体は
+// 「未知フィールドは無視」だが、`enable: false` のような 1 文字違いを黙って無視すると
+// 「止めたつもりの schedule が毎朝発火する」になる。
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Schedule {
     pub every: Every,                     // day | weekday | hour
     pub at: String,                       // "HH:MM" または "MM"
@@ -540,7 +576,7 @@ wire は次の形になった（詳細は CONTRACT.md 続報20）。
 | フィールド | 形 |
 |---|---|
 | `every` / `at` | 宣言そのもの。`summary` は**廃止**（英訳不能な文を wire に残さない） |
-| `lastSkipReason` | `{kind:"overlap"}` / `{kind:"noRoom",occupied,cap,needed}` / `{kind:"late",lateMinutes}` |
+| `lastSkipReason` | `{kind:"overlap"}` / `{kind:"noRoom",occupied,cap,needed}` / `{kind:"late",lateMinutes}`（`lateMinutes` は**切り上げ**。切り捨てだと、見送りが起きる最小の遅れ = 猶予 +1ms が「15 分」と出て、「猶予 15 分と書いてあるのに 15 分遅れで見送られた」と読めてしまう） |
 | `stoppedReason` | `{kind:"consecutiveFailures",failures}` |
 | `lastResult` | `{kind:"succeeded"\|"failed"\|"cancelled"}` / `{kind:"spawnFailed",error}` |
 | `maxConsecutiveFailures` | 追加。`連続失敗 1/3` を出すのに要る |
