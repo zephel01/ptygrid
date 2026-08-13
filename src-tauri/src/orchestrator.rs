@@ -4568,6 +4568,61 @@ const SCHEDULE_TICK_EVERY: u64 = 5;
 // constant would only be a second thing to keep in step.
 use crate::queen::{QUEEN_SPAWN_COLS, QUEEN_SPAWN_ROWS};
 
+/// Why one due time produced no run. A TAG plus its numbers, never a sentence:
+/// the panel is translated and this crate is not, so a `String` built here
+/// (`"skipped: the previous run has not finished"`) reached a Japanese UI
+/// verbatim and made the one line an operator reads to answer "why did nothing
+/// happen?" half English. The decision of WHICH reason applies stays here,
+/// where the scheduler tests can pin it; only the wording moves to the panel.
+///
+/// Internally tagged (`{"kind":"noRoom",…}`), like `LogicalSession` — the wire
+/// convention in this app is camelCase, so the variants and their fields are
+/// renamed rather than left in Rust casing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScheduleSkip {
+    /// A run this schedule started has not reached a terminal state (spec §3.3).
+    Overlap,
+    /// The grid could not seat the panes the fire needs (spec §3.4).
+    #[serde(rename_all = "camelCase")]
+    NoRoom {
+        occupied: usize,
+        cap: usize,
+        needed: usize,
+    },
+    /// The due instant was further in the past than the grace window — the
+    /// machine was asleep, or the clock moved (spec §3.1).
+    #[serde(rename_all = "camelCase")]
+    Late { late_minutes: u64 },
+}
+
+/// Why a schedule stopped itself. One variant today; an enum anyway so that a
+/// second stop condition is an additive wire change and the panel's branch
+/// keeps the same shape as the skip and result ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScheduleStop {
+    /// Reached `maxConsecutiveFailures` in a row (spec §3.5).
+    #[serde(rename_all = "camelCase")]
+    ConsecutiveFailures { failures: u32 },
+}
+
+/// How the last run this schedule started ended.
+///
+/// `SpawnFailed` is deliberately not one of the terminal run states: nothing
+/// ever ran. Its `error` is whatever the spawn path produced and cannot be
+/// translated, so it travels raw and the panel wraps it in a translated
+/// sentence rather than pretending the whole line is one language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScheduleResult {
+    Succeeded,
+    Failed,
+    Cancelled,
+    #[serde(rename_all = "camelCase")]
+    SpawnFailed { error: String },
+}
+
 /// What the panel needs to show about one schedule, and the only thing the new
 /// Tauri command returns. Read-only: nothing here is an input.
 ///
@@ -4580,27 +4635,31 @@ use crate::queen::{QUEEN_SPAWN_COLS, QUEEN_SPAWN_ROWS};
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleView {
     pub name: String,
-    /// Human summary of the declaration ("every day 09:00").
-    pub summary: String,
+    /// The declaration itself, not a sentence about it. The panel builds
+    /// "every day 09:00" / "毎日 09:00" from these two.
+    pub every: Every,
+    pub at: String,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_fire_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fire_at_ms: Option<u64>,
-    /// Terminal state of the last run this schedule started, lowercase
-    /// (`succeeded` / `failed` / `cancelled`), or `None` if it has not
+    /// How the last run this schedule started ended, or `None` if it has not
     /// finished — or was evicted from the registry before anyone looked.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_result: Option<String>,
+    pub last_result: Option<ScheduleResult>,
     /// Why the most recent due time did not produce a run. Cleared by the next
     /// successful fire.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_skip_reason: Option<String>,
+    pub last_skip_reason: Option<ScheduleSkip>,
     pub consecutive_failures: u32,
-    /// Set when the schedule stopped itself; the string is the reason shown to
-    /// the operator.
+    /// The count that stops this schedule. On the wire because "1/3 failures"
+    /// is the only form in which the streak tells an unattended operator
+    /// anything — a bare `1` does not say how close the stop is.
+    pub max_consecutive_failures: u32,
+    /// Set when the schedule stopped itself.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stopped_reason: Option<String>,
+    pub stopped_reason: Option<ScheduleStop>,
 }
 
 /// Per-schedule bookkeeping. In memory only.
@@ -4619,15 +4678,16 @@ struct ScheduleState {
     /// survive a rebuild only while this is unchanged, which is the whole
     /// mechanism behind "fix it and save, and it starts again".
     decl_fingerprint: u64,
-    summary: String,
+    every: Every,
+    at: String,
     enabled: bool,
     max_consecutive_failures: u32,
     next_fire_at_ms: Option<u64>,
     last_fire_at_ms: Option<u64>,
-    last_result: Option<String>,
-    last_skip_reason: Option<String>,
+    last_result: Option<ScheduleResult>,
+    last_skip_reason: Option<ScheduleSkip>,
     consecutive_failures: u32,
-    stopped_reason: Option<String>,
+    stopped_reason: Option<ScheduleStop>,
     /// Run started by this schedule whose outcome has not been counted yet.
     pending_run_id: Option<String>,
 }
@@ -4683,13 +4743,15 @@ impl ScheduleRegistry {
             .iter()
             .map(|(name, s)| ScheduleView {
                 name: name.clone(),
-                summary: s.summary.clone(),
+                every: s.every,
+                at: s.at.clone(),
                 enabled: s.enabled,
                 next_fire_at_ms: s.next_fire_at_ms,
                 last_fire_at_ms: s.last_fire_at_ms,
                 last_result: s.last_result.clone(),
                 last_skip_reason: s.last_skip_reason.clone(),
                 consecutive_failures: s.consecutive_failures,
+                max_consecutive_failures: s.max_consecutive_failures,
                 stopped_reason: s.stopped_reason.clone(),
             })
             .collect()
@@ -4995,7 +5057,11 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
                     name.clone(),
                     ScheduleState {
                         decl_fingerprint: fingerprint,
-                        summary: schedule.summary(),
+                        every: schedule.every,
+                        // Trimmed here rather than in the panel: `at` reaches
+                        // the wire as a display value, and " 09:00 " is a
+                        // config the validator accepts.
+                        at: schedule.at.trim().to_string(),
                         enabled: schedule.effective_enabled(),
                         max_consecutive_failures: schedule.effective_max_consecutive_failures(),
                         next_fire_at_ms: match previous.filter(|_| unchanged) {
@@ -5084,31 +5150,28 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
                 continue;
             };
             let outcome = match run.state {
-                WorkflowState::Succeeded => Some(("succeeded", false)),
-                WorkflowState::Failed => Some(("failed", true)),
-                WorkflowState::Cancelled => Some(("cancelled", false)),
+                WorkflowState::Succeeded => Some(ScheduleResult::Succeeded),
+                WorkflowState::Failed => Some(ScheduleResult::Failed),
+                WorkflowState::Cancelled => Some(ScheduleResult::Cancelled),
                 WorkflowState::Running | WorkflowState::Pending => None,
             };
-            let Some((label, is_failure)) = outcome else {
+            let Some(result) = outcome else {
                 continue;
             };
             state.pending_run_id = None;
-            state.last_result = Some(label.to_string());
-            if is_failure {
+            if result == ScheduleResult::Failed {
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                 if state.consecutive_failures >= state.max_consecutive_failures {
-                    state.stopped_reason = Some(format!(
-                        "stopped after {} consecutive failures",
-                        state.consecutive_failures
-                    ));
+                    state.stopped_reason = Some(ScheduleStop::ConsecutiveFailures {
+                        failures: state.consecutive_failures,
+                    });
                 }
-            } else {
+            } else if result == ScheduleResult::Succeeded {
                 // A cancel is not a failure — the operator did it on purpose —
                 // and it does not clear the streak either. Only a success does.
-                if label == "succeeded" {
-                    state.consecutive_failures = 0;
-                }
+                state.consecutive_failures = 0;
             }
+            state.last_result = Some(result);
             changed = true;
         }
     }
@@ -5156,13 +5219,11 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
                 .filter_map(|id| registry.get(&id))
                 .any(|run| run.name == name);
         let skip = if late_ms > grace_ms {
-            Some(format!(
-                "skipped: the scheduled time had passed {} minutes ago \
-                 (the machine was asleep, or the clock moved)",
-                late_ms / 60_000
-            ))
+            Some(ScheduleSkip::Late {
+                late_minutes: late_ms / 60_000,
+            })
         } else if overlapping {
-            Some("skipped: the previous run has not finished".to_string())
+            Some(ScheduleSkip::Overlap)
         } else {
             // Checked BEFORE spawning rather than after. Left to the ordinary
             // path, a fire onto a full grid produces a run that sits Pending
@@ -5172,11 +5233,11 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
             let needed = schedule_slots_needed(wf);
             let budget = pane_budget(manager);
             if needed > budget {
-                Some(format!(
-                    "skipped: the grid had no room ({}/{} occupied, {needed} needed)",
-                    WORKFLOW_SESSION_CAP.saturating_sub(budget),
-                    WORKFLOW_SESSION_CAP
-                ))
+                Some(ScheduleSkip::NoRoom {
+                    occupied: WORKFLOW_SESSION_CAP.saturating_sub(budget),
+                    cap: WORKFLOW_SESSION_CAP,
+                    needed,
+                })
             } else {
                 None
             }
@@ -5215,13 +5276,14 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
                 // that no longer resolves, an agent removed from the config).
                 state.last_skip_reason = None;
                 state.last_fire_at_ms = Some(now_ms_val);
-                state.last_result = Some(format!("failed: {err}"));
+                state.last_result = Some(ScheduleResult::SpawnFailed {
+                    error: err.to_string(),
+                });
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                 if state.consecutive_failures >= state.max_consecutive_failures {
-                    state.stopped_reason = Some(format!(
-                        "stopped after {} consecutive failures",
-                        state.consecutive_failures
-                    ));
+                    state.stopped_reason = Some(ScheduleStop::ConsecutiveFailures {
+                        failures: state.consecutive_failures,
+                    });
                 }
             }
             (None, None) => {}
@@ -11264,7 +11326,8 @@ workflows:
         let view = schedules.view();
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].name, "timed");
-        assert_eq!(view[0].summary, "every hour :05");
+        assert_eq!(view[0].every, Every::Hour);
+        assert_eq!(view[0].at, "05");
         assert!(view[0].enabled);
         assert!(view[0].last_fire_at_ms.is_none(), "building is not firing");
         assert_eq!(
@@ -11275,6 +11338,133 @@ workflows:
         // Next fire is an hour later, not now — the strictly-after rule.
         let next = view[0].next_fire_at_ms.unwrap();
         assert!(next > now.timestamp_millis() as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wire shape the panel translates against. Every one of these fields
+    /// used to be an English sentence built in this crate, so a Japanese UI
+    /// read "🕒 every day 09:00 · stopped after 3 consecutive failures". The
+    /// tag and its numbers are the contract; the wording is the panel's.
+    #[test]
+    fn schedule_reasons_reach_the_wire_as_tags_and_numbers_not_sentences() {
+        // `to_string`, not `to_value`: `serde_json::Value` sorts its keys, and
+        // key ORDER is not the contract here — the tag name, the field names
+        // and their casing are.
+        assert_eq!(
+            serde_json::to_string(&ScheduleSkip::Overlap).unwrap(),
+            r#"{"kind":"overlap"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleSkip::NoRoom {
+                occupied: 9,
+                cap: 9,
+                needed: 2,
+            })
+            .unwrap(),
+            r#"{"kind":"noRoom","occupied":9,"cap":9,"needed":2}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleSkip::Late { late_minutes: 175 }).unwrap(),
+            r#"{"kind":"late","lateMinutes":175}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleStop::ConsecutiveFailures { failures: 3 }).unwrap(),
+            r#"{"kind":"consecutiveFailures","failures":3}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleResult::Succeeded).unwrap(),
+            r#"{"kind":"succeeded"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleResult::Failed).unwrap(),
+            r#"{"kind":"failed"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScheduleResult::Cancelled).unwrap(),
+            r#"{"kind":"cancelled"}"#
+        );
+        // The one string that cannot be translated travels raw, under its own
+        // tag, so the panel can wrap it ("起動に失敗しました: …") instead of
+        // printing a half-English "failed: no such agent".
+        assert_eq!(
+            serde_json::to_string(&ScheduleResult::SpawnFailed {
+                error: "no such agent".to_string(),
+            })
+            .unwrap(),
+            r#"{"kind":"spawnFailed","error":"no such agent"}"#
+        );
+    }
+
+    /// `ScheduleView` carries the DECLARATION (`every` + `at`), not a sentence
+    /// about it. The old `summary: "every hour :05"` is gone from the wire —
+    /// it had no translated form and the panel had nothing else to build one
+    /// from.
+    #[test]
+    fn a_schedule_view_carries_the_declaration_and_the_stop_threshold() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        let view = schedules.view();
+        let value = serde_json::to_value(&view[0]).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert_eq!(obj.get("every").unwrap(), "hour");
+        assert_eq!(obj.get("at").unwrap(), "05");
+        assert!(
+            !obj.contains_key("summary"),
+            "an untranslatable English sentence must not be on the wire: {value}"
+        );
+        // Without the threshold, "1 failure" does not tell an unattended
+        // operator whether the next one stops the schedule.
+        assert_eq!(obj.get("maxConsecutiveFailures").unwrap(), 3);
+        assert_eq!(obj.get("consecutiveFailures").unwrap(), 0);
+        // Nothing has happened yet, so none of the reason keys are present at
+        // all (they are `skip_serializing_if`).
+        assert!(!obj.contains_key("lastSkipReason"));
+        assert!(!obj.contains_key("stoppedReason"));
+        assert!(!obj.contains_key("lastResult"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `at` reaches the panel as a display value, so the whitespace a config
+    /// may legally carry is trimmed here rather than in four call sites of a
+    /// Svelte template.
+    #[test]
+    fn a_padded_at_is_trimmed_before_it_reaches_the_panel() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let yaml = SCHED_YAML.replace("at: \"05\"", "at: \" 05 \"");
+        assert_ne!(yaml, SCHED_YAML, "the fixture must still name `at`");
+        let (config, store, dir) = harness(&yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        assert_eq!(schedules.view()[0].at, "05");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11306,11 +11496,9 @@ workflows:
             &handle, &manager, &config, &store, &registry, &schedules, next_hour,
         );
         let view = schedules.view();
-        assert!(
-            view[0]
-                .last_skip_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("has not finished")),
+        assert_eq!(
+            view[0].last_skip_reason,
+            Some(ScheduleSkip::Overlap),
             "reason was: {:?}",
             view[0].last_skip_reason
         );
@@ -11339,11 +11527,13 @@ workflows:
         tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, due);
 
         let view = schedules.view();
-        assert!(
-            view[0]
-                .last_skip_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("no room")),
+        assert_eq!(
+            view[0].last_skip_reason,
+            Some(ScheduleSkip::NoRoom {
+                occupied: WORKFLOW_SESSION_CAP,
+                cap: WORKFLOW_SESSION_CAP,
+                needed: 1,
+            }),
             "reason was: {:?}",
             view[0].last_skip_reason
         );
@@ -11391,13 +11581,20 @@ workflows:
 
         let view = schedules.view();
         assert_eq!(view[0].consecutive_failures, 3);
-        assert!(
-            view[0]
-                .stopped_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("3 consecutive failures")),
+        assert_eq!(
+            view[0].max_consecutive_failures, 3,
+            "the panel needs the threshold to render '1/3' before the stop"
+        );
+        assert_eq!(
+            view[0].stopped_reason,
+            Some(ScheduleStop::ConsecutiveFailures { failures: 3 }),
             "reason was: {:?}",
             view[0].stopped_reason
+        );
+        assert_eq!(
+            view[0].last_result,
+            Some(ScheduleResult::Failed),
+            "a run that ran and failed is `failed`, never `spawnFailed`"
         );
 
         // A stopped schedule does not fire again, however long it waits.
@@ -11633,8 +11830,8 @@ workflows:
         );
         assert_eq!(timed.consecutive_failures, 3);
         assert_eq!(
-            view.iter().find(|v| v.name == "parked").unwrap().summary,
-            "every hour :20",
+            view.iter().find(|v| v.name == "parked").unwrap().at,
+            "20",
             "the edited one did pick up its new declaration"
         );
 
@@ -11735,11 +11932,12 @@ workflows:
         tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, woke);
 
         let view = schedules.view();
-        assert!(
-            view[0]
-                .last_skip_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("had passed") && r.contains("asleep")),
+        assert_eq!(
+            view[0].last_skip_reason,
+            // 14:05 was due; the lid opened at 17:00, 175 minutes later. The
+            // number is on the wire, not baked into a sentence, so the panel
+            // can say it in either language.
+            Some(ScheduleSkip::Late { late_minutes: 175 }),
             "reason was: {:?}",
             view[0].last_skip_reason
         );
@@ -11918,12 +12116,10 @@ workflows:
         let view = schedules.view();
         assert!(view.iter().find(|v| v.name == "aaa").unwrap().last_skip_reason.is_none());
         assert!(
-            view.iter()
-                .find(|v| v.name == "zzz")
-                .unwrap()
-                .last_skip_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("no room")),
+            matches!(
+                view.iter().find(|v| v.name == "zzz").unwrap().last_skip_reason,
+                Some(ScheduleSkip::NoRoom { .. })
+            ),
             "the loser is told why"
         );
 
@@ -12041,11 +12237,9 @@ workflows:
         );
         let view = schedules.view();
         assert_eq!(view[0].consecutive_failures, 1);
-        assert!(
-            view[0]
-                .stopped_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("1 consecutive failures")),
+        assert_eq!(
+            view[0].stopped_reason,
+            Some(ScheduleStop::ConsecutiveFailures { failures: 1 }),
             "reason was: {:?}",
             view[0].stopped_reason
         );

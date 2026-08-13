@@ -697,16 +697,13 @@ impl Schedule {
             }
         }
     }
-
-    /// One-line human summary for the panel ("every day 09:00").
-    pub fn summary(&self) -> String {
-        match self.every {
-            Every::Day => format!("every day {}", self.at.trim()),
-            Every::Weekday => format!("every weekday {}", self.at.trim()),
-            Every::Hour => format!("every hour :{}", self.at.trim()),
-        }
-    }
 }
+
+// NOTE: there is deliberately no `summary()` here. It used to return
+// "every day 09:00" and that string travelled to the panel unchanged, which
+// is exactly how a Japanese UI ended up reading "every day 09:00". `every`
+// and `at` go on the wire instead and the panel words them (see
+// `ScheduleView` in orchestrator.rs).
 
 /// Phase 5.0: one workflow declaration. See docs/spec/spec-phase5-0.md §2.1.
 /// Field naming is camelCase in YAML (aligned with existing `spawn_agent` and
