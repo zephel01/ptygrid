@@ -2920,6 +2920,72 @@ team_presets:
 > 時計跳びの閾値も**実測ではない**。
 >
 
+> 追記（2026-08-13、続報20）: **`ScheduleView` の wire が変わった（続報18 (6) の上書き）。**
+> 新しい Phase ではなく 5.0.8 の修正（レビュー指摘 M5）。経緯は
+> [plan.md](docs/design/plan.md) §6.21、仕様は
+> [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md) §6.1。
+> **`schedule:` を書かない設定への影響は引き続きゼロ**で、`list_schedules` 以外の wire
+> （`StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools / 他の Tauri
+> commands / `ptygrid.yml` スキーマ）は 1 バイトも動いていない。
+>
+> **何が壊れていたか。** `ScheduleView` の 4 フィールドが **Rust 側で組み立てた英語の文**
+> だった: `summary`（`"every day 09:00"`）、`last_skip_reason`
+> （`"skipped: the previous run has not finished"` 他 2 種）、`stopped_reason`
+> （`"stopped after 3 consecutive failures"`）、`last_result`（`"succeeded"` /
+> `"failed"` / `"failed: {err}"`）。panel はこれを `join(" · ")` するだけなので、
+> 日本語 UI の 1 行が
+> `🕒 every day 09:00 · stopped after 3 consecutive failures · 最終 8/5 9:00 failed`
+> になっていた。**文は値ではない**ので frontend で翻訳し直す術も無く、
+> `example/scheduled-review/ptygrid.yml` と spec §6 が約束した画面（「前の run が
+> 終わっていません」「自動停止」）は実装から出ていなかった。
+>
+> **新しい `ScheduleView`（`list_schedules` の返り値）。** 判定は backend、文言は
+> frontend。camelCase は従来どおり。
+>
+> | フィールド | 変更 |
+> |---|---|
+> | `summary: string` | **削除。** 英訳不能な文を wire に残さないため。`Schedule::summary()` も削除 |
+> | `every: "day"\|"weekday"\|"hour"` / `at: string` | **追加。** 宣言そのもの。`at` は trim 済み。panel が「毎日 09:00」/「every day 09:00」を組む |
+> | `lastSkipReason` | `string` → **内部タグ付き enum**。`{kind:"overlap"}` / `{kind:"noRoom",occupied,cap,needed}` / `{kind:"late",lateMinutes}` |
+> | `stoppedReason` | `string` → `{kind:"consecutiveFailures",failures}`。1 変種だが enum（2 つ目の停止条件が additive で入るように） |
+> | `lastResult` | `string` → `{kind:"succeeded"\|"failed"\|"cancelled"}` / `{kind:"spawnFailed",error}` |
+> | `maxConsecutiveFailures: number` | **追加。** `consecutiveFailures` 単独では停止までの距離が読めない |
+>
+> `kind` によるタグ付けは `LogicalSession`（`project_state.rs`）と同じ書き方に揃えた。
+> `skip_serializing_if = "Option::is_none"` は 3 つの Option でそのまま。
+>
+> **`spawnFailed` を分けた理由。** 旧 `"failed: {err}"` は 2 つの別物を 1 つの文字列に
+> 詰めていた: run が走って失敗したのか、**そもそも起動しなかった**のか。後者は run が
+> 存在しない。`error` は spawn 経路が返す任意の文字列で**翻訳できない**ので、生のまま
+> 運んで panel が「起動に失敗しました: {err}」と包む。**1 行の中で英語のまま残るのは
+> この例外文だけ**で、それは元の例外文なので他に出しようがない。
+>
+> **判定は backend に残っている。** どの理由が当てはまるかを決めるのは
+> `tick_schedules` のままで、移したのは文言だけ。frontend にテストランナーが無い
+> （`package.json` は `svelte-check` のみ）ので、分岐は Rust 側の unit test で固定した。
+>
+> **panel 側の表示規則（新規、契約ではなく実装の記録）。** (i) カウントダウンは
+> `formatDurationMs` を通さない（あれは step 用で 0.1 秒まで出し、英語の形しか無い）。
+> 分に丸めて「時・分」を i18n に渡すので、日本語は「あと 3 時間 20 分」。
+> `formatDurationMs` 自体は無変更で、step 実行時間 / ペイン待ちの 2 箇所も無変更。
+> (ii) 「次回」は**今日でなければ日付も出す**。 (iii) 自動停止に**到達する前**の
+> 連続失敗を出す（「連続失敗 1/3（あと 2 回で自動停止）」）。
+>
+> **実測。** lib **520 → 523 passed / 0 failed**（追加 3 本:
+> `schedule_reasons_reach_the_wire_as_tags_and_numbers_not_sentences` /
+> `a_schedule_view_carries_the_declaration_and_the_stop_threshold` /
+> `a_padded_at_is_trimmed_before_it_reaches_the_panel`。既存の schedule テスト 6 本は
+> 文字列の `contains` 比較から enum の等値比較に置き換えた）。統合 14 不変。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**。
+> `svelte-check` **136 files 0 errors 0 warnings**、`npm run build` 成功。
+> i18n は **en / ja 両方に 11 本追加**（`wfScheduleEvery` / `wfScheduleUntil` /
+> skip 3 種 / stop / 連続失敗 / result 4 種）。
+>
+> **未実測。** 実機で画面を見た確認は**していない**（→ plan.md §2 U20）。日本語の
+> 文言が例文どおりに出ることは i18n テーブルと `scheduleLine` の読みからの帰結であって、
+> スクリーンショットでの確認ではない。
+>
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。

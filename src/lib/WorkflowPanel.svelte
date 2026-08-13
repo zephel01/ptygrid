@@ -141,7 +141,12 @@
   }
 
   /** The last fire, to the minute. A schedule cannot resolve finer, and
-   * seconds would only make the line longer. */
+   * seconds would only make the line longer.
+   *
+   * `undefined` locale, i.e. the SYSTEM one, not the app's language setting —
+   * same as `fmtTime` on the run rows, and changing only the schedule line
+   * would leave the panel formatting dates two ways. So a Japanese UI on an
+   * English system still shows "8/5, 09:00 AM" here. */
   function fmtSchedStamp(ms: number): string {
     try {
       return new Date(ms).toLocaleString(undefined, {

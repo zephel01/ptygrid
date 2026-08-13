@@ -513,15 +513,51 @@ workflows:
 workflow 一覧の各行に 2 つ足す:
 
 ```
-nightly-review   毎日 09:00   次回 09:00（あと 3 時間）   最終 昨日 09:00 成功
-hourly-check     毎時 :05     見送り（前回の run がまだ走っています）
-weekly-audit     平日 18:00   自動停止（3 回連続で失敗）
+nightly-review   🕒 毎日 09:00 · 次回 09:00（あと 3 時間） · 最終 8/5 09:00 成功
+hourly-check     🕒 毎時 :05 · 見送り（前の run が終わっていません）
+weekly-audit     🕒 平日 18:00 · 自動停止（3 回連続で失敗）
 ```
 
 - データ源は新しい読み取り専用 Tauri command `list_schedules` 1 本。ポーリングは
   frontend 側（1 分間隔で足りる。次回時刻は分単位でしか動かない）
 - **「最終実行」が数日前で止まっていること自体が、アプリを開いていなかったことの表示に
   なる**（3.1）。これが無いと、この機能は「たまに動かない」ように見える
+
+### 6.1 表示文言はどちら側が持つか（2026-08-13 追記、M5 の修正）
+
+**決定: 文言は frontend が持つ。backend は「宣言」と「タグ + 数値」しか返さない。**
+
+初版の実装は `ScheduleView.summary` に `"every day 09:00"`、`lastSkipReason` に
+`"skipped: the previous run has not finished"`、`stoppedReason` に
+`"stopped after 3 consecutive failures"`、`lastResult` に `"succeeded"` という
+**英語の文**を入れて返し、panel はそれをそのまま `join(" · ")` していた。結果として
+日本語 UI では 1 行が半分英語になり、上の表示例も本サンプル
+（`example/scheduled-review/ptygrid.yml`）の説明文も**実装から出ない画面**になっていた。
+Rust 側には i18n が無く、あとから翻訳する術も無い（文は値ではない）。
+
+wire は次の形になった（詳細は CONTRACT.md 続報20）。
+
+| フィールド | 形 |
+|---|---|
+| `every` / `at` | 宣言そのもの。`summary` は**廃止**（英訳不能な文を wire に残さない） |
+| `lastSkipReason` | `{kind:"overlap"}` / `{kind:"noRoom",occupied,cap,needed}` / `{kind:"late",lateMinutes}` |
+| `stoppedReason` | `{kind:"consecutiveFailures",failures}` |
+| `lastResult` | `{kind:"succeeded"\|"failed"\|"cancelled"}` / `{kind:"spawnFailed",error}` |
+| `maxConsecutiveFailures` | 追加。`連続失敗 1/3` を出すのに要る |
+
+- **どの理由が当てはまるかの判定は backend に残る**（scheduler の test で固定できる
+  場所だから）。移したのは文言だけである。
+- `spawnFailed` の `error` だけは翻訳できない backend 文字列なので生で運び、
+  panel が「起動に失敗しました: {err}」と**包む**。半分英語になるのはこの 1 語だけで、
+  それは元の例外文なので他に出しようがない。
+- カウントダウンは `formatDurationMs`（`"3h 20m"`）を**使わない**。あれは step の
+  実行時間用で 0.1 秒まで出すし、英語の形しか無い。schedule は分解像度なので
+  「時・分」の 2 値を i18n に渡し、日本語では「あと 3 時間 20 分」になる。
+- 「次回 09:00」は**今日でなければ日付も出す**（`次回 8/6 09:00`）。今日か明日かを
+  カウントダウンから逆算させない。
+- 自動停止に**到達する前**の連続失敗も出す（`連続失敗 1/3（あと 2 回で自動停止）`）。
+  無人運用では「あと 1 回で止まる」が最も価値のある情報で、`consecutiveFailures` は
+  wire にありながら表示されていなかった。
 
 ---
 
