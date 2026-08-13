@@ -2524,9 +2524,18 @@ team_presets:
 > - **abandon は永続行から workflow 名を読む必要がある**ため、`mark_workflow_abandoned` の
 >   *前*に `list_running_workflow_runs` で引く。行が既に消えている run では掃除をせず、
 >   `mark_workflow_abandoned` の "not found" エラーをそのまま返す。
-> - **`Failed` で終端した run と、正常に `Succeeded` した run は掃かない。** 今回の入口は
->   cancel / abandon の 2 つだけである。同じ滞留は「返信せずに終わった run」でも起きうるが、
->   そこは A-6（retention）の範囲であり本 patch では触っていない。**未実測**。
+> - **`Failed` で終端した run と、正常に `Succeeded` した run は掃かない → 未対応。** 今回の
+>   入口は cancel / abandon の 2 つだけ（`retire_run_kickoffs` の呼び出し元はこの 2 か所のみ）。
+>   **しかも滞留するほうが多数派である**: `joinOn: reply` でない step — route 1（PTY exit）/
+>   route 2（semantic done）で完了する step — は**返信なしで終わるので kickoff は未 ack のまま
+>   残る**。**A-6（retention）はここに効かない**。`prune_terminal_workflow_runs` が触るのは
+>   `workflow_runs` の DELETE だけで、`inbox_messages` には SQL を 1 本も投げないため、
+>   run 行が retention で消えたあとも kickoff は inbox に残り続ける。
+>   **帰結**: `inbox_messages` は ack しても行が消えないので、行数は ack の有無に関わらず
+>   増え続け、`MAX_MESSAGES_PER_PROJECT` = 50,000 に達すると `enforce_limit` が
+>   **`send_inbox` を `Err` で拒否する**（この表は削除ではなく拒否側）。すなわち
+>   `deliver_kickoff` が新規 kickoff を送れなくなる。
+>   直すなら **A-5 の入口を終端書き込みにも広げる**か、**5.6.x（スキーマ分割）で扱う**。
 > - `inbox_messages` に `sender` の索引は無いので、この掃除は project のメッセージを走査する
 >   （`MAX_MESSAGES_PER_PROJECT` = 50,000 で上限）。cancel / abandon 1 回につき 1 度だけ走り、
 >   **driver の tick には乗らない**ので索引とそのスキーマ移行は見送った。
@@ -2612,6 +2621,14 @@ team_presets:
 > - **run 全体の失敗は通知しない。** 入口は step の retry 枯渇 1 つだけである。`retry:` を
 >   書いていない step だけで構成された workflow は、run が red になっても escalation は
 >   出ない（ペイン exit 由来の通知は従来どおり出る）。
+> - **「枯渇 1 回につき 1 通」は step 単位の話で、run 単位ではバーストしうる。** `escalated` は
+>   **step（＝ `onEach` / `fanOut` のコピー 1 つ）ごと**のフラグなので、`reviewer#0`〜`#63` が
+>   同一 tick で枯渇すれば **その 1 tick で 64 通**出る。上限は `STREAM_MAX_UNITS` = 64
+>   （`fanOut` はペイン枠 `WORKFLOW_SESSION_CAP` = 9 で実質頭打ち）。しかも `send_os`
+>   （OS トースト）は **driver スレッド上でインライン**（detached thread に出るのは webhook だけ）
+>   なので、そのぶん 200ms tick が直接ブロックされる。`onEach` × `retry` を併用する設定でだけ
+>   起きる。spec-notifications.md は §7 で事故防止を掲げ、**スロットリング / ダイジェストは
+>   §9 で v2 送り**にしているので、対処するならそこ（→ plan.md §3 のバックログ）。
 > - **実機検証は未実施。** 裏づけは unit test 5 本だけで、実際に OS トーストや Slack に
 >   届いたところは見ていない（→ plan.md §2 の U18）。
 >
@@ -2678,7 +2695,9 @@ team_presets:
 > 呼ぶ `upsert_workflow_run` は、run が生きている間は必ず `state = 'running'` の snapshot で
 > ある。そこで **Rust 側の文字列判定を SQL の前に置き**、終端 snapshot のときだけ
 > `count(*)` + `DELETE` を同一トランザクション内で走らせる。**hot path が払うのは
-> 文字列比較 1 回だけで、SQL は 1 本も増えない。** run が終端に到達するのは 1 回で、
+> 許可リスト照合 1 回（`TERMINAL_WORKFLOW_STATES.contains` = 最大 3 要素の線形走査。
+> `"running"` は 3 つ全部と比較して外れる）だけで、SQL は 1 本も増えない。**
+> run が終端に到達するのは 1 回で、
 > `advance_all` はその直後からその run を tick しなくなるので、実際の掃除は
 > **完了 1 run あたり約 1 回**である。`mark_workflow_abandoned`（`upsert_workflow_run` を
 > 通らないもう 1 つの終端経路）でも同じ関数を呼ぶ。**起動時の一括掃除はしない** —

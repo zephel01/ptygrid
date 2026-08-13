@@ -256,6 +256,19 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
 いずれも「優先度は P1〜P7 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
 
+- **返信せずに終わった run の kickoff は誰も ack しない（A-5 の入口が 2 つしかない）**
+  （2026-08-13、Stage A の最終レビューで確認 → §6.15 / CONTRACT.md 続報15 の既知の限界）。
+  `retire_run_kickoffs` の呼び出し元は `cancel_workflow` と `abandon_workflow` の 2 か所だけで、
+  `Succeeded` / `Failed` で終端した run は掃かない。**滞留するほうが多数派**である:
+  `joinOn: reply` でない step は route 1（PTY exit）/ route 2（semantic done）で完了するので、
+  返信が無く kickoff は未 ack のまま残る。**A-6（retention）はここに効かない** —
+  `prune_terminal_workflow_runs` は `workflow_runs` を DELETE するだけで `inbox_messages` には
+  SQL を 1 本も投げないため、run 行が消えても kickoff は別テーブルに残る。**帰結**: ack しても
+  行は消えないので `inbox_messages` は増え続け、`MAX_MESSAGES_PER_PROJECT` = 50,000 に達すると
+  `enforce_limit` が `send_inbox` を `Err` で拒否する = **新規 kickoff を送れなくなる**
+  （`workflow_runs` と違い、この表は削除ではなく拒否側）。直し方は 2 つ: A-5 の入口を終端書き込みに
+  も広げるか、5.6.x（スキーマ分割）でまとめて扱うか。**A-5 が作った問題ではない**（5.0.0 からの
+  挙動で、A-5 は cancel / abandon ぶんだけを塞いだ）。
 - **`workflow_runs` の retention は入ったが、数字と掃除範囲に穴が残る**
   （2026-08-13、Stage A-6 → §6.17 / CONTRACT.md 続報17）。上限 `MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT`
   = 500 は下限（`REGISTRY_TERMINAL_CAP` = 100）と最悪ファイルサイズの両側から導いた値だが、
@@ -279,6 +292,30 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
   （既存設定に一切影響しないため）。ただし ack の選択キーは message id ではなく
   **sender**（`queen:workflow/<name>/<run_id>`）で、これにより `kickoff_root_msg_id` が
   `#[serde(skip)]` であることに起因する「読み戻した run には id が無い」問題を回避している。
+- **cancel と driver tick の lost-update race（既存の穴に A-5 が新しい失敗形を足した）**
+  （2026-08-13、Stage A の最終レビューで確認。コード読みのみで**実機再現は未実施**）。
+  `WorkflowRegistry` は `get` → 変更 → `put` を**呼び出しをまたいで排他していない**
+  （`orchestrator.rs:363-415`。ロックは 1 回の `get` / `put` の中でしか握られない）。driver は
+  `start_driver` → `std::thread::spawn` の独立 OS スレッドなので、driver が run を local に
+  clone した直後に `cancel_workflow` が走ると、cancel が `Cancelled` を `put` →
+  `persist_run('cancelled')` → **kickoff を全部 ack** したあとで、driver が古い `Running`
+  スナップショットを `put` し直し、**run が Running に復活して DB も `'running'` に戻る**。
+  競合窓は `advance_run` 1 回ぶん。**この lost update 自体は A-5 以前からある**が、以前は
+  「復活しただけ」で済んでいたところ、いまは復活した run の step が `await` している mailbox が
+  空にされているので、その step は**来ない返信を `timeoutMs` まで待って固まる**という失敗形が
+  足された。直すには registry に per-run ロックか cancel フラグが要る（`get`/`put` の粒度を
+  変える話なので、Stage A の範囲では直さない）。
+- **`onEach` / `fanOut` のコピーが一斉枯渇すると escalation がコピー数ぶん出る**
+  （2026-08-13、Stage A の最終レビューで確認 → CONTRACT.md 続報16 の既知の限界）。
+  `escalated` は **step（コピー）単位**のフラグなので、`reviewer#0`〜`#63` が同一 tick で
+  枯渇すると **1 tick で 64 通**出る。上限は `STREAM_MAX_UNITS` = 64（`fanOut` はペイン枠
+  `WORKFLOW_SESSION_CAP` = 9 で実質頭打ち）。しかも `send_os`（`notifications.rs:363`）は
+  **driver スレッド上でインライン**で、detached thread に出るのは webhook だけなので、
+  OS トースト 64 発がそのまま 200ms tick をブロックする。続報16 の「枯渇 1 回につき
+  escalation は 1 通」は step 単位の話で、run 単位のバーストには触れていない。
+  spec-notifications.md は §7 で事故防止を掲げつつ**スロットリング / ダイジェストは §9 で
+  v2 送り**にしているので、対処するならそこ。**A-4 が作った問題ではない**（`onEach` × `retry` を
+  併用する設定でだけ起きる、通知層の v1 が既知で残している穴のほう）。今回は記録のみ。
 - **`feat/terminal-copy-paste` が push 未・PR 未**: ターミナルのコピー & ペースト（→ §4 の v0.5.8
   項目 7）はローカルのブランチにしか無い。push と PR を出し、U13 の残り 4 点を消す
 - **`fanOut` を持つ step を root に置けない**: `spawn_workflow` の root ループは全コピーに枝番なしの
@@ -499,6 +536,22 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
    svelte-check 136 files 0 errors 0 warnings、`npm run build` 成功（メニューは macOS 限定で
    この作業環境の Linux では `cfg` で落ちるため、一時的に `cfg(all())` へ書き換えて実際にコンパイルと
    lint を通してから元に戻している）。実機検証は U13（一部済）。
+8. **（後から入った実装済みの項目）タイトルバーに実行中のバージョンを出す**。コミット `c74997f`
+   （`feat/schedule-5.0.8` の `1a48b1d` からの cherry-pick、`src-tauri/src/lib.rs` の 25 行のみ）。
+   ウィンドウのタイトルが `ptygrid` だけで、「いま見ているのはどのビルドか」が画面のどこにも
+   出ていなかった。`setup` フックで `window.set_title("{name} {version}")` を呼び、
+   **`app.package_info()` から取る**（= `generate_context!` がビルド時に焼き込む値。`name` は
+   `tauri.conf.json` の `productName`、`version` は同ファイルの `version`。後者が未設定のときだけ
+   `CARGO_PKG_VERSION` にフォールバックする）。`tauri.conf.json` の**静的 `title: "ptygrid"` は
+   そのまま残してある**: ウィンドウはまずその題で作られ、setup が直後に上書きする。main ウィンドウが
+   取れないときは何もしない（best effort）ので、静的 `title` はそのときの表示でもある。
+   **バージョン文字列を 4 つ目のファイルに増やさない**ためにこの形にした — version を持つファイルは
+   既に 3 つあり（`package.json` / `Cargo.toml` / `tauri.conf.json`）、`v0.5.7` のタグが 3 つとも
+   `0.5.6` のままのコミットを指している（上の項目 6）という前科がある。
+   **この項目は schedule 機能とは独立**である（cherry-pick 元の `feat/schedule-5.0.8` は
+   Stage A の後に回す判断で、時刻起動のコードは本ビルドに 1 行も入っていない）。
+   wire 契約に変更は無いので CONTRACT.md には追記していないが、**ユーザーに見える挙動変更**なので
+   ここに記録する。frontend 無変更、テスト数も不変。**実機での見え方は未確認**。
 
 **タグの内容には数えないもの**: 実タスクでのベースライン測定と改良構成の比較、`mode: serve` の
 spec 執筆（どちらも §3 P5。順序は項目 4 の実測で `onEach: reply` 先行に決まった）。
@@ -997,6 +1050,9 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   cancel / abandon された run の kickoff が agent の mailbox に**未 ack のまま残り**、次の run の
   ペインが `await` でそれを拾って**取り消された作業を実行してしまう**余地があった。2026-08-05 の
   実機で `coder` のペインが前日の run の kickoff 2 通（id=333 / id=334）を報告したのが観測点。
+  **ただし、その 2 通が cancel / abandon 由来だったかは未確認**（§6.14 に引用したペインの報告は
+  「2026-08-04 の古い run」「返信もしていないため未 ack」としか言っておらず、run がどう終わったかを
+  示していない。返信せずに終わった run でも同じ見え方になる → 下の「未対応のもの」）。
   誤完了は起きない（返信は thread root で相関される）ので、症状は「run の結果が壊れる」ではなく
   「やらなくていい作業をやる」。5.0.7 が作った問題ではなく **5.0.0 からの挙動**。
 - **入ったもの**: `QueenStore::ack_inbox_from_sender`（新設）と
@@ -1028,11 +1084,19 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
 - **未実測のもの**（推測で埋めないこと）:
   - **実機検証は一切していない**。上の裏づけは unit test 4 本だけで、実機で「次の run の
     ペインが古い kickoff を数えなくなった」ところは**見ていない** → §2 の U17。
-  - **`Failed` / `Succeeded` で終端した run は掃いていない。** 入口は cancel / abandon の 2 つ
-    だけである。返信せずに終わった run の kickoff が同じように滞留するかどうかは
-    **未実測**で、範囲としては A-6（retention）側。
   - メッセージは削除ではなく ack なので、`list_inbox(includeAcknowledged: true)` には残る。
     「古い kickoff を読ませない」保証が及ぶのは `await` と未 ack 一覧まで。
+- **未対応のもの**:
+  - **`Failed` / `Succeeded` で終端した run は掃いていない。** 入口は cancel / abandon の
+    2 つだけ（`retire_run_kickoffs` の呼び出し元はこの 2 か所しかない）。しかも**滞留するほうが
+    多数派**である: `joinOn: reply` でない step は route 1（PTY exit）/ route 2（semantic done）で
+    完了するので、**返信が無く kickoff は未 ack のまま残る**。
+    **A-6（retention）はここに効かない** — `prune_terminal_workflow_runs` が触るのは
+    `workflow_runs` の DELETE だけで、`inbox_messages` には SQL を 1 本も投げないので、
+    run 行が消えたあとも kickoff は inbox に残る（別テーブル）。**帰結**: ack しても行は消えない
+    ため `inbox_messages` は増え続け、`MAX_MESSAGES_PER_PROJECT` = 50,000 に達すると
+    `enforce_limit` が `send_inbox` を `Err` で拒否する = **新規 kickoff を送れなくなる**。
+    直すなら A-5 の入口を終端書き込みにも広げるか、5.6.x で扱う（→ §3 のバックログ）。
 
 ### 6.16 2026-08-13: Stage A-4 — retry を使い切った step が外へ 1 通出す（escalation の配線）
 
@@ -1145,7 +1209,9 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
 - **設計判断 4: 走るのは「run が終端に到達した書き込み」だけ。200ms tick には何も足さない。**
   driver が呼ぶ `upsert_workflow_run` は run が生きている間つねに `state = 'running'` の
   snapshot なので、**Rust 側の文字列判定を SQL の前に置く**だけで hot path のコストは
-  文字列比較 1 回に収まる（SQL は 1 本も増えない）。run が終端に到達するのは 1 回、
+  **3 要素の許可リスト照合 1 回**（`TERMINAL_WORKFLOW_STATES.contains` = `[&str; 3]` の線形走査。
+  hot path の `"running"` は 3 つ全部と比較して外れる）に収まる（SQL は 1 本も増えない）。
+  run が終端に到達するのは 1 回、
   かつ `advance_all` はその直後からその run を tick しないので、実際の掃除は
   **完了 1 run あたり約 1 回**。`mark_workflow_abandoned`（`upsert_workflow_run` を通らない
   もう 1 つの終端経路）でも同じ関数を呼ぶ。**起動時の一括掃除は入れていない**（下記）。
@@ -1179,6 +1245,46 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
     空きページが再利用されるだけである。
   - **終端 run 行を読む機能は依然として無い。** A-6 は「上限を決めて DELETE を入れる」までで、
     履歴 UI は 5.6.0 以降の話。したがって**この変更で失われる利用者向けの機能は現時点で無い**。
+
+### 6.18 2026-08-13: Stage A 4 件の最終レビューと、その是正（記述の誤り + テストの穴）
+
+A-2/A-3・A-4・A-5・A-6 を別々に実装したあと、まとめて 1 回レビューした。**コードの機能バグは
+出ていない**ので、是正は記述とテストだけ。
+
+- **記述の誤り 3 件**:
+  - 「返信せずに終わった run の kickoff の滞留は **A-6（retention）の範囲**」（続報15 / §6.15）は
+    **事実として誤り**だった。`prune_terminal_workflow_runs` は `workflow_runs` を DELETE する
+    だけで `inbox_messages` には SQL を投げない。「未対応」に書き換え、帰結
+    （`MAX_MESSAGES_PER_PROJECT` = 50,000 で `send_inbox` が拒否されはじめる）を足し、
+    §3 のバックログに 1 項目として残した。
+  - §6.15 が「2026-08-05 に `coder` のペインが報告した 2 通が A-5 の直した対象」と読めた点。
+    §6.14 に引用した報告は「古い run」「未 ack」としか言っておらず、**cancel / abandon 由来である
+    証拠は無い**ので、その旨を 1 行足した（§7 の「推測を断定で書かない」）。
+  - 「hot path が払うのは**文字列比較 1 回**」（続報17 (4) / §6.17 の設計判断 4）は言い過ぎ。
+    実体は `TERMINAL_WORKFLOW_STATES.contains` = `[&str; 3]` の線形走査なので、
+    **「3 要素の許可リスト照合 1 回（SQL は 1 本も増えない）」**に直した。
+  - あわせて §4 に**項目 8（タイトルバーのバージョン表示、`c74997f`）**を足した。cherry-pick で
+    入っていたのに CONTRACT.md にも plan.md にも記録が無く、wire は変わらないが**ユーザーに
+    見える挙動変更**であるため。
+- **テストの穴 3 件**（→ コミット `test: pin the escalation wiring, ...`）:
+  - `advance_run_escalates_a_step_that_has_run_out_of_retries`: A-4 の**配線**回帰。既存の
+    escalation テストは `take_escalations` を直接呼ぶものだけで、`advance_run` の呼び出しを
+    消しても全テストが通る状態だった（先例は
+    `advance_run_cancels_a_straggler_once_the_any_join_is_won`）。**配線を潰すとこのテストだけが
+    落ちることを確認**してから元に戻している。
+  - `an_escalation_mark_does_not_survive_the_persisted_round_trip`: 続報16 の
+    「`escalated` は `steps_json` にも `workflow-state` にも出ない」を assert で固定（A-5 が
+    `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost` でやっているのと同じ形）。
+  - `a_workflow_run_state_this_build_does_not_know_is_never_pruned`: A-6 の許可リスト方式
+    （続報17 (3)）を、`'weird'` という未知 state の行で固定。既存 5 本は `'running'` と
+    `'succeeded'` しか使っておらず、「`'running'` の否定」に書き換えても全部緑のままだった。
+- **記録だけして直さなかったもの**（→ §3 のバックログ）: cancel と driver tick の lost-update
+  race、`onEach` / `fanOut` の一斉枯渇による escalation バースト（最大 64 通）。**どちらも
+  Stage A が作った問題ではない**。
+- 検証: `cargo test` **lib 489 → 492 passed / 統合 14 passed / 0 failed**。clippy は既存の
+  `config.rs` の `nonminimal_bool` 1 件のみで新規警告ゼロ。`cargo fmt` は**走らせていない**
+  （既存コードが現行 rustfmt で未整形のため、無関係な差分が大量に出る）。frontend 無変更、
+  wire 契約も無変更。**実機検証は依然として未実施**（U17 / U18 / U19 はそのまま残る）。
 
 ---
 
