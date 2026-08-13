@@ -139,6 +139,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U14 | **`onEach: reply` / `joinOn: stream`（5.0.7）の実機検証** | **2026-08-05、macOS で 1 回目を実施（一部済）**。`_OUTPUTS/u14-verify` の `u14-streaming`（git 管理外の使い捨て設定）を流し、run が SUCCEEDED まで到達することを確認: `coder` 37.4 秒で 5 unit を送り番兵 `[[end]]` で Succeeded、`reviewer#0`〜`#4` が**到着順・欠番なし**で 5 つ生え（所要 22.7 / 15.7 / 11.0 / 6.3 / 33.8 秒）、全コピーが終端したあと `summary` が **1 度だけ** 28.4 秒動いた。採番・番兵での閉じ・`dep_satisfied` の stream 節が実機で裏づけられた。**この回で 1 件の設計不備を発見し修正**（→ §6.14）: コピーが agent 定義名の mailbox を共有しており、あるレビュアーのペインが「待機で 3 件届いたので、いちばん新しい id=341 を選び」と報告した。**まだ確認していないことが 3 点**: (1) 「上流が 3 本目を送る前に 1 人目が動いている」瞬間の目視証拠（今回のスクリーンショットは完走後のもので、この 3 つ — `coder` が Running / `reviewer#0` が Running・Succeeded / `reviewer#2` の行が無い — が同時に写った 1 枚がまだ無い。`coder` は 37 秒動くので ▶ の 15〜20 秒後が狙い目）、(2) `u14-no-sentinel`（番兵を送り忘れても `timeoutMs` で run が終端に到達すること）、(3) `u14-queue`（9 面上限で待ち行列ができ、兄弟が走っている間は 5 分を超えても失敗しないこと）。**2 回目（同日 17:19、修正後のバイナリ）で per-copy mailbox の実効を確認**: reviewer のペインが `sender=wf/wfr_18c8daebafa1e87800000000/reviewer#2` / `#3` と自分専用の mailbox 名で返信しており、1 回目に出ていた「待機で N 件届いたので、いちばん新しいものを選び」という報告が消えた。`summarizer` も「reviewer#0〜#3 の 4 件（id 384〜387）」と自分の run の返信だけを数えている。**この回の unit は 4 本**（設定は「5 つ」のまま。1 回目は 5 本）で、実装は本数に関わらず正しく追随したが、**「1 単位ごとに自発的に返信を刻む」挙動がモデル依存であることが 2 回で 2 通りの本数として出た**。残るのは上記 3 点のうち (1)(2)(3) すべてで、いずれも未実施 |
 | U15 | **resume 拒否ガード（`condition:` / `handoffTo:` の carry 喪失、2026-08-07）の実機検証** | 未実施。`condition:` を持つ workflow（例: `gate`(kickoff あり・`joinOn: reply`) → `apply`(`condition:`)）を流し、**`gate` が返信して Succeeded になった直後・`apply` が走り出す前にアプリを落として再起動**する。期待は「再開バナーが失敗表示になり、理由に `cannot be resumed` と `condition:` と `gate` が出る」こと。`handoffTo:` 版（`draft` → `polish`）も同じ形で 1 本。裏づけは現状 unit test 5 本のみ（→ CONTRACT.md 続報12） |
 | U16 | **複数 `handoffTo:` の合流（2026-08-07）の実機検証** | 未実施。`pattern: supervisor` で `implement` → `reviewA` / `reviewB`（2 体とも `joinOn: reply` + `handoffTo: verdict`）→ `verdict`（`dependsOn: [implement, reviewA, reviewB]`）を組み、**判定ペインの kickoff に 2 体ぶんの本文が宣言順で前置されていること**を目視する。1 体だけが返信した場合にその 1 本が運ばれることも同じ回で。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報13） |
+| U17 | **cancel / abandon 時の未 ack kickoff 掃除（Stage A-5、2026-08-13）の実機検証** | 未実施。手順は §6.14 で穴が出たときの逆をたどる: (1) `kickoff:` を持つ step の workflow を起動し、エージェントが返信する前に **⏹ で cancel** する。(2) 同じ workflow をもう一度起動し、ペインに mailbox の中身を数えさせて **前の run の kickoff が未 ack の一覧に出ないこと**を確認する（`await` が古い kickoff を返さないこと、が実際に見たいもの）。(3) abandon 側は「実行中にアプリを落として再起動 → 再開バナーで『破棄』」を選び、同じく次の run で残っていないことを確認する。(4) 並行 run 版（同名 workflow を 2 本走らせ、片方だけ cancel しても**もう片方のペインが自分の kickoff を受け取れる**こと）も同じ回で見たい。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報15） |
 
 ---
 
@@ -246,12 +247,17 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 実績は §1 の表と §4 のタグ表に残す。
 
 - **cancel / abandon された run の kickoff が agent の mailbox に未 ack で残り続ける**
-  （2026-08-05 発見、→ §6.14）。次の run のエージェントが死んだ run の指示を読んで実行しうる。
+  （2026-08-05 発見、→ §6.14）— **2026-08-13、コード上は解消（Stage A-5、→ §6.15 /
+  CONTRACT.md 続報15）。実機検証は未実施（→ §2 の U17）なので、U17 が済むまでここに残す。**
+  以下は発見当時の記述: 次の run のエージェントが死んだ run の指示を読んで実行しうる。
   相関は thread root なので step を誤完了させることはなく、5.0.7 が作った問題でもない
   （5.0.0 からの挙動）。直し方は 2 つあり、(a) `cancel_workflow` / `abandon_workflow` に
   未 ack kickoff の ack を足す、(b) 5.0.7 がコピーに入れた run スコープの mailbox
   （`wf/<run_id>/<step_id>`）を全 step に広げる。(b) は既存の全サンプルの `cmd` が
-  `mailbox=$PTYGRID_MAILBOX` を使う形に揃っていることが前提になる。
+  `mailbox=$PTYGRID_MAILBOX` を使う形に揃っていることが前提になる。**採ったのは (a)**
+  （既存設定に一切影響しないため）。ただし ack の選択キーは message id ではなく
+  **sender**（`queen:workflow/<name>/<run_id>`）で、これにより `kickoff_root_msg_id` が
+  `#[serde(skip)]` であることに起因する「読み戻した run には id が無い」問題を回避している。
 - **`feat/terminal-copy-paste` が push 未・PR 未**: ターミナルのコピー & ペースト（→ §4 の v0.5.8
   項目 7）はローカルのブランチにしか無い。push と PR を出し、U13 の残り 4 点を消す
 - **`fanOut` を持つ step を root に置けない**: `spawn_workflow` の root ループは全コピーに枝番なしの
@@ -961,6 +967,51 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   問題ではなく 5.0.0 からの挙動で、今回コピーに入れた run スコープの mailbox を全 step に広げるか、
   `cancel_workflow` / `abandon_workflow` が未 ack の kickoff を ack するかのどちらかで消える
   （→ §3 の継続ウォッチ / バックログ）。
+
+### 6.15 2026-08-13: Stage A-5 — cancel / abandon された run の kickoff を ack する
+
+詳細な経緯。現在地は §1・§2（U17）・§3。
+
+- **直したもの**: §6.14 の末尾で「本 patch では直していない」と書いた滞留そのもの。
+  cancel / abandon された run の kickoff が agent の mailbox に**未 ack のまま残り**、次の run の
+  ペインが `await` でそれを拾って**取り消された作業を実行してしまう**余地があった。2026-08-05 の
+  実機で `coder` のペインが前日の run の kickoff 2 通（id=333 / id=334）を報告したのが観測点。
+  誤完了は起きない（返信は thread root で相関される）ので、症状は「run の結果が壊れる」ではなく
+  「やらなくていい作業をやる」。5.0.7 が作った問題ではなく **5.0.0 からの挙動**。
+- **入ったもの**: `QueenStore::ack_inbox_from_sender`（新設）と
+  `orchestrator::retire_run_kickoffs`（新設、`cancel_workflow` / `abandon_workflow` から呼ぶ）。
+  §3 に並べていた 2 案のうち **(a)** を採った。(b)（run スコープ mailbox を全 step に広げる）は
+  既存の全サンプル・全ユーザー設定の `cmd` が `mailbox=$PTYGRID_MAILBOX` に揃っていることを
+  前提にするので、既存設定に一切影響しない (a) のほうが安い。
+- **設計判断 1: 選択キーは message id ではなく sender。** kickoff の sender は
+  `workflow_mailbox` が作る `queen:workflow/<name>/<run_id>` で **run_id を含む**ため、
+  文字列一致だけで「この run の kickoff」を正確に選べる（共有 mailbox のぶんも `onEach` コピーの
+  専用 mailbox のぶんも同じ条件で拾え、並行する別 run を巻き込む余地が構造的に無い）。
+  id 経由だとこれが成立しない: `StepOutcome::kickoff_root_msg_id` は `#[serde(skip)]` なので
+  **DB から読み戻した run には id が 1 つも無い**。`abandon_workflow` が見るのは常にその読み戻した
+  run なので、id 方式では abandon 側が丸ごと機能しないところだった。**「resume をまたぐと id が
+  消えるので abandon では縮退する」という穴は、sender 方式では発生しない。**
+- **設計判断 2: step の state を問わず全部 ack する。** 終わった run の kickoff は全部用済みで、
+  かつ `Succeeded` の step の kickoff も未 ack で残っていることが多い（route 1 / route 2 は
+  返信なしで step を完了させる）。次の run から見れば古さは同じ。
+- **設計判断 3: best-effort。** store エラーは `eprintln!` に落として cancel / abandon 自体は
+  成功させる。掃除の失敗で cancel が失敗するのは本末転倒で、失敗時の最悪ケースは修正前の挙動と
+  同じだから。順序も「主目的が先」に固定した（cancel は `persist_run` の後、abandon は
+  `mark_workflow_abandoned` の成功後）。
+- 検証: `cargo test` **lib 475 → 479 passed / 統合 14 passed / 0 failed**（新規 4 本 —
+  `acking_by_sender_closes_only_that_senders_unacknowledged_messages` /
+  `cancelling_a_run_acks_the_kickoff_its_agent_never_answered` /
+  `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost` /
+  `retiring_one_runs_kickoffs_leaves_a_concurrent_runs_alone`）。clippy は既存の `config.rs` の
+  `nonminimal_bool` 1 件のみで新規警告ゼロ。frontend 無変更。
+- **未実測のもの**（推測で埋めないこと）:
+  - **実機検証は一切していない**。上の裏づけは unit test 4 本だけで、実機で「次の run の
+    ペインが古い kickoff を数えなくなった」ところは**見ていない** → §2 の U17。
+  - **`Failed` / `Succeeded` で終端した run は掃いていない。** 入口は cancel / abandon の 2 つ
+    だけである。返信せずに終わった run の kickoff が同じように滞留するかどうかは
+    **未実測**で、範囲としては A-6（retention）側。
+  - メッセージは削除ではなく ack なので、`list_inbox(includeAcknowledged: true)` には残る。
+    「古い kickoff を読ませない」保証が及ぶのは `await` と未 ack 一覧まで。
 
 ---
 
