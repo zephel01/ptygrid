@@ -2624,6 +2624,108 @@ team_presets:
 > `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
 > 本作業起因の新規警告はゼロ。frontend 無変更。
 
+> 追記（2026-08-13、続報17）: **`workflow_runs` に retention を入れた（Stage A-6）。**
+> このテーブルだけ**件数上限も DELETE も無く**、インストールの寿命ぶん**単調増加**していた
+> （pins / notes / inbox は `enforce_limit` の対象。`workflow_runs` は対象外だった）。
+> 実装は `queen_store.rs` に閉じており、**`user_version` は消費していない**（3 のまま）。
+>
+> **(1) 上限は「件数」。日数ではない。** 隣の 3 テーブル（`MAX_PINS_PER_PROJECT` = 256 /
+> `MAX_NOTES_PER_PROJECT` = 10,000 / `MAX_MESSAGES_PER_PROJECT` = 50,000）が全て件数で
+> 揃っており、かつ**日数だけではファイルサイズが有界にならない**（1 日で何百 run でも
+> 書ける）。逆に日数だけにすると、1 か月放置したプロジェクトを開いた人が**まさに見たい
+> 履歴を全部失う**。件数なら最悪サイズが決まり、放置しても消えない。
+>
+> **(2) 上限値は `MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT` = 500（project ごと、終端 run のみ）。**
+> 数字の出どころは 2 つの境界:
+>
+> - **下限 100** = `orchestrator::REGISTRY_TERMINAL_CAP`（メモリ上の registry が保持する
+>   終端 run の数）。**永続ストアが揮発ストアより狭いのは背理**なので、DB 側はこれ以上で
+>   なければならない。500 はその 5 倍で、DB 窓のほうが確実に広い。
+> - **上限** = ファイル増加の抑制。1 行が run 全体の `steps_json` を丸ごと持つので、
+>   この表の 1 行は pin や inbox の 1 行より桁で重い。**悲観的に 1 KiB/行と置くと 500 行 ≒
+>   0.5 MiB/project**。隣の上限が許す最悪値（`MAX_NOTES_PER_PROJECT` × `MAX_NOTE_BODY_BYTES`
+>   だけで ≒ 640 MiB）と比べれば十分に保守的である。**ただし 1 KiB は仮定であって、実際の
+>   `steps_json` の大きさは未実測**。
+> - **時間軸の確認**: 無人スケジューリング（別ブランチ `feat/schedule-5.0.8` の `every: hour`。
+>   **本ビルドには入っていない**）は 1 workflow で 24 行/日を生むので、500 は時間起動 ≒ 20 日、
+>   日次起動なら 1 年以上に相当する。「無人で回しっぱなしにしても数週間の履歴は残る」が
+>   この数字で買っている性質である。
+>
+> `STREAM_MAX_UNITS = 64` と同じく、**導出はあるが実測の裏づけが無い初期値**である。
+> 5.6.0（スキーマ分割）で 1 行が小さく軽くなった時点で見直すこと。
+>
+> **(3) 絶対に消さない run。** 削除対象は `state` が
+> `TERMINAL_WORKFLOW_STATES = ['succeeded', 'failed', 'cancelled']` の行**だけ**である。
+> これは**許可リストであって `'running'` の否定リストではない** — このビルドが知らない
+> state 値（将来スキーマ、手編集）は「まだ生きている」側に倒して**消さない**。
+> retention は間違えるなら残す方向に間違えなければならない。消してはならない行とは
+> `list_running_workflow_runs` が拾う行、すなわち `load_config` の「再開しますか」バナー
+> （5.0.1）の実体であり、消せばクラッシュからの復帰が黙って不可能になるからである。
+> **終端していない run は上限にもカウントしない**ので、履歴がいくら溜まっても生きている run を
+> 押し出せないし、生きている run が何本あっても履歴の窓は狭まらない。
+> `mark_workflow_abandoned` で破棄された run は `state = 'cancelled'` なので**削除対象に含まれる**
+> （操作者が既に「再開しない」と答えた run であり、`error` の abandon マーカーは
+> そのバナーより長生きする必要が無い）。
+>
+> **並び順は `orchestrator::evict_terminal` と同一**にした:
+> `COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC`。`COALESCE` は防御ではなく
+> 必須で、`spawn_workflow` は**全 root の spawn に失敗すると `ended_at_ms` が NULL のまま
+> 終端した run** を publish しうる。これを 0 扱いで最下位に沈めると、**いちばん新しい run から
+> 消える**。`run_id` の tie-break は `new_run_id` が固定幅 hex の単調ナノ秒であるため、
+> 文字列順が生成順に一致することを使っている。
+>
+> **(4) 走るタイミングは「run が終端に到達した書き込み」だけ。** 200ms の driver tick が
+> 呼ぶ `upsert_workflow_run` は、run が生きている間は必ず `state = 'running'` の snapshot で
+> ある。そこで **Rust 側の文字列判定を SQL の前に置き**、終端 snapshot のときだけ
+> `count(*)` + `DELETE` を同一トランザクション内で走らせる。**hot path が払うのは
+> 文字列比較 1 回だけで、SQL は 1 本も増えない。** run が終端に到達するのは 1 回で、
+> `advance_all` はその直後からその run を tick しなくなるので、実際の掃除は
+> **完了 1 run あたり約 1 回**である。`mark_workflow_abandoned`（`upsert_workflow_run` を
+> 通らないもう 1 つの終端経路）でも同じ関数を呼ぶ。**起動時の一括掃除はしない** —
+> 終端行を作る経路が全て掃くようになった以上、上限超過が残っているのは
+> **A-6 以前のビルドが書いた DB だけ**であり、それはそのプロジェクトで次に run が 1 本
+> 終わった時点で窓まで縮む。「もう二度と run しないプロジェクトの古い行は残る」は
+> 既知かつ許容の穴である。
+>
+> **(5) `enforce_limit` と違い、拒否ではなく削除。** pins / notes / inbox は上限に達すると
+> **書き込みを拒否**する（利用者の要求なので「上限です」と答えられる）。`workflow_runs` の
+> 書き込みは要求ではなく、**既に起きたことの記録**（`orchestrator::persist_run`。しかも
+> `Err` を握り潰す）である。拒否しても run は止まらず、**その run の永続記録と resume 可能性が
+> 黙って消えるだけ**になる。したがって新しい行ではなく古い行を消す。
+>
+> **(6) 新しい索引は足していない → `user_version` は消費しない。** `count(*)` も `DELETE` も
+> 絞り込みは `(project_dir, state)` で、これは既存 `workflow_runs_project_state`
+> （`(project_dir, state, started_at_ms DESC)`）の先頭 2 列である。**`user_version` 4 は
+> 5.6.0（スキーマ分割）と 6.0.0（Security の 3 テーブル）で未決のまま**であり
+> （plan.md §5.1 / next-implementation-2026-08.md §4.2）、A-6 はそれに手を触れない。
+>
+> **wire 契約は変わらない。** 新規 Tauri command / MCP tool / event はゼロ。
+> `workflow_runs` の DDL・`WorkflowRunRow`・`StepOutcome` のいずれも無変更。
+> `list_running_workflow_runs` / `list_resumable_workflow_runs` の返り値も、
+> 削除対象が終端 run だけなので**定義上まったく変わらない**。frontend 無変更。
+> `ptygrid.yml` に設定項目は足していない（上限は定数であり、可変にすると
+> 「resume を壊す設定値」を書けるようになるだけである）。
+>
+> **5.6.0（スキーマ分割）が引き継ぐべきこと。** 分割後は run 表と step 表の 2 つになるので、
+> (a) 上限は**引き続き run 単位で数える**（step 行は run の削除に追随して落とす。
+> `ON DELETE CASCADE` を張るか明示 DELETE を 2 本にするかは 5.6.0 の判断）、
+> (b) **終端していない run を数えない/消さない**という (3) の規律はそのまま持ち越すこと、
+> (c) 1 行が軽くなるぶん 500 という数字は見直してよい（上げる方向）、
+> (d) 掃除の起動点は「run が終端に到達した書き込み」に保ち、200ms tick に SQL を足さないこと。
+>
+> **既知の限界。** 削除は行われるが `VACUUM` はしない（SQLite のファイルは縮まず、
+> 空きページが再利用されるだけ）。**実機検証は未実施**で、裏づけは unit test 5 本のみ
+> （→ plan.md §2 の U19）。
+>
+> 検証: `cargo test` **lib 489（484 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `finished_workflow_runs_past_the_cap_lose_the_oldest_rows_first` /
+> `an_unfinished_workflow_run_survives_any_amount_of_history_written_after_it` /
+> `workflow_run_retention_deletes_nothing_while_the_project_is_under_its_cap` /
+> `workflow_run_retention_gives_every_project_its_own_window` /
+> `abandoning_a_run_prunes_the_history_it_has_just_joined`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
