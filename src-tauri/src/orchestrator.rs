@@ -223,6 +223,21 @@ pub struct StepOutcome {
     /// it is about.
     #[serde(skip)]
     pub stream_body: Option<String>,
+    /// Stage A-4: this step's retry budget ran out AND the out-of-app
+    /// escalation for it has already been handed to `notifications` once.
+    /// Internal only — the flag exists purely to turn a LEVEL ("this failed
+    /// step has no budget left", which stays true on every one of the 200ms
+    /// driver's ticks from here on) into an EDGE: `take_escalations` returns
+    /// the step only on the tick that flips this.
+    ///
+    /// `#[serde(skip)]`, deliberately: it is no part of any wire or DB
+    /// contract, and a run read back from `workflow_runs` after a crash starts
+    /// out `false` — so a resumed run re-escalates a step that had already
+    /// exhausted before the crash. That is the right default: the operator who
+    /// missed the first alert (the app was gone) is exactly the one who still
+    /// needs it.
+    #[serde(skip)]
+    pub escalated: bool,
 }
 
 /// Phase 5.0.7: one reply extracted from a `joinOn: stream` step's kickoff
@@ -504,6 +519,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         };
     }
     let spawn = config.resolve_def(&agent).and_then(|(mut def, dir)| {
@@ -535,6 +551,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         },
         Err(error) => StepOutcome {
             step_id: step.id.clone(),
@@ -557,6 +574,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         },
     }
 }
@@ -1111,6 +1129,7 @@ pub fn spawn_workflow<R: Runtime>(
                 next_retry_at_ms: None,
                 deferred_since_ms: None,
                 stream_body: None,
+                escalated: false,
             });
         }
     }
@@ -1160,6 +1179,7 @@ pub fn spawn_workflow<R: Runtime>(
                 next_retry_at_ms: None,
                 deferred_since_ms: Some(started_at_ms),
                 stream_body: None,
+                escalated: false,
             });
             continue;
         }
@@ -1589,6 +1609,7 @@ pub fn resume_workflow<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         });
     }
     steps.sort_by_key(|o| {
@@ -3339,6 +3360,7 @@ fn mint_stream_copies(
                 next_retry_at_ms: None,
                 deferred_since_ms: None,
                 stream_body: Some(unit.body.clone()),
+                escalated: false,
             });
             changed = true;
         }
@@ -3814,6 +3836,129 @@ fn arm_retry_backoff(wf: &WorkflowDef, run: &mut WorkflowRun, now: u64) -> bool 
         }
     }
     changed
+}
+
+/// Stage A-4: one step whose `retry` budget just ran out, on its way to the
+/// out-of-app notification channels (`notifications`, Phase 4.4.2). Owned, so
+/// the dispatch happens after `advance_run` is done mutating the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Escalation {
+    step_id: String,
+    /// Agent definition name, so the message reads like the session-sourced
+    /// notifications do (`who` is the agent, not an opaque id).
+    agent: String,
+    /// The pane the last attempt ran in, if it still had one. `None` when the
+    /// step never got a pane, or when `check_timeouts` already killed it.
+    session_id: Option<u32>,
+    /// Spawn attempts spent. `1` means the original spawn only, i.e. every
+    /// declared retry was consumed by pane-shortage give-ups.
+    attempts: u32,
+    /// The step's own `error` text, when it has one.
+    error: Option<String>,
+}
+
+/// Stage A-4, pure half of the escalation path: collect every step that has
+/// JUST become "failed for good" — `Failed`, no backoff armed, and its
+/// declared `retry` policy has nothing left — and mark each one so it is
+/// collected only once.
+///
+/// The marking is the whole point. "This step is out of retries" is a LEVEL:
+/// it stays true for as long as the run lives, and the driver re-evaluates it
+/// every 200ms, so a naive check would send one notification per tick for as
+/// long as any sibling step keeps the run `Running`. `escalated` converts it
+/// into an edge, in the same spirit as `next_retry_at_ms` converting "failed"
+/// into "failed and waiting".
+///
+/// Deliberately narrower than "the step failed":
+/// - **No `retry:` declared → no escalation.** The gate this implements is
+///   retry EXHAUSTION (plan.md §3 P3). A step that never asked to be retried
+///   has not exhausted anything; its pane exit already notified through
+///   `session::handle_eof`, and escalating every ordinary failure as well
+///   would be the notification flood that spec-notifications.md §7 exists to
+///   avoid.
+/// - **`attempts == 0` → no escalation.** Same shape `arm_retry_backoff`
+///   refuses to arm: the step was failed without ever being spawned (today the
+///   unevaluable-`condition:` arm), so no attempt was ever made, let alone
+///   exhausted.
+/// - **A backoff still armed → no escalation.** That step is not terminal; a
+///   retry is still coming.
+///
+/// Called from `advance_run` AFTER both `arm_retry_backoff` passes, so a step
+/// that failed earlier in this same tick has already had its chance to arm a
+/// backoff and can never be mistaken for an exhausted one.
+fn take_escalations(wf: &WorkflowDef, run: &mut WorkflowRun) -> Vec<Escalation> {
+    let mut out = Vec::new();
+    for outcome in &mut run.steps {
+        if outcome.escalated
+            || outcome.state != StepState::Failed
+            || outcome.next_retry_at_ms.is_some()
+            || outcome.attempts == 0
+        {
+            continue;
+        }
+        let Some(step) = wf.steps.iter().find(|s| s.id.as_str() == base_id(&outcome.step_id)) else {
+            continue;
+        };
+        let Some(policy) = step.retry else {
+            continue;
+        };
+        if retry::allows_another(outcome.attempts, &policy) {
+            continue; // budget left — `arm_retry_backoff` will spend it
+        }
+        outcome.escalated = true;
+        out.push(Escalation {
+            step_id: outcome.step_id.clone(),
+            agent: outcome.agent.clone(),
+            session_id: outcome.session_id,
+            attempts: outcome.attempts,
+            error: outcome.error.clone(),
+        });
+    }
+    out
+}
+
+/// Stage A-4, side-effecting half: hand one exhausted step to the Phase 4.4.2
+/// notification layer as an `Error`.
+///
+/// `Error` rather than `NeedsAttention`, and the choice matters: `critical` is
+/// the DEFAULT `notifications.level`, and it subscribes to `error` only
+/// (spec-notifications.md §2.2). Under `NeedsAttention` this escalation would
+/// be invisible to everyone who never edited the level — that is, in the
+/// default configuration, which is the one the "nobody is watching at 3am"
+/// case runs in. It also matches the existing semantics: `Error` is the
+/// abnormal-termination event, and a step that has burned its whole retry
+/// budget has terminated abnormally in a way nothing will undo.
+///
+/// No new config knob comes with this (ptygrid-yml-guide.md §1 keeps
+/// escalation in the "not written in the config" column): the existing
+/// `notifications:` block's level/channel machinery already expresses "who
+/// gets told and how loudly", and a second, escalation-only switch would only
+/// add a way to configure the two out of agreement.
+fn notify_escalation<R: Runtime>(
+    app: &AppHandle<R>,
+    workflow_name: &str,
+    run_id: &str,
+    esc: &Escalation,
+) {
+    crate::notifications::dispatch_ctx(
+        app,
+        crate::notifications::NotifyEvent::Error,
+        crate::notifications::NotifyContext {
+            // Cosmetic only for this source: the message names the step, never
+            // `#id`, precisely because an exhausted step may have no session
+            // left (killed by `check_timeouts`) or never have had one.
+            session_id: esc.session_id.unwrap_or(0),
+            name: Some(esc.agent.clone()),
+            project: None, // filled in by the dispatch layer
+            detail: esc.error.clone(),
+            origin: Some(crate::notifications::WorkflowOrigin {
+                workflow: workflow_name.to_string(),
+                run_id: run_id.to_string(),
+                step_id: esc.step_id.clone(),
+                attempts: esc.attempts,
+            }),
+        },
+    );
 }
 
 /// Phase 5.0.4 retry driver, side-effecting half: once a `Failed` outcome's
@@ -4309,6 +4454,17 @@ fn advance_run<R: Runtime>(
     // this tick belongs to the next one.
     changed = arm_retry_backoff(&wf, &mut run, now) || changed;
 
+    // Stage A-4, AFTER both arming passes: only now is "Failed with no
+    // `next_retry_at_ms`" the final word rather than a state the second pass
+    // was about to un-terminal. Collecting here also puts it after
+    // `cancel_stragglers`, so a `joinOn: any` loser that this tick retires to
+    // `Cancelled` is never escalated. The `changed` OR is load-bearing: the
+    // `escalated` marks live in this local `run` until `registry.put` below
+    // stores it, and a tick that dropped the write would re-collect — and so
+    // re-send — the same escalation on the next one.
+    let escalations = take_escalations(&wf, &mut run);
+    changed = !escalations.is_empty() || changed;
+
     let new_state = finalize_state(&wf, &run);
     if new_state != run.state {
         run.state = new_state;
@@ -4322,6 +4478,17 @@ fn advance_run<R: Runtime>(
         registry.put(run.clone());
         persist_run(store, &project_dir, &run);
         emit_workflow_state(app, &run);
+    }
+
+    // LAST, after the run's own state is stored and emitted: the out-of-app
+    // send is best-effort I/O that must not sit between the mutation and its
+    // persistence. `dispatch_ctx` itself is cheap on this thread (the webhook
+    // POST goes to a detached thread; only the OS toast is inline), and it is
+    // a no-op entirely when `notifications:` is absent or disabled — but it is
+    // still the one thing here that talks to the outside world, so it goes at
+    // the end. Empty on every tick except the one an exhaustion lands on.
+    for esc in &escalations {
+        notify_escalation(app, &workflow_name, &run_id, esc);
     }
 }
 
@@ -4475,6 +4642,7 @@ mod tests {
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         }
     }
 
@@ -5344,6 +5512,95 @@ workflows:
         };
         assert!(!arm_retry_backoff(&wf, &mut run, 1000));
         assert!(run.steps[0].next_retry_at_ms.is_none());
+    }
+
+    // ---- Stage A-4: escalation on retry exhaustion ----
+
+    /// A one-step run of `retryzero` (`retry: max 2`) with its single step
+    /// already `Failed`. Callers set `attempts` to place it before or after
+    /// the exhaustion line.
+    fn exhausted_run(step_id: &str, attempts: u32) -> WorkflowRun {
+        let mut outcome = mk_outcome(step_id, Some(4), StepState::Failed);
+        outcome.attempts = attempts;
+        outcome.error = Some("exit code 1".to_string());
+        WorkflowRun {
+            run_id: "wfr_r1".to_string(),
+            name: "retryzero".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![outcome],
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn an_exhausted_retry_budget_escalates_once_and_never_again() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        // `max: 2` allows attempts 1..=2 to buy another try; 3 is past the end.
+        let mut run = exhausted_run("first", 3);
+
+        let first_tick = take_escalations(&wf, &mut run);
+        assert_eq!(first_tick.len(), 1, "exhaustion escalates exactly once");
+        assert_eq!(first_tick[0].step_id, "first");
+        assert_eq!(first_tick[0].attempts, 3);
+        assert_eq!(first_tick[0].agent, "x");
+        assert_eq!(first_tick[0].session_id, Some(4));
+        assert_eq!(first_tick[0].error.as_deref(), Some("exit code 1"));
+        assert!(run.steps[0].escalated);
+
+        // The state that produced it is a LEVEL — still exactly as true on
+        // every later 200ms tick — so re-running must stay silent.
+        for tick in 0..5 {
+            assert!(
+                take_escalations(&wf, &mut run).is_empty(),
+                "tick {tick} re-sent an escalation already sent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retry_that_still_has_budget_left_does_not_escalate() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+
+        // Budget left (attempts 1 of max 2): `arm_retry_backoff` is about to
+        // spend it, so nothing has been exhausted.
+        let mut run = exhausted_run("first", 1);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
+
+        // Waiting out an armed backoff: not terminal, not exhausted — even
+        // with the attempts count already past the budget, because the
+        // respawn that is still coming is what will decide.
+        let mut run = exhausted_run("first", 3);
+        run.steps[0].next_retry_at_ms = Some(9_999);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
+
+        // Failed without ever being spawned (`attempts == 0`, the
+        // unevaluable-`condition:` shape `arm_retry_backoff` also refuses):
+        // no attempt was made, so no budget was exhausted.
+        let mut run = exhausted_run("first", 0);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+
+        // Still Running: the step has not failed at all yet.
+        let mut run = exhausted_run("first", 3);
+        run.steps[0].state = StepState::Running;
+        assert!(take_escalations(&wf, &mut run).is_empty());
+    }
+
+    #[test]
+    fn a_step_with_no_retry_policy_never_escalates_however_hard_it_failed() {
+        // The gate is retry EXHAUSTION. A step that never asked to be retried
+        // has nothing to exhaust, and its pane exit already notified through
+        // `session::handle_eof` — escalating it too would double up on every
+        // ordinary workflow failure.
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let mut run = exhausted_run("first", 7);
+        run.name = "chain".to_string();
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
     }
 
     #[test]

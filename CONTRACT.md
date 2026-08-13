@@ -2539,6 +2539,91 @@ team_presets:
 > `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
 > 本作業起因の新規警告はゼロ。frontend 無変更。**実機検証は未実施**（→ plan.md §2 の U17）。
 
+> 追記（2026-08-13、続報16）: **retry を使い切った step が、アプリの外へ 1 通も出さずに
+> 黙って赤くなっていたのを直した（Stage A-4、escalation の配線）。** 4.4.2 の通知基盤
+> （OS トースト / Slack / Mattermost / Discord / Telegram）は 5.0.4 の retry 実行系より前から
+> あるのに、**workflow 側からの入口が無かった**。step が `retry:` の予算を使い切ると
+> `Failed` で終端して run が red になるだけで、離席中・夜間には誰も気づかない
+> （ptygrid-yml-guide.md §1 の escalation 行が ❌ のまま残っていた理由）。
+>
+> 是正: 通知の**第 3 のイベント源**として `orchestrator::take_escalations`（純関数）＋
+> `notify_escalation`（dispatch 呼び出し）を足し、`advance_run` の末尾に配線した。
+> 新しい配送機構はゼロ — 既存の `notifications::dispatch` と同じ経路・同じレベル判定に乗る。
+>
+> **(1) エッジ化は orchestrator 側でやる。** 4.4.2 は「イベント源はすべてエッジで、この層は
+> ポーリングも重複除去もしない」という前提の上に乗っている（notifications.rs 冒頭）。ところが
+> workflow driver は **200ms の tick（ポーリング）**であり、「この step は retry を使い切った」は
+> tick ごとに真であり続ける**レベル**である。そのまま流すと**同じ枯渇で 5 通/秒**になる。
+> そこで `StepOutcome` に `#[serde(skip)] escalated: bool` を足し、`take_escalations` が
+> **フラグを立てた tick の分だけ**返すようにした（`next_retry_at_ms` が「Failed」を
+> 「Failed だが再試行待ち」に変えているのと同じ発想）。4.4.2 の前提はこれで維持される。
+>
+> **(2) `Error` にマップする（`NeedsAttention` ではない）。** 既定の `notifications.level` は
+> `critical` で、`critical` が購読するのは `error` **だけ**である（§2.2 のマトリクス）。
+> `NeedsAttention` にすると **level を一度も書き換えていない利用者＝既定の設定では 1 通も
+> 届かない**。「夜間に誰も見ていない」ケースがまさにその設定なので、A-4 の completion gate
+> （「retry 枯渇で通知経路へ 1 通出る」）を満たさなくなる。意味論的にも `Error`（異常終了）と
+> 整合する — 自動復旧の手を使い切った失敗は、放っておいても元に戻らない終わり方である。
+>
+> **(3) 新しい config フィールドは足さない。** ptygrid-yml-guide.md §1 の escalation 行は
+> 「(config には書かない)」のままで正しい。誰にどの音量で届けるかは既存の `notifications:`
+> ブロックの `level` / `channels` が既に表現しており、escalation 専用のスイッチを足すと
+> 「2 つの設定が食い違う」状態を作れるようになるだけだから。
+>
+> **(4) メッセージは session ではなく step を名乗る。** `NotifyContext` は session 中心の型で
+> `session_id: u32` が必須だが、枯渇した step は **pane を持たないことがある**
+> （spawn できないまま枯渇した / `check_timeouts` に kill されて枠が消えている）。
+> `session_id` を `Option` にすると既存 2 源へ波及するので、代わりに任意フィールド
+> `origin: Option<WorkflowOrigin>`（workflow 名 / run_id / step_id / attempts）を足した。
+> `origin` があるときだけ title / body が分岐する:
+> `[project] ⛔ demo/review#2 exhausted its retries` /
+> `Workflow 'demo' (run wfr_…): step 'review#2' failed after 3 attempts and has no retry budget
+> left. Agent: reviewer. Last error: … No further automatic retry will happen.`
+> **既存 2 源（`session::handle_eof` / `agent_status::emit`）の出力はバイト単位で不変**
+> （`origin: None` を通るため。既存の整形テストもそのまま通る）。`dispatch` は新設の
+> `dispatch_ctx` の薄いラッパになったが、引数も挙動も不変。
+>
+> **範囲は「retry の枯渇」であって「step の失敗」ではない。** `retry:` を宣言していない step は
+> 対象外（使い切る予算が無い）、`attempts == 0`（一度も spawn されずに `Failed` ＝評価不能な
+> `condition:`）も対象外、backoff 待ち（`next_retry_at_ms` が `Some`）も対象外 —
+> `arm_retry_backoff` が再 spawn を拒否するのと同じ 3 条件である。
+>
+> **二重通知は抑止していない（許容）。** 枯渇した step の最後の試行がペイン付きだった場合、
+> その exit で `session::handle_eof` 由来の `Error` が**別途 1 通出る**（これは今回の変更前から
+> 出ていた通知で、しかも**試行のたびに**出る）。両者は別のことを言っている: 前者は
+> 「プロセスが落ちた」、後者は「この run のこの step はもう自動では戻らない」で、
+> workflow / run / step を名乗るのは後者だけである。抑止するには通知層が「どの session が
+> どの workflow の持ち物か」を横断で知る必要があり、4.4.2 の「重複除去をしない」前提
+> （上記 (1) の逆）を壊す。**枯渇 1 回につき escalation は 1 通**で、増えるのはそこだけ。
+>
+> **wire 契約は無変更。** `escalated` は `#[serde(skip)]` なので `workflow-state` イベントの
+> `StepOutcome` にも `workflow_runs.steps_json` にも出ない。新規 Tauri command / MCP tool /
+> event はゼロ。`notifications:` のスキーマも変更なし。frontend 無変更。
+>
+> **既知の限界。**
+>
+> - **resume すると同じ枯渇がもう 1 通出る。** `escalated` は永続化しないので、クラッシュ前に
+>   枯渇していた step を含む run を resume すると再送になる。「1 通目を受け取れなかった
+>   （アプリが落ちていた）人にこそ必要」という判断で `#[serde(skip)]` のままにした。
+> - **`joinOn: any` の敗者が枯渇したあとに兄弟が勝つと、その escalation は取り消せない。**
+>   同一 tick 内なら `cancel_stragglers` が先に走って `Cancelled` になるので出ない
+>   （収集は 2 本の `arm_retry_backoff` パスと `cancel_stragglers` の**後**）。数 tick 後に
+>   勝敗が決まる場合は、run は緑で終わるのに escalation は既に飛んでいる。
+> - **run 全体の失敗は通知しない。** 入口は step の retry 枯渇 1 つだけである。`retry:` を
+>   書いていない step だけで構成された workflow は、run が red になっても escalation は
+>   出ない（ペイン exit 由来の通知は従来どおり出る）。
+> - **実機検証は未実施。** 裏づけは unit test 5 本だけで、実際に OS トーストや Slack に
+>   届いたところは見ていない（→ plan.md §2 の U18）。
+>
+> 検証: `cargo test` **lib 484（479 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `an_exhausted_retry_budget_escalates_once_and_never_again` /
+> `a_retry_that_still_has_budget_left_does_not_escalate` /
+> `a_step_with_no_retry_policy_never_escalates_however_hard_it_failed` /
+> `escalation_names_the_workflow_run_step_and_attempt_count` /
+> `escalation_reaches_a_channel_left_at_the_default_critical_level`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
