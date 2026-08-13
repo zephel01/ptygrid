@@ -79,6 +79,10 @@ supervisor / handoff、`dependsOn` / `fanOut` / `joinOn`（all / any / N / reply
 > **d は config 側と実行側の 2 層を同時に直さないと効かない**。なお連結に使う
 > `handoff::merge_reply_bodies` は既に実装済み（`orchestrator.rs:1723-1731`、`detect_reply_completions`
 > から使用中）なので、c の修正は新規ロジックをほとんど書かずに済む。
+>
+> **追記（2026-08-13）**: c は `502e27c` で解消済み。ただし**方式は上記と異なる** — `merge_reply_bodies`
+> の流用ではなく、バイト上限を source 間で分配する `handoff::merge_carried_bodies` を新設して使い、
+> `handoff_bodies` の返り値は `HashMap<String, String>` のまま保った（→ CONTRACT 続報13 / 続報14）。
 
 ### 1.4 未消化の実機検証
 
@@ -117,6 +121,12 @@ plan.md のバックログに既に載っている項目の解法**である点�
 これは LangGraph が `writes` テーブルで解いている問題（superstep 内の中間書き込みの保存）と
 同じ形をしている。**「step 間データを永続化する」か「resume 拒否リストに足す」かの二択**で、
 前者が本筋、後者が暫定。
+
+> **追記（2026-08-13）**: 暫定側は `3666fef` で実装済み。ただし**方式は上記と異なる** — `onEach` の門と
+> 同じ「定義だけを見て拒否リストに足す」ではなく、collapse 後のスナップショットを見る別関数
+> `lost_carry_blocker` になった（同じ定義でもクラッシュ地点によって復旧可否が変わるため）。
+> その判定が中継 step を取りこぼしていた件は `fix(5.0.1): count a handoffTo target as a producer too`
+> で修正（→ CONTRACT 続報12 / 続報14）。
 
 ### 2.2 Claude Code cross-session messaging — 外部変化への対応
 
@@ -162,8 +172,8 @@ Stage A が終わるまで B/C には着手しない。
 | # | 項目 | 根拠 | Completion gate | サイズ |
 |---|---|---|---|---|
 | A-1 | **v0.5.8 を出す**（plan.md §4 の項目 1〜7）。U4 の消化を含む | plan.md §4 | タグ作成。3 ファイルの version 一致 | 既定 |
-| A-2 | **resume × `condition` / `handoffTo` の不整合を塞ぐ** | §2.1（新規発見） | 暫定: `condition` / `handoffTo` を含む run を `onEach` と同じく resume 拒否（`orchestrator.rs:1393-1399` に条件追加）。本筋は B-1 で永続化 | **S**（暫定）/ M（本筋） |
-| A-3 | **`handoff_bodies` の fail-silent 解消** | §1.3-c | `HashMap<String, String>` → `Vec` 化し `merge_reply_bodies`（既存）で連結。同一 target 複数 `handoffTo` が両方 kickoff に載る unit test | **S** |
+| A-2 | **resume × `condition` / `handoffTo` の不整合を塞ぐ** | §2.1（新規発見） | 暫定: `condition` / `handoffTo` を含む run を `onEach` と同じく resume 拒否（`orchestrator.rs:1393-1399` に条件追加）。本筋は B-1 で永続化。**追記（2026-08-13）: 暫定は `3666fef` で実装済み。方式は左記と異なり、定義ベースの拒否リストではなく collapse 後のスナップショットを見る別関数 `lost_carry_blocker`（→ CONTRACT 続報12 / 続報14）** | **S**（暫定）/ M（本筋） |
+| A-3 | **`handoff_bodies` の fail-silent 解消** | §1.3-c | `HashMap<String, String>` → `Vec` 化し `merge_reply_bodies`（既存）で連結。同一 target 複数 `handoffTo` が両方 kickoff に載る unit test。**追記（2026-08-13）: `502e27c` で実装済み。方式は左記と異なり、返り値は `HashMap<String, String>` のままで、連結は新設の `merge_carried_bodies`（→ CONTRACT 続報13 / 続報14）** | **S** |
 | A-4 | **escalation 配線**（❌ 2 行のうち 1 つ） | plan.md §3 P3 | retry 枯渇で 4.4.2 の通知経路（OS / Slack / …）へ 1 通出る | S |
 | A-5 | **cancel / abandon の kickoff ack** | plan.md バックログ 1 | `cancel_workflow`（`orchestrator.rs:1246-1302`）/ `abandon_workflow`（`1471-1480`）が未 ack kickoff を ack する。次 run が死んだ run の指示を拾わない | S |
 | A-6 | **`workflow_runs` の retention 決定** | §1.3-f | 件数 or 日数の上限と DELETE を入れる。**B-1 のスキーマ分割前に方針だけでも決める**（後から移行するとコストが上がる） | S |
