@@ -2359,9 +2359,10 @@ team_presets:
 > が、こちらは同じ定義でもクラッシュ地点によって復旧可否が変わるため）。拒否するのは
 > 「生産側が永続スナップショット上ですでに終端」かつ「消費側がまだ走っていない」ときだけ:
 > 生産側自身が `Pending` へ畳まれるなら再実行して返信を作り直すので問題にならず、消費側が
-> すでに走っていれば受け渡しは消費済みである。**非空の `kickoff:` を持たない生産側は対象外**
-> — inbox スレッドが無い以上もともと何も運んでおらず、中断の有無で挙動が変わらないため
-> （偽陽性の除外）。エラーは
+> すでに走っていれば受け渡しは消費済みである。**inbox スレッドを持たない生産側は対象外**
+> — スレッドが無い以上もともと何も運んでおらず、中断の有無で挙動が変わらないため
+> （偽陽性の除外）。**この「スレッドを持つ」の判定を宣言 `kickoff:` の有無だけで書いていたのは
+> 誤りで、続報14 で「誰かの `handoffTo` の宛先である」も数えるように訂正した。** エラーは
 > `Err("workflow '<name>' cannot be resumed: <理由>; discard this run and start it again")` で、
 > 理由は宣言順で最初の 1 件だけを返す（メッセージを安定させるため）。
 >
@@ -2416,6 +2417,62 @@ team_presets:
 > `merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others`）。
 > `cargo clippy --all-targets --all-features` は既存の `nonminimal_bool` **1 件のみ**。
 > frontend 無変更。**実機検証は未実施**（→ plan.md §2 U16）。
+>
+> **テストの補強（続報14）**: 上記 4 本のうち `handoff_bodies_joins_every_source_that_claims_one_target`
+> は `run.steps` を宣言順どおりに組んでいたため、**「宣言順」と「到着順」を区別できていなかった**
+> （どちらの実装でも通る）。`run.steps` を逆順に組んでも出力が宣言順になることを
+> `handoff_bodies_orders_the_join_by_declaration_not_by_arrival` で固定した。また
+> `merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others` は「長い 1 本 + 短い 1 本」
+> しか通らず、**全 source が均等枠を超える**（= 使い残しの返却が 0 になる）配分経路が未検証だった。
+> source 4 本すべて上限超過で総和が `MAX_HANDOFF_BODY_BYTES` を超えないことを
+> `merge_carried_bodies_holds_the_cap_when_every_source_is_oversized` で固定した。
+
+> 追記（2026-08-13、続報14）: **続報12 のガードが、宣言 `kickoff:` を持たない中継 step の
+> 受け渡しを取りこぼしていたのを直した。** `lost_carry_blocker` の「その step は inbox
+> スレッドを持つか」の判定が **宣言 `kickoff:` が非空か** だけを見ていた。だが
+> `compose_kickoff(None, Some(body))` は `Some(body)` を返す — **宣言 `kickoff:` が無くても、
+> 誰かの `handoffTo` の宛先になっている step は運ばれてきた本文だけで kickoff され、
+> スレッドを持ち、そこに返信しうる**。`config.rs` が `kickoff:` を要求するのは
+> `joinOn: reply` と `joinOn: stream` だけで、`handoffTo` の source には要求しない。
+>
+> 壊れ方: `a --handoffTo--> b --handoffTo--> c` で `b` に `kickoff:` を書かない
+> （中継 step の最も普通の形）。`a` → `b` が完走し `c` が Pending の時点でクラッシュすると、
+> `b` の `handoffTo: c` を見た判定が `b.kickoff` が空だという理由で **false を返してブロッカーに
+> ならず**、resume が通る。`c` は `b` の本文を受け取らずに自分の宣言 `kickoff:` だけで起動する
+> — **エラーも警告も無い**。続報12 が「こちらが悪質なほう」と書いた症状そのものを、
+> そのガードが素通しにしていた。`c` が `condition:` を持つ場合は `condition_targets` の
+> 3 分岐目に落ちて run が赤くなり、しかも理由文（「`<dep>` に kickoff: を付けろ」）は
+> 真因を指さない。
+>
+> 是正: 判定を「宣言 `kickoff:` が非空 **または** 自分が誰かの `handoffTo` の宛先である」に
+> 緩める。どちらも無い step（= 何も送られておらず、スレッドが無い）は従来どおり対象外で、
+> 続報12 が意図した偽陽性の除外はそのまま残る。
+>
+> **wire 契約は無変更**。`resume_workflow` の引数・返り値・エラー文字列の形（`cannot be resumed:`）も
+> 不変で、変わったのは**同じエラーを返す範囲が広がった**ことだけ。frontend 無変更。
+>
+> **既知の限界（偽陽性・偽陰性の残り）。** このガードは**スナップショットの state と workflow 定義
+> だけ**を見ており、`QueenStore` の inbox を読んでいない。したがって:
+>
+> - **偽陽性が残る**: 生産側が「スレッドは持っていたが実際には一度も返信せずに」（route 1 の
+>   PTY exit / route 2 の semantic done で）終端していた run も拒否する。この run は resume して
+>   も挙動が変わらない（`handoff_bodies` はもともとエントリを出さない）ので、拒否は不要な
+>   ものだった。**判定できるようにするには inbox を見に行く設計変更が要り、本筋は
+>   「運ばれた本文を step と一緒に永続化する」Phase 5.6.1 なので今回は直さない。**
+>   誤った答えに resume するより、不要に拒否するほうがましという続報11 / 続報12 と同じ判断。
+> - 偽陰性は今回の修正で 1 件塞がった（上記）。`onEach` / `joinOn: stream` は続報11 (a) の
+>   定義ベースの門が先に run ごと拒否するので、このガードの守備範囲外である。
+>
+> 検証: `cargo test` **lib 475（470 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `lost_carry_blocker_counts_a_handoff_target_as_a_producer_too`（修正前は None を返して落ちる、
+> = 修正が効いていることの証明）/
+> `lost_carry_blocker_passes_a_workflow_that_carries_nothing_at_all` /
+> `lost_carry_blocker_passes_a_consumer_that_already_finished_either_way` /
+> `handoff_bodies_orders_the_join_by_declaration_not_by_arrival` /
+> `merge_carried_bodies_holds_the_cap_when_every_source_is_oversized`）。
+> `cargo clippy --all-targets` は既存の `nonminimal_bool` **1 件のみ**で本作業起因の新規警告は
+> ゼロ。frontend 無変更。**実機検証は未実施**（続報12 と同じ手順に「中継 step に `kickoff:` を
+> 書かない chain」を 1 本足す → plan.md §2）。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
