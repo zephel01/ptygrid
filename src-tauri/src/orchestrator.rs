@@ -1320,6 +1320,105 @@ pub fn list_resumable_workflow_runs(
         .collect())
 }
 
+/// The one thing `resume_workflow` cannot rebuild: a step-to-step carry that
+/// has already happened.
+///
+/// `StepOutcome::reply_body` is `#[serde(skip)]`, so a step that succeeded
+/// before the crash comes back with `reply_body: None` even though its *state*
+/// is preserved. Nothing downstream can tell that apart from "the upstream
+/// finished without ever replying", and the two readers of a reply body treat
+/// that case very differently:
+///
+/// - `condition_targets` maps a missing dependency reply to `Failed` with a
+///   "give '<dep>' a kickoff:" reason — so a resumed run goes RED on a branch
+///   that would have been taken (or cleanly skipped) had the app not died, and
+///   the reason names a misconfiguration that is not the actual cause;
+/// - `handoff_bodies` yields no entry, so `compose_kickoff` falls back to the
+///   declared `kickoff` alone and the downstream agent starts without the
+///   context the workflow promised it. No error, no warning.
+///
+/// Both only bite when the PRODUCER is already terminal in the persisted
+/// snapshot and the CONSUMER has not run yet. If the producer is itself being
+/// collapsed back to `Pending` it re-runs and mints a fresh reply; if the
+/// consumer already ran, the carry is spent. That is why this reads the
+/// collapsed `steps` and not just `wf`: the same workflow definition is
+/// resumable or not depending on where the crash landed, so refusing on the
+/// definition alone (the way the `onEach` gate has to) would give up resume
+/// for runs that are perfectly recoverable.
+///
+/// A producer with no inbox thread at all is excluded on purpose: with no
+/// thread to reply on it never carried anything, so a resumed run behaves
+/// exactly like an uninterrupted one. Refusing those would be a false
+/// positive. But "has a thread" is NOT the same as "declares `kickoff:`".
+/// `compose_kickoff` sends on the carried body alone when the declared half
+/// is absent — that is the ordinary middle-of-the-chain shape, and `config.rs`
+/// requires a `kickoff:` only of a `joinOn: reply`/`stream` step, never of a
+/// `handoffTo` source. So a step that is somebody's `handoffTo` TARGET was
+/// kicked off too, holds a thread, and can carry a reply of its own onward.
+/// Reading only the declared `kickoff:` here would wave through exactly the
+/// `a --> b --> c` chain (with no `kickoff:` on `b`) that this guard exists
+/// to catch, and `c` would start on its declared kickoff alone with no error
+/// and no warning — the silent wrong answer, in full.
+///
+/// Returns the first blocker in declaration order, so the message is stable
+/// across runs. The real fix is to persist the carried body with the step;
+/// until then refusing beats resuming into a wrong answer.
+fn lost_carry_blocker(wf: &WorkflowDef, steps: &[StepOutcome]) -> Option<String> {
+    let produced_before_restart = |id: &str| -> bool {
+        let Some(def) = wf.steps.iter().find(|s| s.id == id) else {
+            return false;
+        };
+        let declared_kickoff = !def
+            .kickoff
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty();
+        let carried_kickoff = wf
+            .steps
+            .iter()
+            .any(|s| s.handoff_to.as_deref() == Some(id));
+        let has_thread = declared_kickoff || carried_kickoff;
+        if !has_thread {
+            return false;
+        }
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Succeeded)
+    };
+    let awaiting = |id: &str| -> bool {
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Pending)
+    };
+
+    for step in &wf.steps {
+        if step.condition.is_some() && awaiting(&step.id) {
+            if let Some(dep) = step.depends_on.as_deref().unwrap_or(&[]).first() {
+                if produced_before_restart(dep) {
+                    return Some(format!(
+                        "step '{}' has a condition: on '{dep}', which already completed before \
+                         the restart — its reply is not persisted, so the condition would be \
+                         evaluated against nothing and fail the run",
+                        step.id
+                    ));
+                }
+            }
+        }
+        if let Some(target) = step.handoff_to.as_deref() {
+            if awaiting(target) && produced_before_restart(&step.id) {
+                return Some(format!(
+                    "step '{}' declares handoffTo: '{target}' and already completed before the \
+                     restart — its reply is not persisted, so '{target}' would start without the \
+                     handed-off context",
+                    step.id
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Resume a run left `running` in the Queen DB from before a crash/restart
 /// (Phase 5.0.1 "再開"). Succeeded/failed/skipped/cancelled steps are kept
 /// exactly as persisted. Any step with a still-`Running` copy lost its PTY
@@ -1445,6 +1544,17 @@ pub fn resume_workflow<R: Runtime>(
             .position(|s| s.id == base_id(&o.step_id))
             .unwrap_or(usize::MAX)
     });
+
+    // Same refusal-over-bad-resume rule as the `onEach` gate above, but for a
+    // loss that only some runs of a workflow suffer, so it is decided on the
+    // COLLAPSED snapshot rather than on the definition alone (§ see
+    // `lost_carry_blocker`).
+    if let Some(reason) = lost_carry_blocker(&wf, &steps) {
+        return Err(format!(
+            "workflow '{}' cannot be resumed: {reason}; discard this run and start it again",
+            row.name
+        ));
+    }
 
     let run = WorkflowRun {
         run_id: row.run_id.clone(),
@@ -1728,6 +1838,63 @@ mod handoff {
             .collect::<Vec<&str>>()
             .join("\n\n");
         clip(&joined, MAX_HANDOFF_BODY_BYTES)
+    }
+
+    /// Join what SEVERAL `handoffTo` sources carried into one target, in the
+    /// order the sources are declared in `ptygrid.yml`.
+    ///
+    /// Separate from `merge_reply_bodies` because of how the byte cap has to be
+    /// spent. That function joins one step's own replies chronologically, so
+    /// clipping the tail is the natural loss. Here the entries come from
+    /// DIFFERENT steps, and clipping the join would let whoever is declared
+    /// first eat the whole budget and delete the others outright — a two-model
+    /// review where the first reviewer happens to be verbose would hand the
+    /// judge one opinion and no sign that a second ever existed. Silent, and
+    /// exactly the failure this function was written to end.
+    ///
+    /// So the cap is divided instead. Nothing is clipped at all while the
+    /// bodies fit; past that every source is guaranteed an equal share, and
+    /// whatever the short ones leave unused is handed back to the long ones
+    /// (one pass, which covers the usual "one essay plus a one-line verdict"
+    /// shape without pretending to be an allocator). `clip` returns empty for a
+    /// share too small to hold its own marker, so a pathological number of
+    /// sources degrades to dropping bodies rather than to overshooting the cap;
+    /// at 48 KiB that needs upwards of 1,900 of them.
+    ///
+    /// A single source takes the `merge_reply_bodies` path unchanged, so the
+    /// overwhelmingly common case is byte-for-byte what it was before.
+    pub fn merge_carried_bodies(bodies: &[&str]) -> String {
+        let kept: Vec<&str> = bodies
+            .iter()
+            .map(|body| body.trim())
+            .filter(|body| !body.is_empty())
+            .collect();
+        if kept.len() <= 1 {
+            return merge_reply_bodies(&kept);
+        }
+        // The blank line between each pair is part of what has to fit.
+        let budget = MAX_HANDOFF_BODY_BYTES.saturating_sub(2 * (kept.len() - 1));
+        if kept.iter().map(|body| body.len()).sum::<usize>() <= budget {
+            return kept.join("\n\n");
+        }
+        let equal = budget / kept.len();
+        let under: usize = kept
+            .iter()
+            .map(|body| body.len())
+            .filter(|len| *len <= equal)
+            .sum();
+        let over = kept.iter().filter(|body| body.len() > equal).count();
+        // `over == 0` is unreachable here (the total exceeds the budget, so
+        // someone is above the mean), but falling back to the equal share
+        // keeps the arithmetic total rather than relying on that argument.
+        let share = budget
+            .saturating_sub(under)
+            .checked_div(over)
+            .unwrap_or(equal);
+        let clipped: Vec<String> = kept.iter().map(|body| clip(body, share)).collect();
+        let refs: Vec<&str> = clipped.iter().map(String::as_str).collect();
+        // Backstop: re-applies the hard cap and drops anything `clip` emptied.
+        merge_reply_bodies(&refs)
     }
 
     /// The single kickoff body to deliver to a step, given what it declared
@@ -2155,33 +2322,47 @@ fn dep_unsatisfiable(dep_step: &WorkflowStep, outcomes: &[StepOutcome]) -> bool 
 ///
 /// `config.rs` fixes the semantics: the reply body of the step declaring
 /// `handoffTo: X` is prepended to X's own `kickoff`. Validation guarantees
-/// `handoffTo` targets are singular (never fan-out), so the first copy
-/// carrying a non-blank `reply_body` wins; a target claimed by two sources
-/// keeps the first in declaration order rather than concatenating, which
-/// would make the carried context order-dependent on tick timing.
+/// a `handoffTo` SOURCE is never a fan-out, so the first copy carrying a
+/// non-blank `reply_body` wins for any one source.
+///
+/// A target claimed by SEVERAL sources gets all of them, joined in the order
+/// the sources are declared. Until 2026-08-07 it got only the first, and the
+/// rest were dropped with no error and no warning — which is what made
+/// "implement, have two models review in parallel, then judge both verdicts"
+/// unwritable: the judge saw one reviewer and had no way to tell the other had
+/// been discarded. Validation never objected to the second `handoffTo`, so the
+/// config read as if it worked. Declaration order is the author's, not the
+/// tick's, so the carried context stays reproducible across runs.
 ///
 /// Steps whose upstream produced no reply yield no entry — `compose_kickoff`
 /// then falls back to the declared `kickoff` alone.
 fn handoff_bodies(wf: &WorkflowDef, run: &WorkflowRun) -> HashMap<String, String> {
-    let mut bodies: HashMap<String, String> = HashMap::new();
+    // Declaration order matters and `HashMap` has none, so the bodies are
+    // gathered per target in `wf.steps` order first and merged after.
+    let mut collected: Vec<(&str, Vec<&str>)> = Vec::new();
     for step in &wf.steps {
         let Some(target) = step.handoff_to.as_deref() else {
             continue;
         };
-        if bodies.contains_key(target) {
-            continue;
-        }
         let carried = run
             .steps
             .iter()
             .filter(|o| base_id(&o.step_id) == step.id.as_str())
             .find_map(|o| o.reply_body.as_deref())
             .filter(|body| !body.trim().is_empty());
-        if let Some(body) = carried {
-            bodies.insert(target.to_string(), body.to_string());
+        let Some(body) = carried else {
+            continue;
+        };
+        match collected.iter_mut().find(|(id, _)| *id == target) {
+            Some((_, bodies)) => bodies.push(body),
+            None => collected.push((target, vec![body])),
         }
     }
-    bodies
+    collected
+        .into_iter()
+        .map(|(target, bodies)| (target.to_string(), handoff::merge_carried_bodies(&bodies)))
+        .filter(|(_, merged)| !merged.is_empty())
+        .collect()
 }
 
 /// `true` when some *other* step of this run currently holds a live pane for
@@ -5493,6 +5674,295 @@ workflows:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Persist an arbitrary crash shape straight into the store, so a resume
+    /// test can start from "the app died exactly here" without having to
+    /// drive a live workflow into that state first.
+    fn persist_snapshot(
+        store: &QueenStore,
+        dir: &std::path::Path,
+        name: &str,
+        steps: &[StepOutcome],
+    ) {
+        store
+            .upsert_workflow_run(
+                dir,
+                TEST_RUN_ID,
+                name,
+                "running",
+                0,
+                None,
+                &serde_json::to_string(steps).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn mk_persisted(step_id: &str, agent: &str, state: StepState) -> StepOutcome {
+        let mut outcome = mk_outcome(step_id, None, state);
+        outcome.agent = agent.to_string();
+        outcome
+    }
+
+    #[test]
+    fn resume_refuses_when_a_condition_lost_its_upstream_reply() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Crash shape: `gate` replied and succeeded, `apply` never started.
+        // `reply_body` did not survive the restart, so evaluating the
+        // condition now would report the branch as un-evaluable and fail a
+        // run that was on its way to green.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be resumed"), "{err}");
+        assert!(err.contains("condition:"), "{err}");
+        assert!(err.contains("gate"), "reason should name the producer: {err}");
+        assert!(
+            registry.get(TEST_RUN_ID).is_none(),
+            "a refused resume must not register the run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_when_a_handoff_carry_was_lost() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(HANDOFF_CHAIN_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `draft` handed off to `polish` and succeeded; `polish` never ran.
+        // Resuming would start `polish` on its declared kickoff alone —
+        // silently, which is the worse half of this bug.
+        persist_snapshot(
+            &store,
+            &dir,
+            "handwf",
+            &[
+                mk_persisted("draft", "a", StepState::Succeeded),
+                mk_persisted("polish", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("handoffTo"), "{err}");
+        assert!(err.contains("polish"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_producer_is_itself_being_replayed() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `gate` was still Running at crash time, so the collapse puts it
+        // back to Pending: it re-runs and mints a fresh reply, and the
+        // condition has something to match against after all.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Running),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let resumed = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a producer that will re-run is not a blocker");
+        let gate = resumed.steps.iter().find(|o| o.step_id == "gate").unwrap();
+        assert_eq!(gate.state, StepState::Pending);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_carry_was_already_spent() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Both sides are terminal: the condition was evaluated before the
+        // crash, so nothing downstream still needs the lost reply.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Succeeded),
+            ],
+        );
+
+        resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a spent carry is not a blocker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lost_carry_blocker_ignores_a_producer_that_never_had_a_thread() {
+        // No `kickoff:` on `gate` AND nobody hands off to it, so it was never
+        // sent anything, has no inbox thread, and never carried a reply — a
+        // resumed run behaves exactly like an uninterrupted one. Refusing here
+        // would be a false positive. Both halves are load-bearing: a step that
+        // is somebody's `handoffTo` target is kicked off on the carried body
+        // alone and does hold a thread (see the chain test below).
+        let wf = parse_wf(
+            "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  condwf:
+    pattern: pipeline
+    steps:
+      - id: gate
+        agent: a
+      - id: apply
+        agent: b
+        dependsOn: [gate]
+        condition: APPROVED
+",
+            "condwf",
+        );
+        let steps = vec![
+            mk_persisted("gate", "a", StepState::Succeeded),
+            mk_persisted("apply", "b", StepState::Pending),
+        ];
+        assert_eq!(lost_carry_blocker(&wf, &steps), None);
+    }
+
+    /// The middle link of a chain declares no `kickoff:` of its own — it is
+    /// kicked off on what the previous link carried, which is the shape
+    /// `compose_kickoff`'s "carried only" branch exists for. `config.rs`
+    /// demands a `kickoff:` of a `joinOn: reply`/`stream` step, never of a
+    /// `handoffTo` source, so this parses clean.
+    const CARRIED_KICKOFF_CHAIN_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+  - name: c
+    cmd: /bin/cat
+workflows:
+  chain:
+    pattern: handoff
+    steps:
+      - id: a
+        agent: a
+        joinOn: reply
+        handoffTo: b
+        kickoff: write the draft and reply when done
+      - id: b
+        agent: b
+        dependsOn: [a]
+        handoffTo: c
+      - id: c
+        agent: c
+        dependsOn: [b]
+        kickoff: finish it
+";
+
+    #[test]
+    fn lost_carry_blocker_counts_a_handoff_target_as_a_producer_too() {
+        // `b` declares no `kickoff:`, but `a` hands off to it, so `b` was sent
+        // the carried body, holds a thread, and replied on it. Judging "did
+        // this step have a thread" by the declared `kickoff:` alone waved this
+        // exact crash shape through, and `c` then started on `finish it` with
+        // none of `b`'s output — no error, no warning.
+        let wf = parse_wf(CARRIED_KICKOFF_CHAIN_YAML, "chain");
+        let steps = vec![
+            mk_persisted("a", "a", StepState::Succeeded),
+            mk_persisted("b", "b", StepState::Succeeded),
+            mk_persisted("c", "c", StepState::Pending),
+        ];
+        let blocker = lost_carry_blocker(&wf, &steps).expect("a lost carry into 'c' must block");
+        assert!(blocker.contains("handoffTo"), "{blocker}");
+        assert!(
+            blocker.contains("'b'") && blocker.contains("'c'"),
+            "the reason should name both ends of the lost edge: {blocker}"
+        );
+    }
+
+    #[test]
+    fn lost_carry_blocker_passes_a_workflow_that_carries_nothing_at_all() {
+        // No `condition:` and no `handoffTo:` anywhere means no step-to-step
+        // carry exists to lose, so a producer sitting terminal next to a
+        // pending consumer is simply an ordinary interrupted pipeline. Held
+        // down explicitly because the guard would otherwise be free to grow
+        // into refusing every resume.
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let steps = vec![
+            mk_persisted("first", "a", StepState::Succeeded),
+            mk_persisted("second", "b", StepState::Pending),
+        ];
+        assert_eq!(lost_carry_blocker(&wf, &steps), None);
+    }
+
+    #[test]
+    fn lost_carry_blocker_passes_a_consumer_that_already_finished_either_way() {
+        // `Succeeded` is covered by `resume_still_works_when_the_carry_was_
+        // already_spent`; the other two terminal endings spend the carry just
+        // as thoroughly. Only a still-`Pending` consumer can still be handed
+        // the wrong thing.
+        let cond = parse_wf(COND_YAML, "condwf");
+        for spent in [StepState::Skipped, StepState::Failed] {
+            let steps = vec![
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", spent),
+            ];
+            assert_eq!(
+                lost_carry_blocker(&cond, &steps),
+                None,
+                "a consumer that ended {spent:?} no longer needs the lost reply"
+            );
+        }
+
+        let hand = parse_wf(HANDOFF_CHAIN_YAML, "handwf");
+        for spent in [StepState::Skipped, StepState::Failed] {
+            let steps = vec![
+                mk_persisted("draft", "a", StepState::Succeeded),
+                mk_persisted("polish", "b", spent),
+            ];
+            assert_eq!(
+                lost_carry_blocker(&hand, &steps),
+                None,
+                "a handoff target that ended {spent:?} will never read the carry"
+            );
+        }
+    }
+
     #[test]
     fn resume_workflow_errors_when_run_missing_or_definition_gone() {
         let handle = mock_handle();
@@ -6239,6 +6709,202 @@ workflows:
             ],
         );
         assert!(handoff_bodies(&wf, &run).is_empty());
+    }
+
+    /// Two reviewers hand their verdicts to one judge — the shape plan.md
+    /// listed as unwritable while `handoff_bodies` kept only the first.
+    const TWO_REVIEWERS_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+  - name: c
+    cmd: /bin/cat
+workflows:
+  crossreview:
+    pattern: supervisor
+    steps:
+      - id: implement
+        agent: a
+        joinOn: reply
+        kickoff: implement it
+      - id: reviewA
+        agent: b
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it
+      - id: reviewB
+        agent: c
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it too
+      - id: verdict
+        agent: a
+        dependsOn: [implement, reviewA, reviewB]
+        kickoff: decide
+";
+
+    #[test]
+    fn handoff_bodies_joins_every_source_that_claims_one_target() {
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let mut review_b = mk_outcome("reviewB", Some(2), StepState::Succeeded);
+        review_b.reply_body = Some("B: REVISE".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                review_b,
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+
+        let bodies = handoff_bodies(&wf, &run);
+        assert_eq!(
+            bodies.get("verdict").map(String::as_str),
+            Some("A: ACCEPT\n\nB: REVISE"),
+            "both reviewers reach the judge, in the order the steps are declared"
+        );
+        assert_eq!(bodies.len(), 1, "keyed by target, so the two sources merge");
+    }
+
+    #[test]
+    fn handoff_bodies_orders_the_join_by_declaration_not_by_arrival() {
+        // The test above builds `run.steps` in declaration order, so it cannot
+        // tell the two orderings apart. Here the outcomes arrive reversed —
+        // the shape a real run produces whenever the second reviewer replies
+        // first — and the judge must still read them in `ptygrid.yml` order,
+        // because a prompt whose halves swap between runs is not reproducible.
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let mut review_b = mk_outcome("reviewB", Some(2), StepState::Succeeded);
+        review_b.reply_body = Some("B: REVISE".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("verdict", None, StepState::Pending),
+                review_b,
+                review_a,
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+            ],
+        );
+
+        assert_eq!(
+            handoff_bodies(&wf, &run).get("verdict").map(String::as_str),
+            Some("A: ACCEPT\n\nB: REVISE"),
+            "reviewA is declared first, so it leads regardless of outcome order"
+        );
+    }
+
+    #[test]
+    fn handoff_bodies_carries_the_one_source_that_replied() {
+        // The second reviewer finished without a reply (route 1/2). The judge
+        // should still get the first one rather than nothing.
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                mk_outcome("reviewB", Some(2), StepState::Succeeded),
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+        assert_eq!(
+            handoff_bodies(&wf, &run).get("verdict").map(String::as_str),
+            Some("A: ACCEPT"),
+            "a single surviving source is carried unchanged"
+        );
+    }
+
+    #[test]
+    fn merge_carried_bodies_leaves_the_bodies_alone_while_they_fit() {
+        assert_eq!(
+            handoff::merge_carried_bodies(&["first", "second", "third"]),
+            "first\n\nsecond\n\nthird"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["only one"]),
+            "only one",
+            "a single source is the merge_reply_bodies path unchanged"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["  ", "kept"]),
+            "kept",
+            "a blank source is dropped rather than joined as pure separator"
+        );
+        assert_eq!(handoff::merge_carried_bodies(&[]), "");
+    }
+
+    #[test]
+    fn merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others() {
+        // The whole point of the split: clipping the JOIN would cut the short
+        // verdict off the end entirely, and nothing downstream would show that
+        // a second reviewer had ever spoken.
+        let essay = "x".repeat(handoff::MAX_HANDOFF_BODY_BYTES + 12_000);
+        let verdict = "B: ACCEPT";
+        let merged = handoff::merge_carried_bodies(&[essay.as_str(), verdict]);
+
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "the hard cap still holds: {}",
+            merged.len()
+        );
+        assert!(
+            merged.ends_with(verdict),
+            "the short source survives in full at the end"
+        );
+        assert!(
+            merged.contains(handoff::TRUNCATION_MARKER),
+            "the long source is the one that gets cut"
+        );
+        // The short body used far less than its equal share, so the essay got
+        // the remainder back rather than being held to half the cap.
+        assert!(
+            merged.len() > handoff::MAX_HANDOFF_BODY_BYTES / 2,
+            "unused share is handed back to the long source: {}",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn merge_carried_bodies_holds_the_cap_when_every_source_is_oversized() {
+        // The give-back pass has nothing to give back here: nobody is under
+        // the equal share, so `under` is 0 and every body is clipped to the
+        // same width. The sum of the clipped halves plus the separators is
+        // exactly what has to stay under the cap — the arithmetic the earlier
+        // "one essay plus a one-line verdict" case never exercises.
+        let bodies: Vec<String> = (0..4)
+            .map(|i| format!("{i}").repeat(handoff::MAX_HANDOFF_BODY_BYTES))
+            .collect();
+        let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let merged = handoff::merge_carried_bodies(&refs);
+
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "four oversized sources still fit the cap: {}",
+            merged.len()
+        );
+        for (i, _) in bodies.iter().enumerate() {
+            assert!(
+                merged.contains(&format!("{i}{i}{i}")),
+                "source {i} must survive rather than be squeezed out entirely"
+            );
+        }
+        assert_eq!(
+            merged.matches(handoff::TRUNCATION_MARKER).count(),
+            bodies.len(),
+            "every source is the one that gets cut, none is dropped"
+        );
     }
 
     #[test]
