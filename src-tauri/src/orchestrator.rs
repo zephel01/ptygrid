@@ -17,16 +17,16 @@
 // This module is kept OUTSIDE `lib.rs` and outside the session hot path per
 // release discipline (phase3.md).
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Offset, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 
 use crate::agent_status::AgentStatus;
 use crate::config::{
-    ConfigManager, Every, JoinOn, JoinOnName, OnFailure, Schedule, WorkflowDef, WorkflowPattern,
-    WorkflowStep,
+    Config, ConfigManager, Every, JoinOn, JoinOnName, OnFailure, Schedule, WorkflowDef,
+    WorkflowPattern, WorkflowStep,
 };
 use crate::queen_store::QueenStore;
 use crate::session::{PtyManager, SessionState};
@@ -4546,6 +4546,18 @@ fn spawn_status_listener<R: Runtime>(app: &AppHandle<R>, view: Arc<StatusView>) 
 const DRIVER_TICK_MS: u64 = 200;
 const DRIVER_TICK: std::time::Duration = std::time::Duration::from_millis(DRIVER_TICK_MS);
 
+/// `tick_schedules` runs on one driver tick in this many, not on every one:
+/// 5 × 200ms = once a second.
+///
+/// `at:` has minute resolution, so a schedule cannot tell the difference
+/// between being looked at 5 times a second and once a second — but the app
+/// can. Even after `tick_schedules` stopped deep-cloning the config, a tick
+/// that finds nothing due is work with no reader, and the driver loop is the
+/// one thread that runs for the entire life of the app whether or not
+/// anything is happening. Not lower than 1s: a fire is meant to look
+/// immediate, and a second is inside what a person reads as "at 09:00".
+const SCHEDULE_TICK_EVERY: u64 = 5;
+
 // -----------------------------------------------------------------------------
 // Phase 5.0.8: schedules — starting a workflow on a clock
 // -----------------------------------------------------------------------------
@@ -4602,6 +4614,11 @@ pub struct ScheduleView {
 /// shows the count).
 #[derive(Debug, Clone)]
 struct ScheduleState {
+    /// Identity of the declaration this row was built from — see
+    /// [`schedule_decl_fingerprint`]. The row's failure streak and self-stop
+    /// survive a rebuild only while this is unchanged, which is the whole
+    /// mechanism behind "fix it and save, and it starts again".
+    decl_fingerprint: u64,
     summary: String,
     enabled: bool,
     max_consecutive_failures: u32,
@@ -4623,11 +4640,26 @@ pub struct ScheduleRegistry {
 
 #[derive(Default)]
 struct ScheduleInner {
-    /// Cheap identity of the declarations the table was built from. When this
-    /// changes the table is rebuilt — which is how editing `ptygrid.yml` under
-    /// a running app takes effect.
-    fingerprint: String,
-    states: HashMap<String, ScheduleState>,
+    /// `ConfigManager`'s generation counter as of the last rebuild check. The
+    /// tick compares this integer first and does nothing else when it matches,
+    /// so the steady state costs one `Arc` clone and one integer compare —
+    /// no fingerprint is built and no config is copied (spec §3.7).
+    built_generation: Option<u64>,
+    /// `BTreeMap`, not `HashMap`, and that is load-bearing rather than taste:
+    /// the fire loop walks this map, and two schedules that come due in the
+    /// same tick compete for the same grid slots. Under a `HashMap` the winner
+    /// was whichever name the iterator happened to reach first — different on
+    /// every launch, so "which of my two 09:00 workflows runs" was a coin
+    /// flip and the loser got a `no room` reason with no cause an operator
+    /// could find. Name order is arbitrary too, but it is the SAME arbitrary
+    /// order every morning, which is what makes it debuggable.
+    states: BTreeMap<String, ScheduleState>,
+    /// Wall clock of the previous tick, and the UTC offset it was read in.
+    /// Only used to notice that the machine's idea of "now" moved in a way no
+    /// amount of ticking explains — see the re-anchor block in
+    /// [`tick_schedules`].
+    last_tick_ms: Option<i64>,
+    last_offset_seconds: Option<i32>,
 }
 
 impl ScheduleRegistry {
@@ -4642,11 +4674,11 @@ impl ScheduleRegistry {
         }
     }
 
-    /// Snapshot for the panel, in declaration-independent (sorted) order so
-    /// the list does not reshuffle between polls.
+    /// Snapshot for the panel. Name order, because `states` is a `BTreeMap` —
+    /// the list does not reshuffle between polls and no sort is needed here.
     pub fn view(&self) -> Vec<ScheduleView> {
         let inner = self.lock();
-        let mut out: Vec<ScheduleView> = inner
+        inner
             .states
             .iter()
             .map(|(name, s)| ScheduleView {
@@ -4660,30 +4692,117 @@ impl ScheduleRegistry {
                 consecutive_failures: s.consecutive_failures,
                 stopped_reason: s.stopped_reason.clone(),
             })
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+            .collect()
     }
 }
 
-/// Identity of the current set of declarations. Rebuilding on a change of this
-/// string is what makes an edit to `ptygrid.yml` take effect without a
-/// restart, and what makes an unrelated edit NOT reset the failure counters.
-fn schedule_fingerprint(workflows: &BTreeMap<String, WorkflowDef>) -> String {
-    let mut out = String::new();
-    for (name, wf) in workflows {
-        let Some(s) = &wf.schedule else { continue };
-        out.push_str(name);
-        out.push('\u{1}');
-        out.push_str(&s.summary());
-        out.push('\u{1}');
-        out.push_str(if s.effective_enabled() { "on" } else { "off" });
-        out.push('\u{1}');
-        out.push_str(&s.effective_max_consecutive_failures().to_string());
-        out.push('\u{2}');
+/// Identity of ONE schedule's declaration: the whole workflow definition, plus
+/// the definitions of every agent (or process) its steps name.
+///
+/// Per-schedule rather than one fingerprint for the table, and wide rather
+/// than "just the `schedule:` block", and both halves of that are the answer
+/// to the same question: **what does an operator have to do to restart a
+/// schedule that stopped itself after three failures?**
+///
+/// The self-stop (3.5) is memory-only and there is no resume command by
+/// design — the only input this feature accepts is `ptygrid.yml`. So the
+/// documented way back is the one `example/scheduled-review/ptygrid.yml`
+/// gives: *fix it and save the file again*. Spec §3.5 says the same
+/// ("再開はユーザーの明示操作、または設定の再読み込み"). For that sentence to be
+/// true, the thing that clears the stop has to be exactly the edit the
+/// operator would actually make, and the thing that stopped the schedule is
+/// almost never the `schedule:` block — it is a wrong `kickoff`, a step
+/// pointing at an agent that no longer exists, or the agent's `cmd`. A
+/// fingerprint over `every`/`at`/`enabled`/`max` (which is what this was)
+/// would not move for any of those, so the table was never rebuilt and the
+/// schedule stayed stopped until the app was restarted.
+///
+/// The other direction matters just as much: it must NOT be one fingerprint
+/// for all schedules. Editing an unrelated workflow used to rebuild every row,
+/// which both cleared nothing (the stop was copied forward anyway) and re-cut
+/// every row's `next_fire_at` to strictly-after-now — quietly eating a fire
+/// that was due in that very tick.
+///
+/// Erring wide is the cheap mistake. Clearing a stop too eagerly costs at most
+/// `maxConsecutiveFailures` more attempts, visibly counted in the panel;
+/// clearing it too rarely costs the operator the feature.
+///
+/// A `u64` hash rather than the string it hashes: this is only ever compared
+/// with itself inside one process, and holding a debug rendering of every
+/// scheduled workflow for the life of the app buys nothing.
+fn schedule_decl_fingerprint(cfg: &Config, wf: &WorkflowDef) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `Debug` covers every field of the declaration without this function
+    // having to be updated each time `WorkflowDef` grows one — which is the
+    // failure mode being fixed here, so a hand-written field list is exactly
+    // the wrong shape. Deterministic: `WorkflowDef` holds no maps.
+    format!("{wf:?}").hash(&mut hasher);
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for step in &wf.steps {
+        if !seen.insert(step.agent.as_str()) {
+            continue;
+        }
+        if let Some(def) = cfg
+            .agents
+            .iter()
+            .chain(cfg.processes.iter())
+            .find(|d| d.name == step.agent)
+        {
+            format!("{def:?}").hash(&mut hasher);
+        }
     }
-    out
+    hasher.finish()
 }
+
+/// How late a fire may be and still count as that fire.
+///
+/// A due check of "the scheduled instant is in the past" has no upper bound,
+/// and on a laptop the unbounded case is the ordinary one: close the lid at
+/// 08:00 with the app running, open it at 17:00, and today's 09:00 is still
+/// in the past — so "the 9 o'clock review" starts at five in the afternoon.
+/// That also made the app's behaviour depend on which way it stopped running:
+/// quit-and-relaunch caught nothing up (the table is rebuilt strictly after
+/// now), suspend-and-resume caught exactly one fire up. CONTRACT 続報18 (2)
+/// says the app does not chase time it was not running for; a fire this late
+/// is that time.
+///
+/// The numbers:
+///
+/// - **`every: hour` → 5 minutes.** It has to be well inside the interval, or
+///   a late fire lands on top of the next one. 5 minutes is also the number
+///   this file already uses for "how long is it still reasonable to wait for
+///   something that should have happened by now" (`WORKFLOW_DEFER_MAX_MS`),
+///   and reusing it beats inventing a second answer to the same question.
+/// - **`day` / `weekday` → 15 minutes.** Same reasoning, one interval up:
+///   three times the hourly grace, still 1% of the interval, and still inside
+///   what anybody who wrote `at: "09:00"` would call "the nine o'clock run".
+///
+/// Neither number is measured — nothing here has been run on real hardware
+/// yet (plan.md §2 U20). They are bounds chosen so that being wrong is cheap:
+/// too small only turns a very late fire into a visible skip with a reason,
+/// which is the shape 1.3 asks for anyway.
+const SCHEDULE_GRACE_HOURLY_MS: u64 = 5 * 60 * 1000;
+const SCHEDULE_GRACE_DAILY_MS: u64 = 15 * 60 * 1000;
+
+fn schedule_grace_ms(every: Every) -> u64 {
+    match every {
+        Every::Hour => SCHEDULE_GRACE_HOURLY_MS,
+        Every::Day | Every::Weekday => SCHEDULE_GRACE_DAILY_MS,
+    }
+}
+
+/// A backward step of the wall clock larger than this is treated as the clock
+/// having been corrected, not as scheduling jitter.
+///
+/// The driver ticks every 200ms, so 5 seconds is 25 ticks — nothing in the
+/// loop can produce that. ntpd steps (rather than slews) the clock when it is
+/// more than 128ms out, so an ordinary correction stays far below this and
+/// leaves the table alone; a manual change or a large NTP step trips it.
+/// Forward jumps deliberately do NOT trip it: a forward jump and a suspended
+/// machine are the same observation, and the grace window above is the answer
+/// to both.
+const CLOCK_STEP_TOLERANCE_MS: i64 = 5_000;
 
 /// The next local instant matching `schedule` that is STRICTLY after `now`.
 ///
@@ -4706,22 +4825,40 @@ fn schedule_fingerprint(workflows: &BTreeMap<String, WorkflowDef>) -> String {
 /// - **The hour that happens twice** (autumn back): fire on the FIRST of the
 ///   two, so the day gets one run rather than two.
 ///
+/// **Known limitation, pinned by test rather than fixed**: on the autumn day,
+/// `every: hour` produces one fire fewer than there are hours, because the
+/// repeated wall-clock reading always resolves to the earlier of the two and
+/// the second pass over it is therefore never strictly after `now`. Fixing it
+/// means giving up "one wall-clock reading, one fire", which is the rule the
+/// daily forms need; a 25-hour day losing one of 24 hourly runs is the
+/// cheaper side of that trade.
+///
 /// `None` when `at` cannot be parsed. Validation rejects that at load, so it
 /// only happens if the file was edited under a running app; the caller treats
 /// it as "this schedule does not fire" rather than panicking.
-fn next_fire_at(schedule: &Schedule, now: DateTime<Local>) -> Option<DateTime<Local>> {
+///
+/// Generic over the zone rather than hard-wired to [`Local`], and that is a
+/// testability decision, not an abstraction for its own sake. CI runs on
+/// GitHub-hosted runners with no `TZ` set, i.e. in UTC, where
+/// `from_local_datetime` never returns anything but `Single` — so with `Local`
+/// baked in, the two daylight-saving rules above could be *stated* but never
+/// *executed*, and `std::env::set_var("TZ", …)` is not sound to reach for in a
+/// parallel test binary. The zone comes from `now`, so the only caller that
+/// picks one is `driver_loop`, which picks `Local`.
+fn next_fire_at<Tz: TimeZone>(schedule: &Schedule, now: DateTime<Tz>) -> Option<DateTime<Tz>> {
     let (hour, minute) = schedule.hour_minute()?;
+    let tz = now.timezone();
     // Walk forward one candidate at a time. Bounded by 8 days of hours, which
     // covers `weekday` crossing a weekend with room to spare; a loop that
     // cannot terminate is not worth the cleverness of closed-form arithmetic
     // over four cases and two DST edges.
-    let mut probe = now;
+    let mut probe = now.clone();
     for _ in 0..(24 * 8) {
         let candidate_naive = match hour {
             Some(h) => probe.date_naive().and_hms_opt(h, minute, 0)?,
             None => probe.date_naive().and_hms_opt(probe.hour(), minute, 0)?,
         };
-        if let Some(candidate) = resolve_local(candidate_naive) {
+        if let Some(candidate) = resolve_local(&tz, candidate_naive) {
             let weekday_ok = match schedule.every {
                 Every::Weekday => !matches!(
                     candidate.weekday(),
@@ -4740,7 +4877,7 @@ fn next_fire_at(schedule: &Schedule, now: DateTime<Local>) -> Option<DateTime<Lo
                 .date_naive()
                 .succ_opt()
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .and_then(resolve_local)?,
+                .and_then(|n| resolve_local(&tz, n))?,
             // And an hour for the hourly one.
             Every::Hour => probe + ChronoDuration::hours(1),
         };
@@ -4748,11 +4885,11 @@ fn next_fire_at(schedule: &Schedule, now: DateTime<Local>) -> Option<DateTime<Lo
     None
 }
 
-/// Turn a wall-clock reading into an instant, resolving both DST edges the way
-/// `next_fire_at`'s doc comment promises. `None` only if the search for the
-/// far side of a gap runs out of room, which cannot happen for a real zone.
-fn resolve_local(naive: chrono::NaiveDateTime) -> Option<DateTime<Local>> {
-    match Local.from_local_datetime(&naive) {
+/// Turn a wall-clock reading in `tz` into an instant, resolving both DST edges
+/// the way `next_fire_at`'s doc comment promises. `None` only if the search for
+/// the far side of a gap runs out of room, which cannot happen for a real zone.
+fn resolve_local<Tz: TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime) -> Option<DateTime<Tz>> {
+    match tz.from_local_datetime(&naive) {
         chrono::LocalResult::Single(t) => Some(t),
         // Ambiguous: the clock ran over this reading twice. Take the earlier
         // instant so the day gets one run, not two.
@@ -4763,7 +4900,7 @@ fn resolve_local(naive: chrono::NaiveDateTime) -> Option<DateTime<Local>> {
             let mut probe = naive;
             for _ in 0..180 {
                 probe += ChronoDuration::minutes(1);
-                if let chrono::LocalResult::Single(t) = Local.from_local_datetime(&probe) {
+                if let chrono::LocalResult::Single(t) = tz.from_local_datetime(&probe) {
                     return Some(t);
                 }
             }
@@ -4795,16 +4932,19 @@ fn schedule_slots_needed(wf: &WorkflowDef) -> usize {
 ///
 /// Returns whether anything changed, purely so tests can assert on it; the
 /// driver ignores the value.
-fn tick_schedules<R: Runtime>(
+fn tick_schedules<R: Runtime, Tz: TimeZone>(
     app: &AppHandle<R>,
     manager: &PtyManager,
     config: &ConfigManager,
     store: &QueenStore,
     registry: &WorkflowRegistry,
     schedules: &ScheduleRegistry,
-    now: DateTime<Local>,
+    now: DateTime<Tz>,
 ) -> bool {
-    let Some((cfg, _dir)) = config.current() else {
+    // `current_arc`, not `current`: this runs on a timer, and deep-copying
+    // every agent / process / workflow / team preset to answer "is anything
+    // due?" is a cost with no reader (spec §3.7).
+    let Some((cfg, _dir, generation)) = config.current_arc() else {
         return false;
     };
     let Some(workflows) = cfg.workflows.as_ref() else {
@@ -4813,50 +4953,118 @@ fn tick_schedules<R: Runtime>(
         let mut inner = schedules.lock();
         let had = !inner.states.is_empty();
         inner.states.clear();
-        inner.fingerprint.clear();
+        inner.built_generation = Some(generation);
         return had;
     };
-    let now_ms_val = now.timestamp_millis().max(0) as u64;
+    let now_ms_i64 = now.timestamp_millis();
+    let now_ms_val = now_ms_i64.max(0) as u64;
     let mut changed = false;
 
     // ---- rebuild the table if the declarations moved
-    let fingerprint = schedule_fingerprint(workflows);
-    {
+    //
+    // Two gates, cheapest first. The generation counter is an integer compare
+    // against the `ConfigManager`'s last store, so a tick on an unchanged
+    // config builds no fingerprints at all. Only when the config was actually
+    // replaced do the per-schedule fingerprints get computed, and only the
+    // rows whose own declaration moved are reset.
+    if schedules.lock().built_generation != Some(generation) {
+        let fingerprints: BTreeMap<&String, u64> = workflows
+            .iter()
+            .filter(|(_, wf)| wf.schedule.is_some())
+            .map(|(name, wf)| (name, schedule_decl_fingerprint(&cfg, wf)))
+            .collect();
         let mut inner = schedules.lock();
-        if inner.fingerprint != fingerprint {
-            let mut states: HashMap<String, ScheduleState> = HashMap::new();
+        inner.built_generation = Some(generation);
+        let moved = inner.states.len() != fingerprints.len()
+            || fingerprints
+                .iter()
+                .any(|(name, fp)| inner.states.get(*name).map(|s| s.decl_fingerprint) != Some(*fp));
+        if moved {
+            let mut states: BTreeMap<String, ScheduleState> = BTreeMap::new();
             for (name, wf) in workflows {
                 let Some(schedule) = &wf.schedule else { continue };
-                // Counters survive a rebuild only for a schedule whose own
-                // declaration is unchanged; the fingerprint covers every
-                // schedule, so an edit to one resets none of the others'
-                // history beyond what actually changed.
+                let fingerprint = fingerprints.get(name).copied().unwrap_or_default();
                 let previous = inner.states.get(name);
+                // The one question this rebuild has to answer: did THIS
+                // schedule's declaration move? History (when it last ran, how
+                // it went) is true either way and always carries. The failure
+                // streak, the self-stop and the next fire time are answers to
+                // the old declaration, so they only carry while it stands.
+                let unchanged = previous.is_some_and(|p| p.decl_fingerprint == fingerprint);
                 states.insert(
                     name.clone(),
                     ScheduleState {
+                        decl_fingerprint: fingerprint,
                         summary: schedule.summary(),
                         enabled: schedule.effective_enabled(),
-                        max_consecutive_failures: schedule
-                            .effective_max_consecutive_failures(),
-                        // Strictly after `now`, so saving the file inside the
-                        // minute it names does not fire it.
-                        next_fire_at_ms: next_fire_at(schedule, now)
-                            .map(|t| t.timestamp_millis().max(0) as u64),
+                        max_consecutive_failures: schedule.effective_max_consecutive_failures(),
+                        next_fire_at_ms: match previous.filter(|_| unchanged) {
+                            // Untouched declaration: keep the instant already
+                            // computed. Recutting it here is what used to lose
+                            // a fire that came due in the same tick as an edit
+                            // to some other workflow.
+                            Some(p) => p.next_fire_at_ms,
+                            // New or edited: strictly after `now`, so saving
+                            // the file inside the minute it names does not
+                            // fire it (spec §3.9).
+                            None => next_fire_at(schedule, now.clone())
+                                .map(|t| t.timestamp_millis().max(0) as u64),
+                        },
                         last_fire_at_ms: previous.and_then(|p| p.last_fire_at_ms),
                         last_result: previous.and_then(|p| p.last_result.clone()),
                         last_skip_reason: previous.and_then(|p| p.last_skip_reason.clone()),
                         consecutive_failures: previous
+                            .filter(|_| unchanged)
                             .map(|p| p.consecutive_failures)
                             .unwrap_or(0),
-                        stopped_reason: previous.and_then(|p| p.stopped_reason.clone()),
+                        stopped_reason: previous
+                            .filter(|_| unchanged)
+                            .and_then(|p| p.stopped_reason.clone()),
                         pending_run_id: previous.and_then(|p| p.pending_run_id.clone()),
                     },
                 );
             }
-            inner.fingerprint = fingerprint;
             inner.states = states;
             changed = true;
+        }
+    }
+
+    // ---- re-anchor if the machine's idea of "now" moved on its own
+    //
+    // Every `next_fire_at_ms` is an absolute instant computed from a wall
+    // clock reading. Two things invalidate one without any tick noticing:
+    // the clock being set backwards (NTP step, or by hand), and the zone
+    // changing under a running app (a laptop carried from JST to GMT). In
+    // both cases the stored instant still counts down smoothly in the panel
+    // while pointing at the wrong moment — silently late in the first case,
+    // and in the second, one fire at the old zone's offset before the ordinary
+    // recompute lands on the new one.
+    //
+    // Only backwards, and only zone changes. A large FORWARD step is
+    // indistinguishable from a machine that was asleep, and that is the grace
+    // window's business immediately below; re-anchoring there would swallow
+    // fires that are legitimately due.
+    {
+        let offset_now = now.offset().fix().local_minus_utc();
+        let mut inner = schedules.lock();
+        let stepped_back = inner
+            .last_tick_ms
+            .is_some_and(|prev| now_ms_i64 < prev - CLOCK_STEP_TOLERANCE_MS);
+        let zone_moved = inner.last_offset_seconds.is_some_and(|prev| prev != offset_now);
+        inner.last_tick_ms = Some(now_ms_i64);
+        inner.last_offset_seconds = Some(offset_now);
+        if stepped_back || zone_moved {
+            for (name, state) in inner.states.iter_mut() {
+                let recomputed = workflows
+                    .get(name)
+                    .and_then(|wf| wf.schedule.as_ref())
+                    .and_then(|s| next_fire_at(s, now.clone()))
+                    .map(|t| t.timestamp_millis().max(0) as u64);
+                if state.next_fire_at_ms != recomputed {
+                    state.next_fire_at_ms = recomputed;
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -4906,33 +5114,54 @@ fn tick_schedules<R: Runtime>(
     }
 
     // ---- fire what is due
-    let due: Vec<String> = {
+    //
+    // `states` is a `BTreeMap`, so this is name order — the same order on
+    // every launch. When two schedules come due in the same tick and the grid
+    // only has room for one of them, which one wins has to be a fact an
+    // operator can look up, not a property of a hash seed.
+    let due: Vec<(String, u64)> = {
         let inner = schedules.lock();
         inner
             .states
             .iter()
-            .filter(|(_, s)| {
-                s.enabled
-                    && s.stopped_reason.is_none()
-                    && s.next_fire_at_ms.is_some_and(|t| t <= now_ms_val)
+            .filter(|(_, s)| s.enabled && s.stopped_reason.is_none())
+            .filter_map(|(name, s)| {
+                s.next_fire_at_ms
+                    .filter(|t| *t <= now_ms_val)
+                    .map(|t| (name.clone(), t))
             })
-            .map(|(name, _)| name.clone())
             .collect()
     };
-    for name in due {
+    for (name, due_at_ms) in due {
         let Some(wf) = workflows.get(&name) else {
             continue;
         };
+        // How late is this? The comparison above only says "in the past", and
+        // on a laptop the past can be nine hours deep (lid closed at 08:00,
+        // opened at 17:00). See SCHEDULE_GRACE_*_MS.
+        let late_ms = now_ms_val.saturating_sub(due_at_ms);
+        let grace_ms = wf
+            .schedule
+            .as_ref()
+            .map(|s| schedule_grace_ms(s.every))
+            .unwrap_or(0);
         // A run of this workflow that has not finished. Firing anyway would
         // multiply against the 9-pane cap — an hourly schedule over an
         // hour-long run reaches three concurrent runs by lunchtime — so the
         // fire is dropped instead of queued.
-        let overlapping = registry
-            .active_run_ids()
-            .into_iter()
-            .filter_map(|id| registry.get(&id))
-            .any(|run| run.name == name);
-        let skip = if overlapping {
+        let overlapping = late_ms <= grace_ms
+            && registry
+                .active_run_ids()
+                .into_iter()
+                .filter_map(|id| registry.get(&id))
+                .any(|run| run.name == name);
+        let skip = if late_ms > grace_ms {
+            Some(format!(
+                "skipped: the scheduled time had passed {} minutes ago \
+                 (the machine was asleep, or the clock moved)",
+                late_ms / 60_000
+            ))
+        } else if overlapping {
             Some("skipped: the previous run has not finished".to_string())
         } else {
             // Checked BEFORE spawning rather than after. Left to the ordinary
@@ -5003,7 +5232,7 @@ fn tick_schedules<R: Runtime>(
         state.next_fire_at_ms = workflows
             .get(&name)
             .and_then(|wf| wf.schedule.as_ref())
-            .and_then(|s| next_fire_at(s, now))
+            .and_then(|s| next_fire_at(s, now.clone()))
             .map(|t| t.timestamp_millis().max(0) as u64);
         changed = true;
     }
@@ -5017,6 +5246,7 @@ fn tick_schedules<R: Runtime>(
 /// sees the current `WorkflowRegistry` / `ConfigManager` / `QueenStore` /
 /// `PtyManager` even across a config reload.
 fn driver_loop<R: Runtime>(app: &AppHandle<R>, view: &StatusView) {
+    let mut ticks_until_schedules: u64 = 0;
     loop {
         std::thread::sleep(DRIVER_TICK);
         let manager = app.state::<PtyManager>();
@@ -5025,17 +5255,22 @@ fn driver_loop<R: Runtime>(app: &AppHandle<R>, view: &StatusView) {
         let registry = app.state::<WorkflowRegistry>();
         // Phase 5.0.8, BEFORE `advance_all`: a run this tick starts is carried
         // forward by the same tick, so a scheduled run is indistinguishable
-        // from one somebody pressed ▶ on.
-        let schedules = app.state::<ScheduleRegistry>();
-        tick_schedules(
-            app,
-            &manager,
-            &config,
-            &store,
-            &registry,
-            &schedules,
-            Local::now(),
-        );
+        // from one somebody pressed ▶ on. Not on every tick — see
+        // SCHEDULE_TICK_EVERY.
+        if ticks_until_schedules == 0 {
+            ticks_until_schedules = SCHEDULE_TICK_EVERY;
+            let schedules = app.state::<ScheduleRegistry>();
+            tick_schedules(
+                app,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                Local::now(),
+            );
+        }
+        ticks_until_schedules -= 1;
         advance_all(app, &manager, &config, &store, &registry, view);
     }
 }
@@ -10702,12 +10937,26 @@ workflows:
 
     fn local_at(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> DateTime<Local> {
         resolve_local(
+            &Local,
             chrono::NaiveDate::from_ymd_opt(y, m, d)
                 .unwrap()
                 .and_hms_opt(hh, mm, 0)
                 .unwrap(),
         )
         .expect("fixture instant must exist in the host zone")
+    }
+
+    /// The same, in a named zone that actually observes daylight saving.
+    /// `resolve_local` is what decides which instant a repeated or skipped
+    /// wall-clock reading means, so fixtures built with it would beg the
+    /// question — these go through chrono-tz directly and pick the earlier
+    /// instant only for readings that genuinely occur twice.
+    fn ny_at(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> DateTime<chrono_tz::Tz> {
+        use chrono::TimeZone as _;
+        chrono_tz::America::New_York
+            .with_ymd_and_hms(y, m, d, hh, mm, 0)
+            .earliest()
+            .expect("fixture instant must exist in America/New_York")
     }
 
     #[test]
@@ -10801,17 +11050,126 @@ workflows:
         // have neither — so what is asserted is the property that has to hold
         // in every zone: a reading always resolves to an instant, and that
         // instant is never earlier than the reading interpreted naively.
+        // The two edges themselves are pinned in a zone that HAS them, in the
+        // three tests below.
         for (h, m) in [(0, 0), (1, 30), (2, 0), (2, 30), (3, 0), (23, 59)] {
             let naive = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
                 .unwrap()
                 .and_hms_opt(h, m, 0)
                 .unwrap();
-            let resolved = resolve_local(naive).expect("every reading resolves");
+            let resolved = resolve_local(&Local, naive).expect("every reading resolves");
             assert!(
                 resolved.naive_local() >= naive,
                 "a skipped reading moves forward to the far side of the gap, never back"
             );
         }
+    }
+
+    // ---- the two DST rules, in a zone that actually has them.
+    //
+    // CONTRACT 続報18 (1) states both, and until this file grew chrono-tz they
+    // were only stated: CI runs with no TZ set (UTC), where `Local` returns
+    // `Single` for every reading in existence and neither branch of
+    // `resolve_local` is ever taken. America/New_York springs forward on
+    // 2026-03-08 (02:00 EST → 03:00 EDT) and falls back on 2026-11-01 (01:00
+    // EDT happens, then 01:00 EST happens again).
+
+    #[test]
+    fn a_daily_schedule_in_the_hour_that_does_not_exist_fires_once_just_after_the_gap() {
+        let s = sched(Every::Day, "02:30");
+        // 02:30 does not exist on 2026-03-08 in New York.
+        let before = ny_at(2026, 3, 8, 0, 0);
+        let next = next_fire_at(&s, before).unwrap();
+        assert_eq!(
+            next.date_naive(),
+            before.date_naive(),
+            "the skipped day still gets its run"
+        );
+        assert_eq!(
+            (next.hour(), next.minute()),
+            (3, 0),
+            "the first instant that exists on the far side of the gap, not 02:30 the next day"
+        );
+
+        // And exactly once: from that fire, the next one is tomorrow.
+        let after = next_fire_at(&s, next).unwrap();
+        assert_eq!(after.date_naive(), next.date_naive().succ_opt().unwrap());
+        assert_eq!((after.hour(), after.minute()), (2, 30));
+    }
+
+    #[test]
+    fn a_daily_schedule_in_the_hour_that_happens_twice_fires_only_on_the_first_one() {
+        let s = sched(Every::Day, "01:30");
+        // 01:30 occurs twice on 2026-11-01 in New York: 05:30Z (EDT) and
+        // 06:30Z (EST).
+        let before = ny_at(2026, 11, 1, 0, 0);
+        let first = next_fire_at(&s, before).unwrap();
+        assert_eq!((first.hour(), first.minute()), (1, 30));
+        assert_eq!(
+            first.naive_utc(),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(5, 30, 0)
+                .unwrap(),
+            "the earlier of the two 01:30s (EDT), so the day gets one run"
+        );
+
+        // The second 01:30 (EST, 06:30Z) is NOT a second fire: the next one is
+        // tomorrow.
+        let second = next_fire_at(&s, first).unwrap();
+        assert_eq!(
+            second.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+            "one wall-clock reading, one fire — even when the clock reads it twice"
+        );
+    }
+
+    #[test]
+    fn known_limitation_an_hourly_schedule_loses_one_fire_on_the_autumn_day() {
+        // Pinned, not fixed. `resolve_local` always answers with the EARLIER
+        // of two identical readings, which is what makes the daily rule above
+        // hold; the price is that the second pass over 01:30 is never
+        // strictly after `now`, so the 25-hour day gets 24 fires instead of
+        // 25. Losing one hourly run once a year is the cheaper side of that
+        // trade than a daily schedule running twice. See CONTRACT 続報19,
+        // known limitation (f).
+        let s = sched(Every::Hour, "30");
+        let first = next_fire_at(&s, ny_at(2026, 11, 1, 0, 45)).unwrap();
+        assert_eq!(
+            first.naive_utc(),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(5, 30, 0)
+                .unwrap(),
+            "01:30 EDT"
+        );
+        let second = next_fire_at(&s, first).unwrap();
+        assert_eq!(
+            (second.hour(), second.minute()),
+            (2, 30),
+            "01:30 EST is skipped — the next fire is 02:30 EST"
+        );
+        assert_eq!(
+            second - first,
+            ChronoDuration::hours(2),
+            "two real hours between consecutive hourly fires, once a year"
+        );
+
+        // Count the whole day to state the limitation as a number.
+        let mut probe = ny_at(2026, 11, 1, 0, 0);
+        let end = ny_at(2026, 11, 2, 0, 0);
+        let mut fires = 0;
+        while let Some(next) = next_fire_at(&s, probe) {
+            if next >= end {
+                break;
+            }
+            fires += 1;
+            probe = next;
+        }
+        assert_eq!(
+            fires, 24,
+            "the day is 25 hours long and gets 24 hourly fires"
+        );
     }
 
     #[test]
@@ -11013,8 +11371,10 @@ workflows:
 
         // Three fires, each ending Failed. The run is driven to its terminal
         // state by hand: what is under test is the counting, not the driver.
+        // The clock lands one minute past each :05 rather than a whole hour
+        // past it — an hour late is now a skip, not a fire (SCHEDULE_GRACE_*).
         for round in 0..3 {
-            clock += ChronoDuration::hours(1);
+            clock = local_at(2026, 8, 5, 14 + round, 6);
             tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, clock);
             let run_id = registry
                 .active_run_ids()
@@ -11086,4 +11446,718 @@ workflows:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- 5.0.8 review fixes (2026-08-13). See plan.md §6.20.
+
+    /// `SCHED_YAML` with a `kickoff:` under the operator's control, so a test
+    /// can make the edit an operator would actually make after a schedule
+    /// stopped itself: fix the instructions, leave `schedule:` alone.
+    fn sched_yaml_with_kickoff(kickoff: &str) -> String {
+        format!(
+            "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+        kickoff: {kickoff}
+"
+        )
+    }
+
+    /// Drive a schedule that fires at :05 past the hour into its self-stop:
+    /// `rounds` fires, each ending Failed. The clock lands at :06 past
+    /// successive hours from 14:00, which is inside the hourly grace window.
+    #[allow(clippy::too_many_arguments)]
+    fn fail_until_stopped(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        manager: &PtyManager,
+        config: &ConfigManager,
+        store: &QueenStore,
+        registry: &WorkflowRegistry,
+        schedules: &ScheduleRegistry,
+        name: &str,
+        rounds: u32,
+    ) {
+        let mut clock = local_at(2026, 8, 5, 14, 0);
+        tick_schedules(handle, manager, config, store, registry, schedules, clock);
+        for round in 0..rounds {
+            clock = local_at(2026, 8, 5, 14 + round, 6);
+            tick_schedules(handle, manager, config, store, registry, schedules, clock);
+            let run_id = registry
+                .active_run_ids()
+                .into_iter()
+                .find(|id| registry.get(id).is_some_and(|r| r.name == name))
+                .unwrap_or_else(|| panic!("round {round} of '{name}' should have fired"));
+            let mut run = registry.get(&run_id).unwrap();
+            run.state = WorkflowState::Failed;
+            run.ended_at_ms = Some(1);
+            registry.put(run);
+            clock += ChronoDuration::minutes(1);
+            tick_schedules(handle, manager, config, store, registry, schedules, clock);
+        }
+    }
+
+    #[test]
+    fn fixing_a_stopped_schedules_own_workflow_starts_it_again() {
+        // The self-stop has no resume command and no UI button, by design —
+        // the only input this feature takes is ptygrid.yml. So the way back
+        // that spec §3.5 and example/scheduled-review/ptygrid.yml both promise
+        // ("fix it and save the file again") has to be the ONLY way back, and
+        // it has to work for the edit that is actually made: the instructions,
+        // not the `schedule:` block.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(&sched_yaml_with_kickoff("please do the wrong thing"));
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        fail_until_stopped(
+            &handle, &manager, &config, &store, &registry, &schedules, "timed", 3,
+        );
+        assert!(
+            schedules.view()[0].stopped_reason.is_some(),
+            "three failures should have stopped it"
+        );
+
+        // The operator fixes the kickoff and saves. Not one byte of
+        // `schedule:` changes.
+        config.set_for_test(
+            dir.clone(),
+            parse_config(&sched_yaml_with_kickoff("please do the right thing")).unwrap(),
+        );
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 17, 0),
+        );
+        let view = schedules.view();
+        assert!(
+            view[0].stopped_reason.is_none(),
+            "the reason it stopped is the thing that was just edited"
+        );
+        assert_eq!(view[0].consecutive_failures, 0);
+
+        // And it really fires again, not merely looks unstopped.
+        let before = registry.active_run_ids().len();
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 17, 6),
+        );
+        assert_eq!(registry.active_run_ids().len(), before + 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_an_unrelated_schedule_does_not_restart_a_stopped_one() {
+        // The other half of the same rule. Saving ptygrid.yml at all used to
+        // rebuild the whole table; if a rebuild cleared stops, then editing
+        // any workflow in the file would silently re-arm a schedule the
+        // operator had not looked at — and the failure streak would never
+        // reach three on a busy config.
+        let yaml = |other_at: &str| {
+            format!(
+                "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+  parked:
+    schedule:
+      every: hour
+      at: \"{other_at}\"
+      enabled: false
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+"
+            )
+        };
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(&yaml("10"));
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        fail_until_stopped(
+            &handle, &manager, &config, &store, &registry, &schedules, "timed", 3,
+        );
+        let stopped = schedules
+            .view()
+            .into_iter()
+            .find(|v| v.name == "timed")
+            .unwrap();
+        assert!(stopped.stopped_reason.is_some());
+
+        // Edit the OTHER schedule and save.
+        config.set_for_test(dir.clone(), parse_config(&yaml("20")).unwrap());
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 17, 0),
+        );
+        let view = schedules.view();
+        let timed = view.iter().find(|v| v.name == "timed").unwrap();
+        assert!(
+            timed.stopped_reason.is_some(),
+            "an edit somewhere else in the file is not a fix"
+        );
+        assert_eq!(timed.consecutive_failures, 3);
+        assert_eq!(
+            view.iter().find(|v| v.name == "parked").unwrap().summary,
+            "every hour :20",
+            "the edited one did pick up its new declaration"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unrelated_edit_does_not_eat_a_fire_that_is_due_in_the_same_tick() {
+        // The second thing the single whole-table fingerprint cost: a rebuild
+        // re-cut every row's next fire to strictly-after-now, so saving any
+        // part of ptygrid.yml during the minute another workflow was due threw
+        // that fire away silently.
+        let yaml = |cmd: &str| {
+            format!(
+                "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: unrelated
+    cmd: {cmd}
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+  plain:
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: unrelated
+"
+            )
+        };
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(&yaml("/bin/cat"));
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        // 14:05 has arrived AND the file was just saved with an unrelated
+        // change.
+        config.set_for_test(dir.clone(), parse_config(&yaml("/bin/echo")).unwrap());
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 6),
+        );
+        assert_eq!(
+            registry.active_run_ids().len(),
+            1,
+            "the due fire survives an edit to a different workflow"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fire_the_machine_slept_through_is_skipped_with_a_reason() {
+        // Lid closed at 14:00, opened at 17:00, with the app running the whole
+        // time. The 14:05 fire is three hours stale; running it now would be
+        // "the hourly check ran once, at five past five" and would contradict
+        // CONTRACT 続報18 (2), which says time the app was not running for is
+        // not chased.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        let woke = local_at(2026, 8, 5, 17, 0);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, woke);
+
+        let view = schedules.view();
+        assert!(
+            view[0]
+                .last_skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("had passed") && r.contains("asleep")),
+            "reason was: {:?}",
+            view[0].last_skip_reason
+        );
+        assert!(
+            registry.active_run_ids().is_empty(),
+            "nothing is caught up — not one fire, and certainly not three"
+        );
+        assert_eq!(manager.occupied_pane_count(), 0);
+        // The clock still moves on: next is 17:05, not another stale 14:05.
+        assert_eq!(
+            view[0].next_fire_at_ms,
+            Some(local_at(2026, 8, 5, 17, 5).timestamp_millis() as u64)
+        );
+
+        // And a second look does not produce a burst either.
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 17, 1),
+        );
+        assert!(registry.active_run_ids().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fire_a_few_minutes_late_still_happens_and_the_daily_window_is_wider() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let registry = WorkflowRegistry::new();
+
+        // Hourly: 4 minutes late is inside the 5-minute window.
+        let (config, store, dir) = harness(SCHED_YAML);
+        let schedules = ScheduleRegistry::new();
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 9),
+        );
+        assert_eq!(
+            registry.active_run_ids().len(),
+            1,
+            "a few minutes of drift is not a machine that was asleep"
+        );
+        assert!(schedules.view()[0].last_skip_reason.is_none());
+
+        // Daily: 10 minutes late would be outside the hourly window and is
+        // inside the daily one.
+        let daily = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  morning:
+    schedule:
+      every: day
+      at: \"09:00\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let (config2, store2, _) = harness(daily);
+        let registry2 = WorkflowRegistry::new();
+        let schedules2 = ScheduleRegistry::new();
+        tick_schedules(
+            &handle,
+            &manager,
+            &config2,
+            &store2,
+            &registry2,
+            &schedules2,
+            local_at(2026, 8, 5, 8, 0),
+        );
+        tick_schedules(
+            &handle,
+            &manager,
+            &config2,
+            &store2,
+            &registry2,
+            &schedules2,
+            local_at(2026, 8, 5, 9, 10),
+        );
+        assert_eq!(registry2.active_run_ids().len(), 1);
+        assert!(schedules2.view()[0].last_skip_reason.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_schedules_due_in_the_same_tick_are_taken_in_name_order() {
+        // Both need two root panes and the grid has room for exactly two, so
+        // one of them gets the slots and the other gets `no room`. Which one
+        // must not depend on a hash seed: "whichever of my two 09:00 reviews
+        // ran today" is the hardest kind of behaviour to chase down.
+        let yaml = "agents:
+  - name: worker
+    cmd: /bin/cat
+workflows:
+  aaa:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: fan-out
+    steps:
+      - id: candidate
+        agent: worker
+        fanOut: 2
+        joinOn: all
+  zzz:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: fan-out
+    steps:
+      - id: candidate
+        agent: worker
+        fanOut: 2
+        joinOn: all
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP - 2);
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 6),
+        );
+
+        let running: Vec<String> = registry
+            .active_run_ids()
+            .into_iter()
+            .filter_map(|id| registry.get(&id))
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            running,
+            vec!["aaa".to_string()],
+            "the first name in order takes the room"
+        );
+        let view = schedules.view();
+        assert!(view.iter().find(|v| v.name == "aaa").unwrap().last_skip_reason.is_none());
+        assert!(
+            view.iter()
+                .find(|v| v.name == "zzz")
+                .unwrap()
+                .last_skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no room")),
+            "the loser is told why"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_misspelled_schedule_key_is_a_load_error() {
+        // The one place in config.rs with `deny_unknown_fields`. Without it,
+        // `enable: false` is dropped by serde, `enabled` defaults to true, and
+        // a schedule the operator believes is parked fires every morning —
+        // which is the exact failure mode the closed vocabulary exists to
+        // prevent, arriving through the key name instead of the value.
+        let yaml = |extra: &str| {
+            format!(
+                "agents:\n  - name: a\n    cmd: /bin/cat\nworkflows:\n  wf:\n    schedule:\n      every: day\n      at: \"09:00\"\n      {extra}\n    steps:\n      - id: only\n        agent: a\n"
+            )
+        };
+        for typo in [
+            "enable: false",
+            "maxConsecutiveFailure: 5",
+            "max_consecutive_failures: 5",
+            "ever: day",
+        ] {
+            assert!(
+                parse_config(&yaml(typo)).is_err(),
+                "'{typo}' must not be silently ignored"
+            );
+        }
+        // The spellings that exist still load, so this is not just "everything
+        // fails now".
+        assert!(parse_config(&yaml("enabled: false")).is_ok());
+        assert!(parse_config(&yaml("maxConsecutiveFailures: 5")).is_ok());
+    }
+
+    #[test]
+    fn a_disabled_schedule_never_fires() {
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  parked:
+    schedule:
+      every: hour
+      at: \"05\"
+      enabled: false
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        assert!(!schedules.view()[0].enabled);
+        for (h, m) in [(14, 6), (15, 6), (16, 6)] {
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                local_at(2026, 8, 5, h, m),
+            );
+        }
+        assert!(
+            registry.active_run_ids().is_empty(),
+            "`enabled: false` is how a schedule is parked without deleting it"
+        );
+        assert_eq!(manager.occupied_pane_count(), 0);
+        assert!(schedules.view()[0].last_fire_at_ms.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_consecutive_failures_of_one_stops_after_a_single_failure() {
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+      maxConsecutiveFailures: 1
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        fail_until_stopped(
+            &handle, &manager, &config, &store, &registry, &schedules, "timed", 1,
+        );
+        let view = schedules.view();
+        assert_eq!(view[0].consecutive_failures, 1);
+        assert!(
+            view[0]
+                .stopped_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("1 consecutive failures")),
+            "reason was: {:?}",
+            view[0].stopped_reason
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clock_stepped_backwards_re_anchors_every_schedule() {
+        // An NTP step correction (or a hand-set clock) moves `now` without
+        // moving any stored `next_fire_at_ms`. Left alone, the day's fire is
+        // quietly late by the size of the step, the panel counts down happily,
+        // and no skip reason is ever set — the one shape 1.3 says this feature
+        // must not have.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        assert_eq!(
+            schedules.view()[0].next_fire_at_ms,
+            Some(local_at(2026, 8, 5, 14, 5).timestamp_millis() as u64)
+        );
+
+        // The clock is set back three hours.
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 11, 0),
+        );
+        assert_eq!(
+            schedules.view()[0].next_fire_at_ms,
+            Some(local_at(2026, 8, 5, 11, 5).timestamp_millis() as u64),
+            "the next fire is 11:05, not three hours of dead time first"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_to_another_timezone_re_anchors_instead_of_firing_at_the_old_offset() {
+        // A laptop carried from JST to GMT. `next_fire_at_ms` is an absolute
+        // instant that meant 09:00 in Tokyo; in London that same instant is
+        // midnight, so without this the first fire after landing happens at
+        // 00:00 and only the fire AFTER that lands on 09:00.
+        use chrono::FixedOffset;
+        let jst = FixedOffset::east_opt(9 * 3600).unwrap();
+        let gmt = FixedOffset::east_opt(0).unwrap();
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  morning:
+    schedule:
+      every: day
+      at: \"09:00\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        let in_tokyo = jst.with_ymd_and_hms(2026, 8, 5, 10, 0, 0).unwrap();
+        tick_schedules(
+            &handle, &manager, &config, &store, &registry, &schedules, in_tokyo,
+        );
+        assert_eq!(
+            schedules.view()[0].next_fire_at_ms,
+            Some(
+                jst.with_ymd_and_hms(2026, 8, 6, 9, 0, 0)
+                    .unwrap()
+                    .timestamp_millis() as u64
+            ),
+            "tomorrow 09:00 Tokyo, which is 00:00 UTC"
+        );
+
+        // Same instant a minute later, read in the new zone.
+        let in_london = (in_tokyo + ChronoDuration::minutes(1)).with_timezone(&gmt);
+        tick_schedules(
+            &handle, &manager, &config, &store, &registry, &schedules, in_london,
+        );
+        assert_eq!(
+            schedules.view()[0].next_fire_at_ms,
+            Some(
+                gmt.with_ymd_and_hms(2026, 8, 5, 9, 0, 0)
+                    .unwrap()
+                    .timestamp_millis() as u64
+            ),
+            "09:00 London, today — not midnight, and not one stale fire first"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
