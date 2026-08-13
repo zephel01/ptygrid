@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -631,8 +631,21 @@ pub enum OnEach {
 /// feature. A free-form string carries typos to runtime; a struct lets serde
 /// reject `every: dayly` at load and `validate_workflows` reject `at: "9時"`
 /// right beside it. See docs/spec/spec-schedule-5.0.8.md §3.2.
+///
+/// **`deny_unknown_fields` is deliberate, and it is the only place in this file
+/// that carries it.** Everywhere else an unknown key is ignored, because an
+/// ignored key on an existing block costs the operator nothing they will not
+/// see. Here it costs them the whole feature silently: `enable: false` (one
+/// letter short of `enabled`) or `maxConsecutiveFailure: 10` (one letter short
+/// of the plural) is dropped by serde, the defaults apply, and a schedule the
+/// operator believes is parked fires every morning. The value vocabulary is
+/// already closed — `every` is a three-variant enum and `at` is checked by
+/// rule S2 — so the key names were the only remaining hole, and closing them
+/// is what makes "a typo dies at load" true rather than nearly true. New key
+/// on this struct is a non-breaking change either way; a config that names a
+/// key this struct does not have has never worked.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Schedule {
     pub every: Every,
     /// `"HH:MM"` for `day`/`weekday`, `"MM"` for `hour`. Validated below.
@@ -1801,7 +1814,16 @@ pub(crate) fn launch_dir() -> Option<PathBuf> {
 #[derive(Default)]
 struct ConfigStateInner {
     dir: Option<PathBuf>,
-    config: Option<Config>,
+    /// Behind an `Arc` so a reader that only needs to LOOK at the config does
+    /// not have to deep-clone every agent, process, workflow and team preset
+    /// to do it (see [`ConfigManager::current_arc`]). `current()` still hands
+    /// out an owned `Config`, so nothing outside this file changes.
+    config: Option<Arc<Config>>,
+    /// Bumped on every successful store. Lets a poller answer "is this the
+    /// same config I looked at last time?" with an integer compare instead of
+    /// a structural one — the scheduler's tick runs five times a second and
+    /// must not rebuild anything to find out that nothing moved.
+    generation: u64,
     /// Kept alive so the notify watcher keeps running; replaced on reload.
     watcher: Option<RecommendedWatcher>,
 }
@@ -1908,7 +1930,8 @@ impl ConfigManager {
         let trusted = crate::trust::is_trusted(app, origin, &dir_path);
         let dir = dir_path.display().to_string();
         inner.dir = Some(dir_path);
-        inner.config = Some(config.clone());
+        inner.config = Some(Arc::new(config.clone()));
+        inner.generation = inner.generation.wrapping_add(1);
         inner.watcher = Some(watcher);
 
         Ok(ConfigInfo {
@@ -1926,14 +1949,34 @@ impl ConfigManager {
     pub(crate) fn set_for_test(&self, dir: PathBuf, config: Config) {
         let mut inner = self.lock();
         inner.dir = Some(dir);
-        inner.config = Some(config);
+        inner.config = Some(Arc::new(config));
+        inner.generation = inner.generation.wrapping_add(1);
     }
 
     /// Current loaded config + its directory (Queen list_agents).
     pub fn current(&self) -> Option<(Config, PathBuf)> {
         let inner = self.lock();
         match (&inner.config, &inner.dir) {
-            (Some(c), Some(d)) => Some((c.clone(), d.clone())),
+            (Some(c), Some(d)) => Some(((**c).clone(), d.clone())),
+            _ => None,
+        }
+    }
+
+    /// The same thing [`Self::current`] returns, without the deep clone, plus
+    /// the generation counter.
+    ///
+    /// For callers that read the config on a timer rather than in response to
+    /// a user action. `current()` copies every agent, process, workflow (every
+    /// step's `kickoff` string included) and team preset; doing that five
+    /// times a second for the life of the app — which is what the 5.0.8
+    /// scheduler tick did before this — is a cost with no reader. The
+    /// generation is the cheap "did anything change at all?" answer: equal
+    /// means the very same `Config` value, so a poller can skip its own
+    /// bookkeeping entirely.
+    pub fn current_arc(&self) -> Option<(Arc<Config>, PathBuf, u64)> {
+        let inner = self.lock();
+        match (&inner.config, &inner.dir) {
+            (Some(c), Some(d)) => Some((Arc::clone(c), d.clone(), inner.generation)),
             _ => None,
         }
     }
