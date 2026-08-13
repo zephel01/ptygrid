@@ -2524,6 +2524,38 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_run_state_this_build_does_not_know_is_never_pruned() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        // The allow-list claim (CONTRACT.md 続報17 (3)) in the only form that
+        // can actually fail: a state that is on neither list. Every other
+        // retention test uses 'running' or 'succeeded', so rewriting
+        // `is_terminal_workflow_state` as "anything that is not 'running'"
+        // would keep all of them green while a future schema's — or a hand
+        // edited — row started being deleted. It is also the OLDEST row here,
+        // so the ordering key puts it first in line to go.
+        store
+            .upsert_workflow_run(&one, "from-the-future", "demo", "weird", 1, Some(2), "[]")
+            .unwrap();
+        assert!(!is_terminal_workflow_state("weird"));
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 20);
+
+        let kept = stored_run_ids(&store, &one);
+        assert!(
+            kept.contains(&"from-the-future".to_string()),
+            "retention must err towards keeping: an unrecognised state counts \
+             as still-live and is out of its reach entirely"
+        );
+        assert_eq!(
+            kept.len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 1,
+            "...and it does not eat into the window either — only the three \
+             terminal states are counted against the cap"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn workflow_run_retention_deletes_nothing_while_the_project_is_under_its_cap() {
         let (root, one, _) = projects();
         let store = QueenStore::open_in_memory().unwrap();

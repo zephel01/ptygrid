@@ -5603,6 +5603,101 @@ workflows:
         assert!(!run.steps[0].escalated);
     }
 
+    /// Wiring regression, same shape and same reason as
+    /// `advance_run_cancels_a_straggler_once_the_any_join_is_won` below.
+    /// Every other Stage A-4 test calls `take_escalations` directly, so
+    /// deleting the one line in `advance_run` that calls it would leave the
+    /// whole suite green while no exhausted step ever reached the
+    /// notification layer again — and unlike the straggler pass, the
+    /// compiler would not even warn, because the pure function stays
+    /// referenced by those unit tests. This drives a whole tick and asserts
+    /// the mark the collector leaves behind on the run the registry
+    /// publishes.
+    #[test]
+    fn advance_run_escalates_a_step_that_has_run_out_of_retries() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        // `retry: max 2` with 3 attempts already spent and no backoff armed:
+        // exhausted before the tick starts. Deliberately no `session_id`, so
+        // `detect_completions` / `check_timeouts` skip it (both only look at
+        // a Running step that holds a session) and the escalation pass is the
+        // only thing in the tick that can touch it.
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 3;
+        run.steps[0].escalated = false;
+        registry.put(run.clone());
+
+        advance_run(
+            &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+        );
+
+        let snap = registry.get(&run.run_id).expect("the run is still held");
+        assert!(
+            snap.steps[0].escalated,
+            "advance_run must run the escalation pass — an exhausted step that \
+             is never collected is never notified"
+        );
+        // The mark has to reach the PUBLISHED snapshot, not just the tick's
+        // local copy: collection is edge-triggered off it, so a tick that
+        // dropped the write would re-send the same escalation on the next one.
+        assert_eq!(
+            snap.state,
+            WorkflowState::Failed,
+            "the exhausted step is the whole run, so this tick also ends it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The persistence half of the same claim. CONTRACT.md 続報16 states that
+    /// `escalated` appears in neither `workflow_runs.steps_json` nor the
+    /// `workflow-state` event (both serialize this very struct), and that a
+    /// resumed run therefore re-sends the escalation on purpose. Nothing
+    /// else in the suite fails if that `#[serde(skip)]` is dropped, so the
+    /// round trip is pinned here the way A-5 pins the same shape of claim in
+    /// `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost`.
+    #[test]
+    fn an_escalation_mark_does_not_survive_the_persisted_round_trip() {
+        let (_config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 3;
+        run.steps[0].escalated = true;
+
+        let wire = serde_json::to_string(&run.steps).unwrap();
+        assert!(
+            !wire.contains("escalated"),
+            "the field is skipped on the way out, so it is absent from both \
+             steps_json and the workflow-state payload"
+        );
+
+        persist_run(&store, &dir, &run);
+        let reloaded = store
+            .list_running_workflow_runs(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.run_id == TEST_RUN_ID)
+            .expect("the run is persisted as running and therefore resumable");
+        let steps: Vec<StepOutcome> = serde_json::from_str(&reloaded.steps_json).unwrap();
+        assert!(
+            !steps[0].escalated,
+            "a resumed run comes back with the mark cleared — the re-send after \
+             a crash is the documented behaviour, not an accident"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn check_timeouts_kills_and_fails_only_steps_past_their_declared_timeout() {
         let wf = parse_wf(TIMEOUT_YAML, "timeoutwf");
