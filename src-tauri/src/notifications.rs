@@ -1,19 +1,25 @@
 // Out-of-app notifications (Phase 4.4.2) — routing + message model.
 //
 // Edge-triggered alerts to channels OUTSIDE the ptygrid window: the desktop OS
-// toast and chat webhooks (Slack / Mattermost / Discord / Telegram). Two event
-// sources feed this module, both ALREADY edge-triggered (so this layer never
-// polls and never dedups a level):
+// toast and chat webhooks (Slack / Mattermost / Discord / Telegram). Three event
+// sources feed this module, all ALREADY edge-triggered by the time they get here
+// (so this layer never polls and never dedups a level):
 //   - session lifecycle (`session::handle_eof`): a session EXITED — abnormally
 //     (nonzero exit / signal) => `Error`, cleanly (code 0) => `Complete`.
 //   - agent-status (`agent_status::emit`): a live session's semantic status
 //     CHANGED — to `blocked` => `NeedsAttention`, to `done` => `Complete`.
+//   - workflow escalation (`orchestrator::take_escalations`, Stage A-4): a
+//     workflow step spent its whole `retry` budget => `Error`. That source sits
+//     on the 200ms driver tick, which IS a poll, so the EDGE is made there, not
+//     here: `take_escalations` flips a once-only `StepOutcome::escalated` flag
+//     and only hands this module the steps that flipped on that tick. This
+//     module's "never dedups" premise therefore still holds.
 //
 // This file is the PURE core: the event model, the (event × level) routing
 // decision, channel selection, and message formatting — all unit-tested with no
 // I/O. The managed state, `${VAR}` expansion, OS-toast + webhook dispatch, and
-// the wiring from the two event sources land in the dispatch layer (a follow-up
-// within this module) and never run on the reader hot path.
+// the wiring from the three event sources land in the dispatch layer (a
+// follow-up within this module) and never run on the reader hot path.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -78,6 +84,29 @@ pub fn channels_for(
         .filter(move |c| should_send(c.effective_level(global), event))
 }
 
+/// Which workflow step a notification is about, when the event came from the
+/// orchestrator rather than from a session (Stage A-4). `None` for the two
+/// session-centric sources, which is what keeps their messages byte-identical
+/// to what they were before this existed.
+///
+/// Deliberately additive rather than a change to `NotifyContext::session_id`:
+/// an escalating step may have NO session at all (its spawn never got a pane,
+/// or its pane was killed by `check_timeouts` before the budget ran out), and
+/// making `session_id` an `Option` would have rippled through the two sources
+/// that always do have one. Here the step is named by workflow + step id, so
+/// the session id is never needed to name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowOrigin {
+    /// Workflow name as declared under `workflows:`.
+    pub workflow: String,
+    /// Run id (`wfr_…`), so a message can be matched to a row in the panel.
+    pub run_id: String,
+    /// Step id, suffixed (`review#2`) for a fan-out / `onEach` copy.
+    pub step_id: String,
+    /// Spawn attempts made before the budget ran out (1 = the original spawn).
+    pub attempts: u32,
+}
+
 /// Owned session context for a notification message. Owned strings so a
 /// dispatch payload can outlive the session-map lock it was read under.
 #[derive(Debug, Clone, Default)]
@@ -88,8 +117,11 @@ pub struct NotifyContext {
     /// Loaded project name (`config.project`), for multi-project disambiguation.
     pub project: Option<String>,
     /// Event-specific tail: exit-code text for `Error`/`Complete`, the matched
-    /// rule / prompt hint for `NeedsAttention`.
+    /// rule / prompt hint for `NeedsAttention`, the step's own error text for a
+    /// workflow escalation.
     pub detail: Option<String>,
+    /// Set only by the workflow-escalation source; see `WorkflowOrigin`.
+    pub origin: Option<WorkflowOrigin>,
 }
 
 impl NotifyContext {
@@ -115,7 +147,24 @@ fn glyph(event: NotifyEvent) -> &'static str {
 
 /// One-line notification title: `<glyph> <who> <verb>`, optionally prefixed with
 /// the project so a multi-project desktop can tell alerts apart.
+///
+/// A workflow escalation (Stage A-4) names the STEP rather than the session
+/// (`demo/review#2`) and gets its own verb: "exited abnormally" would be a lie
+/// twice over — the step may never have had a process to exit, and the point of
+/// the message is that the automatic recovery is over, not that something ended.
 pub fn format_title(event: NotifyEvent, ctx: &NotifyContext) -> String {
+    if let Some(origin) = &ctx.origin {
+        let mut title = format!(
+            "{} {}/{} exhausted its retries",
+            glyph(event),
+            origin.workflow,
+            origin.step_id
+        );
+        if let Some(project) = ctx.project.as_deref().filter(|p| !p.is_empty()) {
+            title = format!("[{project}] {title}");
+        }
+        return title;
+    }
     let verb = match event {
         NotifyEvent::Error => "exited abnormally",
         NotifyEvent::NeedsAttention => "needs attention",
@@ -131,7 +180,15 @@ pub fn format_title(event: NotifyEvent, ctx: &NotifyContext) -> String {
 
 /// Notification body: the event-specific `detail` when present, else a stable
 /// fallback naming the session. Never empty (some transports reject empty text).
+///
+/// A workflow escalation composes instead of substituting: the operator has to
+/// be able to act on the message alone, so it always states which workflow,
+/// which run, which step, which agent and how many attempts, and appends the
+/// step's own error text as the tail rather than letting it replace all of that.
 pub fn format_body(event: NotifyEvent, ctx: &NotifyContext) -> String {
+    if let Some(origin) = &ctx.origin {
+        return escalation_body(origin, ctx);
+    }
     if let Some(detail) = ctx.detail.as_deref().filter(|d| !d.is_empty()) {
         return detail.to_string();
     }
@@ -141,6 +198,24 @@ pub fn format_body(event: NotifyEvent, ctx: &NotifyContext) -> String {
         NotifyEvent::Complete => format!("Session {} completed.", ctx.who()),
         NotifyEvent::Progress => format!("Session {} update.", ctx.who()),
     }
+}
+
+/// Body for a retry-exhaustion escalation. Ends with what the operator is being
+/// asked to do, because nothing in ptygrid will try this step again.
+fn escalation_body(origin: &WorkflowOrigin, ctx: &NotifyContext) -> String {
+    let plural = if origin.attempts == 1 { "" } else { "s" };
+    let mut body = format!(
+        "Workflow '{}' (run {}): step '{}' failed after {} attempt{} and has no retry budget left.",
+        origin.workflow, origin.run_id, origin.step_id, origin.attempts, plural
+    );
+    if let Some(agent) = ctx.name.as_deref().filter(|n| !n.is_empty()) {
+        body.push_str(&format!(" Agent: {agent}."));
+    }
+    if let Some(detail) = ctx.detail.as_deref().filter(|d| !d.is_empty()) {
+        body.push_str(&format!(" Last error: {detail}"));
+    }
+    body.push_str(" No further automatic retry will happen.");
+    body
 }
 
 /// Map a session exit code to the right lifecycle event: `Complete` on a clean
@@ -220,8 +295,9 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, config: &Config) {
 
 /// Route one edge event to every channel whose effective level includes it, and
 /// fire each: the OS toast inline, chat webhooks on a detached thread so blocking
-/// network I/O never touches the caller (the agent-status task or the PTY reader
-/// thread). A no-op when the feature is off or no channel matches.
+/// network I/O never touches the caller (the agent-status task, the PTY reader
+/// thread, or the 200ms workflow driver). A no-op when the feature is off or no
+/// channel matches. Session-sourced convenience wrapper over `dispatch_ctx`.
 pub fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     event: NotifyEvent,
@@ -229,6 +305,26 @@ pub fn dispatch<R: Runtime>(
     name: Option<String>,
     detail: Option<String>,
 ) {
+    dispatch_ctx(
+        app,
+        event,
+        NotifyContext {
+            session_id: id,
+            name,
+            project: None, // filled in from the loaded config below
+            detail,
+            origin: None,
+        },
+    );
+}
+
+/// `dispatch` for a caller that has more than a session to say — today only the
+/// workflow-escalation source (Stage A-4), which fills `NotifyContext::origin`.
+/// Same routing, same channels, same threading rules; the only difference is
+/// that the context is supplied whole instead of assembled from three arguments.
+/// `ctx.project` is always overwritten from the loaded config, so no caller has
+/// to know the project name.
+pub fn dispatch_ctx<R: Runtime>(app: &AppHandle<R>, event: NotifyEvent, mut ctx: NotifyContext) {
     let Some(state) = app.try_state::<NotificationManager>() else {
         return;
     };
@@ -242,12 +338,7 @@ pub fn dispatch<R: Runtime>(
     if targets.is_empty() {
         return;
     }
-    let ctx = NotifyContext {
-        session_id: id,
-        name,
-        project: loaded.project.clone(),
-        detail,
-    };
+    ctx.project = loaded.project.clone();
     let title = format_title(event, &ctx);
     let body = format_body(event, &ctx);
     for ch in &targets {
@@ -496,6 +587,7 @@ mod tests {
             name: Some("claude".to_string()),
             project: Some("my-app".to_string()),
             detail: None,
+            origin: None,
         };
         assert_eq!(
             format_title(NotifyEvent::Complete, &ctx),
@@ -516,6 +608,7 @@ mod tests {
             name: Some("web".to_string()),
             project: None,
             detail: Some("exit code 2".to_string()),
+            origin: None,
         };
         assert_eq!(format_body(NotifyEvent::Error, &with_detail), "exit code 2");
 
@@ -534,6 +627,79 @@ mod tests {
             ..no_detail
         };
         assert!(!format_body(NotifyEvent::Complete, &empty_detail).is_empty());
+    }
+
+    // ---- workflow escalation (Stage A-4) ----
+
+    fn escalation_ctx() -> NotifyContext {
+        NotifyContext {
+            session_id: 0, // an escalating step may have had no pane at all
+            name: Some("reviewer".to_string()),
+            project: Some("my-app".to_string()),
+            detail: Some("timed out after 60000ms".to_string()),
+            origin: Some(WorkflowOrigin {
+                workflow: "demo".to_string(),
+                run_id: "wfr_abc".to_string(),
+                step_id: "review#2".to_string(),
+                attempts: 3,
+            }),
+        }
+    }
+
+    #[test]
+    fn escalation_names_the_workflow_run_step_and_attempt_count() {
+        let ctx = escalation_ctx();
+        // Title names the STEP, not `#0` — the step may never have had a session.
+        assert_eq!(
+            format_title(NotifyEvent::Error, &ctx),
+            "[my-app] ⛔ demo/review#2 exhausted its retries"
+        );
+        let body = format_body(NotifyEvent::Error, &ctx);
+        for needle in [
+            "demo",
+            "wfr_abc",
+            "review#2",
+            "3 attempts",
+            "reviewer",
+            "timed out after 60000ms",
+            "No further automatic retry",
+        ] {
+            assert!(body.contains(needle), "body must mention {needle}: {body}");
+        }
+        // A single attempt is not pluralised, and a step that failed without an
+        // error string still produces a usable, non-empty body.
+        let bare = NotifyContext {
+            name: None,
+            detail: None,
+            origin: Some(WorkflowOrigin {
+                workflow: "demo".to_string(),
+                run_id: "wfr_abc".to_string(),
+                step_id: "first".to_string(),
+                attempts: 1,
+            }),
+            ..escalation_ctx()
+        };
+        let body = format_body(NotifyEvent::Error, &bare);
+        assert!(body.contains("1 attempt and"), "no plural for one: {body}");
+        assert!(!body.contains("Agent:"), "no agent clause when unnamed: {body}");
+        assert!(!body.contains("Last error:"), "no error clause when none: {body}");
+    }
+
+    #[test]
+    fn escalation_reaches_a_channel_left_at_the_default_critical_level() {
+        // Why `Error` and not `NeedsAttention`: `critical` is the DEFAULT level,
+        // and it subscribes to `error` only. Mapping retry exhaustion to
+        // `NeedsAttention` would make the escalation invisible to every operator
+        // who never edited `level:` — i.e. to the default configuration.
+        let (chans, global) =
+            channels("notifications:\n  channels:\n    - type: slack\n      webhook: s\n");
+        assert_eq!(global, NotifyLevel::Critical, "default level is critical");
+        assert_eq!(channels_for(&chans, global, NotifyEvent::Error).count(), 1);
+        assert_eq!(
+            channels_for(&chans, global, NotifyEvent::NeedsAttention).count(),
+            0,
+            "a critical channel would have dropped a NeedsAttention escalation"
+        );
     }
 
     // ---- webhook payload builders ----

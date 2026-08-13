@@ -2342,6 +2342,409 @@ team_presets:
 > `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
 
+> 追記（2026-08-07、続報12）: **`resume_workflow` は「すでに起きた step 間の受け渡し」を
+> 失った run も拒否する。** 続報11 (a) が `onEach` について書いた拒否と同じ判断を、
+> `condition:` と `handoffTo:` にも広げる。原因は同じ 1 点で、`StepOutcome::reply_body` が
+> `#[serde(skip)]` であること — 再起動をまたぐと、**state は `Succeeded` のまま残るのに
+> 返信本文だけが消える**。下流の 2 か所はこれを「上流が返信せずに終わった」と区別できない:
+>
+> - `condition_targets` は依存の返信が無い場合を `Failed`（理由は「`<dep>` に kickoff: を
+>   付けろ」）に落とす。**中断が無ければ通っていた（あるいは素直に `Skipped` になっていた）
+>   分岐で、resume した run だけが赤くなる**。しかも理由文は真因を指していない。
+> - `handoff_bodies` はエントリを出さず、`compose_kickoff` が宣言された `kickoff` だけに
+>   フォールバックする。**下流エージェントは約束された文脈を持たずに起動し、エラーも警告も
+>   出ない**。こちらが悪質なほう。
+>
+> **判定は定義ではなく collapse 後のスナップショットで行う**（`onEach` の門は定義だけを見る
+> が、こちらは同じ定義でもクラッシュ地点によって復旧可否が変わるため）。拒否するのは
+> 「生産側が永続スナップショット上ですでに終端」かつ「消費側がまだ走っていない」ときだけ:
+> 生産側自身が `Pending` へ畳まれるなら再実行して返信を作り直すので問題にならず、消費側が
+> すでに走っていれば受け渡しは消費済みである。**inbox スレッドを持たない生産側は対象外**
+> — スレッドが無い以上もともと何も運んでおらず、中断の有無で挙動が変わらないため
+> （偽陽性の除外）。**この「スレッドを持つ」の判定を宣言 `kickoff:` の有無だけで書いていたのは
+> 誤りで、続報14 で「誰かの `handoffTo` の宛先である」も数えるように訂正した。** エラーは
+> `Err("workflow '<name>' cannot be resumed: <理由>; discard this run and start it again")` で、
+> 理由は宣言順で最初の 1 件だけを返す（メッセージを安定させるため）。
+>
+> **wire 契約は無変更**。`resume_workflow` の引数・返り値は不変で、増えたのは失敗ケースだけ。
+> frontend は既存の resume 失敗パスにそのまま落ちる（`onEach` の拒否で通っている経路と同じ）。
+> `StepOutcome` の serialize されるフィールドも不変。**恒久対策は「運ばれた本文を step と
+> 一緒に永続化する」ことで、それは別 patch**（→ docs/design/next-implementation-2026-08.md
+> の 5.6.1）。それまでは、誤った答えに resume するより拒否するほうがましという続報11 と
+> 同じ判断を採る。
+>
+> 検証: `cargo test` **lib 466（461 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `resume_refuses_when_a_condition_lost_its_upstream_reply` /
+> `resume_refuses_when_a_handoff_carry_was_lost` /
+> `resume_still_works_when_the_producer_is_itself_being_replayed` /
+> `resume_still_works_when_the_carry_was_already_spent` /
+> `lost_carry_blocker_ignores_a_producer_that_never_had_a_thread`）。
+> `cargo clippy --all-targets --all-features` は既存の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。**実機検証は未実施**（→ plan.md §2 に
+> U 番号を立てる。手順は「`condition:` を持つ run を gate 完了後に落として再起動し、
+> 再開バナーが失敗表示になること」）。
+
+> 追記（2026-08-07、続報13）: **1 つの target を複数の `handoffTo:` が指したとき、本文を
+> 全部運ぶようになった。** 従来は `handoff_bodies` が `if bodies.contains_key(target) { continue; }`
+> で宣言順の最初の 1 本だけを採り、**2 本目以降をエラーにも警告にもせず捨てていた**。
+> `config.rs` の `handoffTo` 検証は「同一 target を複数 source が指す」を止めないので、
+> 設定は通り、レビュー 2 体を並べた workflow は**判定 step が片方の意見しか受け取らず、
+> もう片方が捨てられたことを知る手段も無い**という形で静かに壊れていた（plan.md §3
+> バックログ「2 体レビューの突き合わせ（cross-model review）」の原因 (1)）。
+>
+> 是正: target ごとに本文を集めて連結する。**順序は `ptygrid.yml` の宣言順**（`run.steps` の
+> 到着順ではない）なので、同じ設定なら run をまたいで同じ並びになる。連結は
+> `handoff::merge_carried_bodies` を新設して行う — 既存の `merge_reply_bodies` を使わないのは
+> **バイト上限の使い方が違う**ため。後者は同一 step の返信を時系列で連ねるので末尾を切るのが
+> 自然だが、こちらは別々の step の意見なので join を切ると**宣言順で先の source が予算を
+> 食い尽くして後続を丸ごと消す**（= 直そうとしている症状そのもの）。よって
+> `MAX_HANDOFF_BODY_BYTES`（48 KiB）は分配する: 収まるうちは 1 バイトも切らず、超えたら
+> 全 source に均等枠を保証し、短い source が使い残した分は 1 パスで長い source へ返す。
+> **source が 1 本の場合は従来の `merge_reply_bodies` 経路そのままで、バイト単位で不変**。
+>
+> **wire 契約は無変更**。`handoff_bodies` の型（`HashMap<String, String>`、target 別に
+> 連結済み）も呼び出し側 2 か所（`spawn_ready` / `fire_due_retries`）も変えていない。
+> `compose_kickoff` の合成規則（carried を宣言 `kickoff` の前に置き、間は空行）も不変。
+> **残る半分は未着手**: `condition_targets` が `depends_on.first()` しか見ず、かつ
+> `config.rs:850-856` が `condition` の `dependsOn` を 1 本に制限しているため、
+> 「両方が ACCEPT なら進む」は依然として書けない（→ docs/design/next-implementation-2026-08.md
+> の 5.6.3）。今回入ったのは**突き合わせる材料が判定 step に届くところまで**である。
+>
+> 検証: `cargo test` **lib 470（466 + 新規 4）/ 統合 14、いずれも 0 failed**
+> （`handoff_bodies_joins_every_source_that_claims_one_target` /
+> `handoff_bodies_carries_the_one_source_that_replied` /
+> `merge_carried_bodies_leaves_the_bodies_alone_while_they_fit` /
+> `merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others`）。
+> `cargo clippy --all-targets --all-features` は既存の `nonminimal_bool` **1 件のみ**。
+> frontend 無変更。**実機検証は未実施**（→ plan.md §2 U16）。
+>
+> **テストの補強（続報14）**: 上記 4 本のうち `handoff_bodies_joins_every_source_that_claims_one_target`
+> は `run.steps` を宣言順どおりに組んでいたため、**「宣言順」と「到着順」を区別できていなかった**
+> （どちらの実装でも通る）。`run.steps` を逆順に組んでも出力が宣言順になることを
+> `handoff_bodies_orders_the_join_by_declaration_not_by_arrival` で固定した。また
+> `merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others` は「長い 1 本 + 短い 1 本」
+> しか通らず、**全 source が均等枠を超える**（= 使い残しの返却が 0 になる）配分経路が未検証だった。
+> source 4 本すべて上限超過で総和が `MAX_HANDOFF_BODY_BYTES` を超えないことを
+> `merge_carried_bodies_holds_the_cap_when_every_source_is_oversized` で固定した。
+
+> 追記（2026-08-13、続報14）: **続報12 のガードが、宣言 `kickoff:` を持たない中継 step の
+> 受け渡しを取りこぼしていたのを直した。** `lost_carry_blocker` の「その step は inbox
+> スレッドを持つか」の判定が **宣言 `kickoff:` が非空か** だけを見ていた。だが
+> `compose_kickoff(None, Some(body))` は `Some(body)` を返す — **宣言 `kickoff:` が無くても、
+> 誰かの `handoffTo` の宛先になっている step は運ばれてきた本文だけで kickoff され、
+> スレッドを持ち、そこに返信しうる**。`config.rs` が `kickoff:` を要求するのは
+> `joinOn: reply` と `joinOn: stream` だけで、`handoffTo` の source には要求しない。
+>
+> 壊れ方: `a --handoffTo--> b --handoffTo--> c` で `b` に `kickoff:` を書かない
+> （中継 step の最も普通の形）。`a` → `b` が完走し `c` が Pending の時点でクラッシュすると、
+> `b` の `handoffTo: c` を見た判定が `b.kickoff` が空だという理由で **false を返してブロッカーに
+> ならず**、resume が通る。`c` は `b` の本文を受け取らずに自分の宣言 `kickoff:` だけで起動する
+> — **エラーも警告も無い**。続報12 が「こちらが悪質なほう」と書いた症状そのものを、
+> そのガードが素通しにしていた。`c` が `condition:` を持つ場合は `condition_targets` の
+> 3 分岐目に落ちて run が赤くなり、しかも理由文（「`<dep>` に kickoff: を付けろ」）は
+> 真因を指さない。
+>
+> 是正: 判定を「宣言 `kickoff:` が非空 **または** 自分が誰かの `handoffTo` の宛先である」に
+> 緩める。どちらも無い step（= 何も送られておらず、スレッドが無い）は従来どおり対象外で、
+> 続報12 が意図した偽陽性の除外はそのまま残る。
+>
+> **wire 契約は無変更**。`resume_workflow` の引数・返り値・エラー文字列の形（`cannot be resumed:`）も
+> 不変で、変わったのは**同じエラーを返す範囲が広がった**ことだけ。frontend 無変更。
+>
+> **既知の限界（偽陽性・偽陰性の残り）。** このガードは**スナップショットの state と workflow 定義
+> だけ**を見ており、`QueenStore` の inbox を読んでいない。したがって:
+>
+> - **偽陽性が残る**: 生産側が「スレッドは持っていたが実際には一度も返信せずに」（route 1 の
+>   PTY exit / route 2 の semantic done で）終端していた run も拒否する。この run は resume して
+>   も挙動が変わらない（`handoff_bodies` はもともとエントリを出さない）ので、拒否は不要な
+>   ものだった。**判定できるようにするには inbox を見に行く設計変更が要り、本筋は
+>   「運ばれた本文を step と一緒に永続化する」Phase 5.6.1 なので今回は直さない。**
+>   誤った答えに resume するより、不要に拒否するほうがましという続報11 / 続報12 と同じ判断。
+> - 偽陰性は今回の修正で 1 件塞がった（上記）。`onEach` / `joinOn: stream` は続報11 (a) の
+>   定義ベースの門が先に run ごと拒否するので、このガードの守備範囲外である。
+>
+> 検証: `cargo test` **lib 475（470 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `lost_carry_blocker_counts_a_handoff_target_as_a_producer_too`（修正前は None を返して落ちる、
+> = 修正が効いていることの証明）/
+> `lost_carry_blocker_passes_a_workflow_that_carries_nothing_at_all` /
+> `lost_carry_blocker_passes_a_consumer_that_already_finished_either_way` /
+> `handoff_bodies_orders_the_join_by_declaration_not_by_arrival` /
+> `merge_carried_bodies_holds_the_cap_when_every_source_is_oversized`）。
+> `cargo clippy --all-targets` は既存の `nonminimal_bool` **1 件のみ**で本作業起因の新規警告は
+> ゼロ。frontend 無変更。**実機検証は未実施**（続報12 と同じ手順に「中継 step に `kickoff:` を
+> 書かない chain」を 1 本足す → plan.md §2）。
+
+> 追記（2026-08-13、続報15）: **cancel / abandon された run が、誰も ack しない kickoff を
+> agent の mailbox に置き去りにしていたのを直した（Stage A-5）。** kickoff は durable inbox に
+> 入り、**エージェントが返信して初めて ack される**（`reply_inbox` がスレッド root を ack する）。
+> run が cancel / abandon されると誰も返信しないので、その kickoff は**未 ack のまま mailbox に
+> 残り続ける**。`onEach` のコピー以外は宛先が **agent 定義名** — 同じ agent を使う将来の全 run と
+> 共有される mailbox — なので、次の run のペインが `await` したとき**死んだ run の指示を自分宛の
+> 指示として読む**。2026-08-05 の実機で `coder` のペインが前日の run の kickoff 2 通（id=333 /
+> id=334）を報告したのがこれ（plan.md §6.14）。5.0.7 が作った問題ではなく **5.0.0 からの挙動**。
+> 誤完了ではない（返信は thread root で相関されるので、古い kickoff への返信が別 step を
+> 完了させることはない）。**取り消された作業をエージェントが実行してしまう**という穴である。
+>
+> 是正: `cancel_workflow` / `abandon_workflow` が、その run が送った kickoff のうち未 ack のものを
+> すべて ack する（`orchestrator::retire_run_kickoffs` → 新設の
+> `QueenStore::ack_inbox_from_sender`）。
+>
+> **選択キーは message id ではなく sender である。** これが要点で、理由は 2 つある:
+>
+> - `workflow_mailbox` が作る sender は `queen:workflow/<name>/<run_id>` で **run_id を含む**。
+>   したがって「この run の kickoff だけ」を文字列一致で正確に選べる。共有 mailbox に入った
+>   ものも `onEach` コピーの `wf/<run_id>/<step_id>` に入ったものも同じ 1 本の条件で拾え、
+>   **並行している別 run の kickoff を巻き込む余地が構造的に無い**。
+> - id 経由では両方の呼び出し元をカバーできない。`StepOutcome::kickoff_root_msg_id` は
+>   `#[serde(skip)]` なので、**DB から読み戻した run には id が 1 つも無い**。
+>   `abandon_workflow`（再起動後の「破棄」しか入口が無い）が見るのは常にその読み戻した run で
+>   あり、resume をまたいだ run も再起動前の id を失っている。sender 経由はこの穴を通らない。
+>   → **「resume をまたぐと id が消えるので abandon では何もできない」という縮退は発生しない。**
+>
+> **step の state を問わず、その run の kickoff を全部 ack する。** 終わった run の kickoff は
+> すべて用済みであり、しかも `Succeeded` の step の kickoff も未 ack で残っていることが多い —
+> route 1（PTY exit）/ route 2（semantic done）は返信なしで step を完了させるからで、次の run から
+> 見ればそれも同じだけ古い。
+>
+> **best-effort。** `retire_run_kickoffs` は値を返さず、store エラーは `eprintln!` に落とす。
+> cancel が mailbox の掃除に失敗したせいで失敗するのは本末転倒であり、失敗時の最悪ケースは
+> この修正以前の挙動そのものだから。順序も「主目的が先」で固定した: cancel は `persist_run` の
+> **後**、abandon は `mark_workflow_abandoned` が成功した**後**にだけ掃く。
+>
+> **wire 契約は無変更**。Tauri command `cancel_workflow` / `abandon_workflow` の引数・返り値・
+> エラー文字列、`workflow-state` イベントの形、MCP tool（`ack_inbox` を含む）のシグネチャは
+> いずれも不変。`ack_inbox_from_sender` は **Rust 内部 API で、MCP には出していない**
+> （エージェントに他人のメールボックスを一括 ack させる道具を渡す理由が無い）。frontend 無変更。
+>
+> **既知の限界。**
+>
+> - **メッセージは削除ではなく ack** である。`list_inbox(includeAcknowledged: true)` には
+>   従来どおり残る（履歴・監査のため）。「古い kickoff を読ませない」保証は `await` /
+>   未 ack 一覧の側にしか及ばない。
+> - **abandon は永続行から workflow 名を読む必要がある**ため、`mark_workflow_abandoned` の
+>   *前*に `list_running_workflow_runs` で引く。行が既に消えている run では掃除をせず、
+>   `mark_workflow_abandoned` の "not found" エラーをそのまま返す。
+> - **`Failed` で終端した run と、正常に `Succeeded` した run は掃かない → 未対応。** 今回の
+>   入口は cancel / abandon の 2 つだけ（`retire_run_kickoffs` の呼び出し元はこの 2 か所のみ）。
+>   **しかも滞留するほうが多数派である**: `joinOn: reply` でない step — route 1（PTY exit）/
+>   route 2（semantic done）で完了する step — は**返信なしで終わるので kickoff は未 ack のまま
+>   残る**。**A-6（retention）はここに効かない**。`prune_terminal_workflow_runs` が触るのは
+>   `workflow_runs` の DELETE だけで、`inbox_messages` には SQL を 1 本も投げないため、
+>   run 行が retention で消えたあとも kickoff は inbox に残り続ける。
+>   **帰結**: `inbox_messages` は ack しても行が消えないので、行数は ack の有無に関わらず
+>   増え続け、`MAX_MESSAGES_PER_PROJECT` = 50,000 に達すると `enforce_limit` が
+>   **`send_inbox` を `Err` で拒否する**（この表は削除ではなく拒否側）。すなわち
+>   `deliver_kickoff` が新規 kickoff を送れなくなる。
+>   直すなら **A-5 の入口を終端書き込みにも広げる**か、**5.6.x（スキーマ分割）で扱う**。
+> - `inbox_messages` に `sender` の索引は無いので、この掃除は project のメッセージを走査する
+>   （`MAX_MESSAGES_PER_PROJECT` = 50,000 で上限）。cancel / abandon 1 回につき 1 度だけ走り、
+>   **driver の tick には乗らない**ので索引とそのスキーマ移行は見送った。
+>
+> 検証: `cargo test` **lib 479（475 + 新規 4）/ 統合 14、いずれも 0 failed**（新規 4 本 —
+> `acking_by_sender_closes_only_that_senders_unacknowledged_messages` /
+> `cancelling_a_run_acks_the_kickoff_its_agent_never_answered` /
+> `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost` /
+> `retiring_one_runs_kickoffs_leaves_a_concurrent_runs_alone`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。**実機検証は未実施**（→ plan.md §2 の U17）。
+
+> 追記（2026-08-13、続報16）: **retry を使い切った step が、アプリの外へ 1 通も出さずに
+> 黙って赤くなっていたのを直した（Stage A-4、escalation の配線）。** 4.4.2 の通知基盤
+> （OS トースト / Slack / Mattermost / Discord / Telegram）は 5.0.4 の retry 実行系より前から
+> あるのに、**workflow 側からの入口が無かった**。step が `retry:` の予算を使い切ると
+> `Failed` で終端して run が red になるだけで、離席中・夜間には誰も気づかない
+> （ptygrid-yml-guide.md §1 の escalation 行が ❌ のまま残っていた理由）。
+>
+> 是正: 通知の**第 3 のイベント源**として `orchestrator::take_escalations`（純関数）＋
+> `notify_escalation`（dispatch 呼び出し）を足し、`advance_run` の末尾に配線した。
+> 新しい配送機構はゼロ — 既存の `notifications::dispatch` と同じ経路・同じレベル判定に乗る。
+>
+> **(1) エッジ化は orchestrator 側でやる。** 4.4.2 は「イベント源はすべてエッジで、この層は
+> ポーリングも重複除去もしない」という前提の上に乗っている（notifications.rs 冒頭）。ところが
+> workflow driver は **200ms の tick（ポーリング）**であり、「この step は retry を使い切った」は
+> tick ごとに真であり続ける**レベル**である。そのまま流すと**同じ枯渇で 5 通/秒**になる。
+> そこで `StepOutcome` に `#[serde(skip)] escalated: bool` を足し、`take_escalations` が
+> **フラグを立てた tick の分だけ**返すようにした（`next_retry_at_ms` が「Failed」を
+> 「Failed だが再試行待ち」に変えているのと同じ発想）。4.4.2 の前提はこれで維持される。
+>
+> **(2) `Error` にマップする（`NeedsAttention` ではない）。** 既定の `notifications.level` は
+> `critical` で、`critical` が購読するのは `error` **だけ**である（§2.2 のマトリクス）。
+> `NeedsAttention` にすると **level を一度も書き換えていない利用者＝既定の設定では 1 通も
+> 届かない**。「夜間に誰も見ていない」ケースがまさにその設定なので、A-4 の completion gate
+> （「retry 枯渇で通知経路へ 1 通出る」）を満たさなくなる。意味論的にも `Error`（異常終了）と
+> 整合する — 自動復旧の手を使い切った失敗は、放っておいても元に戻らない終わり方である。
+>
+> **(3) 新しい config フィールドは足さない。** ptygrid-yml-guide.md §1 の escalation 行は
+> 「(config には書かない)」のままで正しい。誰にどの音量で届けるかは既存の `notifications:`
+> ブロックの `level` / `channels` が既に表現しており、escalation 専用のスイッチを足すと
+> 「2 つの設定が食い違う」状態を作れるようになるだけだから。
+>
+> **(4) メッセージは session ではなく step を名乗る。** `NotifyContext` は session 中心の型で
+> `session_id: u32` が必須だが、枯渇した step は **pane を持たないことがある**
+> （spawn できないまま枯渇した / `check_timeouts` に kill されて枠が消えている）。
+> `session_id` を `Option` にすると既存 2 源へ波及するので、代わりに任意フィールド
+> `origin: Option<WorkflowOrigin>`（workflow 名 / run_id / step_id / attempts）を足した。
+> `origin` があるときだけ title / body が分岐する:
+> `[project] ⛔ demo/review#2 exhausted its retries` /
+> `Workflow 'demo' (run wfr_…): step 'review#2' failed after 3 attempts and has no retry budget
+> left. Agent: reviewer. Last error: … No further automatic retry will happen.`
+> **既存 2 源（`session::handle_eof` / `agent_status::emit`）の出力はバイト単位で不変**
+> （`origin: None` を通るため。既存の整形テストもそのまま通る）。`dispatch` は新設の
+> `dispatch_ctx` の薄いラッパになったが、引数も挙動も不変。
+>
+> **範囲は「retry の枯渇」であって「step の失敗」ではない。** `retry:` を宣言していない step は
+> 対象外（使い切る予算が無い）、`attempts == 0`（一度も spawn されずに `Failed` ＝評価不能な
+> `condition:`）も対象外、backoff 待ち（`next_retry_at_ms` が `Some`）も対象外 —
+> `arm_retry_backoff` が再 spawn を拒否するのと同じ 3 条件である。
+>
+> **二重通知は抑止していない（許容）。** 枯渇した step の最後の試行がペイン付きだった場合、
+> その exit で `session::handle_eof` 由来の `Error` が**別途 1 通出る**（これは今回の変更前から
+> 出ていた通知で、しかも**試行のたびに**出る）。両者は別のことを言っている: 前者は
+> 「プロセスが落ちた」、後者は「この run のこの step はもう自動では戻らない」で、
+> workflow / run / step を名乗るのは後者だけである。抑止するには通知層が「どの session が
+> どの workflow の持ち物か」を横断で知る必要があり、4.4.2 の「重複除去をしない」前提
+> （上記 (1) の逆）を壊す。**枯渇 1 回につき escalation は 1 通**で、増えるのはそこだけ。
+>
+> **wire 契約は無変更。** `escalated` は `#[serde(skip)]` なので `workflow-state` イベントの
+> `StepOutcome` にも `workflow_runs.steps_json` にも出ない。新規 Tauri command / MCP tool /
+> event はゼロ。`notifications:` のスキーマも変更なし。frontend 無変更。
+>
+> **既知の限界。**
+>
+> - **resume すると同じ枯渇がもう 1 通出る。** `escalated` は永続化しないので、クラッシュ前に
+>   枯渇していた step を含む run を resume すると再送になる。「1 通目を受け取れなかった
+>   （アプリが落ちていた）人にこそ必要」という判断で `#[serde(skip)]` のままにした。
+> - **`joinOn: any` の敗者が枯渇したあとに兄弟が勝つと、その escalation は取り消せない。**
+>   同一 tick 内なら `cancel_stragglers` が先に走って `Cancelled` になるので出ない
+>   （収集は 2 本の `arm_retry_backoff` パスと `cancel_stragglers` の**後**）。数 tick 後に
+>   勝敗が決まる場合は、run は緑で終わるのに escalation は既に飛んでいる。
+> - **run 全体の失敗は通知しない。** 入口は step の retry 枯渇 1 つだけである。`retry:` を
+>   書いていない step だけで構成された workflow は、run が red になっても escalation は
+>   出ない（ペイン exit 由来の通知は従来どおり出る）。
+> - **「枯渇 1 回につき 1 通」は step 単位の話で、run 単位ではバーストしうる。** `escalated` は
+>   **step（＝ `onEach` / `fanOut` のコピー 1 つ）ごと**のフラグなので、`reviewer#0`〜`#63` が
+>   同一 tick で枯渇すれば **その 1 tick で 64 通**出る。上限は `STREAM_MAX_UNITS` = 64
+>   （`fanOut` はペイン枠 `WORKFLOW_SESSION_CAP` = 9 で実質頭打ち）。しかも `send_os`
+>   （OS トースト）は **driver スレッド上でインライン**（detached thread に出るのは webhook だけ）
+>   なので、そのぶん 200ms tick が直接ブロックされる。`onEach` × `retry` を併用する設定でだけ
+>   起きる。spec-notifications.md は §7 で事故防止を掲げ、**スロットリング / ダイジェストは
+>   §9 で v2 送り**にしているので、対処するならそこ（→ plan.md §3 のバックログ）。
+> - **実機検証は未実施。** 裏づけは unit test 5 本だけで、実際に OS トーストや Slack に
+>   届いたところは見ていない（→ plan.md §2 の U18）。
+>
+> 検証: `cargo test` **lib 484（479 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `an_exhausted_retry_budget_escalates_once_and_never_again` /
+> `a_retry_that_still_has_budget_left_does_not_escalate` /
+> `a_step_with_no_retry_policy_never_escalates_however_hard_it_failed` /
+> `escalation_names_the_workflow_run_step_and_attempt_count` /
+> `escalation_reaches_a_channel_left_at_the_default_critical_level`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。
+
+> 追記（2026-08-13、続報17）: **`workflow_runs` に retention を入れた（Stage A-6）。**
+> このテーブルだけ**件数上限も DELETE も無く**、インストールの寿命ぶん**単調増加**していた
+> （pins / notes / inbox は `enforce_limit` の対象。`workflow_runs` は対象外だった）。
+> 実装は `queen_store.rs` に閉じており、**`user_version` は消費していない**（3 のまま）。
+>
+> **(1) 上限は「件数」。日数ではない。** 隣の 3 テーブル（`MAX_PINS_PER_PROJECT` = 256 /
+> `MAX_NOTES_PER_PROJECT` = 10,000 / `MAX_MESSAGES_PER_PROJECT` = 50,000）が全て件数で
+> 揃っており、かつ**日数だけではファイルサイズが有界にならない**（1 日で何百 run でも
+> 書ける）。逆に日数だけにすると、1 か月放置したプロジェクトを開いた人が**まさに見たい
+> 履歴を全部失う**。件数なら最悪サイズが決まり、放置しても消えない。
+>
+> **(2) 上限値は `MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT` = 500（project ごと、終端 run のみ）。**
+> 数字の出どころは 2 つの境界:
+>
+> - **下限 100** = `orchestrator::REGISTRY_TERMINAL_CAP`（メモリ上の registry が保持する
+>   終端 run の数）。**永続ストアが揮発ストアより狭いのは背理**なので、DB 側はこれ以上で
+>   なければならない。500 はその 5 倍で、DB 窓のほうが確実に広い。
+> - **上限** = ファイル増加の抑制。1 行が run 全体の `steps_json` を丸ごと持つので、
+>   この表の 1 行は pin や inbox の 1 行より桁で重い。**悲観的に 1 KiB/行と置くと 500 行 ≒
+>   0.5 MiB/project**。隣の上限が許す最悪値（`MAX_NOTES_PER_PROJECT` × `MAX_NOTE_BODY_BYTES`
+>   だけで ≒ 640 MiB）と比べれば十分に保守的である。**ただし 1 KiB は仮定であって、実際の
+>   `steps_json` の大きさは未実測**。
+> - **時間軸の確認**: 無人スケジューリング（別ブランチ `feat/schedule-5.0.8` の `every: hour`。
+>   **本ビルドには入っていない**）は 1 workflow で 24 行/日を生むので、500 は時間起動 ≒ 20 日、
+>   日次起動なら 1 年以上に相当する。「無人で回しっぱなしにしても数週間の履歴は残る」が
+>   この数字で買っている性質である。
+>
+> `STREAM_MAX_UNITS = 64` と同じく、**導出はあるが実測の裏づけが無い初期値**である。
+> 5.6.0（スキーマ分割）で 1 行が小さく軽くなった時点で見直すこと。
+>
+> **(3) 絶対に消さない run。** 削除対象は `state` が
+> `TERMINAL_WORKFLOW_STATES = ['succeeded', 'failed', 'cancelled']` の行**だけ**である。
+> これは**許可リストであって `'running'` の否定リストではない** — このビルドが知らない
+> state 値（将来スキーマ、手編集）は「まだ生きている」側に倒して**消さない**。
+> retention は間違えるなら残す方向に間違えなければならない。消してはならない行とは
+> `list_running_workflow_runs` が拾う行、すなわち `load_config` の「再開しますか」バナー
+> （5.0.1）の実体であり、消せばクラッシュからの復帰が黙って不可能になるからである。
+> **終端していない run は上限にもカウントしない**ので、履歴がいくら溜まっても生きている run を
+> 押し出せないし、生きている run が何本あっても履歴の窓は狭まらない。
+> `mark_workflow_abandoned` で破棄された run は `state = 'cancelled'` なので**削除対象に含まれる**
+> （操作者が既に「再開しない」と答えた run であり、`error` の abandon マーカーは
+> そのバナーより長生きする必要が無い）。
+>
+> **並び順は `orchestrator::evict_terminal` と同一**にした:
+> `COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC`。`COALESCE` は防御ではなく
+> 必須で、`spawn_workflow` は**全 root の spawn に失敗すると `ended_at_ms` が NULL のまま
+> 終端した run** を publish しうる。これを 0 扱いで最下位に沈めると、**いちばん新しい run から
+> 消える**。`run_id` の tie-break は `new_run_id` が固定幅 hex の単調ナノ秒であるため、
+> 文字列順が生成順に一致することを使っている。
+>
+> **(4) 走るタイミングは「run が終端に到達した書き込み」だけ。** 200ms の driver tick が
+> 呼ぶ `upsert_workflow_run` は、run が生きている間は必ず `state = 'running'` の snapshot で
+> ある。そこで **Rust 側の文字列判定を SQL の前に置き**、終端 snapshot のときだけ
+> `count(*)` + `DELETE` を同一トランザクション内で走らせる。**hot path が払うのは
+> 許可リスト照合 1 回（`TERMINAL_WORKFLOW_STATES.contains` = 最大 3 要素の線形走査。
+> `"running"` は 3 つ全部と比較して外れる）だけで、SQL は 1 本も増えない。**
+> run が終端に到達するのは 1 回で、
+> `advance_all` はその直後からその run を tick しなくなるので、実際の掃除は
+> **完了 1 run あたり約 1 回**である。`mark_workflow_abandoned`（`upsert_workflow_run` を
+> 通らないもう 1 つの終端経路）でも同じ関数を呼ぶ。**起動時の一括掃除はしない** —
+> 終端行を作る経路が全て掃くようになった以上、上限超過が残っているのは
+> **A-6 以前のビルドが書いた DB だけ**であり、それはそのプロジェクトで次に run が 1 本
+> 終わった時点で窓まで縮む。「もう二度と run しないプロジェクトの古い行は残る」は
+> 既知かつ許容の穴である。
+>
+> **(5) `enforce_limit` と違い、拒否ではなく削除。** pins / notes / inbox は上限に達すると
+> **書き込みを拒否**する（利用者の要求なので「上限です」と答えられる）。`workflow_runs` の
+> 書き込みは要求ではなく、**既に起きたことの記録**（`orchestrator::persist_run`。しかも
+> `Err` を握り潰す）である。拒否しても run は止まらず、**その run の永続記録と resume 可能性が
+> 黙って消えるだけ**になる。したがって新しい行ではなく古い行を消す。
+>
+> **(6) 新しい索引は足していない → `user_version` は消費しない。** `count(*)` も `DELETE` も
+> 絞り込みは `(project_dir, state)` で、これは既存 `workflow_runs_project_state`
+> （`(project_dir, state, started_at_ms DESC)`）の先頭 2 列である。**`user_version` 4 は
+> 5.6.0（スキーマ分割）と 6.0.0（Security の 3 テーブル）で未決のまま**であり
+> （plan.md §5.1 / next-implementation-2026-08.md §4.2）、A-6 はそれに手を触れない。
+>
+> **wire 契約は変わらない。** 新規 Tauri command / MCP tool / event はゼロ。
+> `workflow_runs` の DDL・`WorkflowRunRow`・`StepOutcome` のいずれも無変更。
+> `list_running_workflow_runs` / `list_resumable_workflow_runs` の返り値も、
+> 削除対象が終端 run だけなので**定義上まったく変わらない**。frontend 無変更。
+> `ptygrid.yml` に設定項目は足していない（上限は定数であり、可変にすると
+> 「resume を壊す設定値」を書けるようになるだけである）。
+>
+> **5.6.0（スキーマ分割）が引き継ぐべきこと。** 分割後は run 表と step 表の 2 つになるので、
+> (a) 上限は**引き続き run 単位で数える**（step 行は run の削除に追随して落とす。
+> `ON DELETE CASCADE` を張るか明示 DELETE を 2 本にするかは 5.6.0 の判断）、
+> (b) **終端していない run を数えない/消さない**という (3) の規律はそのまま持ち越すこと、
+> (c) 1 行が軽くなるぶん 500 という数字は見直してよい（上げる方向）、
+> (d) 掃除の起動点は「run が終端に到達した書き込み」に保ち、200ms tick に SQL を足さないこと。
+>
+> **既知の限界。** 削除は行われるが `VACUUM` はしない（SQLite のファイルは縮まず、
+> 空きページが再利用されるだけ）。**実機検証は未実施**で、裏づけは unit test 5 本のみ
+> （→ plan.md §2 の U19）。
+>
+> 検証: `cargo test` **lib 489（484 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
+> `finished_workflow_runs_past_the_cap_lose_the_oldest_rows_first` /
+> `an_unfinished_workflow_run_survives_any_amount_of_history_written_after_it` /
+> `workflow_run_retention_deletes_nothing_while_the_project_is_under_its_cap` /
+> `workflow_run_retention_gives_every_project_its_own_window` /
+> `abandoning_a_run_prunes_the_history_it_has_just_joined`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。

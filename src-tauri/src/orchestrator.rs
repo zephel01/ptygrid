@@ -223,6 +223,21 @@ pub struct StepOutcome {
     /// it is about.
     #[serde(skip)]
     pub stream_body: Option<String>,
+    /// Stage A-4: this step's retry budget ran out AND the out-of-app
+    /// escalation for it has already been handed to `notifications` once.
+    /// Internal only — the flag exists purely to turn a LEVEL ("this failed
+    /// step has no budget left", which stays true on every one of the 200ms
+    /// driver's ticks from here on) into an EDGE: `take_escalations` returns
+    /// the step only on the tick that flips this.
+    ///
+    /// `#[serde(skip)]`, deliberately: it is no part of any wire or DB
+    /// contract, and a run read back from `workflow_runs` after a crash starts
+    /// out `false` — so a resumed run re-escalates a step that had already
+    /// exhausted before the crash. That is the right default: the operator who
+    /// missed the first alert (the app was gone) is exactly the one who still
+    /// needs it.
+    #[serde(skip)]
+    pub escalated: bool,
 }
 
 /// Phase 5.0.7: one reply extracted from a `joinOn: stream` step's kickoff
@@ -504,6 +519,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         };
     }
     let spawn = config.resolve_def(&agent).and_then(|(mut def, dir)| {
@@ -535,6 +551,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         },
         Err(error) => StepOutcome {
             step_id: step.id.clone(),
@@ -557,6 +574,7 @@ fn spawn_step<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         },
     }
 }
@@ -1111,6 +1129,7 @@ pub fn spawn_workflow<R: Runtime>(
                 next_retry_at_ms: None,
                 deferred_since_ms: None,
                 stream_body: None,
+                escalated: false,
             });
         }
     }
@@ -1160,6 +1179,7 @@ pub fn spawn_workflow<R: Runtime>(
                 next_retry_at_ms: None,
                 deferred_since_ms: Some(started_at_ms),
                 stream_body: None,
+                escalated: false,
             });
             continue;
         }
@@ -1239,6 +1259,53 @@ pub fn spawn_workflow<R: Runtime>(
     Ok(run)
 }
 
+/// Close out every kickoff this run ever delivered, so nothing it sent can be
+/// mistaken for live work once the run is over (Stage A-5).
+///
+/// A kickoff lives in the AGENT'S mailbox, and for every step except an
+/// `onEach` copy that mailbox is the agent's definition name — shared with
+/// every other run that ever used the same agent. An agent only clears one by
+/// replying (`reply_inbox` acks the thread root it answers). A run that ends
+/// with nobody replying therefore leaves its kickoffs behind, unacknowledged,
+/// and the next run's pane — which `await`s that same mailbox — reads a dead
+/// run's instructions as its own. Observed on hardware 2026-08-05 with two
+/// day-old kickoffs still queued for `coder` (plan.md §6.14). It is not a
+/// mis-completion — replies are correlated by thread root, so an answer to a
+/// stale kickoff cannot finish somebody else's step — it is an agent doing
+/// work that was called off.
+///
+/// Selected by SENDER, not by id, and that is the whole trick:
+/// `workflow_mailbox` embeds the run id, so `queen:workflow/<name>/<run_id>`
+/// names this run's kickoffs and no others, whether they went to a shared
+/// agent mailbox or to an `onEach` copy's private `wf/<run_id>/<step_id>`.
+/// Going through ids instead would have covered neither caller properly:
+/// `StepOutcome::kickoff_root_msg_id` is `#[serde(skip)]`, so `abandon_workflow`
+/// (which only ever sees a run read back from the DB) has none at all, and a
+/// resumed run has lost the ones from before the restart.
+///
+/// Deliberately indifferent to step state. Every kickoff of a finished run is
+/// spent, including those of steps that SUCCEEDED: routes 1 (PTY exit) and 2
+/// (semantic `done`) complete a step without any reply, so a successful step
+/// very often leaves its kickoff unacknowledged too, and that copy is just as
+/// stale to the next run as a cancelled step's.
+///
+/// Best-effort by construction — it returns nothing and swallows store errors
+/// into a log line. Cancelling a run must not fail because a mailbox could not
+/// be tidied; the run is over either way, and the worst case of a failure here
+/// is the pre-Stage A-5 behaviour.
+fn retire_run_kickoffs(
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+    workflow_name: &str,
+    run_id: &str,
+) {
+    if let Err(error) =
+        store.ack_inbox_from_sender(project_dir, workflow_mailbox(workflow_name, run_id))
+    {
+        eprintln!("workflow {run_id}: could not ack leftover kickoffs: {error}");
+    }
+}
+
 /// Cancel a running workflow: kill every step's live PTY, mark remaining
 /// pending steps CANCELLED, and set the run to `Cancelled`. Idempotent —
 /// a terminal (Succeeded/Failed/Cancelled) run is a no-op that returns
@@ -1297,6 +1364,12 @@ pub fn cancel_workflow(
     // crash-interrupted run and re-offered as "resume?" after a restart.
     if let Ok(project_dir) = resolve_project_dir(config) {
         persist_run(store, &project_dir, &run);
+        // Stage A-5, AFTER the write-through: the durable record of the
+        // cancel is the thing worth having if the process dies mid-call, and
+        // this is best-effort cleanup that must not delay it. The early return
+        // above means a re-cancel never reaches here, which is fine — the
+        // first call already swept, and a sweep is idempotent anyway.
+        retire_run_kickoffs(store, &project_dir, &run.name, &run.run_id);
     }
     Ok(run)
 }
@@ -1318,6 +1391,105 @@ pub fn list_resumable_workflow_runs(
             started_at_ms: row.started_at_ms as u64,
         })
         .collect())
+}
+
+/// The one thing `resume_workflow` cannot rebuild: a step-to-step carry that
+/// has already happened.
+///
+/// `StepOutcome::reply_body` is `#[serde(skip)]`, so a step that succeeded
+/// before the crash comes back with `reply_body: None` even though its *state*
+/// is preserved. Nothing downstream can tell that apart from "the upstream
+/// finished without ever replying", and the two readers of a reply body treat
+/// that case very differently:
+///
+/// - `condition_targets` maps a missing dependency reply to `Failed` with a
+///   "give '<dep>' a kickoff:" reason — so a resumed run goes RED on a branch
+///   that would have been taken (or cleanly skipped) had the app not died, and
+///   the reason names a misconfiguration that is not the actual cause;
+/// - `handoff_bodies` yields no entry, so `compose_kickoff` falls back to the
+///   declared `kickoff` alone and the downstream agent starts without the
+///   context the workflow promised it. No error, no warning.
+///
+/// Both only bite when the PRODUCER is already terminal in the persisted
+/// snapshot and the CONSUMER has not run yet. If the producer is itself being
+/// collapsed back to `Pending` it re-runs and mints a fresh reply; if the
+/// consumer already ran, the carry is spent. That is why this reads the
+/// collapsed `steps` and not just `wf`: the same workflow definition is
+/// resumable or not depending on where the crash landed, so refusing on the
+/// definition alone (the way the `onEach` gate has to) would give up resume
+/// for runs that are perfectly recoverable.
+///
+/// A producer with no inbox thread at all is excluded on purpose: with no
+/// thread to reply on it never carried anything, so a resumed run behaves
+/// exactly like an uninterrupted one. Refusing those would be a false
+/// positive. But "has a thread" is NOT the same as "declares `kickoff:`".
+/// `compose_kickoff` sends on the carried body alone when the declared half
+/// is absent — that is the ordinary middle-of-the-chain shape, and `config.rs`
+/// requires a `kickoff:` only of a `joinOn: reply`/`stream` step, never of a
+/// `handoffTo` source. So a step that is somebody's `handoffTo` TARGET was
+/// kicked off too, holds a thread, and can carry a reply of its own onward.
+/// Reading only the declared `kickoff:` here would wave through exactly the
+/// `a --> b --> c` chain (with no `kickoff:` on `b`) that this guard exists
+/// to catch, and `c` would start on its declared kickoff alone with no error
+/// and no warning — the silent wrong answer, in full.
+///
+/// Returns the first blocker in declaration order, so the message is stable
+/// across runs. The real fix is to persist the carried body with the step;
+/// until then refusing beats resuming into a wrong answer.
+fn lost_carry_blocker(wf: &WorkflowDef, steps: &[StepOutcome]) -> Option<String> {
+    let produced_before_restart = |id: &str| -> bool {
+        let Some(def) = wf.steps.iter().find(|s| s.id == id) else {
+            return false;
+        };
+        let declared_kickoff = !def
+            .kickoff
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty();
+        let carried_kickoff = wf
+            .steps
+            .iter()
+            .any(|s| s.handoff_to.as_deref() == Some(id));
+        let has_thread = declared_kickoff || carried_kickoff;
+        if !has_thread {
+            return false;
+        }
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Succeeded)
+    };
+    let awaiting = |id: &str| -> bool {
+        steps
+            .iter()
+            .any(|o| base_id(&o.step_id) == id && o.state == StepState::Pending)
+    };
+
+    for step in &wf.steps {
+        if step.condition.is_some() && awaiting(&step.id) {
+            if let Some(dep) = step.depends_on.as_deref().unwrap_or(&[]).first() {
+                if produced_before_restart(dep) {
+                    return Some(format!(
+                        "step '{}' has a condition: on '{dep}', which already completed before \
+                         the restart — its reply is not persisted, so the condition would be \
+                         evaluated against nothing and fail the run",
+                        step.id
+                    ));
+                }
+            }
+        }
+        if let Some(target) = step.handoff_to.as_deref() {
+            if awaiting(target) && produced_before_restart(&step.id) {
+                return Some(format!(
+                    "step '{}' declares handoffTo: '{target}' and already completed before the \
+                     restart — its reply is not persisted, so '{target}' would start without the \
+                     handed-off context",
+                    step.id
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Resume a run left `running` in the Queen DB from before a crash/restart
@@ -1437,6 +1609,7 @@ pub fn resume_workflow<R: Runtime>(
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         });
     }
     steps.sort_by_key(|o| {
@@ -1445,6 +1618,17 @@ pub fn resume_workflow<R: Runtime>(
             .position(|s| s.id == base_id(&o.step_id))
             .unwrap_or(usize::MAX)
     });
+
+    // Same refusal-over-bad-resume rule as the `onEach` gate above, but for a
+    // loss that only some runs of a workflow suffer, so it is decided on the
+    // COLLAPSED snapshot rather than on the definition alone (§ see
+    // `lost_carry_blocker`).
+    if let Some(reason) = lost_carry_blocker(&wf, &steps) {
+        return Err(format!(
+            "workflow '{}' cannot be resumed: {reason}; discard this run and start it again",
+            row.name
+        ));
+    }
 
     let run = WorkflowRun {
         run_id: row.run_id.clone(),
@@ -1468,6 +1652,13 @@ pub fn resume_workflow<R: Runtime>(
 /// registry entry to touch. `QueenStore::mark_workflow_abandoned` sets
 /// `state = 'cancelled'`, so `load_config`'s resume-detection query never
 /// surfaces this run_id again.
+///
+/// Stage A-5: it also retires the run's leftover kickoffs, and the workflow
+/// NAME that needs is read out of the persisted row before the row is marked —
+/// after `mark_workflow_abandoned` the run is no longer `running` and
+/// `list_running_workflow_runs` cannot find it. A run whose row has already
+/// vanished skips the sweep and lets `mark_workflow_abandoned` produce the
+/// "not found" error, which is the caller-visible failure that matters.
 pub fn abandon_workflow(
     config: &ConfigManager,
     store: &QueenStore,
@@ -1476,7 +1667,19 @@ pub fn abandon_workflow(
     let (_cfg, project_dir) = config
         .current()
         .ok_or_else(|| "no config loaded (call load_config first)".to_string())?;
-    store.mark_workflow_abandoned(&project_dir, run_id)
+    let name = store
+        .list_running_workflow_runs(&project_dir)
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|row| row.run_id == run_id))
+        .map(|row| row.name);
+    store.mark_workflow_abandoned(&project_dir, run_id)?;
+    // After the mark, and only once it succeeded: the point of abandoning is
+    // to stop the resume prompt re-offering the run, and that must not be
+    // held up — or undone — by mailbox tidying.
+    if let Some(name) = name {
+        retire_run_kickoffs(store, &project_dir, &name, run_id);
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -1728,6 +1931,63 @@ mod handoff {
             .collect::<Vec<&str>>()
             .join("\n\n");
         clip(&joined, MAX_HANDOFF_BODY_BYTES)
+    }
+
+    /// Join what SEVERAL `handoffTo` sources carried into one target, in the
+    /// order the sources are declared in `ptygrid.yml`.
+    ///
+    /// Separate from `merge_reply_bodies` because of how the byte cap has to be
+    /// spent. That function joins one step's own replies chronologically, so
+    /// clipping the tail is the natural loss. Here the entries come from
+    /// DIFFERENT steps, and clipping the join would let whoever is declared
+    /// first eat the whole budget and delete the others outright — a two-model
+    /// review where the first reviewer happens to be verbose would hand the
+    /// judge one opinion and no sign that a second ever existed. Silent, and
+    /// exactly the failure this function was written to end.
+    ///
+    /// So the cap is divided instead. Nothing is clipped at all while the
+    /// bodies fit; past that every source is guaranteed an equal share, and
+    /// whatever the short ones leave unused is handed back to the long ones
+    /// (one pass, which covers the usual "one essay plus a one-line verdict"
+    /// shape without pretending to be an allocator). `clip` returns empty for a
+    /// share too small to hold its own marker, so a pathological number of
+    /// sources degrades to dropping bodies rather than to overshooting the cap;
+    /// at 48 KiB that needs upwards of 1,900 of them.
+    ///
+    /// A single source takes the `merge_reply_bodies` path unchanged, so the
+    /// overwhelmingly common case is byte-for-byte what it was before.
+    pub fn merge_carried_bodies(bodies: &[&str]) -> String {
+        let kept: Vec<&str> = bodies
+            .iter()
+            .map(|body| body.trim())
+            .filter(|body| !body.is_empty())
+            .collect();
+        if kept.len() <= 1 {
+            return merge_reply_bodies(&kept);
+        }
+        // The blank line between each pair is part of what has to fit.
+        let budget = MAX_HANDOFF_BODY_BYTES.saturating_sub(2 * (kept.len() - 1));
+        if kept.iter().map(|body| body.len()).sum::<usize>() <= budget {
+            return kept.join("\n\n");
+        }
+        let equal = budget / kept.len();
+        let under: usize = kept
+            .iter()
+            .map(|body| body.len())
+            .filter(|len| *len <= equal)
+            .sum();
+        let over = kept.iter().filter(|body| body.len() > equal).count();
+        // `over == 0` is unreachable here (the total exceeds the budget, so
+        // someone is above the mean), but falling back to the equal share
+        // keeps the arithmetic total rather than relying on that argument.
+        let share = budget
+            .saturating_sub(under)
+            .checked_div(over)
+            .unwrap_or(equal);
+        let clipped: Vec<String> = kept.iter().map(|body| clip(body, share)).collect();
+        let refs: Vec<&str> = clipped.iter().map(String::as_str).collect();
+        // Backstop: re-applies the hard cap and drops anything `clip` emptied.
+        merge_reply_bodies(&refs)
     }
 
     /// The single kickoff body to deliver to a step, given what it declared
@@ -2155,33 +2415,47 @@ fn dep_unsatisfiable(dep_step: &WorkflowStep, outcomes: &[StepOutcome]) -> bool 
 ///
 /// `config.rs` fixes the semantics: the reply body of the step declaring
 /// `handoffTo: X` is prepended to X's own `kickoff`. Validation guarantees
-/// `handoffTo` targets are singular (never fan-out), so the first copy
-/// carrying a non-blank `reply_body` wins; a target claimed by two sources
-/// keeps the first in declaration order rather than concatenating, which
-/// would make the carried context order-dependent on tick timing.
+/// a `handoffTo` SOURCE is never a fan-out, so the first copy carrying a
+/// non-blank `reply_body` wins for any one source.
+///
+/// A target claimed by SEVERAL sources gets all of them, joined in the order
+/// the sources are declared. Until 2026-08-07 it got only the first, and the
+/// rest were dropped with no error and no warning — which is what made
+/// "implement, have two models review in parallel, then judge both verdicts"
+/// unwritable: the judge saw one reviewer and had no way to tell the other had
+/// been discarded. Validation never objected to the second `handoffTo`, so the
+/// config read as if it worked. Declaration order is the author's, not the
+/// tick's, so the carried context stays reproducible across runs.
 ///
 /// Steps whose upstream produced no reply yield no entry — `compose_kickoff`
 /// then falls back to the declared `kickoff` alone.
 fn handoff_bodies(wf: &WorkflowDef, run: &WorkflowRun) -> HashMap<String, String> {
-    let mut bodies: HashMap<String, String> = HashMap::new();
+    // Declaration order matters and `HashMap` has none, so the bodies are
+    // gathered per target in `wf.steps` order first and merged after.
+    let mut collected: Vec<(&str, Vec<&str>)> = Vec::new();
     for step in &wf.steps {
         let Some(target) = step.handoff_to.as_deref() else {
             continue;
         };
-        if bodies.contains_key(target) {
-            continue;
-        }
         let carried = run
             .steps
             .iter()
             .filter(|o| base_id(&o.step_id) == step.id.as_str())
             .find_map(|o| o.reply_body.as_deref())
             .filter(|body| !body.trim().is_empty());
-        if let Some(body) = carried {
-            bodies.insert(target.to_string(), body.to_string());
+        let Some(body) = carried else {
+            continue;
+        };
+        match collected.iter_mut().find(|(id, _)| *id == target) {
+            Some((_, bodies)) => bodies.push(body),
+            None => collected.push((target, vec![body])),
         }
     }
-    bodies
+    collected
+        .into_iter()
+        .map(|(target, bodies)| (target.to_string(), handoff::merge_carried_bodies(&bodies)))
+        .filter(|(_, merged)| !merged.is_empty())
+        .collect()
 }
 
 /// `true` when some *other* step of this run currently holds a live pane for
@@ -3086,6 +3360,7 @@ fn mint_stream_copies(
                 next_retry_at_ms: None,
                 deferred_since_ms: None,
                 stream_body: Some(unit.body.clone()),
+                escalated: false,
             });
             changed = true;
         }
@@ -3561,6 +3836,129 @@ fn arm_retry_backoff(wf: &WorkflowDef, run: &mut WorkflowRun, now: u64) -> bool 
         }
     }
     changed
+}
+
+/// Stage A-4: one step whose `retry` budget just ran out, on its way to the
+/// out-of-app notification channels (`notifications`, Phase 4.4.2). Owned, so
+/// the dispatch happens after `advance_run` is done mutating the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Escalation {
+    step_id: String,
+    /// Agent definition name, so the message reads like the session-sourced
+    /// notifications do (`who` is the agent, not an opaque id).
+    agent: String,
+    /// The pane the last attempt ran in, if it still had one. `None` when the
+    /// step never got a pane, or when `check_timeouts` already killed it.
+    session_id: Option<u32>,
+    /// Spawn attempts spent. `1` means the original spawn only, i.e. every
+    /// declared retry was consumed by pane-shortage give-ups.
+    attempts: u32,
+    /// The step's own `error` text, when it has one.
+    error: Option<String>,
+}
+
+/// Stage A-4, pure half of the escalation path: collect every step that has
+/// JUST become "failed for good" — `Failed`, no backoff armed, and its
+/// declared `retry` policy has nothing left — and mark each one so it is
+/// collected only once.
+///
+/// The marking is the whole point. "This step is out of retries" is a LEVEL:
+/// it stays true for as long as the run lives, and the driver re-evaluates it
+/// every 200ms, so a naive check would send one notification per tick for as
+/// long as any sibling step keeps the run `Running`. `escalated` converts it
+/// into an edge, in the same spirit as `next_retry_at_ms` converting "failed"
+/// into "failed and waiting".
+///
+/// Deliberately narrower than "the step failed":
+/// - **No `retry:` declared → no escalation.** The gate this implements is
+///   retry EXHAUSTION (plan.md §3 P3). A step that never asked to be retried
+///   has not exhausted anything; its pane exit already notified through
+///   `session::handle_eof`, and escalating every ordinary failure as well
+///   would be the notification flood that spec-notifications.md §7 exists to
+///   avoid.
+/// - **`attempts == 0` → no escalation.** Same shape `arm_retry_backoff`
+///   refuses to arm: the step was failed without ever being spawned (today the
+///   unevaluable-`condition:` arm), so no attempt was ever made, let alone
+///   exhausted.
+/// - **A backoff still armed → no escalation.** That step is not terminal; a
+///   retry is still coming.
+///
+/// Called from `advance_run` AFTER both `arm_retry_backoff` passes, so a step
+/// that failed earlier in this same tick has already had its chance to arm a
+/// backoff and can never be mistaken for an exhausted one.
+fn take_escalations(wf: &WorkflowDef, run: &mut WorkflowRun) -> Vec<Escalation> {
+    let mut out = Vec::new();
+    for outcome in &mut run.steps {
+        if outcome.escalated
+            || outcome.state != StepState::Failed
+            || outcome.next_retry_at_ms.is_some()
+            || outcome.attempts == 0
+        {
+            continue;
+        }
+        let Some(step) = wf.steps.iter().find(|s| s.id.as_str() == base_id(&outcome.step_id)) else {
+            continue;
+        };
+        let Some(policy) = step.retry else {
+            continue;
+        };
+        if retry::allows_another(outcome.attempts, &policy) {
+            continue; // budget left — `arm_retry_backoff` will spend it
+        }
+        outcome.escalated = true;
+        out.push(Escalation {
+            step_id: outcome.step_id.clone(),
+            agent: outcome.agent.clone(),
+            session_id: outcome.session_id,
+            attempts: outcome.attempts,
+            error: outcome.error.clone(),
+        });
+    }
+    out
+}
+
+/// Stage A-4, side-effecting half: hand one exhausted step to the Phase 4.4.2
+/// notification layer as an `Error`.
+///
+/// `Error` rather than `NeedsAttention`, and the choice matters: `critical` is
+/// the DEFAULT `notifications.level`, and it subscribes to `error` only
+/// (spec-notifications.md §2.2). Under `NeedsAttention` this escalation would
+/// be invisible to everyone who never edited the level — that is, in the
+/// default configuration, which is the one the "nobody is watching at 3am"
+/// case runs in. It also matches the existing semantics: `Error` is the
+/// abnormal-termination event, and a step that has burned its whole retry
+/// budget has terminated abnormally in a way nothing will undo.
+///
+/// No new config knob comes with this (ptygrid-yml-guide.md §1 keeps
+/// escalation in the "not written in the config" column): the existing
+/// `notifications:` block's level/channel machinery already expresses "who
+/// gets told and how loudly", and a second, escalation-only switch would only
+/// add a way to configure the two out of agreement.
+fn notify_escalation<R: Runtime>(
+    app: &AppHandle<R>,
+    workflow_name: &str,
+    run_id: &str,
+    esc: &Escalation,
+) {
+    crate::notifications::dispatch_ctx(
+        app,
+        crate::notifications::NotifyEvent::Error,
+        crate::notifications::NotifyContext {
+            // Cosmetic only for this source: the message names the step, never
+            // `#id`, precisely because an exhausted step may have no session
+            // left (killed by `check_timeouts`) or never have had one.
+            session_id: esc.session_id.unwrap_or(0),
+            name: Some(esc.agent.clone()),
+            project: None, // filled in by the dispatch layer
+            detail: esc.error.clone(),
+            origin: Some(crate::notifications::WorkflowOrigin {
+                workflow: workflow_name.to_string(),
+                run_id: run_id.to_string(),
+                step_id: esc.step_id.clone(),
+                attempts: esc.attempts,
+            }),
+        },
+    );
 }
 
 /// Phase 5.0.4 retry driver, side-effecting half: once a `Failed` outcome's
@@ -4056,6 +4454,17 @@ fn advance_run<R: Runtime>(
     // this tick belongs to the next one.
     changed = arm_retry_backoff(&wf, &mut run, now) || changed;
 
+    // Stage A-4, AFTER both arming passes: only now is "Failed with no
+    // `next_retry_at_ms`" the final word rather than a state the second pass
+    // was about to un-terminal. Collecting here also puts it after
+    // `cancel_stragglers`, so a `joinOn: any` loser that this tick retires to
+    // `Cancelled` is never escalated. The `changed` OR is load-bearing: the
+    // `escalated` marks live in this local `run` until `registry.put` below
+    // stores it, and a tick that dropped the write would re-collect — and so
+    // re-send — the same escalation on the next one.
+    let escalations = take_escalations(&wf, &mut run);
+    changed = !escalations.is_empty() || changed;
+
     let new_state = finalize_state(&wf, &run);
     if new_state != run.state {
         run.state = new_state;
@@ -4069,6 +4478,17 @@ fn advance_run<R: Runtime>(
         registry.put(run.clone());
         persist_run(store, &project_dir, &run);
         emit_workflow_state(app, &run);
+    }
+
+    // LAST, after the run's own state is stored and emitted: the out-of-app
+    // send is best-effort I/O that must not sit between the mutation and its
+    // persistence. `dispatch_ctx` itself is cheap on this thread (the webhook
+    // POST goes to a detached thread; only the OS toast is inline), and it is
+    // a no-op entirely when `notifications:` is absent or disabled — but it is
+    // still the one thing here that talks to the outside world, so it goes at
+    // the end. Empty on every tick except the one an exhaustion lands on.
+    for esc in &escalations {
+        notify_escalation(app, &workflow_name, &run_id, esc);
     }
 }
 
@@ -4222,6 +4642,7 @@ mod tests {
             next_retry_at_ms: None,
             deferred_since_ms: None,
             stream_body: None,
+            escalated: false,
         }
     }
 
@@ -4333,6 +4754,135 @@ workflows:
         // Second cancel is idempotent.
         let again = cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
         assert_eq!(again.state, WorkflowState::Cancelled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage A-5. A cancelled run's kickoff must not survive in the agent's
+    /// mailbox: that mailbox is the agent's definition NAME, shared with every
+    /// future run using the same agent, and an `await` there returns the
+    /// oldest unacknowledged message — so the next run's pane would be handed
+    /// instructions from a run that was called off (plan.md §6.14).
+    #[test]
+    fn cancelling_a_run_acks_the_kickoff_its_agent_never_answered() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+        assert!(
+            run.steps[0].kickoff_root_msg_id.is_some(),
+            "step `first` declares a kickoff, so a thread was opened for it"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "and it is waiting, unacknowledged, in agent `a`'s mailbox"
+        );
+
+        cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
+
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "cancel retires the kickoff so no later pane can pick it up"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, true, 50)
+                .unwrap()
+                .len(),
+            1,
+            "the message itself is kept — acknowledged, not deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage A-5, and the reason the sweep selects by SENDER rather than by
+    /// the ids the run recorded: `abandon_workflow` only ever sees a run read
+    /// back out of the DB, and `kickoff_root_msg_id` is `#[serde(skip)]`, so
+    /// there are no ids to sweep with. The test asserts that loss explicitly
+    /// so a future change that starts persisting the field does not quietly
+    /// leave this rationale stale.
+    #[test]
+    fn abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost() {
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        let root = deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+        let run = mk_run("demo", vec![mk_kicked("first", "a", root)]);
+        persist_run(&store, &dir, &run);
+
+        let reloaded = store
+            .list_running_workflow_runs(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.run_id == TEST_RUN_ID)
+            .expect("the run is persisted as running and therefore resumable");
+        let steps: Vec<StepOutcome> = serde_json::from_str(&reloaded.steps_json).unwrap();
+        assert_eq!(
+            steps[0].kickoff_root_msg_id, None,
+            "the kickoff thread id does not survive the round trip"
+        );
+
+        abandon_workflow(&config, &store, TEST_RUN_ID).unwrap();
+
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "discarding the run still retires its kickoff"
+        );
+        assert!(
+            store.list_running_workflow_runs(&dir).unwrap().is_empty(),
+            "and the run stops being offered for resume"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep's blast radius. `workflow_mailbox` embeds the run id, so the
+    /// sender string names one run's kickoffs exactly — cancelling run A must
+    /// not acknowledge the kickoff a concurrent run B of the SAME workflow is
+    /// still waiting on, even though both landed in the same agent mailbox.
+    #[test]
+    fn retiring_one_runs_kickoffs_leaves_a_concurrent_runs_alone() {
+        const RUN_A: &str = "wfr_0000000000000001000000aa";
+        const RUN_B: &str = "wfr_0000000000000002000000bb";
+
+        let (_config, store, dir) = harness(PIPELINE_YAML);
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        deliver_kickoff(&store, &dir, "demo", RUN_A, first, &first.agent, None).unwrap();
+        let root_b = deliver_kickoff(&store, &dir, "demo", RUN_B, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        retire_run_kickoffs(&store, &dir, "demo", RUN_A);
+
+        let left = store
+            .list_inbox(&dir, "a".to_string(), 0, false, 50)
+            .unwrap();
+        assert_eq!(left.len(), 1, "exactly one kickoff is still live");
+        assert_eq!(
+            left[0].root_message_id, root_b,
+            "and it is run B's, which nobody cancelled"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4964,6 +5514,190 @@ workflows:
         assert!(run.steps[0].next_retry_at_ms.is_none());
     }
 
+    // ---- Stage A-4: escalation on retry exhaustion ----
+
+    /// A one-step run of `retryzero` (`retry: max 2`) with its single step
+    /// already `Failed`. Callers set `attempts` to place it before or after
+    /// the exhaustion line.
+    fn exhausted_run(step_id: &str, attempts: u32) -> WorkflowRun {
+        let mut outcome = mk_outcome(step_id, Some(4), StepState::Failed);
+        outcome.attempts = attempts;
+        outcome.error = Some("exit code 1".to_string());
+        WorkflowRun {
+            run_id: "wfr_r1".to_string(),
+            name: "retryzero".to_string(),
+            state: WorkflowState::Running,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            steps: vec![outcome],
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    #[test]
+    fn an_exhausted_retry_budget_escalates_once_and_never_again() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+        // `max: 2` allows attempts 1..=2 to buy another try; 3 is past the end.
+        let mut run = exhausted_run("first", 3);
+
+        let first_tick = take_escalations(&wf, &mut run);
+        assert_eq!(first_tick.len(), 1, "exhaustion escalates exactly once");
+        assert_eq!(first_tick[0].step_id, "first");
+        assert_eq!(first_tick[0].attempts, 3);
+        assert_eq!(first_tick[0].agent, "x");
+        assert_eq!(first_tick[0].session_id, Some(4));
+        assert_eq!(first_tick[0].error.as_deref(), Some("exit code 1"));
+        assert!(run.steps[0].escalated);
+
+        // The state that produced it is a LEVEL — still exactly as true on
+        // every later 200ms tick — so re-running must stay silent.
+        for tick in 0..5 {
+            assert!(
+                take_escalations(&wf, &mut run).is_empty(),
+                "tick {tick} re-sent an escalation already sent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retry_that_still_has_budget_left_does_not_escalate() {
+        let wf = parse_wf(RETRY_ZERO_BACKOFF_YAML, "retryzero");
+
+        // Budget left (attempts 1 of max 2): `arm_retry_backoff` is about to
+        // spend it, so nothing has been exhausted.
+        let mut run = exhausted_run("first", 1);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
+
+        // Waiting out an armed backoff: not terminal, not exhausted — even
+        // with the attempts count already past the budget, because the
+        // respawn that is still coming is what will decide.
+        let mut run = exhausted_run("first", 3);
+        run.steps[0].next_retry_at_ms = Some(9_999);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
+
+        // Failed without ever being spawned (`attempts == 0`, the
+        // unevaluable-`condition:` shape `arm_retry_backoff` also refuses):
+        // no attempt was made, so no budget was exhausted.
+        let mut run = exhausted_run("first", 0);
+        assert!(take_escalations(&wf, &mut run).is_empty());
+
+        // Still Running: the step has not failed at all yet.
+        let mut run = exhausted_run("first", 3);
+        run.steps[0].state = StepState::Running;
+        assert!(take_escalations(&wf, &mut run).is_empty());
+    }
+
+    #[test]
+    fn a_step_with_no_retry_policy_never_escalates_however_hard_it_failed() {
+        // The gate is retry EXHAUSTION. A step that never asked to be retried
+        // has nothing to exhaust, and its pane exit already notified through
+        // `session::handle_eof` — escalating it too would double up on every
+        // ordinary workflow failure.
+        let wf = parse_wf(CHAIN_YAML, "chain");
+        let mut run = exhausted_run("first", 7);
+        run.name = "chain".to_string();
+        assert!(take_escalations(&wf, &mut run).is_empty());
+        assert!(!run.steps[0].escalated);
+    }
+
+    /// Wiring regression, same shape and same reason as
+    /// `advance_run_cancels_a_straggler_once_the_any_join_is_won` below.
+    /// Every other Stage A-4 test calls `take_escalations` directly, so
+    /// deleting the one line in `advance_run` that calls it would leave the
+    /// whole suite green while no exhausted step ever reached the
+    /// notification layer again — and unlike the straggler pass, the
+    /// compiler would not even warn, because the pure function stays
+    /// referenced by those unit tests. This drives a whole tick and asserts
+    /// the mark the collector leaves behind on the run the registry
+    /// publishes.
+    #[test]
+    fn advance_run_escalates_a_step_that_has_run_out_of_retries() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        // `retry: max 2` with 3 attempts already spent and no backoff armed:
+        // exhausted before the tick starts. Deliberately no `session_id`, so
+        // `detect_completions` / `check_timeouts` skip it (both only look at
+        // a Running step that holds a session) and the escalation pass is the
+        // only thing in the tick that can touch it.
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 3;
+        run.steps[0].escalated = false;
+        registry.put(run.clone());
+
+        advance_run(
+            &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+        );
+
+        let snap = registry.get(&run.run_id).expect("the run is still held");
+        assert!(
+            snap.steps[0].escalated,
+            "advance_run must run the escalation pass — an exhausted step that \
+             is never collected is never notified"
+        );
+        // The mark has to reach the PUBLISHED snapshot, not just the tick's
+        // local copy: collection is edge-triggered off it, so a tick that
+        // dropped the write would re-send the same escalation on the next one.
+        assert_eq!(
+            snap.state,
+            WorkflowState::Failed,
+            "the exhausted step is the whole run, so this tick also ends it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The persistence half of the same claim. CONTRACT.md 続報16 states that
+    /// `escalated` appears in neither `workflow_runs.steps_json` nor the
+    /// `workflow-state` event (both serialize this very struct), and that a
+    /// resumed run therefore re-sends the escalation on purpose. Nothing
+    /// else in the suite fails if that `#[serde(skip)]` is dropped, so the
+    /// round trip is pinned here the way A-5 pins the same shape of claim in
+    /// `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost`.
+    #[test]
+    fn an_escalation_mark_does_not_survive_the_persisted_round_trip() {
+        let (_config, store, dir) = harness(RETRY_ZERO_BACKOFF_YAML);
+
+        let mut run = mk_run(
+            "retryzero",
+            vec![mk_outcome("first", None, StepState::Failed)],
+        );
+        run.steps[0].attempts = 3;
+        run.steps[0].escalated = true;
+
+        let wire = serde_json::to_string(&run.steps).unwrap();
+        assert!(
+            !wire.contains("escalated"),
+            "the field is skipped on the way out, so it is absent from both \
+             steps_json and the workflow-state payload"
+        );
+
+        persist_run(&store, &dir, &run);
+        let reloaded = store
+            .list_running_workflow_runs(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.run_id == TEST_RUN_ID)
+            .expect("the run is persisted as running and therefore resumable");
+        let steps: Vec<StepOutcome> = serde_json::from_str(&reloaded.steps_json).unwrap();
+        assert!(
+            !steps[0].escalated,
+            "a resumed run comes back with the mark cleared — the re-send after \
+             a crash is the documented behaviour, not an accident"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn check_timeouts_kills_and_fails_only_steps_past_their_declared_timeout() {
         let wf = parse_wf(TIMEOUT_YAML, "timeoutwf");
@@ -5491,6 +6225,295 @@ workflows:
         assert_eq!(repeat.steps.len(), resumed.steps.len());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Persist an arbitrary crash shape straight into the store, so a resume
+    /// test can start from "the app died exactly here" without having to
+    /// drive a live workflow into that state first.
+    fn persist_snapshot(
+        store: &QueenStore,
+        dir: &std::path::Path,
+        name: &str,
+        steps: &[StepOutcome],
+    ) {
+        store
+            .upsert_workflow_run(
+                dir,
+                TEST_RUN_ID,
+                name,
+                "running",
+                0,
+                None,
+                &serde_json::to_string(steps).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn mk_persisted(step_id: &str, agent: &str, state: StepState) -> StepOutcome {
+        let mut outcome = mk_outcome(step_id, None, state);
+        outcome.agent = agent.to_string();
+        outcome
+    }
+
+    #[test]
+    fn resume_refuses_when_a_condition_lost_its_upstream_reply() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Crash shape: `gate` replied and succeeded, `apply` never started.
+        // `reply_body` did not survive the restart, so evaluating the
+        // condition now would report the branch as un-evaluable and fail a
+        // run that was on its way to green.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be resumed"), "{err}");
+        assert!(err.contains("condition:"), "{err}");
+        assert!(err.contains("gate"), "reason should name the producer: {err}");
+        assert!(
+            registry.get(TEST_RUN_ID).is_none(),
+            "a refused resume must not register the run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_when_a_handoff_carry_was_lost() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(HANDOFF_CHAIN_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `draft` handed off to `polish` and succeeded; `polish` never ran.
+        // Resuming would start `polish` on its declared kickoff alone —
+        // silently, which is the worse half of this bug.
+        persist_snapshot(
+            &store,
+            &dir,
+            "handwf",
+            &[
+                mk_persisted("draft", "a", StepState::Succeeded),
+                mk_persisted("polish", "b", StepState::Pending),
+            ],
+        );
+
+        let err = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .unwrap_err();
+        assert!(err.contains("handoffTo"), "{err}");
+        assert!(err.contains("polish"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_producer_is_itself_being_replayed() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // `gate` was still Running at crash time, so the collapse puts it
+        // back to Pending: it re-runs and mints a fresh reply, and the
+        // condition has something to match against after all.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Running),
+                mk_persisted("apply", "b", StepState::Pending),
+            ],
+        );
+
+        let resumed = resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a producer that will re-run is not a blocker");
+        let gate = resumed.steps.iter().find(|o| o.step_id == "gate").unwrap();
+        assert_eq!(gate.state, StepState::Pending);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_still_works_when_the_carry_was_already_spent() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(COND_YAML);
+        let registry = WorkflowRegistry::new();
+
+        // Both sides are terminal: the condition was evaluated before the
+        // crash, so nothing downstream still needs the lost reply.
+        persist_snapshot(
+            &store,
+            &dir,
+            "condwf",
+            &[
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", StepState::Succeeded),
+            ],
+        );
+
+        resume_workflow(
+            &handle, &manager, &config, &store, &registry, TEST_RUN_ID, 80, 24,
+        )
+        .expect("a spent carry is not a blocker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lost_carry_blocker_ignores_a_producer_that_never_had_a_thread() {
+        // No `kickoff:` on `gate` AND nobody hands off to it, so it was never
+        // sent anything, has no inbox thread, and never carried a reply — a
+        // resumed run behaves exactly like an uninterrupted one. Refusing here
+        // would be a false positive. Both halves are load-bearing: a step that
+        // is somebody's `handoffTo` target is kicked off on the carried body
+        // alone and does hold a thread (see the chain test below).
+        let wf = parse_wf(
+            "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+workflows:
+  condwf:
+    pattern: pipeline
+    steps:
+      - id: gate
+        agent: a
+      - id: apply
+        agent: b
+        dependsOn: [gate]
+        condition: APPROVED
+",
+            "condwf",
+        );
+        let steps = vec![
+            mk_persisted("gate", "a", StepState::Succeeded),
+            mk_persisted("apply", "b", StepState::Pending),
+        ];
+        assert_eq!(lost_carry_blocker(&wf, &steps), None);
+    }
+
+    /// The middle link of a chain declares no `kickoff:` of its own — it is
+    /// kicked off on what the previous link carried, which is the shape
+    /// `compose_kickoff`'s "carried only" branch exists for. `config.rs`
+    /// demands a `kickoff:` of a `joinOn: reply`/`stream` step, never of a
+    /// `handoffTo` source, so this parses clean.
+    const CARRIED_KICKOFF_CHAIN_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+  - name: c
+    cmd: /bin/cat
+workflows:
+  chain:
+    pattern: handoff
+    steps:
+      - id: a
+        agent: a
+        joinOn: reply
+        handoffTo: b
+        kickoff: write the draft and reply when done
+      - id: b
+        agent: b
+        dependsOn: [a]
+        handoffTo: c
+      - id: c
+        agent: c
+        dependsOn: [b]
+        kickoff: finish it
+";
+
+    #[test]
+    fn lost_carry_blocker_counts_a_handoff_target_as_a_producer_too() {
+        // `b` declares no `kickoff:`, but `a` hands off to it, so `b` was sent
+        // the carried body, holds a thread, and replied on it. Judging "did
+        // this step have a thread" by the declared `kickoff:` alone waved this
+        // exact crash shape through, and `c` then started on `finish it` with
+        // none of `b`'s output — no error, no warning.
+        let wf = parse_wf(CARRIED_KICKOFF_CHAIN_YAML, "chain");
+        let steps = vec![
+            mk_persisted("a", "a", StepState::Succeeded),
+            mk_persisted("b", "b", StepState::Succeeded),
+            mk_persisted("c", "c", StepState::Pending),
+        ];
+        let blocker = lost_carry_blocker(&wf, &steps).expect("a lost carry into 'c' must block");
+        assert!(blocker.contains("handoffTo"), "{blocker}");
+        assert!(
+            blocker.contains("'b'") && blocker.contains("'c'"),
+            "the reason should name both ends of the lost edge: {blocker}"
+        );
+    }
+
+    #[test]
+    fn lost_carry_blocker_passes_a_workflow_that_carries_nothing_at_all() {
+        // No `condition:` and no `handoffTo:` anywhere means no step-to-step
+        // carry exists to lose, so a producer sitting terminal next to a
+        // pending consumer is simply an ordinary interrupted pipeline. Held
+        // down explicitly because the guard would otherwise be free to grow
+        // into refusing every resume.
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let steps = vec![
+            mk_persisted("first", "a", StepState::Succeeded),
+            mk_persisted("second", "b", StepState::Pending),
+        ];
+        assert_eq!(lost_carry_blocker(&wf, &steps), None);
+    }
+
+    #[test]
+    fn lost_carry_blocker_passes_a_consumer_that_already_finished_either_way() {
+        // `Succeeded` is covered by `resume_still_works_when_the_carry_was_
+        // already_spent`; the other two terminal endings spend the carry just
+        // as thoroughly. Only a still-`Pending` consumer can still be handed
+        // the wrong thing.
+        let cond = parse_wf(COND_YAML, "condwf");
+        for spent in [StepState::Skipped, StepState::Failed] {
+            let steps = vec![
+                mk_persisted("gate", "a", StepState::Succeeded),
+                mk_persisted("apply", "b", spent),
+            ];
+            assert_eq!(
+                lost_carry_blocker(&cond, &steps),
+                None,
+                "a consumer that ended {spent:?} no longer needs the lost reply"
+            );
+        }
+
+        let hand = parse_wf(HANDOFF_CHAIN_YAML, "handwf");
+        for spent in [StepState::Skipped, StepState::Failed] {
+            let steps = vec![
+                mk_persisted("draft", "a", StepState::Succeeded),
+                mk_persisted("polish", "b", spent),
+            ];
+            assert_eq!(
+                lost_carry_blocker(&hand, &steps),
+                None,
+                "a handoff target that ended {spent:?} will never read the carry"
+            );
+        }
     }
 
     #[test]
@@ -6239,6 +7262,202 @@ workflows:
             ],
         );
         assert!(handoff_bodies(&wf, &run).is_empty());
+    }
+
+    /// Two reviewers hand their verdicts to one judge — the shape plan.md
+    /// listed as unwritable while `handoff_bodies` kept only the first.
+    const TWO_REVIEWERS_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+  - name: b
+    cmd: /bin/cat
+  - name: c
+    cmd: /bin/cat
+workflows:
+  crossreview:
+    pattern: supervisor
+    steps:
+      - id: implement
+        agent: a
+        joinOn: reply
+        kickoff: implement it
+      - id: reviewA
+        agent: b
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it
+      - id: reviewB
+        agent: c
+        dependsOn: [implement]
+        joinOn: reply
+        handoffTo: verdict
+        kickoff: review it too
+      - id: verdict
+        agent: a
+        dependsOn: [implement, reviewA, reviewB]
+        kickoff: decide
+";
+
+    #[test]
+    fn handoff_bodies_joins_every_source_that_claims_one_target() {
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let mut review_b = mk_outcome("reviewB", Some(2), StepState::Succeeded);
+        review_b.reply_body = Some("B: REVISE".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                review_b,
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+
+        let bodies = handoff_bodies(&wf, &run);
+        assert_eq!(
+            bodies.get("verdict").map(String::as_str),
+            Some("A: ACCEPT\n\nB: REVISE"),
+            "both reviewers reach the judge, in the order the steps are declared"
+        );
+        assert_eq!(bodies.len(), 1, "keyed by target, so the two sources merge");
+    }
+
+    #[test]
+    fn handoff_bodies_orders_the_join_by_declaration_not_by_arrival() {
+        // The test above builds `run.steps` in declaration order, so it cannot
+        // tell the two orderings apart. Here the outcomes arrive reversed —
+        // the shape a real run produces whenever the second reviewer replies
+        // first — and the judge must still read them in `ptygrid.yml` order,
+        // because a prompt whose halves swap between runs is not reproducible.
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let mut review_b = mk_outcome("reviewB", Some(2), StepState::Succeeded);
+        review_b.reply_body = Some("B: REVISE".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("verdict", None, StepState::Pending),
+                review_b,
+                review_a,
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+            ],
+        );
+
+        assert_eq!(
+            handoff_bodies(&wf, &run).get("verdict").map(String::as_str),
+            Some("A: ACCEPT\n\nB: REVISE"),
+            "reviewA is declared first, so it leads regardless of outcome order"
+        );
+    }
+
+    #[test]
+    fn handoff_bodies_carries_the_one_source_that_replied() {
+        // The second reviewer finished without a reply (route 1/2). The judge
+        // should still get the first one rather than nothing.
+        let wf = parse_wf(TWO_REVIEWERS_YAML, "crossreview");
+        let mut review_a = mk_outcome("reviewA", Some(1), StepState::Succeeded);
+        review_a.reply_body = Some("A: ACCEPT".to_string());
+        let run = mk_run(
+            "crossreview",
+            vec![
+                mk_outcome("implement", Some(0), StepState::Succeeded),
+                review_a,
+                mk_outcome("reviewB", Some(2), StepState::Succeeded),
+                mk_outcome("verdict", None, StepState::Pending),
+            ],
+        );
+        assert_eq!(
+            handoff_bodies(&wf, &run).get("verdict").map(String::as_str),
+            Some("A: ACCEPT"),
+            "a single surviving source is carried unchanged"
+        );
+    }
+
+    #[test]
+    fn merge_carried_bodies_leaves_the_bodies_alone_while_they_fit() {
+        assert_eq!(
+            handoff::merge_carried_bodies(&["first", "second", "third"]),
+            "first\n\nsecond\n\nthird"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["only one"]),
+            "only one",
+            "a single source is the merge_reply_bodies path unchanged"
+        );
+        assert_eq!(
+            handoff::merge_carried_bodies(&["  ", "kept"]),
+            "kept",
+            "a blank source is dropped rather than joined as pure separator"
+        );
+        assert_eq!(handoff::merge_carried_bodies(&[]), "");
+    }
+
+    #[test]
+    fn merge_carried_bodies_does_not_let_one_verbose_source_delete_the_others() {
+        // The whole point of the split: clipping the JOIN would cut the short
+        // verdict off the end entirely, and nothing downstream would show that
+        // a second reviewer had ever spoken.
+        let essay = "x".repeat(handoff::MAX_HANDOFF_BODY_BYTES + 12_000);
+        let verdict = "B: ACCEPT";
+        let merged = handoff::merge_carried_bodies(&[essay.as_str(), verdict]);
+
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "the hard cap still holds: {}",
+            merged.len()
+        );
+        assert!(
+            merged.ends_with(verdict),
+            "the short source survives in full at the end"
+        );
+        assert!(
+            merged.contains(handoff::TRUNCATION_MARKER),
+            "the long source is the one that gets cut"
+        );
+        // The short body used far less than its equal share, so the essay got
+        // the remainder back rather than being held to half the cap.
+        assert!(
+            merged.len() > handoff::MAX_HANDOFF_BODY_BYTES / 2,
+            "unused share is handed back to the long source: {}",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn merge_carried_bodies_holds_the_cap_when_every_source_is_oversized() {
+        // The give-back pass has nothing to give back here: nobody is under
+        // the equal share, so `under` is 0 and every body is clipped to the
+        // same width. The sum of the clipped halves plus the separators is
+        // exactly what has to stay under the cap — the arithmetic the earlier
+        // "one essay plus a one-line verdict" case never exercises.
+        let bodies: Vec<String> = (0..4)
+            .map(|i| format!("{i}").repeat(handoff::MAX_HANDOFF_BODY_BYTES))
+            .collect();
+        let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let merged = handoff::merge_carried_bodies(&refs);
+
+        assert!(
+            merged.len() <= handoff::MAX_HANDOFF_BODY_BYTES,
+            "four oversized sources still fit the cap: {}",
+            merged.len()
+        );
+        for (i, _) in bodies.iter().enumerate() {
+            assert!(
+                merged.contains(&format!("{i}{i}{i}")),
+                "source {i} must survive rather than be squeezed out entirely"
+            );
+        }
+        assert_eq!(
+            merged.matches(handoff::TRUNCATION_MARKER).count(),
+            bodies.len(),
+            "every source is the one that gets cut, none is dropped"
+        );
     }
 
     #[test]

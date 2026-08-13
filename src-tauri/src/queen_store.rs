@@ -23,6 +23,57 @@ const MAX_MAILBOX_BYTES: usize = 128;
 const MAX_MESSAGE_SUBJECT_BYTES: usize = 256;
 const MAX_MESSAGE_BODY_BYTES: usize = 64 * 1024;
 
+/// Stage A-6: the `workflow_runs.state` values that mean "this run is over".
+/// The single source of truth for both the Rust-side gate
+/// (`is_terminal_workflow_state`) and the SQL below, which binds these three
+/// strings as parameters rather than spelling them out a second time.
+///
+/// Mirrors `orchestrator::workflow_state_wire` for
+/// `WorkflowState::{Succeeded, Failed, Cancelled}` — the states
+/// `evict_terminal` already treats as terminal in memory. It is deliberately
+/// an ALLOW-list and not a deny-list of `'running'`: a value this build does
+/// not recognise (an older or newer schema, a hand-edited row) is treated as
+/// still-live and therefore never deleted. Retention must fail towards
+/// keeping rows, because the row it would wrongly delete is a resumable run.
+const TERMINAL_WORKFLOW_STATES: [&str; 3] = ["succeeded", "failed", "cancelled"];
+
+/// Stage A-6: how many *terminal* runs one project keeps in `workflow_runs`.
+/// Non-terminal runs are never counted and never deleted (see
+/// `prune_terminal_workflow_runs`), so this is a cap on HISTORY, not on
+/// concurrency.
+///
+/// Until Stage A-6 this table had neither a cap nor a DELETE anywhere — the
+/// only table in this store without one — so it grew monotonically for the
+/// life of the install.
+///
+/// Where 500 comes from (both bounds are derived, not guessed; the byte
+/// figure inside the upper bound is an ASSUMPTION and is called out as such):
+///
+/// - **Lower bound — 100.** `orchestrator::REGISTRY_TERMINAL_CAP` is the
+///   number of terminal runs the in-memory registry keeps. A durable store
+///   narrower than a volatile one is nonsense: the DB must be able to hold at
+///   least everything the running app is still willing to show. 500 is 5x
+///   that, so the DB window is strictly the wider of the two.
+/// - **Upper bound — bounded file growth.** One row carries the run's WHOLE
+///   `steps_json` (see `WORKFLOW_RUNS_SCHEMA_SQL`), so rows here are an order
+///   of magnitude heavier than a pin or an inbox row. At a deliberately
+///   pessimistic 1 KiB/row — room for ~9 JSON keys per step across a handful
+///   of steps plus a few hundred bytes of `error` text — 500 rows is ~0.5 MiB
+///   per project. That is far below the worst case the neighbouring caps
+///   already permit (`MAX_NOTES_PER_PROJECT` x `MAX_NOTE_BODY_BYTES` alone is
+///   ~640 MiB), so 500 is conservative in the company it keeps. **The 1 KiB
+///   is an estimate: real `steps_json` sizes have not been measured.**
+/// - **Time axis.** Unattended scheduling (the `every: hour` work on the
+///   `feat/schedule-5.0.8` branch, not in this build) produces 24 rows/day
+///   from one workflow, so 500 is ~20 days of hourly runs, or well over a
+///   year of daily ones. "A few weeks of history survives a machine left
+///   running unattended" is the property the number is chosen for.
+///
+/// Like `orchestrator::STREAM_MAX_UNITS`, this is an initial value with a
+/// derivation but no field measurement behind it. Phase 5.6.0 (the schema
+/// split) makes rows small and cheap, and should revisit it then.
+const MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT: i64 = 500;
+
 /// Phase 5.0.1: `workflow_runs` schema, shared verbatim by all three
 /// migration paths below (fresh v0 database, v1->v3, v2->v3) so the
 /// table/index text is defined exactly once. `IF NOT EXISTS` keeps every
@@ -795,6 +846,51 @@ impl QueenStore {
         Ok(message)
     }
 
+    /// Acknowledge every still-unacknowledged message a given `sender` put in
+    /// somebody else's mailbox, and report how many that closed (Stage A-5).
+    ///
+    /// The sender-side counterpart of `ack_inbox`, which is recipient-side and
+    /// takes one id at a time. It exists for one caller shape: a workflow run
+    /// that ends without its agents ever answering — cancelled, or abandoned
+    /// after a restart — leaves its kickoffs sitting unread and unacknowledged
+    /// in the AGENT'S mailbox, where the next run's pane picks them up as live
+    /// instructions (observed on hardware 2026-08-05, plan.md §6.14). The
+    /// orchestrator cannot express that cleanup as a list of ids: the kickoff
+    /// thread roots it records are `#[serde(skip)]`, so a run read back from
+    /// the DB has none of them.
+    ///
+    /// `sender` is the whole selector, which is safe precisely because
+    /// `orchestrator::workflow_mailbox` embeds the run id in it — no string
+    /// other than that one run's own `queen:workflow/<name>/<run_id>` can
+    /// match, so this can never acknowledge a sibling run's kickoff. Callers
+    /// with a less specific sender get a less specific sweep; that is on them.
+    ///
+    /// Already-acknowledged messages are left exactly as they are (their
+    /// original `acknowledged_at_ms` stands) and are not counted, so calling
+    /// this twice on one run is a no-op the second time.
+    ///
+    /// COST: `inbox_messages` has no index on `sender`, so this is a scan of
+    /// the project's messages (bounded by `MAX_MESSAGES_PER_PROJECT`). It runs
+    /// once per cancel/abandon — never on the driver tick — so an index and
+    /// the schema migration it would need are not worth it.
+    pub fn ack_inbox_from_sender(&self, project: &Path, sender: String) -> Result<usize, String> {
+        let project = project_id(project)?;
+        let sender = validated_mailbox("sender", sender)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let acked = transaction
+            .execute(
+                "UPDATE inbox_messages SET acknowledged_at_ms = ?3
+                 WHERE project_dir = ?1 AND sender = ?2 AND acknowledged_at_ms IS NULL",
+                params![project, sender, now_ms()],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(acked)
+    }
+
     pub fn reply_inbox(
         &self,
         project: &Path,
@@ -979,6 +1075,16 @@ impl QueenStore {
     /// optimistic-concurrency dance here (unlike pins/notes). Resuming a
     /// previously-abandoned run_id clears its `error` marker back to NULL,
     /// same as a brand new run.
+    ///
+    /// Stage A-6: when — and only when — the snapshot being written is a
+    /// TERMINAL one, the same transaction also prunes this project's old
+    /// finished runs (`prune_terminal_workflow_runs`). The gate is a string
+    /// match in Rust, before any SQL, and that is the whole point: the
+    /// orchestrator's 200ms driver calls this on every tick a live run
+    /// changes, and every one of those snapshots is `'running'`, so the hot
+    /// path pays one `matches!`-equivalent and nothing else. A run reaches a
+    /// terminal state once, and `advance_all` stops ticking it immediately
+    /// after, so the `count(*)` runs about once per finished run.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_workflow_run(
         &self,
@@ -1020,6 +1126,17 @@ impl QueenStore {
                 ],
             )
             .map_err(db_error)?;
+        // Stage A-6, AFTER the row is in the transaction: the run that just
+        // ended has to be inside the window it is measured against, otherwise
+        // a project sitting exactly on the cap would delete the oldest row on
+        // every completion whether or not it needed to.
+        if is_terminal_workflow_state(state) {
+            prune_terminal_workflow_runs(
+                &transaction,
+                &project,
+                MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+            )?;
+        }
         transaction.commit().map_err(db_error)?;
         Ok(())
     }
@@ -1051,6 +1168,12 @@ impl QueenStore {
     /// resuming it (Phase 5.0.1 "破棄"): marks it `cancelled` with an
     /// explanatory `error`, so `list_running_workflow_runs` — and therefore
     /// `load_config`'s resume prompt — never surfaces it again.
+    ///
+    /// Stage A-6: this is the OTHER way a run becomes terminal — it never
+    /// goes through `upsert_workflow_run`, so it prunes here too, or an
+    /// install whose runs are all discarded rather than finished would keep
+    /// growing unbounded. Once per operator click on "discard", never on a
+    /// driver tick.
     pub fn mark_workflow_abandoned(&self, project: &Path, run_id: &str) -> Result<(), String> {
         let project = project_id(project)?;
         let mut connection = self.lock();
@@ -1069,6 +1192,11 @@ impl QueenStore {
         if !changed {
             return Err(format!("workflow run '{run_id}' not found"));
         }
+        prune_terminal_workflow_runs(
+            &transaction,
+            &project,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+        )?;
         transaction.commit().map_err(db_error)?;
         Ok(())
     }
@@ -1161,6 +1289,86 @@ fn enforce_limit(
     if count >= max {
         return Err(format!("Queen {table} limit reached (max {max})"));
     }
+    Ok(())
+}
+
+/// Stage A-6: is this persisted `workflow_runs.state` a finished run?
+/// Anything not on the allow-list — `'running'`, `'pending'`, or a value this
+/// build has never heard of — counts as still-live and is out of retention's
+/// reach entirely.
+fn is_terminal_workflow_state(state: &str) -> bool {
+    TERMINAL_WORKFLOW_STATES.contains(&state)
+}
+
+/// Stage A-6: keep at most `max` terminal `workflow_runs` rows for `project`,
+/// newest first, and delete the rest.
+///
+/// This is retention by DELETE, and that is the one place it departs from
+/// `enforce_limit` above: pins / notes / inbox are capped by REFUSING the
+/// write, because each of those writes is a user asking for something and can
+/// be answered with "limit reached". A `workflow_runs` write is not a request
+/// — it is `orchestrator::persist_run` recording something that has already
+/// happened, and whose `Err` it swallows. Refusing it would not stop the run;
+/// it would silently drop the run's durable record and, with it, the ability
+/// to resume it. So the old rows go, not the new one.
+///
+/// **What is never deleted.** Only states on `TERMINAL_WORKFLOW_STATES` are
+/// counted or touched. A run still `'running'` is exactly what
+/// `list_running_workflow_runs` — and therefore `load_config`'s "resume this
+/// interrupted run?" banner (Phase 5.0.1) — exists to find, so deleting one
+/// would silently make a crash unrecoverable. Non-terminal runs are also not
+/// counted towards `max`, so no amount of finished history can push a live
+/// run out, and no number of live runs can shrink the history window.
+/// A run abandoned via `mark_workflow_abandoned` IS terminal
+/// (`state = 'cancelled'`) and therefore prunable — the operator has already
+/// declined to resume it, and its `error` marker only has to outlive the
+/// resume prompt it was written for.
+///
+/// **Ordering** matches `orchestrator::evict_terminal` exactly, so the
+/// in-memory and on-disk windows drop the same runs:
+/// `COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC`. The `COALESCE`
+/// is load-bearing rather than defensive — `spawn_workflow` can publish an
+/// already-terminal run with `ended_at_ms` still `NULL` when every root fails
+/// to spawn, and sorting those to the bottom would evict the newest runs
+/// first. `run_id` breaks ties because `new_run_id` is a monotonic nanosecond
+/// stamp in fixed-width hex, so its string order agrees with creation order.
+///
+/// **Cost.** The `count(*)` short-circuits the common case (under the cap)
+/// before any sort, same shape as `enforce_limit` and as `evict_terminal`'s
+/// early return. Both statements filter on `(project_dir, state)`, the
+/// leading columns of the existing `workflow_runs_project_state` index, so
+/// Stage A-6 needs no new index and therefore no `user_version` bump — the
+/// numbering for 4 is still unclaimed between 5.6.0 and 6.0.0.
+fn prune_terminal_workflow_runs(
+    transaction: &rusqlite::Transaction<'_>,
+    project: &str,
+    max: i64,
+) -> Result<(), String> {
+    let [succeeded, failed, cancelled] = TERMINAL_WORKFLOW_STATES;
+    let count: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM workflow_runs
+             WHERE project_dir = ?1 AND state IN (?2, ?3, ?4)",
+            params![project, succeeded, failed, cancelled],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if count <= max {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "DELETE FROM workflow_runs
+             WHERE project_dir = ?1 AND state IN (?2, ?3, ?4)
+               AND run_id NOT IN (
+                 SELECT run_id FROM workflow_runs
+                 WHERE project_dir = ?1 AND state IN (?2, ?3, ?4)
+                 ORDER BY COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC
+                 LIMIT ?5
+               )",
+            params![project, succeeded, failed, cancelled, max],
+        )
+        .map_err(db_error)?;
     Ok(())
 }
 
@@ -1496,6 +1704,88 @@ mod tests {
                 .list_inbox(&one, "codex-review".to_string(), 0, true, 50)
                 .unwrap(),
             vec![acknowledged]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Stage A-5. Three properties in one, because they are the three the
+    /// orchestrator's cancel/abandon sweep leans on:
+    ///
+    /// 1. the selector is the SENDER, so one sender's leftovers can be closed
+    ///    without touching another's — that is what keeps a cancelled run from
+    ///    acknowledging a live sibling run's kickoff;
+    /// 2. it is project-scoped like every other store method;
+    /// 3. it never re-stamps an already-acknowledged message, and reports 0
+    ///    the second time, so a repeat sweep is a genuine no-op.
+    #[test]
+    fn acking_by_sender_closes_only_that_senders_unacknowledged_messages() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let send = |project: &Path, sender: &str, recipient: &str| {
+            store
+                .send_inbox(
+                    project,
+                    sender.to_string(),
+                    recipient.to_string(),
+                    "kickoff".to_string(),
+                    format!("work for {recipient}"),
+                )
+                .unwrap()
+        };
+        send(&one, "queen:workflow/demo/run-a", "coder");
+        send(&one, "queen:workflow/demo/run-a", "reviewer");
+        let sibling = send(&one, "queen:workflow/demo/run-b", "coder");
+        send(&two, "queen:workflow/demo/run-a", "coder");
+        // Already answered, so already acknowledged: the sweep must leave its
+        // original timestamp alone rather than move it to "now".
+        let answered = send(&one, "queen:workflow/demo/run-a", "writer");
+        store
+            .reply_inbox(&one, answered.id, "writer".to_string(), "done".to_string())
+            .unwrap();
+        let answered_before = store
+            .list_inbox(&one, "writer".to_string(), 0, true, 50)
+            .unwrap();
+        assert!(answered_before[0].acknowledged_at_ms.is_some());
+
+        assert_eq!(
+            store
+                .ack_inbox_from_sender(&one, "queen:workflow/demo/run-a".to_string())
+                .unwrap(),
+            2,
+            "only the two unacknowledged messages of run-a are counted"
+        );
+        assert!(store
+            .list_inbox(&one, "reviewer".to_string(), 0, false, 50)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_inbox(&one, "writer".to_string(), 0, true, 50)
+                .unwrap(),
+            answered_before,
+            "an already-acknowledged message keeps its original stamp"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&one, "coder".to_string(), 0, false, 50)
+                .unwrap(),
+            vec![sibling],
+            "another run's kickoff is a different sender and is untouched"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&two, "coder".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "same sender in another project is untouched"
+        );
+        assert_eq!(
+            store
+                .ack_inbox_from_sender(&one, "queen:workflow/demo/run-a".to_string())
+                .unwrap(),
+            0,
+            "sweeping twice closes nothing the second time"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2121,6 +2411,204 @@ mod tests {
             .mark_workflow_abandoned(&one, "does-not-exist")
             .unwrap_err()
             .contains("not found"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ------------------------------------------------------------------
+    // Stage A-6: workflow_runs retention
+    // ------------------------------------------------------------------
+
+    /// Every `workflow_runs` row this project still has, ordered the way
+    /// retention orders them: newest kept first.
+    fn stored_run_ids(store: &QueenStore, project: &Path) -> Vec<String> {
+        let project = project_id(project).unwrap();
+        let connection = store.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id FROM workflow_runs WHERE project_dir = ?1
+                 ORDER BY COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC",
+            )
+            .unwrap();
+        let ids = statement
+            .query_map(params![project], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids
+    }
+
+    /// `count` finished runs, oldest first, so run `n` is always newer than
+    /// run `n - 1` under retention's ordering key.
+    fn store_finished_runs(store: &QueenStore, project: &Path, count: i64) {
+        for n in 0..count {
+            let ended = 1_000 + n;
+            store
+                .upsert_workflow_run(
+                    project,
+                    &format!("done-{n:05}"),
+                    "demo",
+                    "succeeded",
+                    ended - 1,
+                    Some(ended),
+                    "[]",
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn finished_workflow_runs_past_the_cap_lose_the_oldest_rows_first() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let overshoot = 5;
+        store_finished_runs(
+            &store,
+            &one,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + overshoot,
+        );
+
+        let kept = stored_run_ids(&store, &one);
+        assert_eq!(
+            kept.len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+            "retention trims back to the cap, it does not merely stop growing"
+        );
+        // The `overshoot` oldest runs are the ones gone, and the newest run —
+        // the one whose own write triggered the prune — is still there.
+        assert_eq!(
+            kept.first().map(String::as_str),
+            Some(
+                format!("done-{:05}", MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + overshoot - 1)
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            kept.last().map(String::as_str),
+            Some(format!("done-{overshoot:05}").as_str())
+        );
+        for n in 0..overshoot {
+            assert!(
+                !kept.contains(&format!("done-{n:05}")),
+                "run {n} is older than the cap allows and should be gone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unfinished_workflow_run_survives_any_amount_of_history_written_after_it() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        // Deliberately the OLDEST row in the project: under a naive
+        // "keep the newest N rows" rule this is the first thing to go, and
+        // losing it is losing the resume banner for a crashed run.
+        store
+            .upsert_workflow_run(&one, "still-going", "demo", "running", 1, None, "[]")
+            .unwrap();
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 50);
+
+        let resumable = store.list_running_workflow_runs(&one).unwrap();
+        assert_eq!(
+            resumable.len(),
+            1,
+            "a run that never reached a terminal state is not retention's business"
+        );
+        assert_eq!(resumable[0].run_id, "still-going");
+        // ...and it does not eat into the history window either: the cap
+        // counts finished runs only.
+        assert_eq!(
+            stored_run_ids(&store, &one).len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_workflow_run_state_this_build_does_not_know_is_never_pruned() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        // The allow-list claim (CONTRACT.md 続報17 (3)) in the only form that
+        // can actually fail: a state that is on neither list. Every other
+        // retention test uses 'running' or 'succeeded', so rewriting
+        // `is_terminal_workflow_state` as "anything that is not 'running'"
+        // would keep all of them green while a future schema's — or a hand
+        // edited — row started being deleted. It is also the OLDEST row here,
+        // so the ordering key puts it first in line to go.
+        store
+            .upsert_workflow_run(&one, "from-the-future", "demo", "weird", 1, Some(2), "[]")
+            .unwrap();
+        assert!(!is_terminal_workflow_state("weird"));
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 20);
+
+        let kept = stored_run_ids(&store, &one);
+        assert!(
+            kept.contains(&"from-the-future".to_string()),
+            "retention must err towards keeping: an unrecognised state counts \
+             as still-live and is out of its reach entirely"
+        );
+        assert_eq!(
+            kept.len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 1,
+            "...and it does not eat into the window either — only the three \
+             terminal states are counted against the cap"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_run_retention_deletes_nothing_while_the_project_is_under_its_cap() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT);
+
+        assert_eq!(
+            stored_run_ids(&store, &one).len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+            "sitting exactly on the cap is not over it"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_run_retention_gives_every_project_its_own_window() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        store
+            .upsert_workflow_run(&two, "quiet-project", "demo", "succeeded", 1, Some(2), "[]")
+            .unwrap();
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 20);
+
+        assert_eq!(
+            stored_run_ids(&store, &two),
+            vec!["quiet-project".to_string()],
+            "a busy project must not evict a quiet one's single run"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn abandoning_a_run_prunes_the_history_it_has_just_joined() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        store_finished_runs(&store, &one, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT);
+        // A crash-interrupted run the operator discards: it never passes
+        // through `upsert_workflow_run` again, so this is the only chance to
+        // notice that the project is now one over the cap.
+        store
+            .upsert_workflow_run(&one, "interrupted", "demo", "running", 9_000, None, "[]")
+            .unwrap();
+        store.mark_workflow_abandoned(&one, "interrupted").unwrap();
+
+        let kept = stored_run_ids(&store, &one);
+        assert_eq!(kept.len() as i64, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT);
+        assert!(
+            kept.contains(&"interrupted".to_string()),
+            "the abandoned run is the newest one, so it is what stays"
+        );
+        assert!(
+            !kept.contains(&"done-00000".to_string()),
+            "the oldest finished run is what made room for it"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

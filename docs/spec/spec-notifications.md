@@ -1,6 +1,8 @@
 # ptygrid 仕様: アウトオブアプリ通知（OS / チャットWebHook）
 
-作成日: 2026-07-17 / 状態: 実装済み（Phase 4.4.2）/ 対象: セッション終了・エージェント状態変化の外部通知
+作成日: 2026-07-17 / 状態: 実装済み（Phase 4.4.2）/ 対象: セッション終了・エージェント状態変化・workflow の retry 枯渇の外部通知
+（2026-08-13、Stage A-4 で 3 つ目のイベント源「workflow escalation」を追加。→ §2.1 / §5.3 /
+[../../CONTRACT.md](../../CONTRACT.md) 続報16）
 
 関連: [spec-agent-status.md](spec-agent-status.md)（通知イベントの供給源: blocked/done 検出）/
 [design.md](../design/design.md)（アーキテクチャ原則）/ [competitive-landscape.md](../design/competitive-landscape.md)
@@ -11,7 +13,8 @@
 実装: [../src-tauri/src/notifications.rs](../../src-tauri/src/notifications.rs)（本体）/
 [../src-tauri/src/config.rs](../../src-tauri/src/config.rs)（`notifications:` スキーマ）/
 配線元 [../src-tauri/src/agent_status.rs](../../src-tauri/src/agent_status.rs)・
-[../src-tauri/src/session.rs](../../src-tauri/src/session.rs)。
+[../src-tauri/src/session.rs](../../src-tauri/src/session.rs)・
+[../src-tauri/src/orchestrator.rs](../../src-tauri/src/orchestrator.rs)（retry 枯渇、Stage A-4）。
 
 ---
 
@@ -33,14 +36,18 @@ Discord / Telegram のチャット）へ**エッジトリガの通知**として
 
 ### 意味的状態・プロセス生死との関係
 
-通知は**新しい状態レイヤを足さない**。既存の2つの**エッジ**をそのまま外部へ中継するだけである。
+通知は**新しい状態レイヤを足さない**。既存の**エッジ**をそのまま外部へ中継するだけである。
 
 - **プロセス生死**（`SessionState`、[../CONTRACT.md](../../CONTRACT.md) Phase 1）の `exited` 遷移。
 - **意味的状態**（`AgentStatus`、[spec-agent-status.md](spec-agent-status.md)）の `blocked` / `done`
   への変化。
+- **workflow step の retry 枯渇**（`StepOutcome`、Stage A-4）— 予算を使い切った瞬間。
 
-どちらも既に「変化した瞬間」だけ発生するイベントなので、通知レイヤはポーリングも重複除去も
-行わない（6.1）。
+前の2つは既に「変化した瞬間」だけ発生するイベントである。3つ目だけは供給側の事情が違い、
+workflow driver は 200ms の**ポーリング**で、「この step は retry を使い切った」は以後の全 tick で
+真であり続ける**レベル**である。**エッジ化は orchestrator 側の責務**とし、`StepOutcome::escalated`
+（`#[serde(skip)]`）を立てた tick の分だけを通知レイヤへ渡す（5.3）。したがって
+**通知レイヤはポーリングも重複除去も行わない**という 6.1 の前提は 3 源とも維持される。
 
 ---
 
@@ -50,7 +57,7 @@ Discord / Telegram のチャット）へ**エッジトリガの通知**として
 
 | イベント | 重大度 | 供給源 | 意味 |
 |---|---|---|---|
-| `error` | 最高 | `session::handle_eof` の終了で exit code が 0 以外 / 不明（シグナル・reap 失敗） | 不正終了・クラッシュ |
+| `error` | 最高 | `session::handle_eof` の終了で exit code が 0 以外 / 不明（シグナル・reap 失敗）／`orchestrator::take_escalations`（workflow step の retry 枯渇、Stage A-4） | 不正終了・クラッシュ／自動復旧の手が尽きた失敗 |
 | `needs-attention` | 高 | `agent_status` が `blocked` へ変化 | 承認 / 入力 / 権限プロンプトで停止（人待ち） |
 | `complete` | 中 | 終了で exit code が 0、または `agent_status` が `done` へ変化 | 正常完了 |
 | `progress` | 低 | （予約。現在どの供給源も発火しない） | 途中経過。`all` のみ受信 |
@@ -98,6 +105,20 @@ Discord / Telegram のチャット）へ**エッジトリガの通知**として
 - 本文: イベント固有の `detail`（終了なら `exit code 2` 等、blocked なら一致ルール）優先。無ければ
   セッション名を含む定型文。**本文は常に非空**（空文字を拒否する送信先があるため）。
 - 絵文字は `error=⛔ / needs-attention=⏳ / complete=✅ / progress=…`（画面内の状態語彙に合わせる）。
+
+**workflow escalation だけは session ではなく step を名乗る**（Stage A-4）。`NotifyContext` に任意
+フィールド `origin`（`WorkflowOrigin { workflow, run_id, step_id, attempts }`）が載っているときだけ
+整形が分岐する。
+
+- タイトル: `[project] ⛔ <workflow>/<step_id> exhausted its retries`
+- 本文: `Workflow '<workflow>' (run <run_id>): step '<step_id>' failed after <n> attempts and has no
+  retry budget left. Agent: <agent>. Last error: <error> No further automatic retry will happen.`
+  （`detail` は**置き換えではなく末尾に足す**。この 1 通だけで動けるよう、workflow / run / step /
+  試行回数を必ず名乗る。）
+
+`origin` を持たない既存 2 源の出力は**バイト単位で不変**である。`session_id: u32` は必須のままで、
+枯渇した step は**ペインを持たないことがある**（spawn できずに枯渇した / `check_timeouts` が
+kill 済み）ため、`origin` 側は session id を名前に使わない。
 
 ---
 
@@ -166,6 +187,32 @@ notifications:
   （`done`→`idle`）経路は `idle` しか emit しないので通知しない。
 - 通知の名前・detail は分類時の `snapshot.name` と一致ルール（`matched`）を使う。
 
+### 5.3 workflow step の retry 枯渇 → error（Stage A-4、2026-08-13）
+
+`advance_run` の末尾（2 本の `arm_retry_backoff` パスと `cancel_stragglers` の**後**）で
+`take_escalations`（純関数）が枯渇 step を集め、`registry.put` / `persist_run` /
+`emit_workflow_state` の**後**に `notify_escalation` が `dispatch_ctx` を呼ぶ。I/O は最後に置く。
+
+- **判定条件（3 つとも満たすときだけ）**: `Failed` であり、`next_retry_at_ms` が `None`（backoff 待ち
+  ではない）であり、`attempts > 0` であり、宣言された `retry:` に対して
+  `retry::allows_another(attempts, policy)` が偽。`retry:` を宣言していない step、
+  `attempts == 0`（一度も spawn されていない＝評価不能な `condition:` の `Failed`）は**対象外**。
+  これは `arm_retry_backoff` が再 spawn を拒否する条件と同じ 3 つである。
+- **重複抑止**: `StepOutcome::escalated`（`#[serde(skip)]`）を立てた tick でだけ返す。
+  200ms tick 上のレベルをエッジに変えるのはこの層の責務（§1「意味的状態・プロセス生死との関係」）。
+  永続化しないので、**resume した run では同じ枯渇がもう 1 通出る**（1 通目を受け取れなかった
+  人にこそ必要、という判断）。
+- **イベントは `error`**。`needs-attention` にすると、既定の `level: critical` のままの利用者には
+  1 通も届かない（§2.2 のマトリクス）。escalation が最も要るのは「誰も画面を見ていない」設定で
+  あり、それは既定の設定でもある。
+- **config には何も足さない**。宛先と音量は既存の `notifications:` ブロックが決める
+  （ptygrid-yml-guide.md §1 の escalation 行は「(config には書かない)」のまま）。
+- **ペイン exit 由来の通知は別に出る（抑止しない）**。最後の試行がペインを持っていれば
+  5.1 の `error` も出る。前者は「プロセスが落ちた」、後者は「この run のこの step はもう自動では
+  戻らない」で、workflow / run / step を名乗るのは後者だけ。抑止するには通知層が session と
+  workflow の対応を横断で知る必要があり、6.1 の「重複除去をしない」前提を壊す。
+- **run 全体の失敗は通知しない。** 入口は step の retry 枯渇 1 つだけである。
+
 ---
 
 ## 6. 送信の実装
@@ -210,6 +257,8 @@ OS 通知の `show()` 失敗、webhook POST の失敗は `eprintln!` で記録�
   `ConfigInfo.config` に additive に載る（省略可能・後方互換）。
 - **新規 IPC コマンドは無い。** 通知はバックエンド内部の外向き送信であり、フロントエンドの新イベント
   も追加しない。既存の `session-state` / `agent-status` イベントはそのまま。
+- Stage A-4 でも wire は変わらない。`StepOutcome::escalated` は `#[serde(skip)]` なので
+  `workflow-state` イベントにも `workflow_runs.steps_json` にも出ない（→ CONTRACT.md 続報16）。
 - capabilities への追記は不要（プラグインをバックエンドから呼ぶため。webview→プラグインの権限は
   使わない）。
 
@@ -235,3 +284,15 @@ OS 通知の `show()` 失敗、webhook POST の失敗は `eprintln!` で記録�
 - メッセージ整形: 名前→`#id` フォールバック、`project` 前置、`detail` 優先と非空保証。
 - WebHook ペイロード: Slack `text` / Discord `content` / Telegram URL・body の形状。
 - config スキーマ: kebab レベル・`type` 列挙のパース、未知キー無視、個別レベル上書き。
+- workflow escalation（Stage A-4、5 本）: 枯渇で**ちょうど 1 回**返り以後の tick では返らないこと
+  （`an_exhausted_retry_budget_escalates_once_and_never_again`）、予算が残っている / backoff 待ち /
+  `attempts == 0` / まだ `Running` では返らないこと
+  （`a_retry_that_still_has_budget_left_does_not_escalate`）、`retry:` 未宣言の step は対象外
+  （`a_step_with_no_retry_policy_never_escalates_however_hard_it_failed`）、本文が workflow / run /
+  step / 試行回数 / agent / 最後のエラーを名乗ること
+  （`escalation_names_the_workflow_run_step_and_attempt_count`）、既定の `critical` チャネルに
+  届くこと（`escalation_reaches_a_channel_left_at_the_default_critical_level`）。
+  **判定と整形はいずれも純関数側で固定しており、`dispatch` は経由しない。**
+
+**実機検証は未実施**（Stage A-4）。OS トースト / Slack に実際に届いたところは見ていない
+（→ [plan.md](../design/plan.md) §2 の U18）。
