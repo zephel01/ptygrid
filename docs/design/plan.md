@@ -64,7 +64,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.5.2 | Cost 計算 + `agent-cost` イベント | ⬜ | — | 該当なし |
 | 5.5.3 | Agent Status Rings（通知リング / 要承認ハイライト。出自は competitive-landscape の「次に取る UX」で、4.0 の teammate permission 表示の汎用化。設計は spec-phase5-5.md §2.3 / §3.7） | ⬜ | — | 該当なし |
 | 5.5.4 | Trace Waterfall + Cost Dashboard | ⬜ | — | 該当なし |
-| （無番号） | escalation: retry 枯渇時に外部へ通知する経路（4.4.2 の `notifications:` 基盤への配線）。枯渇判定は 5.0.4 で発火するようになったが配送経路が無い | ⬜ | — | 該当なし |
+| （無番号） | escalation: retry 枯渇時に外部へ通知する経路（4.4.2 の `notifications:` 基盤への配線）。枯渇判定は 5.0.4 で発火するようになったが配送経路が無い | ✅（2026-08-13、Stage A-4。→ §6.16） | 未タグ | 未（U18） |
 | 6.0.0 | Security Foundation: `user_version` 4 の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）同時導入 | ⬜ | — | 該当なし |
 | 6.0.1 | Sandbox filesystem-only プロファイル | ⬜ | — | 該当なし |
 | 6.0.2 | Sandbox strict プロファイル | ⬜ | — | 該当なし |
@@ -140,6 +140,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U15 | **resume 拒否ガード（`condition:` / `handoffTo:` の carry 喪失、2026-08-07）の実機検証** | 未実施。`condition:` を持つ workflow（例: `gate`(kickoff あり・`joinOn: reply`) → `apply`(`condition:`)）を流し、**`gate` が返信して Succeeded になった直後・`apply` が走り出す前にアプリを落として再起動**する。期待は「再開バナーが失敗表示になり、理由に `cannot be resumed` と `condition:` と `gate` が出る」こと。`handoffTo:` 版（`draft` → `polish`）も同じ形で 1 本。裏づけは現状 unit test 5 本のみ（→ CONTRACT.md 続報12） |
 | U16 | **複数 `handoffTo:` の合流（2026-08-07）の実機検証** | 未実施。`pattern: supervisor` で `implement` → `reviewA` / `reviewB`（2 体とも `joinOn: reply` + `handoffTo: verdict`）→ `verdict`（`dependsOn: [implement, reviewA, reviewB]`）を組み、**判定ペインの kickoff に 2 体ぶんの本文が宣言順で前置されていること**を目視する。1 体だけが返信した場合にその 1 本が運ばれることも同じ回で。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報13） |
 | U17 | **cancel / abandon 時の未 ack kickoff 掃除（Stage A-5、2026-08-13）の実機検証** | 未実施。手順は §6.14 で穴が出たときの逆をたどる: (1) `kickoff:` を持つ step の workflow を起動し、エージェントが返信する前に **⏹ で cancel** する。(2) 同じ workflow をもう一度起動し、ペインに mailbox の中身を数えさせて **前の run の kickoff が未 ack の一覧に出ないこと**を確認する（`await` が古い kickoff を返さないこと、が実際に見たいもの）。(3) abandon 側は「実行中にアプリを落として再起動 → 再開バナーで『破棄』」を選び、同じく次の run で残っていないことを確認する。(4) 並行 run 版（同名 workflow を 2 本走らせ、片方だけ cancel しても**もう片方のペインが自分の kickoff を受け取れる**こと）も同じ回で見たい。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報15） |
+| U18 | **retry 枯渇の escalation 通知（Stage A-4、2026-08-13）の実機検証** | 未実施。手順: (1) `ptygrid.yml` に `notifications:`（`enabled: true`、`channels:` に `os` と、可能なら Slack の incoming webhook を 1 本）を書く。`level` は**既定の `critical` のまま**にする — 「既定でも届く」ことがこの回で見たいことの半分だから。(2) 必ず失敗する step（例 `cmd: /bin/false`、あるいは短い `timeoutMs` で必ず超過する step）に `retry: { max: 1, backoffMs: 500 }` を付けた workflow を 1 本流す。(3) 期待は **escalation が 1 通だけ**届き、本文に workflow 名 / run id / step id / `2 attempts` / 最後のエラーが入っていること。**枯渇の瞬間に 1 通で、200ms ごとの連投にならないこと**が最重要の観測点（`escalated` フラグの実効）。(4) 同じ回で**ペイン exit 由来の通知も別に届く**ことを確認する（仕様どおりの二重で、バグではない）。(5) 余力があれば `level: silent` にして 1 通も出ないことも見る。裏づけは現状 unit test 5 本のみ（→ CONTRACT.md 続報16 / §6.16） |
 
 ---
 
@@ -169,7 +170,14 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 
 2026-07-30、`v0.5.7` としてリリース済み（詳細は §4・§6.8）。以降の次の作業は P3 から。
 
-### P3. retry 枯渇時の外部通知経路（escalation）
+### P3. retry 枯渇時の外部通知経路（escalation）— 完了（コード上）
+
+**2026-08-13、Stage A-4 として実装した**（→ §6.16 / CONTRACT.md 続報16）。step が `retry:` の
+予算を使い切った瞬間に、4.4.2 の通知経路へ `error` として 1 通出る。見込みどおり**新しい配送機構は
+不要**で、`orchestrator::take_escalations`（純関数）＋ `notify_escalation` を `advance_run` の末尾に
+足しただけである。config には何も足していない（ptygrid-yml-guide.md §1 の
+「(config には書かない)」は現状のまま正しい）。**実機検証は未実施**（→ §2 の U18）なので、
+U18 が済むまでこの節は「コード上は完了」として残す。以下は着手前の記述:
 
 **なぜ今それか**: 4.4.2 の通知基盤が既にあるので**配線するだけ**で済み、労力に対して自主運用の
 安全性の伸びが大きいから。
@@ -1012,6 +1020,68 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
     **未実測**で、範囲としては A-6（retention）側。
   - メッセージは削除ではなく ack なので、`list_inbox(includeAcknowledged: true)` には残る。
     「古い kickoff を読ませない」保証が及ぶのは `await` と未 ack 一覧まで。
+
+### 6.16 2026-08-13: Stage A-4 — retry を使い切った step が外へ 1 通出す（escalation の配線）
+
+詳細な経緯。現在地は §1・§2（U18）・§3（P3）。
+
+- **直したもの**: §3 P3 そのもの。4.4.2 の通知基盤（OS トースト / Slack / Mattermost / Discord /
+  Telegram）は 5.0.4 の retry 実行系より前からあったのに、**workflow 側からの入口が無かった**。
+  step が `retry:` の予算を使い切っても `Failed` で終端して run が red になるだけで、
+  アプリの外へは 1 通も出ない。自主運用は「人間が気づく」ことに依存しているので、
+  離席中・夜間の失敗がそのまま滞留する。ptygrid-yml-guide.md §1 で escalation 行が ❌ のまま
+  残っていた理由でもある。
+- **入ったもの**: `orchestrator::take_escalations`（純関数、枯渇 step の収集）と
+  `notify_escalation`（`notifications::dispatch_ctx` の呼び出し）を新設し、`advance_run` の末尾に
+  配線した。通知側は `NotifyContext` に任意フィールド `origin`（`WorkflowOrigin`）と、
+  文脈をまとめて渡せる `dispatch_ctx` を追加。**新しい配送機構はゼロ**で、P3 の見込み
+  （「workflow 側のイベントを既存経路へ流すだけ」）はそのまま成立した。
+- **設計判断 1: エッジ化は orchestrator 側でやる。** notifications.rs は冒頭で「イベント源は
+  すべてエッジなので、この層はポーリングも重複除去もしない」と宣言している。ところが
+  workflow driver は **200ms の tick（ポーリング）**で、「この step は retry を使い切った」は
+  以後の全 tick で真であり続ける**レベル**である。そのまま流すと同じ枯渇で **5 通/秒**になる。
+  `StepOutcome` に `#[serde(skip)] escalated: bool` を足し、それを立てた tick の分だけ返す形にした
+  （`next_retry_at_ms` が「Failed」を「Failed だが再試行待ち」に変えているのと同じ発想）。
+- **設計判断 2: イベントは `Error`（`NeedsAttention` ではない）。** 既定の
+  `notifications.level` は `critical` で、`critical` が購読するのは `error` **だけ**である。
+  `NeedsAttention` にすると、**level を書き換えていない利用者＝既定の設定には 1 通も届かない**。
+  escalation が最も要るのは「誰も画面を見ていない」設定であり、それが既定の設定でもあるので、
+  ここを外すと A-4 の completion gate 自体を満たさない。
+- **設計判断 3: config には何も足さない。** 宛先と音量は既存の `notifications:` ブロックの
+  `level` / `channels` が既に表現している。escalation 専用のスイッチを足すと、
+  「2 つの設定が食い違う」状態を作れるようになるだけである。ptygrid-yml-guide.md §1 の
+  「(config には書かない)」は変えていない。
+- **設計判断 4: メッセージは session ではなく step を名乗る。** `NotifyContext` は
+  `session_id: u32` が必須の session 中心の型だが、枯渇した step は**ペインを持たないことがある**
+  （spawn できないまま枯渇した / `check_timeouts` に kill 済み）。`session_id` を `Option` に
+  すると既存 2 源へ波及するので、任意フィールド `origin` を足して、あるときだけ整形を分岐させた。
+  **既存 2 源の出力はバイト単位で不変**である。
+- **二重通知は抑止していない（許容）。** 枯渇した step の最後の試行がペイン付きだったなら、
+  その exit で `session::handle_eof` 由来の `error` が別途 1 通出る（変更前から、しかも
+  **試行のたびに**出ていた通知）。両者は別のことを言っている: 前者は「プロセスが落ちた」、
+  後者は「この run のこの step はもう自動では戻らない」で、workflow / run / step を名乗るのは
+  後者だけ。抑止するには通知層が session と workflow の対応を横断で知る必要があり、
+  4.4.2 の前提を壊す。
+- 検証: `cargo test` **lib 479 → 484 passed / 統合 14 passed / 0 failed**（新規 5 本 —
+  `an_exhausted_retry_budget_escalates_once_and_never_again` /
+  `a_retry_that_still_has_budget_left_does_not_escalate` /
+  `a_step_with_no_retry_policy_never_escalates_however_hard_it_failed` /
+  `escalation_names_the_workflow_run_step_and_attempt_count` /
+  `escalation_reaches_a_channel_left_at_the_default_critical_level`）。clippy は既存の
+  `config.rs` の `nonminimal_bool` 1 件のみで新規警告ゼロ。frontend 無変更。wire 契約も無変更
+  （`escalated` は `#[serde(skip)]`）。
+- **未実測のもの**（推測で埋めないこと）:
+  - **実機検証は一切していない。** OS トーストにも Slack にも、実際に届いたところは
+    **見ていない**。「200ms の連投にならない」ことも unit test（同じ run を 6 回 tick 相当で
+    回して 2 回目以降が空）で固定しただけで、**実機では未確認** → §2 の U18。
+  - **通知の所要・遅延は未計測。** 枯渇から着信までどれだけかかるかは測っていない。
+  - **`joinOn: any` の敗者が枯渇したあとに兄弟が勝つ場合**、run は緑で終わるのに escalation は
+    既に飛んでいる（同一 tick 内なら `cancel_stragglers` が先に走るので出ない）。
+    この競合が実際にどのくらい起きるかは**未実測**。
+  - **resume すると同じ枯渇がもう 1 通出る**（`escalated` を永続化していないため）。
+    意図した挙動だが、実機では未確認。
+  - **run 全体の失敗は依然として通知しない。** 入口は step の retry 枯渇 1 つだけで、
+    `retry:` を書いていない workflow は red になっても escalation を出さない。
 
 ---
 
