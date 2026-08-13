@@ -65,6 +65,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.5.3 | Agent Status Rings（通知リング / 要承認ハイライト。出自は competitive-landscape の「次に取る UX」で、4.0 の teammate permission 表示の汎用化。設計は spec-phase5-5.md §2.3 / §3.7） | ⬜ | — | 該当なし |
 | 5.5.4 | Trace Waterfall + Cost Dashboard | ⬜ | — | 該当なし |
 | （無番号） | escalation: retry 枯渇時に外部へ通知する経路（4.4.2 の `notifications:` 基盤への配線）。枯渇判定は 5.0.4 で発火するようになったが配送経路が無い | ✅（2026-08-13、Stage A-4。→ §6.16） | 未タグ | 未（U18） |
+| （無番号） | `workflow_runs` の retention: project ごと **終端 run 500 件**の上限と DELETE。終端していない run は数えも消しもしない（resume を守る）。掃除は「run が終端に到達した書き込み」と abandon のときだけで、200ms tick には SQL を足さない。`user_version` は消費しない（3 のまま） | ✅（2026-08-13、Stage A-6。→ §6.17） | 未タグ | 未（U19） |
 | 6.0.0 | Security Foundation: `user_version` 4 の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）同時導入 | ⬜ | — | 該当なし |
 | 6.0.1 | Sandbox filesystem-only プロファイル | ⬜ | — | 該当なし |
 | 6.0.2 | Sandbox strict プロファイル | ⬜ | — | 該当なし |
@@ -141,6 +142,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U16 | **複数 `handoffTo:` の合流（2026-08-07）の実機検証** | 未実施。`pattern: supervisor` で `implement` → `reviewA` / `reviewB`（2 体とも `joinOn: reply` + `handoffTo: verdict`）→ `verdict`（`dependsOn: [implement, reviewA, reviewB]`）を組み、**判定ペインの kickoff に 2 体ぶんの本文が宣言順で前置されていること**を目視する。1 体だけが返信した場合にその 1 本が運ばれることも同じ回で。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報13） |
 | U17 | **cancel / abandon 時の未 ack kickoff 掃除（Stage A-5、2026-08-13）の実機検証** | 未実施。手順は §6.14 で穴が出たときの逆をたどる: (1) `kickoff:` を持つ step の workflow を起動し、エージェントが返信する前に **⏹ で cancel** する。(2) 同じ workflow をもう一度起動し、ペインに mailbox の中身を数えさせて **前の run の kickoff が未 ack の一覧に出ないこと**を確認する（`await` が古い kickoff を返さないこと、が実際に見たいもの）。(3) abandon 側は「実行中にアプリを落として再起動 → 再開バナーで『破棄』」を選び、同じく次の run で残っていないことを確認する。(4) 並行 run 版（同名 workflow を 2 本走らせ、片方だけ cancel しても**もう片方のペインが自分の kickoff を受け取れる**こと）も同じ回で見たい。裏づけは現状 unit test 4 本のみ（→ CONTRACT.md 続報15） |
 | U18 | **retry 枯渇の escalation 通知（Stage A-4、2026-08-13）の実機検証** | 未実施。手順: (1) `ptygrid.yml` に `notifications:`（`enabled: true`、`channels:` に `os` と、可能なら Slack の incoming webhook を 1 本）を書く。`level` は**既定の `critical` のまま**にする — 「既定でも届く」ことがこの回で見たいことの半分だから。(2) 必ず失敗する step（例 `cmd: /bin/false`、あるいは短い `timeoutMs` で必ず超過する step）に `retry: { max: 1, backoffMs: 500 }` を付けた workflow を 1 本流す。(3) 期待は **escalation が 1 通だけ**届き、本文に workflow 名 / run id / step id / `2 attempts` / 最後のエラーが入っていること。**枯渇の瞬間に 1 通で、200ms ごとの連投にならないこと**が最重要の観測点（`escalated` フラグの実効）。(4) 同じ回で**ペイン exit 由来の通知も別に届く**ことを確認する（仕様どおりの二重で、バグではない）。(5) 余力があれば `level: silent` にして 1 通も出ないことも見る。裏づけは現状 unit test 5 本のみ（→ CONTRACT.md 続報16 / §6.16） |
+| U19 | **`workflow_runs` の retention（Stage A-6、2026-08-13）の実機検証** | 未実施。**上限が 500 件なので「本物の 500 run を流す」のは現実的でない**。見たいのは件数そのものではなく (a) 200ms tick に SQL が増えていないこと、(b) 生きている run が消えないこと、の 2 点なので、手順は次のとおり: (1) `queen.sqlite3` に `state = 'succeeded'` のダミー行を 500 件超（`sqlite3` で直接 INSERT。`run_id` は `done-00001` のような固定幅で）仕込んだ状態でアプリを起動し、**起動時には何も消えない**ことを確認する（開いた直後の `count(*)` が仕込んだ値のまま）。(2) その状態で workflow を 1 本流して完走させ、**完走した瞬間に 500 件へ縮む**ことと、いちばん古い行から消えていることを確認する。(3) 同じ回で、**実行中にアプリを落として再起動 → 再開バナーが出る**ことを確認する（`state = 'running'` の行が (2) の掃除に巻き込まれていないことの実証。これが最も重要）。(4) `steps_json` の実サイズを 1 行 SELECT して測り、CONTRACT.md 続報17 の「1 KiB/行と仮定」を実測値に置き換える。(5) 余力があれば、run 実行中に `PRAGMA` や `sqlite3` で書き込み待ちが増えていないこと（tick が重くなっていないこと）を体感で見る。裏づけは現状 unit test 5 本のみ（→ CONTRACT.md 続報17 / §6.17） |
 
 ---
 
@@ -254,6 +256,17 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
 いずれも「優先度は P1〜P7 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
 
+- **`workflow_runs` の retention は入ったが、数字と掃除範囲に穴が残る**
+  （2026-08-13、Stage A-6 → §6.17 / CONTRACT.md 続報17）。上限 `MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT`
+  = 500 は下限（`REGISTRY_TERMINAL_CAP` = 100）と最悪ファイルサイズの両側から導いた値だが、
+  **1 行あたりの `steps_json` の実サイズは未実測**（1 KiB/行と仮定した）。`STREAM_MAX_UNITS = 64`
+  と同じ扱いで、実測（→ §2 の U19 (4)）と 5.6.0 のスキーマ分割のあとに見直す。
+  残る穴は 3 つ: (1) **起動時の一括掃除をしていない**ので、A-6 以前のビルドが太らせた DB は
+  そのプロジェクトで次に run が 1 本終わるまで縮まない（もう run しないプロジェクトなら永久に残る）、
+  (2) **`VACUUM` はしない**ので SQLite のファイル自体は縮まず空きページの再利用にとどまる、
+  (3) 実機検証が未実施（→ §2 の U19）。**5.6.0 が retention を引き取るときの申し送りは
+  CONTRACT.md 続報17 の末尾**（run 単位で数える / 終端していない run は触らない /
+  掃除の起動点は tick ではなく終端書き込み）。U19 が済むまでここに残す。
 - **cancel / abandon された run の kickoff が agent の mailbox に未 ack で残り続ける**
   （2026-08-05 発見、→ §6.14）— **2026-08-13、コード上は解消（Stage A-5、→ §6.15 /
   CONTRACT.md 続報15）。実機検証は未実施（→ §2 の U17）なので、U17 が済むまでここに残す。**
@@ -1082,6 +1095,90 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
     意図した挙動だが、実機では未確認。
   - **run 全体の失敗は依然として通知しない。** 入口は step の retry 枯渇 1 つだけで、
     `retry:` を書いていない workflow は red になっても escalation を出さない。
+
+### 6.17 2026-08-13: Stage A-6 — `workflow_runs` に retention を入れる
+
+詳細な経緯。現在地は §1・§2（U19）・§3（バックログ）。
+
+- **直したもの**: `workflow_runs` は `queen.sqlite3` の中で**唯一、件数上限も DELETE も
+  持たない表**だった（pins / notes / inbox_messages は `enforce_limit` を通る）。
+  5.0.1 で表が入って以来、実行した workflow の run 行が**インストールの寿命ぶん単調増加**する。
+  しかもこの表の終端行を読む経路は現時点で**存在しない**（唯一の SELECT は
+  `state = 'running'` で絞る `list_running_workflow_runs`）ので、溜まっているのは
+  **書き込み専用の重さ**である。いま直す実質的な理由は 2 つ: 別ブランチ
+  `feat/schedule-5.0.8`（時刻起動。**本ビルドには入っていない**）が入ると `every: hour`
+  1 本で 24 行/日を無人で積むこと、そして 5.6.0（スキーマ分割）が**太った表を移行する
+  羽目になる**こと。next-implementation-2026-08.md の依存グラフでも
+  A-6 → 5.6.0 → 5.6.1 → 5.6.2 → 5.7.0 がクリティカルパスになっている。
+- **入ったもの**: `queen_store.rs` だけ。定数
+  `MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT = 500` と `TERMINAL_WORKFLOW_STATES`、
+  関数 `is_terminal_workflow_state` / `prune_terminal_workflow_runs` を新設し、
+  `upsert_workflow_run`（終端 snapshot のときだけ）と `mark_workflow_abandoned` から呼ぶ。
+  `orchestrator.rs` / `lib.rs` / frontend / DDL / wire は**すべて無変更**。
+- **設計判断 1: 件数であって日数ではない。** 隣の 3 つ（256 / 10,000 / 50,000）が全部件数で
+  揃っているのに加えて、**日数だけではファイルサイズが有界にならない**（1 日で何百 run でも
+  書ける）。逆に日数だけにすると 1 か月放置したプロジェクトを開いた人が**まさに見たい履歴を
+  全部失う**。件数なら最悪値が決まり、放置では減らない。両方入れる案は、消える条件が 2 つに
+  なるぶん「なぜ消えたか」の説明が難しくなるので採らなかった。
+- **設計判断 2: 500 という数字の根拠。** 2 つの境界から挟んで決めた。**下限は 100** =
+  `orchestrator::REGISTRY_TERMINAL_CAP`（メモリ上の registry が保持する終端 run 数）。
+  永続ストアが揮発ストアより狭いのは背理なので、DB はこれ以上でなければならない。
+  **上限はファイル増加**で、1 行が run 全体の `steps_json` を丸ごと持つため 1 行が重い。
+  **悲観的に 1 KiB/行と置いて 500 行 ≒ 0.5 MiB/project**、隣が許す最悪値
+  （`MAX_NOTES_PER_PROJECT` × `MAX_NOTE_BODY_BYTES` だけで ≒ 640 MiB）に比べれば十分保守的。
+  時間軸では時間起動 ≒ 20 日、日次起動 ≒ 1 年以上に当たる。
+  **ただし 1 KiB は仮定で、実サイズは未実測**（→ 下の「未実測のもの」）。
+- **設計判断 3: 消さない run の条件は「終端していないこと」で、しかも許可リストで書く。**
+  削除対象は `state` が `succeeded` / `failed` / `cancelled` の行だけ。`'running'` の否定では
+  なく明示の許可リストにしたのは、**このビルドが知らない state 値を「まだ生きている」側へ
+  倒す**ため。retention は間違えるなら残す方向に間違えなければならない —
+  誤って消す行は `list_running_workflow_runs` が拾う行、すなわち「再開しますか」バナー
+  （5.0.1）の実体であり、消せばクラッシュからの復帰が**黙って**不可能になるからである。
+  終端していない run は**上限にもカウントしない**ので、履歴が溜まっても生きている run を
+  押し出せず、生きている run が何本あっても履歴の窓は狭まらない。
+  abandon された run は `cancelled` なので削除対象**に含める**（操作者が既に「再開しない」と
+  答えており、`error` の abandon マーカーがそのバナーより長生きする必要は無い）。
+  並び順は `orchestrator::evict_terminal` と同一にした
+  （`COALESCE(ended_at_ms, started_at_ms) DESC, run_id DESC`）。`COALESCE` は防御ではなく必須で、
+  `spawn_workflow` は全 root の spawn に失敗すると **`ended_at_ms` が NULL のまま終端した run**
+  を publish しうる。これを 0 扱いにすると**いちばん新しい run から消える**。
+- **設計判断 4: 走るのは「run が終端に到達した書き込み」だけ。200ms tick には何も足さない。**
+  driver が呼ぶ `upsert_workflow_run` は run が生きている間つねに `state = 'running'` の
+  snapshot なので、**Rust 側の文字列判定を SQL の前に置く**だけで hot path のコストは
+  文字列比較 1 回に収まる（SQL は 1 本も増えない）。run が終端に到達するのは 1 回、
+  かつ `advance_all` はその直後からその run を tick しないので、実際の掃除は
+  **完了 1 run あたり約 1 回**。`mark_workflow_abandoned`（`upsert_workflow_run` を通らない
+  もう 1 つの終端経路）でも同じ関数を呼ぶ。**起動時の一括掃除は入れていない**（下記）。
+- **設計判断 5: `enforce_limit` と違って拒否ではなく削除。** pins / notes / inbox は上限で
+  **書き込みを拒否**する（利用者の要求なので「上限です」と答えられる）が、`workflow_runs` の
+  書き込みは要求ではなく**既に起きたことの記録**（`persist_run`。しかも `Err` を握り潰す）。
+  拒否しても run は止まらず、**その run の永続記録と resume 可能性が黙って消えるだけ**になる。
+- **設計判断 6: project スコープ。** 既存 `enforce_limit` と同じ単位。全体で 1 つの上限に
+  すると、忙しいプロジェクトが静かなプロジェクトの履歴を追い出せてしまう。
+- **`user_version` は消費していない（3 のまま）。** `count(*)` も `DELETE` も絞り込みは
+  `(project_dir, state)` で、これは既存 `workflow_runs_project_state` の先頭 2 列である。
+  §5.1 のとおり **`user_version` 4 は 5.6.0 と 6.0.0 で未決**なので、A-6 はそこに触らない。
+- 検証: `cargo test` **lib 484 → 489 passed / 統合 14 passed / 0 failed**（新規 5 本 —
+  `finished_workflow_runs_past_the_cap_lose_the_oldest_rows_first` /
+  `an_unfinished_workflow_run_survives_any_amount_of_history_written_after_it` /
+  `workflow_run_retention_deletes_nothing_while_the_project_is_under_its_cap` /
+  `workflow_run_retention_gives_every_project_its_own_window` /
+  `abandoning_a_run_prunes_the_history_it_has_just_joined`）。clippy は既存の
+  `config.rs` の `nonminimal_bool` 1 件のみで新規警告ゼロ。frontend 無変更。wire 契約も無変更。
+- **未実測のもの**（推測で埋めないこと）:
+  - **実機検証は一切していない。** 裏づけは unit test 5 本だけで、実機の `queen.sqlite3` が
+    実際に縮むところも、resume バナーが掃除後も出るところも**見ていない** → §2 の U19。
+  - **`steps_json` の 1 行あたりの実サイズは測っていない。** 上限値の導出に使った
+    「悲観的に 1 KiB/行」は**仮定**であり、実測すれば 500 が過大にも過小にもなりうる。
+  - **掃除の所要時間も未計測。** 「完了 1 run あたり `count(*)` 1 回 + 超過時のみ DELETE 1 回」
+    は設計上そうなるというだけで、実機で tick が重くならないことは**確認していない**。
+  - **起動時の一括掃除は入れていない。** A-6 以前のビルドが太らせた DB は、そのプロジェクトで
+    次に run が 1 本終わるまで縮まない（もう run しないプロジェクトなら永久に残る）。
+    既知かつ許容の穴。
+  - **`VACUUM` はしない。** 行は消えるが SQLite のファイルサイズ自体は縮まず、
+    空きページが再利用されるだけである。
+  - **終端 run 行を読む機能は依然として無い。** A-6 は「上限を決めて DELETE を入れる」までで、
+    履歴 UI は 5.6.0 以降の話。したがって**この変更で失われる利用者向けの機能は現時点で無い**。
 
 ---
 
