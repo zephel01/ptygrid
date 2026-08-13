@@ -106,28 +106,52 @@ export type WorkflowDef = {
 };
 
 // Phase 5.0.8 (schedule: 時刻で workflow を起こす)
+export type ScheduleEvery = "day" | "weekday" | "hour";
+
 /** workflows.<name>.schedule。cron 式ではなく限定語彙。 */
 export type Schedule = {
-  every: "day" | "weekday" | "hour";
+  every: ScheduleEvery;
   /** day/weekday は "HH:MM"、hour は "MM"。 */
   at: string;
   enabled?: boolean;
   maxConsecutiveFailures?: number;
 };
 
+/** 見送りの理由。**タグと数値だけ**で、文にはしない(5.0.8 修正)。
+ * backend は英語しか喋れないので、文を組み立てるのは i18n を持つこちら側。 */
+export type ScheduleSkip =
+  | { kind: "overlap" }
+  | { kind: "noRoom"; occupied: number; cap: number; needed: number }
+  | { kind: "late"; lateMinutes: number };
+
+/** 自動停止の理由。いまは 1 種類だが、増えても wire は additive。 */
+export type ScheduleStop = { kind: "consecutiveFailures"; failures: number };
+
+/** 最終実行の結果。spawnFailed だけは run が存在しない(起動そのものが失敗した)
+ * ケースで、error は翻訳できない backend 文字列なので生で来る。 */
+export type ScheduleResult =
+  | { kind: "succeeded" }
+  | { kind: "failed" }
+  | { kind: "cancelled" }
+  | { kind: "spawnFailed"; error: string };
+
 /** list_schedules の返り値。宣言そのものではなく「いま何が起きているか」。
  * next だけでは「健全な予定」と「金曜から動いていない予定」が区別できないので、
  * 最終発火・その結果・見送り理由・自動停止をまとめて持つ。 */
 export type ScheduleView = {
   name: string;
-  summary: string;
+  /** 宣言そのもの。表示文言("毎日 09:00")はこの 2 つから panel が組む。 */
+  every: ScheduleEvery;
+  at: string;
   enabled: boolean;
   nextFireAtMs?: number;
   lastFireAtMs?: number;
-  lastResult?: string;
-  lastSkipReason?: string;
+  lastResult?: ScheduleResult;
+  lastSkipReason?: ScheduleSkip;
   consecutiveFailures: number;
-  stoppedReason?: string;
+  /** 何回連続で失敗したら止まるか。"1/3" と出すために必要。 */
+  maxConsecutiveFailures: number;
+  stoppedReason?: ScheduleStop;
 };
 
 /** ワークフロー全体のライフサイクル。 */

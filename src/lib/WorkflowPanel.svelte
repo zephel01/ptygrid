@@ -68,36 +68,104 @@
    * schedule has no countdown worth reading. The last run's outcome is always
    * appended — a "last run: 3 days ago" next to a healthy-looking "next 09:00"
    * is how a closed laptop shows up here, and there is no other signal for it
-   * (nothing is caught up on launch, by design). */
+   * (nothing is caught up on launch, by design).
+   *
+   * Every word of it is built here (5.0.8 fix M5). `list_schedules` used to
+   * hand over English sentences (`"stopped after 3 consecutive failures"`)
+   * that were printed verbatim, so this line came out half-translated in a
+   * Japanese UI. The backend now sends the declaration and tagged reasons; the
+   * wording lives in `i18n.svelte.ts` on both sides. */
   function scheduleLine(s: ScheduleView): string {
-    const parts: string[] = [s.summary];
+    const parts: string[] = [m.wfScheduleEvery(s.every, s.at)];
     if (!s.enabled) {
       parts.push(m.wfScheduleDisabled);
     } else if (s.stoppedReason) {
-      parts.push(s.stoppedReason);
+      parts.push(stopLabel(s.stoppedReason));
     } else if (s.lastSkipReason) {
-      parts.push(s.lastSkipReason);
+      parts.push(skipLabel(s.lastSkipReason));
     } else if (s.nextFireAtMs !== undefined) {
-      parts.push(m.wfScheduleNext(fmtTime(s.nextFireAtMs), untilLabel(s.nextFireAtMs)));
+      parts.push(m.wfScheduleNext(fmtSchedTime(s.nextFireAtMs), untilLabel(s.nextFireAtMs)));
+    }
+    // A streak that has not yet reached the stop. Shown only while the
+    // schedule is still live, because "1/3" next to "自動停止" would be
+    // saying the same thing twice.
+    if (s.enabled && !s.stoppedReason && s.consecutiveFailures > 0) {
+      parts.push(m.wfScheduleFailureStreak(s.consecutiveFailures, s.maxConsecutiveFailures));
     }
     if (s.lastFireAtMs !== undefined) {
       parts.push(
-        m.wfScheduleLast(fmtStamp(s.lastFireAtMs), s.lastResult ?? m.wfScheduleRunning),
+        m.wfScheduleLast(
+          fmtSchedStamp(s.lastFireAtMs),
+          s.lastResult ? resultLabel(s.lastResult) : m.wfScheduleRunning,
+        ),
       );
     }
     return parts.join(" · ");
   }
 
-  /** "in 3h 20m" — rounded to the minute, which is the resolution the
-   * schedule vocabulary has. */
-  function untilLabel(atMs: number): string {
-    const left = Math.max(0, atMs - Date.now());
-    return formatDurationMs(left) ?? "0s";
+  function skipLabel(skip: NonNullable<ScheduleView["lastSkipReason"]>): string {
+    switch (skip.kind) {
+      case "overlap":
+        return m.wfScheduleSkipOverlap;
+      case "noRoom":
+        return m.wfScheduleSkipNoRoom(skip.occupied, skip.cap, skip.needed);
+      case "late":
+        return m.wfScheduleSkipLate(skip.lateMinutes);
+    }
   }
 
-  function fmtStamp(ms: number): string {
+  function stopLabel(stop: NonNullable<ScheduleView["stoppedReason"]>): string {
+    return m.wfScheduleStopped(stop.failures);
+  }
+
+  function resultLabel(result: NonNullable<ScheduleView["lastResult"]>): string {
+    switch (result.kind) {
+      case "succeeded":
+        return m.wfScheduleResultSucceeded;
+      case "failed":
+        return m.wfScheduleResultFailed;
+      case "cancelled":
+        return m.wfScheduleResultCancelled;
+      case "spawnFailed":
+        return m.wfScheduleResultSpawnFailed(result.error);
+    }
+  }
+
+  /** "3 時間 20 分" / "3h 20m" — rounded to the minute, which is the
+   * resolution the schedule vocabulary has. Deliberately not
+   * `formatDurationMs`: that one is for step timings and its "3h 20m" has no
+   * translated form. */
+  function untilLabel(atMs: number): string {
+    const minutes = Math.round(Math.max(0, atMs - Date.now()) / 60_000);
+    return m.wfScheduleUntil(Math.floor(minutes / 60), minutes % 60);
+  }
+
+  /** The last fire, to the minute. A schedule cannot resolve finer, and
+   * seconds would only make the line longer. */
+  function fmtSchedStamp(ms: number): string {
     try {
-      return new Date(ms).toLocaleString();
+      return new Date(ms).toLocaleString(undefined, {
+        month: "numeric",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return String(ms);
+    }
+  }
+
+  /** The next fire. Carries the date whenever it is not today, so "next 09:00"
+   * no longer leaves "today or tomorrow?" to be inferred from the countdown. */
+  function fmtSchedTime(ms: number): string {
+    try {
+      const d = new Date(ms);
+      const sameDay = d.toDateString() === new Date().toDateString();
+      return d.toLocaleString(undefined, {
+        ...(sameDay ? {} : { month: "numeric", day: "numeric" }),
+        hour: "2-digit",
+        minute: "2-digit",
+      });
     } catch {
       return String(ms);
     }
