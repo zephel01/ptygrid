@@ -98,8 +98,36 @@ export type WorkflowDef = {
   onFailure?: OnFailure;
   /** fan-out ワークフロー起動時に Arena drawer を開く(Phase 5.0.5 予定、parse のみ)。 */
   arena?: boolean;
-  /** step ペインの終了時自動クローズ(agent 定義より優先)。既定 never。 */
+  /** step ペインの終了時自動クローズ(agent 定義より優先)。既定 never。
+   * ただし schedule を持つ workflow は既定が success になる(5.0.8)。 */
   autoClose?: AutoCloseMode;
+  /** 時刻で自分を起動する宣言(5.0.8)。アプリが起動している間だけ発火する。 */
+  schedule?: Schedule;
+};
+
+// Phase 5.0.8 (schedule: 時刻で workflow を起こす)
+/** workflows.<name>.schedule。cron 式ではなく限定語彙。 */
+export type Schedule = {
+  every: "day" | "weekday" | "hour";
+  /** day/weekday は "HH:MM"、hour は "MM"。 */
+  at: string;
+  enabled?: boolean;
+  maxConsecutiveFailures?: number;
+};
+
+/** list_schedules の返り値。宣言そのものではなく「いま何が起きているか」。
+ * next だけでは「健全な予定」と「金曜から動いていない予定」が区別できないので、
+ * 最終発火・その結果・見送り理由・自動停止をまとめて持つ。 */
+export type ScheduleView = {
+  name: string;
+  summary: string;
+  enabled: boolean;
+  nextFireAtMs?: number;
+  lastFireAtMs?: number;
+  lastResult?: string;
+  lastSkipReason?: string;
+  consecutiveFailures: number;
+  stoppedReason?: string;
 };
 
 /** ワークフロー全体のライフサイクル。 */

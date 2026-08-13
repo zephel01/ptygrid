@@ -618,6 +618,83 @@ pub enum OnEach {
     Reply,
 }
 
+/// Phase 5.0.8: when a workflow starts itself.
+///
+/// Deliberately NOT a cron expression. The people this exists for are the ones
+/// who cannot write `0 9 * * *` — an engineer early in their career, or someone
+/// who arrived at development through vibe coding and has never touched a
+/// crontab. For them the OS scheduler is not a fallback, it is a wall: the
+/// syntax, then a PATH that does not match their interactive shell (so `claude`
+/// is not found), then output that goes nowhere so the failure is silent.
+///
+/// Three vocabularies, and the fact that nothing else can be written is the
+/// feature. A free-form string carries typos to runtime; a struct lets serde
+/// reject `every: dayly` at load and `validate_workflows` reject `at: "9時"`
+/// right beside it. See docs/spec/spec-schedule-5.0.8.md §3.2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Schedule {
+    pub every: Every,
+    /// `"HH:MM"` for `day`/`weekday`, `"MM"` for `hour`. Validated below.
+    pub at: String,
+    /// Default true. Written by hand to park a schedule without deleting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Consecutive failures that stop the schedule (default 3). The stop is
+    /// runtime state and is NEVER written back here — ptygrid does not edit
+    /// the user's config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consecutive_failures: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Every {
+    /// Once a day, at `at`.
+    Day,
+    /// Once a day Monday to Friday, at `at`.
+    Weekday,
+    /// Once an hour, at minute `at`.
+    Hour,
+}
+
+impl Schedule {
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn effective_max_consecutive_failures(&self) -> u32 {
+        self.max_consecutive_failures.unwrap_or(3)
+    }
+
+    /// `(hour, minute)` in local time. `hour` is `None` for `every: hour`,
+    /// which only pins the minute. Returns `None` for a malformed `at`, which
+    /// `validate_workflows` has already rejected — callers treat that as
+    /// "never fires" rather than panicking, because the config can be edited
+    /// under a running app.
+    pub fn hour_minute(&self) -> Option<(Option<u32>, u32)> {
+        let at = self.at.trim();
+        match self.every {
+            Every::Hour => at.parse::<u32>().ok().filter(|m| *m < 60).map(|m| (None, m)),
+            Every::Day | Every::Weekday => {
+                let (h, m) = at.split_once(':')?;
+                let h = h.parse::<u32>().ok().filter(|h| *h < 24)?;
+                let m = m.parse::<u32>().ok().filter(|m| *m < 60)?;
+                Some((Some(h), m))
+            }
+        }
+    }
+
+    /// One-line human summary for the panel ("every day 09:00").
+    pub fn summary(&self) -> String {
+        match self.every {
+            Every::Day => format!("every day {}", self.at.trim()),
+            Every::Weekday => format!("every weekday {}", self.at.trim()),
+            Every::Hour => format!("every hour :{}", self.at.trim()),
+        }
+    }
+}
+
 /// Phase 5.0: one workflow declaration. See docs/spec/spec-phase5-0.md §2.1.
 /// Field naming is camelCase in YAML (aligned with existing `spawn_agent` and
 /// `spawn_team` conventions) — `depends_on` here maps to `dependsOn` in YAML.
@@ -642,6 +719,12 @@ pub struct WorkflowDef {
     /// above). Wire: `autoClose` (WorkflowDef is `rename_all = "camelCase"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_close: Option<AutoCloseMode>,
+    /// Phase 5.0.8: start this workflow on a clock instead of waiting for a ▶
+    /// or an MCP `spawn_workflow`. Fires only while the app is running —
+    /// nothing is caught up on launch, which is a contract, not a limitation
+    /// (spec-schedule-5.0.8 §3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
 }
 
 /// Phase 5.0.4: per-step retry policy. `max` bounds the number of restart
@@ -776,6 +859,33 @@ fn validate_workflows(config: &Config) -> Result<(), String> {
         }
         if wf.steps.is_empty() {
             return Err(format!("{ctx}: steps must not be empty"));
+        }
+        // ---- Phase 5.0.8 `schedule:` (spec-schedule-5.0.8 §4.2).
+        // S1 is serde's job: `every` only accepts day/weekday/hour, so a typo
+        // never reaches here. S2 and S3 are what is left.
+        if let Some(schedule) = &wf.schedule {
+            if schedule.hour_minute().is_none() {
+                let expected = match schedule.every {
+                    Every::Hour => "a minute of the hour, \"MM\" (00-59)",
+                    Every::Day | Every::Weekday => "a time of day, \"HH:MM\" (00:00-23:59)",
+                };
+                return Err(format!(
+                    "{ctx}: schedule.at '{}' is not {expected}; \
+                     with every: {} it must be written that way",
+                    schedule.at,
+                    match schedule.every {
+                        Every::Day => "day",
+                        Every::Weekday => "weekday",
+                        Every::Hour => "hour",
+                    }
+                ));
+            }
+            let max = schedule.effective_max_consecutive_failures();
+            if !(1..=10).contains(&max) {
+                return Err(format!(
+                    "{ctx}: schedule.maxConsecutiveFailures ({max}) must be between 1 and 10"
+                ));
+            }
         }
         // Step id uniqueness + agent allowlist.
         let mut ids: Vec<&str> = Vec::with_capacity(wf.steps.len());
@@ -1583,10 +1693,37 @@ pub struct ConfigInfo {
 /// `team_presets:` block is validated here too, so every load path (file,
 /// reload, tests) gets the same guarantees.
 pub fn parse_config(text: &str) -> Result<Config, String> {
-    let config: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
+    let mut config: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
     validate_team_presets(&config)?;
     validate_workflows(&config)?;
+    apply_schedule_defaults(&mut config);
     Ok(config)
+}
+
+/// Phase 5.0.8: a scheduled workflow closes its panes on success unless the
+/// author said otherwise.
+///
+/// The ordinary default is `never`, which is right for a run a human launched
+/// and is watching. It is wrong for one that starts at 09:00 every day: the
+/// panes from Monday are still on the grid on Tuesday, the grid is full, and
+/// Tuesday's fire is skipped for want of a slot. "Yesterday succeeded, so
+/// today did not run" is the hardest shape of this feature to explain, so the
+/// default is flipped where it applies rather than left as a footnote in the
+/// docs.
+///
+/// Applied here, after validation, rather than at read time so that everything
+/// downstream — including the frontend, which decides auto-close from the
+/// config it is handed — sees one answer. An explicit `autoClose:` always
+/// wins; the declaration beats the default.
+fn apply_schedule_defaults(config: &mut Config) {
+    let Some(workflows) = config.workflows.as_mut() else {
+        return;
+    };
+    for wf in workflows.values_mut() {
+        if wf.schedule.is_some() && wf.auto_close.is_none() {
+            wf.auto_close = Some(AutoCloseMode::Success);
+        }
+    }
 }
 
 /// Expand `${VAR}` occurrences in a value using the host environment.
@@ -4211,6 +4348,52 @@ agents:
         let summary = wf.steps.iter().find(|s| s.id == "summary").unwrap();
         assert!(summary.on_each.is_none());
         assert_eq!(summary.depends_on.as_deref(), Some(&["reviewer".to_string()][..]));
+    }
+
+    /// `example/scheduled-review/ptygrid.yml` — the 5.0.8 sample — must load
+    /// through the real `parse_config`. It is the one sample aimed at somebody
+    /// who cannot write a crontab, so a config that only fails at load time
+    /// would fail them at the worst possible moment: unattended, at 09:00.
+    ///
+    /// The assertions are the four things the sample promises in its own
+    /// comments, each of which it would be free to drift away from.
+    #[test]
+    fn example_scheduled_review_config_parses() {
+        let text = include_str!("../../example/scheduled-review/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/scheduled-review must parse");
+
+        assert_eq!(
+            cfg.queen.as_ref().and_then(|q| q.enabled),
+            Some(true),
+            "the kickoff travels through the durable inbox"
+        );
+        let wf = cfg
+            .workflows
+            .as_ref()
+            .expect("workflows block")
+            .get("scheduled-review")
+            .expect("the sample's workflow");
+
+        let schedule = wf.schedule.as_ref().expect("the sample is about schedule:");
+        assert_eq!(schedule.every, Every::Day);
+        assert_eq!(schedule.hour_minute(), Some((Some(9), 0)));
+        assert!(schedule.effective_enabled());
+
+        assert_eq!(
+            wf.auto_close,
+            Some(AutoCloseMode::Success),
+            "the sample says autoClose need not be written; that only holds if \
+             the schedule default actually applies"
+        );
+        assert!(
+            wf.steps[0].timeout_ms.is_some(),
+            "an unattended step with no timeout can sit until morning"
+        );
+        let kickoff = wf.steps[0].kickoff.as_deref().unwrap_or_default();
+        assert!(
+            kickoff.contains("reply_inbox"),
+            "joinOn: reply completes on a reply, so the kickoff has to ask for one"
+        );
     }
 
 }

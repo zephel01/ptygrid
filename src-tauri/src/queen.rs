@@ -35,9 +35,12 @@ use crate::token_store::TokenHandle;
 /// Contract default port; fallback +1 each up to DEFAULT_PORT+9 (39246).
 pub const DEFAULT_PORT: u16 = 39237;
 const PORT_TRIES: u16 = 10;
-/// PTY size for sessions spawned by Queen (frontend resizes on pane attach).
-const QUEEN_SPAWN_COLS: u16 = 120;
-const QUEEN_SPAWN_ROWS: u16 = 30;
+/// PTY size for sessions spawned without a UI call site to take one from —
+/// Queen's own tools, and (5.0.8) the workflow scheduler, which has the same
+/// problem for the same reason. The frontend resizes on pane attach, so this
+/// only has to be sane rather than right.
+pub(crate) const QUEEN_SPAWN_COLS: u16 = 120;
+pub(crate) const QUEEN_SPAWN_ROWS: u16 = 30;
 
 // ---------- status (managed state + queen_status command payload) ----------
 

@@ -17,14 +17,16 @@
 // This module is kept OUTSIDE `lib.rs` and outside the session hot path per
 // release discipline (phase3.md).
 
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 
 use crate::agent_status::AgentStatus;
 use crate::config::{
-    ConfigManager, JoinOn, JoinOnName, OnFailure, WorkflowDef, WorkflowPattern, WorkflowStep,
+    ConfigManager, Every, JoinOn, JoinOnName, OnFailure, Schedule, WorkflowDef, WorkflowPattern,
+    WorkflowStep,
 };
 use crate::queen_store::QueenStore;
 use crate::session::{PtyManager, SessionState};
@@ -4544,6 +4546,471 @@ fn spawn_status_listener<R: Runtime>(app: &AppHandle<R>, view: Arc<StatusView>) 
 const DRIVER_TICK_MS: u64 = 200;
 const DRIVER_TICK: std::time::Duration = std::time::Duration::from_millis(DRIVER_TICK_MS);
 
+// -----------------------------------------------------------------------------
+// Phase 5.0.8: schedules — starting a workflow on a clock
+// -----------------------------------------------------------------------------
+
+// Pane geometry for a run nobody launched by hand. Borrowed from the Queen
+// MCP path, which had the same problem first: `spawn_workflow` wants cols and
+// rows and a scheduler has no UI call site to take them from. A second
+// constant would only be a second thing to keep in step.
+use crate::queen::{QUEEN_SPAWN_COLS, QUEEN_SPAWN_ROWS};
+
+/// What the panel needs to show about one schedule, and the only thing the new
+/// Tauri command returns. Read-only: nothing here is an input.
+///
+/// Every field exists to answer "why did nothing happen?", which is the
+/// question this feature has to keep answerable. A schedule that is simply not
+/// firing — because the app was closed all weekend, because yesterday's run is
+/// still going, because the grid is full — must never look the same as one
+/// that is working.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleView {
+    pub name: String,
+    /// Human summary of the declaration ("every day 09:00").
+    pub summary: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fire_at_ms: Option<u64>,
+    /// Terminal state of the last run this schedule started, lowercase
+    /// (`succeeded` / `failed` / `cancelled`), or `None` if it has not
+    /// finished — or was evicted from the registry before anyone looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// Why the most recent due time did not produce a run. Cleared by the next
+    /// successful fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_skip_reason: Option<String>,
+    pub consecutive_failures: u32,
+    /// Set when the schedule stopped itself; the string is the reason shown to
+    /// the operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
+}
+
+/// Per-schedule bookkeeping. In memory only.
+///
+/// Deliberately not persisted, with one consequence stated up front: a
+/// schedule that stopped itself after three failures starts again from zero
+/// when the app restarts. Persisting it means either a new table or a
+/// `user_version` bump, and Phase 5.5.1 already has plans for that column of
+/// the schema — spending it here, on a counter, would be premature. The cost
+/// is bounded (three more attempts after a restart) and visible (the panel
+/// shows the count).
+#[derive(Debug, Clone)]
+struct ScheduleState {
+    summary: String,
+    enabled: bool,
+    max_consecutive_failures: u32,
+    next_fire_at_ms: Option<u64>,
+    last_fire_at_ms: Option<u64>,
+    last_result: Option<String>,
+    last_skip_reason: Option<String>,
+    consecutive_failures: u32,
+    stopped_reason: Option<String>,
+    /// Run started by this schedule whose outcome has not been counted yet.
+    pending_run_id: Option<String>,
+}
+
+/// The live schedule table, rebuilt whenever the declarations change.
+#[derive(Default)]
+pub struct ScheduleRegistry {
+    inner: Mutex<ScheduleInner>,
+}
+
+#[derive(Default)]
+struct ScheduleInner {
+    /// Cheap identity of the declarations the table was built from. When this
+    /// changes the table is rebuilt — which is how editing `ptygrid.yml` under
+    /// a running app takes effect.
+    fingerprint: String,
+    states: HashMap<String, ScheduleState>,
+}
+
+impl ScheduleRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScheduleInner> {
+        match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Snapshot for the panel, in declaration-independent (sorted) order so
+    /// the list does not reshuffle between polls.
+    pub fn view(&self) -> Vec<ScheduleView> {
+        let inner = self.lock();
+        let mut out: Vec<ScheduleView> = inner
+            .states
+            .iter()
+            .map(|(name, s)| ScheduleView {
+                name: name.clone(),
+                summary: s.summary.clone(),
+                enabled: s.enabled,
+                next_fire_at_ms: s.next_fire_at_ms,
+                last_fire_at_ms: s.last_fire_at_ms,
+                last_result: s.last_result.clone(),
+                last_skip_reason: s.last_skip_reason.clone(),
+                consecutive_failures: s.consecutive_failures,
+                stopped_reason: s.stopped_reason.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+}
+
+/// Identity of the current set of declarations. Rebuilding on a change of this
+/// string is what makes an edit to `ptygrid.yml` take effect without a
+/// restart, and what makes an unrelated edit NOT reset the failure counters.
+fn schedule_fingerprint(workflows: &BTreeMap<String, WorkflowDef>) -> String {
+    let mut out = String::new();
+    for (name, wf) in workflows {
+        let Some(s) = &wf.schedule else { continue };
+        out.push_str(name);
+        out.push('\u{1}');
+        out.push_str(&s.summary());
+        out.push('\u{1}');
+        out.push_str(if s.effective_enabled() { "on" } else { "off" });
+        out.push('\u{1}');
+        out.push_str(&s.effective_max_consecutive_failures().to_string());
+        out.push('\u{2}');
+    }
+    out
+}
+
+/// The next local instant matching `schedule` that is STRICTLY after `now`.
+///
+/// Pure: no clock, no config, no store, so the part of this feature most
+/// likely to be wrong is the part that is exhaustively testable. Same posture
+/// as `mod retry` / `mod condition` / `mod verdict`.
+///
+/// Strictly after, never equal, and that is load-bearing rather than a
+/// rounding preference: the table is rebuilt every time `ptygrid.yml` is
+/// saved, so a `>=` here would fire the moment somebody saves the file during
+/// the minute they just typed into it. Editing a config must never launch
+/// anything.
+///
+/// Two daylight-saving edges are decided rather than left to the platform,
+/// because "once a day" has to survive both:
+///
+/// - **The hour that does not exist** (spring forward, 02:30 on the day the
+///   clock jumps 02:00 → 03:00): fire at the first instant that does exist
+///   after the gap.
+/// - **The hour that happens twice** (autumn back): fire on the FIRST of the
+///   two, so the day gets one run rather than two.
+///
+/// `None` when `at` cannot be parsed. Validation rejects that at load, so it
+/// only happens if the file was edited under a running app; the caller treats
+/// it as "this schedule does not fire" rather than panicking.
+fn next_fire_at(schedule: &Schedule, now: DateTime<Local>) -> Option<DateTime<Local>> {
+    let (hour, minute) = schedule.hour_minute()?;
+    // Walk forward one candidate at a time. Bounded by 8 days of hours, which
+    // covers `weekday` crossing a weekend with room to spare; a loop that
+    // cannot terminate is not worth the cleverness of closed-form arithmetic
+    // over four cases and two DST edges.
+    let mut probe = now;
+    for _ in 0..(24 * 8) {
+        let candidate_naive = match hour {
+            Some(h) => probe.date_naive().and_hms_opt(h, minute, 0)?,
+            None => probe.date_naive().and_hms_opt(probe.hour(), minute, 0)?,
+        };
+        if let Some(candidate) = resolve_local(candidate_naive) {
+            let weekday_ok = match schedule.every {
+                Every::Weekday => !matches!(
+                    candidate.weekday(),
+                    chrono::Weekday::Sat | chrono::Weekday::Sun
+                ),
+                Every::Day | Every::Hour => true,
+            };
+            if weekday_ok && candidate > now {
+                return Some(candidate);
+            }
+        }
+        probe = match schedule.every {
+            // Advance a whole day for the daily forms; the time of day is
+            // fixed, so the next opportunity is tomorrow.
+            Every::Day | Every::Weekday => probe
+                .date_naive()
+                .succ_opt()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .and_then(resolve_local)?,
+            // And an hour for the hourly one.
+            Every::Hour => probe + ChronoDuration::hours(1),
+        };
+    }
+    None
+}
+
+/// Turn a wall-clock reading into an instant, resolving both DST edges the way
+/// `next_fire_at`'s doc comment promises. `None` only if the search for the
+/// far side of a gap runs out of room, which cannot happen for a real zone.
+fn resolve_local(naive: chrono::NaiveDateTime) -> Option<DateTime<Local>> {
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(t) => Some(t),
+        // Ambiguous: the clock ran over this reading twice. Take the earlier
+        // instant so the day gets one run, not two.
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        // Nonexistent: the clock skipped this reading. Step forward a minute
+        // at a time to the first instant on the far side of the gap.
+        chrono::LocalResult::None => {
+            let mut probe = naive;
+            for _ in 0..180 {
+                probe += ChronoDuration::minutes(1);
+                if let chrono::LocalResult::Single(t) = Local.from_local_datetime(&probe) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Slots a schedule's fire would need on the grid right now.
+///
+/// Counts every root copy, ignoring the pane-reuse a singular step might get.
+/// Over-counting defers a fire by one interval; under-counting starts a run
+/// that then sits `Pending` until `WORKFLOW_DEFER_MAX_MS` fails it, which is
+/// the outcome this whole check exists to avoid. Erring high is the cheap
+/// mistake.
+fn schedule_slots_needed(wf: &WorkflowDef) -> usize {
+    root_steps(wf)
+        .into_iter()
+        .map(|step| copies_for(wf.pattern, step))
+        .sum()
+}
+
+/// One scheduler tick: count what finished, then fire what is due.
+///
+/// Runs BEFORE `advance_all` in the driver loop so a run started here is
+/// carried forward by the same tick that created it — otherwise a scheduled
+/// run would spend its first 200ms visibly doing nothing, which is one more
+/// state an operator would have to be taught to ignore.
+///
+/// Returns whether anything changed, purely so tests can assert on it; the
+/// driver ignores the value.
+fn tick_schedules<R: Runtime>(
+    app: &AppHandle<R>,
+    manager: &PtyManager,
+    config: &ConfigManager,
+    store: &QueenStore,
+    registry: &WorkflowRegistry,
+    schedules: &ScheduleRegistry,
+    now: DateTime<Local>,
+) -> bool {
+    let Some((cfg, _dir)) = config.current() else {
+        return false;
+    };
+    let Some(workflows) = cfg.workflows.as_ref() else {
+        // No workflows at all: drop any table we were holding so the panel
+        // does not show schedules the config no longer declares.
+        let mut inner = schedules.lock();
+        let had = !inner.states.is_empty();
+        inner.states.clear();
+        inner.fingerprint.clear();
+        return had;
+    };
+    let now_ms_val = now.timestamp_millis().max(0) as u64;
+    let mut changed = false;
+
+    // ---- rebuild the table if the declarations moved
+    let fingerprint = schedule_fingerprint(workflows);
+    {
+        let mut inner = schedules.lock();
+        if inner.fingerprint != fingerprint {
+            let mut states: HashMap<String, ScheduleState> = HashMap::new();
+            for (name, wf) in workflows {
+                let Some(schedule) = &wf.schedule else { continue };
+                // Counters survive a rebuild only for a schedule whose own
+                // declaration is unchanged; the fingerprint covers every
+                // schedule, so an edit to one resets none of the others'
+                // history beyond what actually changed.
+                let previous = inner.states.get(name);
+                states.insert(
+                    name.clone(),
+                    ScheduleState {
+                        summary: schedule.summary(),
+                        enabled: schedule.effective_enabled(),
+                        max_consecutive_failures: schedule
+                            .effective_max_consecutive_failures(),
+                        // Strictly after `now`, so saving the file inside the
+                        // minute it names does not fire it.
+                        next_fire_at_ms: next_fire_at(schedule, now)
+                            .map(|t| t.timestamp_millis().max(0) as u64),
+                        last_fire_at_ms: previous.and_then(|p| p.last_fire_at_ms),
+                        last_result: previous.and_then(|p| p.last_result.clone()),
+                        last_skip_reason: previous.and_then(|p| p.last_skip_reason.clone()),
+                        consecutive_failures: previous
+                            .map(|p| p.consecutive_failures)
+                            .unwrap_or(0),
+                        stopped_reason: previous.and_then(|p| p.stopped_reason.clone()),
+                        pending_run_id: previous.and_then(|p| p.pending_run_id.clone()),
+                    },
+                );
+            }
+            inner.fingerprint = fingerprint;
+            inner.states = states;
+            changed = true;
+        }
+    }
+
+    // ---- count the outcome of anything this scheduler started
+    {
+        let mut inner = schedules.lock();
+        for state in inner.states.values_mut() {
+            let Some(run_id) = state.pending_run_id.clone() else {
+                continue;
+            };
+            let Some(run) = registry.get(&run_id) else {
+                // Evicted by REGISTRY_TERMINAL_CAP before anyone looked. Not
+                // counted either way: guessing "failure" would stop a healthy
+                // schedule on a bookkeeping detail.
+                state.pending_run_id = None;
+                changed = true;
+                continue;
+            };
+            let outcome = match run.state {
+                WorkflowState::Succeeded => Some(("succeeded", false)),
+                WorkflowState::Failed => Some(("failed", true)),
+                WorkflowState::Cancelled => Some(("cancelled", false)),
+                WorkflowState::Running | WorkflowState::Pending => None,
+            };
+            let Some((label, is_failure)) = outcome else {
+                continue;
+            };
+            state.pending_run_id = None;
+            state.last_result = Some(label.to_string());
+            if is_failure {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if state.consecutive_failures >= state.max_consecutive_failures {
+                    state.stopped_reason = Some(format!(
+                        "stopped after {} consecutive failures",
+                        state.consecutive_failures
+                    ));
+                }
+            } else {
+                // A cancel is not a failure — the operator did it on purpose —
+                // and it does not clear the streak either. Only a success does.
+                if label == "succeeded" {
+                    state.consecutive_failures = 0;
+                }
+            }
+            changed = true;
+        }
+    }
+
+    // ---- fire what is due
+    let due: Vec<String> = {
+        let inner = schedules.lock();
+        inner
+            .states
+            .iter()
+            .filter(|(_, s)| {
+                s.enabled
+                    && s.stopped_reason.is_none()
+                    && s.next_fire_at_ms.is_some_and(|t| t <= now_ms_val)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    for name in due {
+        let Some(wf) = workflows.get(&name) else {
+            continue;
+        };
+        // A run of this workflow that has not finished. Firing anyway would
+        // multiply against the 9-pane cap — an hourly schedule over an
+        // hour-long run reaches three concurrent runs by lunchtime — so the
+        // fire is dropped instead of queued.
+        let overlapping = registry
+            .active_run_ids()
+            .into_iter()
+            .filter_map(|id| registry.get(&id))
+            .any(|run| run.name == name);
+        let skip = if overlapping {
+            Some("skipped: the previous run has not finished".to_string())
+        } else {
+            // Checked BEFORE spawning rather than after. Left to the ordinary
+            // path, a fire onto a full grid produces a run that sits Pending
+            // for WORKFLOW_DEFER_MAX_MS and then goes red — "it started by
+            // itself and failed by itself" is the least explainable thing this
+            // feature could do.
+            let needed = schedule_slots_needed(wf);
+            let budget = pane_budget(manager);
+            if needed > budget {
+                Some(format!(
+                    "skipped: the grid had no room ({}/{} occupied, {needed} needed)",
+                    WORKFLOW_SESSION_CAP.saturating_sub(budget),
+                    WORKFLOW_SESSION_CAP
+                ))
+            } else {
+                None
+            }
+        };
+
+        let fired = if skip.is_none() {
+            Some(spawn_workflow(
+                app,
+                manager,
+                config,
+                store,
+                registry,
+                &name,
+                QUEEN_SPAWN_COLS,
+                QUEEN_SPAWN_ROWS,
+            ))
+        } else {
+            None
+        };
+
+        let mut inner = schedules.lock();
+        let Some(state) = inner.states.get_mut(&name) else {
+            continue;
+        };
+        match (skip, fired) {
+            (Some(reason), _) => state.last_skip_reason = Some(reason),
+            (None, Some(Ok(run))) => {
+                state.last_skip_reason = None;
+                state.last_fire_at_ms = Some(now_ms_val);
+                state.last_result = None;
+                state.pending_run_id = Some(run.run_id);
+            }
+            (None, Some(Err(err))) => {
+                // A spawn that never got off the ground counts as a failure:
+                // it is exactly the case the stop exists for (a workflow name
+                // that no longer resolves, an agent removed from the config).
+                state.last_skip_reason = None;
+                state.last_fire_at_ms = Some(now_ms_val);
+                state.last_result = Some(format!("failed: {err}"));
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if state.consecutive_failures >= state.max_consecutive_failures {
+                    state.stopped_reason = Some(format!(
+                        "stopped after {} consecutive failures",
+                        state.consecutive_failures
+                    ));
+                }
+            }
+            (None, None) => {}
+        }
+        // Whether it fired or was skipped, the clock moves on. A skipped fire
+        // is never retried before the next scheduled time — retrying would
+        // turn a full grid into a spin.
+        state.next_fire_at_ms = workflows
+            .get(&name)
+            .and_then(|wf| wf.schedule.as_ref())
+            .and_then(|s| next_fire_at(s, now))
+            .map(|t| t.timestamp_millis().max(0) as u64);
+        changed = true;
+    }
+
+    changed
+}
+
 /// The driver's background loop: forever, sleep one tick then advance every
 /// non-terminal run. Fetches managed state fresh every tick (same
 /// `app.state::<T>()` pattern as `resource_monitor::start`), so it always
@@ -4556,6 +5023,19 @@ fn driver_loop<R: Runtime>(app: &AppHandle<R>, view: &StatusView) {
         let config = app.state::<ConfigManager>();
         let store = app.state::<QueenStore>();
         let registry = app.state::<WorkflowRegistry>();
+        // Phase 5.0.8, BEFORE `advance_all`: a run this tick starts is carried
+        // forward by the same tick, so a scheduled run is indistinguishable
+        // from one somebody pressed ▶ on.
+        let schedules = app.state::<ScheduleRegistry>();
+        tick_schedules(
+            app,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            Local::now(),
+        );
         advance_all(app, &manager, &config, &store, &registry, view);
     }
 }
@@ -10199,6 +10679,409 @@ workflows:
             StepState::Running,
             "traffic on the shared agent mailbox cannot complete a copy"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    // ---- Phase 5.0.8: schedules.
+    // The clock arithmetic is where this feature will be wrong if it is wrong,
+    // and it is a pure function, so it gets the weight. `Local` is whatever the
+    // test host is set to; every assertion below is written to hold in any
+    // zone, and the DST edges are checked through `resolve_local` rather than
+    // by pinning a zone the CI machine may not have.
+
+    fn sched(every: Every, at: &str) -> Schedule {
+        Schedule {
+            every,
+            at: at.to_string(),
+            enabled: None,
+            max_consecutive_failures: None,
+        }
+    }
+
+    fn local_at(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> DateTime<Local> {
+        resolve_local(
+            chrono::NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(hh, mm, 0)
+                .unwrap(),
+        )
+        .expect("fixture instant must exist in the host zone")
+    }
+
+    #[test]
+    fn next_fire_at_daily_moves_to_tomorrow_once_today_has_passed() {
+        let s = sched(Every::Day, "09:00");
+        // Before today's time: today.
+        let morning = local_at(2026, 8, 5, 7, 30);
+        let next = next_fire_at(&s, morning).unwrap();
+        assert_eq!((next.hour(), next.minute()), (9, 0));
+        assert_eq!(next.date_naive(), morning.date_naive());
+        // After it: tomorrow, same clock time.
+        let evening = local_at(2026, 8, 5, 21, 0);
+        let next = next_fire_at(&s, evening).unwrap();
+        assert_eq!((next.hour(), next.minute()), (9, 0));
+        assert_eq!(
+            next.date_naive(),
+            evening.date_naive().succ_opt().unwrap(),
+            "a time already past today belongs to tomorrow"
+        );
+    }
+
+    #[test]
+    fn next_fire_at_is_strictly_after_now() {
+        // The reason this matters is not tidiness. The schedule table is
+        // rebuilt every time ptygrid.yml is saved, so an inclusive comparison
+        // would launch the workflow the instant somebody saved the file during
+        // the very minute they had just typed into it.
+        let s = sched(Every::Day, "09:00");
+        let exactly = local_at(2026, 8, 5, 9, 0);
+        let next = next_fire_at(&s, exactly).unwrap();
+        assert!(next > exactly);
+        assert_eq!(
+            next.date_naive(),
+            exactly.date_naive().succ_opt().unwrap(),
+            "saving the config at 09:00 must not fire 09:00"
+        );
+    }
+
+    #[test]
+    fn next_fire_at_weekday_skips_the_weekend() {
+        let s = sched(Every::Weekday, "09:00");
+        // 2026-08-07 is a Friday.
+        let friday_evening = local_at(2026, 8, 7, 20, 0);
+        assert_eq!(friday_evening.weekday(), chrono::Weekday::Fri);
+        let next = next_fire_at(&s, friday_evening).unwrap();
+        assert_eq!(next.weekday(), chrono::Weekday::Mon);
+        assert_eq!((next.hour(), next.minute()), (9, 0));
+
+        // And from inside the weekend it still lands on Monday.
+        let sunday = local_at(2026, 8, 9, 12, 0);
+        assert_eq!(sunday.weekday(), chrono::Weekday::Sun);
+        assert_eq!(
+            next_fire_at(&s, sunday).unwrap().weekday(),
+            chrono::Weekday::Mon
+        );
+    }
+
+    #[test]
+    fn next_fire_at_hourly_crosses_the_hour_and_the_day() {
+        let s = sched(Every::Hour, "05");
+        let before = local_at(2026, 8, 5, 14, 2);
+        let next = next_fire_at(&s, before).unwrap();
+        assert_eq!((next.hour(), next.minute()), (14, 5));
+
+        let after = local_at(2026, 8, 5, 14, 30);
+        let next = next_fire_at(&s, after).unwrap();
+        assert_eq!((next.hour(), next.minute()), (15, 5));
+
+        // Last hour of the day rolls the date over.
+        let late = local_at(2026, 8, 5, 23, 40);
+        let next = next_fire_at(&s, late).unwrap();
+        assert_eq!((next.hour(), next.minute()), (0, 5));
+        assert_eq!(next.date_naive(), late.date_naive().succ_opt().unwrap());
+    }
+
+    #[test]
+    fn next_fire_at_crosses_month_and_year_boundaries() {
+        let s = sched(Every::Day, "09:00");
+        let month_end = local_at(2026, 8, 31, 23, 0);
+        let next = next_fire_at(&s, month_end).unwrap();
+        assert_eq!((next.month(), next.day()), (9, 1));
+
+        let year_end = local_at(2026, 12, 31, 23, 0);
+        let next = next_fire_at(&s, year_end).unwrap();
+        assert_eq!((next.year(), next.month(), next.day()), (2027, 1, 1));
+    }
+
+    #[test]
+    fn resolve_local_answers_for_every_wall_clock_reading() {
+        // Both daylight-saving edges go through here, and the host zone may
+        // have neither — so what is asserted is the property that has to hold
+        // in every zone: a reading always resolves to an instant, and that
+        // instant is never earlier than the reading interpreted naively.
+        for (h, m) in [(0, 0), (1, 30), (2, 0), (2, 30), (3, 0), (23, 59)] {
+            let naive = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(h, m, 0)
+                .unwrap();
+            let resolved = resolve_local(naive).expect("every reading resolves");
+            assert!(
+                resolved.naive_local() >= naive,
+                "a skipped reading moves forward to the far side of the gap, never back"
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_at_is_validated_at_load() {
+        // The point of the struct-with-vocabulary design: a typo is a load
+        // error, not a workflow that silently never runs.
+        let yaml = |every: &str, at: &str| {
+            format!(
+                "agents:\n  - name: a\n    cmd: /bin/cat\nworkflows:\n  wf:\n    schedule:\n      every: {every}\n      at: \"{at}\"\n    steps:\n      - id: only\n        agent: a\n"
+            )
+        };
+        assert!(parse_config(&yaml("day", "09:00")).is_ok());
+        assert!(parse_config(&yaml("weekday", "23:59")).is_ok());
+        assert!(parse_config(&yaml("hour", "05")).is_ok());
+
+        for (every, at) in [
+            ("day", "9時"),
+            ("day", "25:00"),
+            ("day", "09:60"),
+            ("day", "09"),
+            ("hour", "60"),
+            ("hour", "09:00"),
+        ] {
+            let err = parse_config(&yaml(every, at)).unwrap_err();
+            assert!(
+                err.contains("schedule.at"),
+                "every: {every} at: {at} should be rejected; error was: {err}"
+            );
+        }
+        // And the vocabulary itself is closed — serde rejects anything else.
+        assert!(parse_config(&yaml("dayly", "09:00")).is_err());
+        assert!(parse_config(&yaml("minute", "05")).is_err());
+    }
+
+    #[test]
+    fn a_scheduled_workflow_closes_its_panes_on_success_by_default() {
+        // Otherwise Monday's panes are still on the grid on Tuesday, Tuesday's
+        // fire is skipped for want of a slot, and the operator is left with
+        // "yesterday succeeded, so today did not run".
+        let base = "agents:\n  - name: a\n    cmd: /bin/cat\nworkflows:\n  wf:\n    schedule:\n      every: day\n      at: \"09:00\"\n";
+        let steps = "    steps:\n      - id: only\n        agent: a\n";
+        let cfg = parse_config(&format!("{base}{steps}")).unwrap();
+        assert_eq!(
+            cfg.workflows.unwrap()["wf"].auto_close,
+            Some(crate::config::AutoCloseMode::Success)
+        );
+
+        // A declared value always wins over the default.
+        let cfg = parse_config(&format!("{base}    autoClose: never\n{steps}")).unwrap();
+        assert_eq!(
+            cfg.workflows.unwrap()["wf"].auto_close,
+            Some(crate::config::AutoCloseMode::Never)
+        );
+
+        // And a workflow with no schedule is untouched: still None, i.e. the
+        // 5.0.0 default of `never`.
+        let cfg = parse_config(
+            "agents:\n  - name: a\n    cmd: /bin/cat\nworkflows:\n  wf:\n    steps:\n      - id: only\n        agent: a\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.workflows.unwrap()["wf"].auto_close, None);
+    }
+
+    const SCHED_YAML: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+
+    #[test]
+    fn tick_schedules_builds_the_table_and_does_not_fire_on_the_first_look() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        let now = local_at(2026, 8, 5, 14, 5);
+        assert!(tick_schedules(
+            &handle, &manager, &config, &store, &registry, &schedules, now,
+        ));
+
+        let view = schedules.view();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].name, "timed");
+        assert_eq!(view[0].summary, "every hour :05");
+        assert!(view[0].enabled);
+        assert!(view[0].last_fire_at_ms.is_none(), "building is not firing");
+        assert_eq!(
+            manager.occupied_pane_count(),
+            0,
+            "the tick that discovers a schedule must not launch it"
+        );
+        // Next fire is an hour later, not now — the strictly-after rule.
+        let next = view[0].next_fire_at_ms.unwrap();
+        assert!(next > now.timestamp_millis() as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_due_schedule_fires_and_a_second_run_is_skipped_while_the_first_lives() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        let start = local_at(2026, 8, 5, 14, 0);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, start);
+        // Move past the next fire time.
+        let due = local_at(2026, 8, 5, 14, 6);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, due);
+
+        let view = schedules.view();
+        assert!(view[0].last_fire_at_ms.is_some(), "it fired");
+        assert!(view[0].last_skip_reason.is_none());
+        assert_eq!(manager.occupied_pane_count(), 1, "one root pane");
+        assert_eq!(registry.active_run_ids().len(), 1);
+
+        // The next hour comes round while that run is still going.
+        let next_hour = local_at(2026, 8, 5, 15, 6);
+        tick_schedules(
+            &handle, &manager, &config, &store, &registry, &schedules, next_hour,
+        );
+        let view = schedules.view();
+        assert!(
+            view[0]
+                .last_skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("has not finished")),
+            "reason was: {:?}",
+            view[0].last_skip_reason
+        );
+        assert_eq!(
+            registry.active_run_ids().len(),
+            1,
+            "overlapping fires are dropped, never queued"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_grid_skips_the_fire_instead_of_starting_a_run_that_will_go_red() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
+        let start = local_at(2026, 8, 5, 14, 0);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, start);
+        let due = local_at(2026, 8, 5, 14, 6);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, due);
+
+        let view = schedules.view();
+        assert!(
+            view[0]
+                .last_skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no room")),
+            "reason was: {:?}",
+            view[0].last_skip_reason
+        );
+        assert!(
+            registry.active_run_ids().is_empty(),
+            "no run is created at all — the alternative is a run that sits \
+             Pending for five minutes and then fails on its own"
+        );
+        assert!(view[0].last_fire_at_ms.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn consecutive_failures_stop_the_schedule_and_a_success_clears_the_streak() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        let mut clock = local_at(2026, 8, 5, 14, 0);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, clock);
+
+        // Three fires, each ending Failed. The run is driven to its terminal
+        // state by hand: what is under test is the counting, not the driver.
+        for round in 0..3 {
+            clock += ChronoDuration::hours(1);
+            tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, clock);
+            let run_id = registry
+                .active_run_ids()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("round {round} should have fired"));
+            let mut run = registry.get(&run_id).unwrap();
+            run.state = WorkflowState::Failed;
+            run.ended_at_ms = Some(1);
+            registry.put(run);
+            clock += ChronoDuration::minutes(1);
+            tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, clock);
+        }
+
+        let view = schedules.view();
+        assert_eq!(view[0].consecutive_failures, 3);
+        assert!(
+            view[0]
+                .stopped_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("3 consecutive failures")),
+            "reason was: {:?}",
+            view[0].stopped_reason
+        );
+
+        // A stopped schedule does not fire again, however long it waits.
+        let before = manager.occupied_pane_count();
+        clock += ChronoDuration::hours(2);
+        tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, clock);
+        assert_eq!(
+            manager.occupied_pane_count(),
+            before,
+            "an unattended schedule that keeps failing must stop costing money"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_without_schedules_leaves_the_scheduler_inert() {
+        // Non-regression, stated rather than inferred: every existing config
+        // has no `schedule:`, and for those the new tick must do nothing at
+        // all — no table, no fire, no pane.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        for hour in [9, 10, 11] {
+            assert!(
+                !tick_schedules(
+                    &handle,
+                    &manager,
+                    &config,
+                    &store,
+                    &registry,
+                    &schedules,
+                    local_at(2026, 8, 5, hour, 0),
+                ),
+                "nothing to do means nothing changed"
+            );
+        }
+        assert!(schedules.view().is_empty());
+        assert_eq!(manager.occupied_pane_count(), 0);
+        assert!(registry.active_run_ids().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

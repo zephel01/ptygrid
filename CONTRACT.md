@@ -2341,7 +2341,6 @@ team_presets:
 > 「上流が 3 本目を送る前に 1 人目が動いている」瞬間の目視証拠と、`u14-no-sentinel` /
 > `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
-
 > 追記（2026-08-07、続報12）: **`resume_workflow` は「すでに起きた step 間の受け渡し」を
 > 失った run も拒否する。** 続報11 (a) が `onEach` について書いた拒否と同じ判断を、
 > `condition:` と `handoffTo:` にも広げる。原因は同じ 1 点で、`StepOutcome::reply_body` が
@@ -2744,6 +2743,81 @@ team_presets:
 > `abandoning_a_run_prunes_the_history_it_has_just_joined`）。
 > `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
 > 本作業起因の新規警告はゼロ。frontend 無変更。
+
+> 追記（2026-08-05、続報18）: **`schedule:` — 時刻で workflow を起こす（Phase 5.0.8）。**
+> （2026-08-13 に Stage A の上へ載せ替えた際、続報12 の採番が Stage A と衝突していたため 続報18 に振り直した。内容は 2026-08-05 時点のまま）
+> 仕様は [docs/spec/spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md)。
+> **本追記も完全に additive** で、`schedule:` を書かない設定の挙動は 1 バイトも変わらない。
+>
+> **(1) 語彙。** cron 式は**受け付けない**。書けるのは 3 つだけで、
+> `every: day` + `at: "HH:MM"` / `every: weekday` + `at: "HH:MM"`（月〜金）/
+> `every: hour` + `at: "MM"`。**それ以外を書けないことが機能である** — 想定利用者には
+> crontab の書式そのものが障壁になる層（経験の浅いエンジニア、バイブコーディングから
+> 入った人）が含まれ、OS の cron は書式・PATH・無言の失敗の 3 つで詰まる。自由文字列に
+> しないのはタイプミスを実行時まで運ばないためで、`every: dayly` は serde が、
+> `at: "9時"` は検証 S2 が load 時に落とす。時刻の解釈は**ローカルタイム**。
+>
+> **(2) 発火の条件（契約であって実装の限界ではない）。** **アプリが起動している間だけ
+> 発火し、起動していなかった時間の分は追わない。** キャッチアップは実装しない — 朝に
+> 5 本が同時に走り出してグリッドを埋めるほうが事故だからである。代わりに「次回」と
+> 「最終実行」を常時表示し、最終実行が数日前で止まっていること自体が「開いていなかった」
+> の表示になる（6）。
+>
+> **(3) 見送りの 2 条件。** どちらも**発火の前**に判定し、理由を必ず残す。(a) 同じ
+> workflow の run がまだ終端に達していない（積まない。1 時間かかる run を毎時起動しても
+> 同時に走らない）、(b) グリッドに root ぶんの空きが無い（始めてから
+> `WORKFLOW_DEFER_MAX_MS` の 5 分を待って赤くする形にはしない）。見送った回は次の予定
+> 時刻まで再試行しない。
+>
+> **(4) `autoClose` の既定が変わる。** `schedule` を持つ workflow は `autoClose` 未宣言
+> のとき **`success`** として扱う（既存の既定は `never`）。昨日のペインが残っていて今日の
+> 発火が (3)(b) で飛ぶ、という最も説明しづらい形を避けるため。明示宣言があればそちらが
+> 勝つ。この正規化は `parse_config` の中で行うので、frontend が受け取る config にも
+> 同じ答えが入る。
+>
+> **(5) 連続失敗による自動停止。** 連続 `maxConsecutiveFailures` 回（既定 3、1..=10）
+> 失敗したスケジュールは停止する。成功で 0 に戻り、`cancel` は失敗に数えない。
+> **停止状態はメモリ上の runtime state であり、`ptygrid.yml` は書き換えない**
+> （「ユーザーマシンの状態を勝手に変えない」原則）。したがって**再起動すると 0 に戻る** —
+> 永続化には新テーブルか `user_version` の更新が要り、それは Phase 5.5.1 と衝突しうるので
+> 本 patch では持たない（既知の限界 (b)）。
+>
+> **(6) 新しい wire は Tauri command 1 本だけ。** `list_schedules`（読み取り専用、
+> `ScheduleView[]` を返す）。**スケジュールを作る API は無い** — 宣言は `ptygrid.yml` に
+> しか無く、アプリが書き戻す設定は operator のものではなくなるため。`ScheduleView` は
+> 「次回」だけでなく最終発火・その結果・見送り理由・自動停止をまとめて持つ。次回時刻
+> だけでは「健全な予定」と「金曜から動いていない予定」が区別できないからである。
+> 新規イベントは**無い**（panel が 60 秒間隔で poll する。分単位でしか動かない値に
+> 新しい wire 契約を作らない）。
+>
+> **(7) 環境変数。** 変更なし（5.0.7 の `PTYGRID_MAILBOX` のみ）。スケジュール発火の
+> ペイン寸法は Queen MCP 経路と同じ `QUEEN_SPAWN_COLS` / `QUEEN_SPAWN_ROWS` を借りる
+> （UI の呼び出し元が無いという同じ問題に、既にある答えを使う）。
+>
+> **(8) load 時検証。** S1 は serde（`every` は 3 値のみ）、S2 は `at` の形式
+> （`day`/`weekday` は `HH:MM`、`hour` は `MM`）、S3 は `maxConsecutiveFailures` の
+> 1..=10。
+>
+> **(9) 非回帰宣言。** `StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools
+> / 既存の Tauri commands はすべて不変。スケジュール由来の run は手で ▶ した run と
+> **同じ形**で、実行時に区別する必要が無い。`schedule` を書かない設定は挙動も
+> 永続化も同じ。
+>
+> **実装と自動テストの実測。** `config.rs`（`Schedule` / `Every` / S2・S3 /
+> `apply_schedule_defaults`）、`orchestrator.rs`（純関数 `next_fire_at` と `resolve_local`、
+> `ScheduleRegistry`、`tick_schedules` を `driver_loop` の `advance_all` の**前**に 1 段）、
+> `commands.rs`（`list_schedules`）、frontend（`WorkflowPanel` の 1 行表示と i18n 4 本）。
+> `queen_store.rs` / `queen.rs` のスキーマは無変更。lib **461 → 475 passed / 0 failed**、
+> 統合 14 不変、`svelte-check` 136 files 0 errors 0 warnings。
+>
+> **解除されないもの（既知の限界）。** (a) 起動していない間は発火せず、取りこぼしも
+> 追わない（これは契約）。(b) 自動停止はメモリ上のみで、再起動すると 0 に戻る。
+> (c) cron 式・祝日カレンダー・1 workflow に複数スケジュール・積む（queue）はいずれも
+> 書けない。(d) **通知が無い** — 無人で失敗したことを外部へ知らせる経路は
+> [plan.md](docs/design/plan.md) §3 P3（escalation）の担当で、**未配線のままである**。
+> P3 が入るまで、このスケジューラは失敗を静かに溜める側に倒れうる。(e) **実機検証は
+> 未実施**（→ plan.md §2 U20）。
+>
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 

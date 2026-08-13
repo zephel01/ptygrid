@@ -428,6 +428,16 @@ const en = {
   wfStepDurationWaited: (dur: string, wait: string) => `${dur} (waited ${wait})`,
   /** Inline label when only the pane wait is known (step not terminal yet). */
   wfStepWaitOnly: (wait: string) => `waited ${wait}`,
+
+  // ---- Workflow schedules (Phase 5.0.8) ----
+  /** Countdown beside a scheduled workflow. Fires only while the app runs. */
+  wfScheduleNext: (at: string, until: string) => `next ${at} (in ${until})`,
+  /** Always shown once a schedule has fired: a "last run" from days ago next
+   * to a healthy-looking countdown is how a closed laptop appears here. */
+  wfScheduleLast: (at: string, result: string) => `last ${at} ${result}`,
+  wfScheduleRunning: "running",
+  wfScheduleDisabled: "disabled",
+
   /** Tooltip. Either side may be null; execution time and pane wait are
    * separate quantities and are shown on separate lines, never summed. */
   wfStepTimingTitle: (dur: string | null, wait: string | null) =>
@@ -882,6 +892,13 @@ const ja: Messages = {
   // ---- Workflow panel step timings (Phase 5.0.6) ----
   wfStepDurationWaited: (dur: string, wait: string) => `${dur}（待ち ${wait}）`,
   wfStepWaitOnly: (wait: string) => `待ち ${wait}`,
+
+  // ---- Workflow schedules (Phase 5.0.8) ----
+  wfScheduleNext: (at: string, until: string) => `次回 ${at}（あと ${until}）`,
+  wfScheduleLast: (at: string, result: string) => `最終 ${at} ${result}`,
+  wfScheduleRunning: "実行中",
+  wfScheduleDisabled: "停止中",
+
   wfStepTimingTitle: (dur: string | null, wait: string | null) =>
     [
       dur === null ? null : `実行時間: ${dur}`,
