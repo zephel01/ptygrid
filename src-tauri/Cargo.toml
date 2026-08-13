@@ -77,3 +77,11 @@ ureq = { version = "2", features = ["json", "tls"] }
 tauri = { version = "2", features = ["test"] }
 # Phase 4.2: base64 for the socket-server end-to-end host test (write payload).
 base64 = "0.22"
+# Phase 5.0.8: a real zone with daylight saving, for the two DST rules in
+# `orchestrator::next_fire_at`. TEST ONLY — the app itself never names a zone,
+# it reads `chrono::Local`. CI runs on GitHub-hosted runners with no TZ set,
+# i.e. in UTC, where `from_local_datetime` never returns Ambiguous or None, so
+# without a fixed zone those two rules could only be asserted vacuously.
+# `std::env::set_var("TZ", …)` is the other way to fix a zone and is not sound
+# in a parallel test binary.
+chrono-tz = "0.10"

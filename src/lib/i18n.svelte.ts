@@ -428,6 +428,49 @@ const en = {
   wfStepDurationWaited: (dur: string, wait: string) => `${dur} (waited ${wait})`,
   /** Inline label when only the pane wait is known (step not terminal yet). */
   wfStepWaitOnly: (wait: string) => `waited ${wait}`,
+
+  // ---- Workflow schedules (Phase 5.0.8) ----
+  // Everything on this line is built HERE. `list_schedules` returns the
+  // declaration (`every` + `at`) and tagged reasons, never sentences: the
+  // scheduler is Rust and cannot translate, and a wire that carries
+  // "stopped after 3 consecutive failures" makes a Japanese panel read half
+  // in English (5.0.8 fix M5).
+  /** The declaration, worded: "every day 09:00". */
+  wfScheduleEvery: (every: "day" | "weekday" | "hour", at: string) =>
+    every === "hour" ? `every hour :${at}` : `every ${every} ${at}`,
+  /** Countdown beside a scheduled workflow. Fires only while the app runs. */
+  wfScheduleNext: (at: string, until: string) => `next ${at} (in ${until})`,
+  /** Countdown body. Minute resolution, because that is all the schedule
+   * vocabulary has — deliberately NOT `formatDurationMs`, whose tenths of a
+   * second belong to step timings. */
+  wfScheduleUntil: (hours: number, minutes: number) =>
+    hours > 0 ? `${hours}h ${minutes}m` : minutes > 0 ? `${minutes}m` : "under a minute",
+  /** Always shown once a schedule has fired: a "last run" from days ago next
+   * to a healthy-looking countdown is how a closed laptop appears here. */
+  wfScheduleLast: (at: string, result: string) => `last ${at} ${result}`,
+  wfScheduleRunning: "running",
+  wfScheduleDisabled: "disabled",
+  // ---- why one due time produced no run ----
+  wfScheduleSkipOverlap: "skipped: the previous run has not finished",
+  wfScheduleSkipNoRoom: (occupied: number, cap: number, needed: number) =>
+    `skipped: the grid had no room (${occupied}/${cap} occupied, ${needed} needed)`,
+  wfScheduleSkipLate: (minutes: number) =>
+    `skipped: the scheduled time had passed ${minutes} minutes ago ` +
+    `(the machine was asleep, or the clock moved)`,
+  wfScheduleStopped: (failures: number) => `stopped (${failures} consecutive failures)`,
+  /** Shown while the streak is running but has not stopped the schedule yet:
+   * "how close is this to stopping" is the thing an unattended operator has no
+   * other way to see. */
+  wfScheduleFailureStreak: (failures: number, max: number) =>
+    `${failures}/${max} consecutive failures (${max - failures} more stops it)`,
+  // ---- how the last run ended ----
+  wfScheduleResultSucceeded: "succeeded",
+  wfScheduleResultFailed: "failed",
+  wfScheduleResultCancelled: "cancelled",
+  /** The spawn itself never got off the ground. `err` is backend text with no
+   * translated form, so it is quoted rather than paraphrased. */
+  wfScheduleResultSpawnFailed: (err: string) => `failed to start: ${err}`,
+
   /** Tooltip. Either side may be null; execution time and pane wait are
    * separate quantities and are shown on separate lines, never summed. */
   wfStepTimingTitle: (dur: string | null, wait: string | null) =>
@@ -882,6 +925,37 @@ const ja: Messages = {
   // ---- Workflow panel step timings (Phase 5.0.6) ----
   wfStepDurationWaited: (dur: string, wait: string) => `${dur}（待ち ${wait}）`,
   wfStepWaitOnly: (wait: string) => `待ち ${wait}`,
+
+  // ---- Workflow schedules (Phase 5.0.8) ----
+  // 文言は example/scheduled-review/ptygrid.yml と spec §6 の表示例に
+  // 一致させること（サンプルが約束した画面が出ないのが 5.0.8 の M5 だった）。
+  wfScheduleEvery: (every: "day" | "weekday" | "hour", at: string) =>
+    every === "hour" ? `毎時 :${at}` : every === "weekday" ? `平日 ${at}` : `毎日 ${at}`,
+  wfScheduleNext: (at: string, until: string) => `次回 ${at}（あと ${until}）`,
+  wfScheduleUntil: (hours: number, minutes: number) =>
+    hours > 0
+      ? minutes > 0
+        ? `${hours} 時間 ${minutes} 分`
+        : `${hours} 時間`
+      : minutes > 0
+        ? `${minutes} 分`
+        : "1 分未満",
+  wfScheduleLast: (at: string, result: string) => `最終 ${at} ${result}`,
+  wfScheduleRunning: "実行中",
+  wfScheduleDisabled: "停止中",
+  wfScheduleSkipOverlap: "見送り（前の run が終わっていません）",
+  wfScheduleSkipNoRoom: (occupied: number, cap: number, needed: number) =>
+    `見送り（グリッドに空きがありません。${occupied}/${cap} 使用中・${needed} 必要）`,
+  wfScheduleSkipLate: (minutes: number) =>
+    `見送り（予定時刻を ${minutes} 分過ぎていました。スリープか時計の移動）`,
+  wfScheduleStopped: (failures: number) => `自動停止（${failures} 回連続で失敗）`,
+  wfScheduleFailureStreak: (failures: number, max: number) =>
+    `連続失敗 ${failures}/${max}（あと ${max - failures} 回で自動停止）`,
+  wfScheduleResultSucceeded: "成功",
+  wfScheduleResultFailed: "失敗",
+  wfScheduleResultCancelled: "キャンセル",
+  wfScheduleResultSpawnFailed: (err: string) => `起動に失敗しました: ${err}`,
+
   wfStepTimingTitle: (dur: string | null, wait: string | null) =>
     [
       dur === null ? null : `実行時間: ${dur}`,

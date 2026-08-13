@@ -2341,7 +2341,6 @@ team_presets:
 > 「上流が 3 本目を送る前に 1 人目が動いている」瞬間の目視証拠と、`u14-no-sentinel` /
 > `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
-
 > 追記（2026-08-07、続報12）: **`resume_workflow` は「すでに起きた step 間の受け渡し」を
 > 失った run も拒否する。** 続報11 (a) が `onEach` について書いた拒否と同じ判断を、
 > `condition:` と `handoffTo:` にも広げる。原因は同じ 1 点で、`StepOutcome::reply_body` が
@@ -2744,6 +2743,330 @@ team_presets:
 > `abandoning_a_run_prunes_the_history_it_has_just_joined`）。
 > `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
 > 本作業起因の新規警告はゼロ。frontend 無変更。
+
+> 追記（2026-08-05、続報18）: **`schedule:` — 時刻で workflow を起こす（Phase 5.0.8）。**
+> （2026-08-13 に Stage A の上へ載せ替えた際、続報12 の採番が Stage A と衝突していたため 続報18 に振り直した。内容は 2026-08-05 時点のまま）
+> 仕様は [docs/spec/spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md)。
+> **本追記も完全に additive** で、`schedule:` を書かない設定の挙動は 1 バイトも変わらない。
+>
+> **(1) 語彙。** cron 式は**受け付けない**。書けるのは 3 つだけで、
+> `every: day` + `at: "HH:MM"` / `every: weekday` + `at: "HH:MM"`（月〜金）/
+> `every: hour` + `at: "MM"`。**それ以外を書けないことが機能である** — 想定利用者には
+> crontab の書式そのものが障壁になる層（経験の浅いエンジニア、バイブコーディングから
+> 入った人）が含まれ、OS の cron は書式・PATH・無言の失敗の 3 つで詰まる。自由文字列に
+> しないのはタイプミスを実行時まで運ばないためで、`every: dayly` は serde が、
+> `at: "9時"` は検証 S2 が load 時に落とす。時刻の解釈は**ローカルタイム**。
+>
+> **(2) 発火の条件（契約であって実装の限界ではない）。** **アプリが起動している間だけ
+> 発火し、起動していなかった時間の分は追わない。** キャッチアップは実装しない — 朝に
+> 5 本が同時に走り出してグリッドを埋めるほうが事故だからである。代わりに「次回」と
+> 「最終実行」を常時表示し、最終実行が数日前で止まっていること自体が「開いていなかった」
+> の表示になる（6）。
+>
+> **(3) 見送りの 2 条件。** どちらも**発火の前**に判定し、理由を必ず残す。(a) 同じ
+> workflow の run がまだ終端に達していない（積まない。1 時間かかる run を毎時起動しても
+> 同時に走らない）、(b) グリッドに root ぶんの空きが無い（始めてから
+> `WORKFLOW_DEFER_MAX_MS` の 5 分を待って赤くする形にはしない）。見送った回は次の予定
+> 時刻まで再試行しない。
+>
+> **(4) `autoClose` の既定が変わる。** `schedule` を持つ workflow は `autoClose` 未宣言
+> のとき **`success`** として扱う（既存の既定は `never`）。昨日のペインが残っていて今日の
+> 発火が (3)(b) で飛ぶ、という最も説明しづらい形を避けるため。明示宣言があればそちらが
+> 勝つ。この正規化は `parse_config` の中で行うので、frontend が受け取る config にも
+> 同じ答えが入る。
+>
+> **(5) 連続失敗による自動停止。** 連続 `maxConsecutiveFailures` 回（既定 3、1..=10）
+> 失敗したスケジュールは停止する。成功で 0 に戻り、`cancel` は失敗に数えない。
+> **停止状態はメモリ上の runtime state であり、`ptygrid.yml` は書き換えない**
+> （「ユーザーマシンの状態を勝手に変えない」原則）。したがって**再起動すると 0 に戻る** —
+> 永続化には新テーブルか `user_version` の更新が要り、それは Phase 5.5.1 と衝突しうるので
+> 本 patch では持たない（既知の限界 (b)）。
+>
+> **(6) 新しい wire は Tauri command 1 本だけ。** `list_schedules`（読み取り専用、
+> `ScheduleView[]` を返す）。**スケジュールを作る API は無い** — 宣言は `ptygrid.yml` に
+> しか無く、アプリが書き戻す設定は operator のものではなくなるため。`ScheduleView` は
+> 「次回」だけでなく最終発火・その結果・見送り理由・自動停止をまとめて持つ。次回時刻
+> だけでは「健全な予定」と「金曜から動いていない予定」が区別できないからである。
+> 新規イベントは**無い**（panel が 60 秒間隔で poll する。分単位でしか動かない値に
+> 新しい wire 契約を作らない）。
+>
+> **(7) 環境変数。** 変更なし（5.0.7 の `PTYGRID_MAILBOX` のみ）。スケジュール発火の
+> ペイン寸法は Queen MCP 経路と同じ `QUEEN_SPAWN_COLS` / `QUEEN_SPAWN_ROWS` を借りる
+> （UI の呼び出し元が無いという同じ問題に、既にある答えを使う）。
+>
+> **(8) load 時検証。** S1 は serde（`every` は 3 値のみ）、S2 は `at` の形式
+> （`day`/`weekday` は `HH:MM`、`hour` は `MM`）、S3 は `maxConsecutiveFailures` の
+> 1..=10。
+>
+> **(9) 非回帰宣言。** `StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools
+> / 既存の Tauri commands はすべて不変。スケジュール由来の run は手で ▶ した run と
+> **同じ形**で、実行時に区別する必要が無い。`schedule` を書かない設定は挙動も
+> 永続化も同じ。
+>
+> **実装と自動テストの実測。** `config.rs`（`Schedule` / `Every` / S2・S3 /
+> `apply_schedule_defaults`）、`orchestrator.rs`（純関数 `next_fire_at` と `resolve_local`、
+> `ScheduleRegistry`、`tick_schedules` を `driver_loop` の `advance_all` の**前**に 1 段）、
+> `commands.rs`（`list_schedules`）、frontend（`WorkflowPanel` の 1 行表示と i18n 4 本）。
+> `queen_store.rs` / `queen.rs` のスキーマは無変更。lib **461 → 475 passed / 0 failed**、
+> 統合 14 不変、`svelte-check` 136 files 0 errors 0 warnings。
+>
+> **解除されないもの（既知の限界）。** (a) 起動していない間は発火せず、取りこぼしも
+> 追わない（これは契約）。(b) 自動停止はメモリ上のみで、再起動すると 0 に戻る。
+> (c) cron 式・祝日カレンダー・1 workflow に複数スケジュール・積む（queue）はいずれも
+> 書けない。(d) **通知が無い** — 無人で失敗したことを外部へ知らせる経路は
+> [plan.md](docs/design/plan.md) §3 P3（escalation）の担当で、**未配線のままである**。
+> P3 が入るまで、このスケジューラは失敗を静かに溜める側に倒れうる。(e) **実機検証は
+> 未実施**（→ plan.md §2 U20）。
+>
+
+> 追記（2026-08-13、続報19）: **続報18（`schedule:` / Phase 5.0.8）のうち、レビューで
+> 出た 7 件を直した分の差分。** 新しい Phase ではなく 5.0.8 の修正であり、`schedule:` を
+> 書かない設定への影響は**引き続きゼロ**。経緯は [plan.md](docs/design/plan.md) §6.20、
+> 仕様は [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md)（§3.1 / §3.2 / §3.5 /
+> §3.7 / §8.1 / §8.2 を実装に合わせて更新済み）。**続報18 の記述で下の 5 点に触れる箇所は、
+> 本項が上書きする。**
+>
+> **(A) 発火に猶予の上限ができた（続報18 (2) の補強）。** これまで due の判定は
+> 「予定時刻が過去にある」という一方向の比較だけで、上限が無かった。ノート PC で
+> 08:00 に蓋を閉じ 17:00 に開くと、今日の 09:00 は過去なので**復帰した最初の tick で
+> 発火する** — 「毎朝 9 時のレビュー」が 17 時に始まる。しかもアプリを終了して起動し
+> 直した場合はキャッチアップしない（表が strictly-after で作り直される）ので、
+> **終了→起動では追わず、サスペンド→復帰では 1 回だけ追う**という非対称が生まれていた。
+> 続報18 (2)「起動していなかった時間の分は追わない」はこの経路で破れていた。
+> 現在は**予定時刻から `every: hour` は 5 分、`day` / `weekday` は 15 分**を超えて
+> 遅れた発火は行わず、見送り理由（「予定時刻を過ぎていた。スリープか時計の移動」）を
+> 立てて次回へ送る。数字の根拠: 猶予は間隔より十分に短くないと遅れた発火が次の発火に
+> 重なる。5 分は本ファイルが既に「起きているべきことをどれだけ待つか」に使っている値
+> （`WORKFLOW_DEFER_MAX_MS`）の再利用で、日次はその 3 倍を取った。**どちらも実測値では
+> ない**（→ plan.md §2 U20）。
+>
+> **(B) 自動停止の解除条件が定義された（続報18 (5) の補強）。** 続報18 は停止の**セット**
+> しか書いておらず、実装にも解除経路が無かった（再開コマンドも UI ボタンも無く、
+> 表の作り直しは前の停止をそのままコピーしていた）ため、**アプリを再起動する以外に
+> 再開する手段が無かった**。spec §3.5 の「再開はユーザーの明示操作、または設定の
+> 再読み込み」と `example/scheduled-review/ptygrid.yml` の「直したら設定を保存し直せば、
+> また動き出す」は、どちらも満たされていなかった。現在は**スケジュール 1 本ごとに宣言の
+> fingerprint を持つ**。fingerprint が見るのは `schedule:` ブロックだけではなく、**その
+> workflow の宣言全体（`kickoff` を含む全 step）と、その step が名指しする agent /
+> process の定義**である。停止の原因はほぼ常に `schedule:` の外（指示文の誤り、消えた
+> agent）にあるので、`every` / `at` / `enabled` / `max` だけを見る fingerprint では
+> 「直して保存する」が解除にならない。したがって:
+> - **自分の workflow（または自分が使う agent）を編集して保存すると、連続失敗カウンタと
+>   自動停止が解除される。**
+> - **関係の無い workflow を編集しても解除されない。** 連続失敗カウンタも `next_fire_at`
+>   も動かない（これまでは表全体を作り直していたため、無関係な保存が**その tick で
+>   due だった発火を黙って 1 回捨てて**いた）。
+>
+> **(C) 同一 tick で複数が due のときの処理順が決定論的になった。** スケジュール表を
+> `HashMap` から `BTreeMap` に変えた。**名前の昇順**で処理する。両方が同じ時刻で、
+> グリッドの空きが片方ぶんしか無いとき、どちらが走るかが起動のたびに変わる（負けたほうに
+> `no room` が付く）状態を消すため。順序そのものに意味は無いが、**毎朝同じ順序である**
+> ことに意味がある。
+>
+> **(D) 時計の跳びとタイムゾーン変更で再アンカーする。** `next_fire_at_ms` は壁時計から
+> 計算した絶対時刻なので、(a) 時計が**巻き戻る**（NTP のステップ補正、手動変更）と
+> その日の発火が巻き戻し幅ぶん無言で遅れ、(b) 実行中に**OS の TZ が変わる**（JST の
+> ノートを GMT へ持ち込む）と 1 回だけ旧オフセットの時刻に発火する。現在は前 tick の
+> 時刻とオフセットを覚えており、**5 秒を超える巻き戻し**または**オフセットの変化**を
+> 見たら全スケジュールの次回時刻を計算し直す。**前方向の跳びは再アンカーしない** —
+> 前方向の跳びとサスペンドは観測上区別できず、そちらは (A) の猶予の担当である。
+>
+> **(E) `schedule:` のキー名が閉じた（続報18 (8) の補強）。** `Schedule` に
+> `#[serde(deny_unknown_fields)]` を付けた。**このリポジトリで唯一の例外**で、他は
+> 「未知フィールドは黙って無視」のままである。理由: `enabled` の `d` 落ち
+> （`enable: false`）や `maxConsecutiveFailures` の `s` 落ちは serde に捨てられ、既定値
+> （有効 / 3）で動く。**「止めたつもりのスケジュールが毎朝発火する」**は、続報18 (1) が
+> 「書けないことが機能」と言っているものの唯一の抜け穴だった。値の語彙は既に閉じて
+> いる（`every` は 3 値の enum、`at` は検証 S2）ので、残っていたのはキー名だけである。
+> `Schedule` は 5.0.8 の新規型なので、既存設定への非回帰リスクは無い。
+>
+> **(F) 内部コスト。** `tick_schedules` は 200ms ごとではなく **1 秒ごと**（driver tick
+> 5 回に 1 回）に走る。`at` は分解像度なので観測上の差は無い。あわせて
+> `ConfigManager::current_arc()` を足し、tick から `Config` 全体のディープクローンが
+> 消えた（`current()` は無変更、既存の呼び出し側に影響なし）。宣言の fingerprint は
+> `ConfigManager` の世代カウンタが動いたときにしか組み立てない。続報18 (9) の
+> 「`schedule` を書かない設定は挙動も永続化も同じ」は**コストの面でも**正しくなった。
+>
+> **(G) wire。** `ScheduleView` の**フィールドは 1 つも増減していない**。変わったのは
+> `lastSkipReason` に新しい文言（予定時刻超過）が入りうることだけで、既に自由文字列
+> だったので契約の変更ではない。Tauri command / event / Queen MCP tools は無変更。
+>
+> **実装と自動テストの実測。** `config.rs`（`Schedule` の `deny_unknown_fields`、
+> `ConfigManager` の `Arc<Config>` 化 + 世代カウンタ + `current_arc`）、
+> `orchestrator.rs`（`schedule_decl_fingerprint` / `SCHEDULE_GRACE_*_MS` /
+> `CLOCK_STEP_TOLERANCE_MS` / `SCHEDULE_TICK_EVERY`、`next_fire_at` と `resolve_local` を
+> `Tz: TimeZone` でジェネリック化、`ScheduleInner` を `BTreeMap` + 前 tick の時刻/
+> オフセット保持）。frontend **無変更**。lib **506 → 520 passed / 0 failed**（新規 14 本）、
+> 統合 14 不変。`cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool`
+> **1 件のみ**で本作業起因の新規警告はゼロ。
+>
+> **DST の 2 規則が初めて CI で実行される。** 続報18 (1) の「存在しない時刻 → 飛んだ
+> 直後に 1 回」「二重に存在する時刻 → 早いほうだけ」は、これまで**宣言であって実測では
+> なかった**: `resolve_local` が `chrono::Local` 固定で、CI（`macos-14` / `ubuntu-22.04`、
+> `TZ` 指定なし = UTC）には DST が無いため `LocalResult::Ambiguous` / `None` の分岐に
+> 一度も入っていなかった。`next_fire_at` / `resolve_local` をゾーンでジェネリックにし、
+> dev-dependency に `chrono-tz` を足して `America/New_York` の 2026-03-08（春）/
+> 2026-11-01（秋）で固定した（`std::env::set_var("TZ", …)` は並列テストで unsound なので
+> 採らない）。アプリ本体は従来どおり `Local` しか渡さない。
+>
+> **既知の限界（続報18 のものに追加）。** (f) **秋の DST の日、`every: hour` はその日の
+> 発火が 1 回減る**（25 時間の日に 24 回）。繰り返される壁時計の読みは常に早いほうに
+> 解決する — それが日次の「1 日 1 回」を守る規則そのものなので — 結果として 2 周目の
+> `:MM` が `候補 > now` を満たさず読み飛ばされる。年 1 回、毎時スケジュールが 1 回減る
+> ほうが、日次スケジュールが 2 回走るより安いという判断で、**直さずテストで固定した**。
+> (g) 自動停止の解除は**その workflow（と、それが使う agent）の宣言の変更**で起きる。
+> 設定を触らずに解除する経路は依然として無い（再開コマンドは作らない。宣言は
+> `ptygrid.yml` にしか無いという (6) の原則を崩さないため）。(h) 猶予の 2 つの数字も
+> 時計跳びの閾値も**実測ではない**。
+>
+
+> 追記（2026-08-13、続報20）: **`ScheduleView` の wire が変わった（続報18 (6) と
+> 続報19 (G) の上書き）。** 続報19 (G) は「`ScheduleView` のフィールドは 1 つも増減して
+> いない」「`lastSkipReason` は既に自由文字列だったので契約の変更ではない」と書いたが、
+> 本項で `summary` が消え `every` / `at` / `maxConsecutiveFailures` が増え、3 つの理由
+> フィールドが文字列から enum になったので、**その 2 文はどちらも本項の時点で偽**である
+> （上書き宣言の漏れ。2026-08-13 の最終レビュー指摘 9 で補った）。
+> 新しい Phase ではなく 5.0.8 の修正（レビュー指摘 M5）。経緯は
+> [plan.md](docs/design/plan.md) §6.21、仕様は
+> [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md) §6.1。
+> **`schedule:` を書かない設定への影響は引き続きゼロ**で、`list_schedules` 以外の wire
+> （`StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools / 他の Tauri
+> commands / `ptygrid.yml` スキーマ）は 1 バイトも動いていない。
+>
+> **何が壊れていたか。** `ScheduleView` の 4 フィールドが **Rust 側で組み立てた英語の文**
+> だった: `summary`（`"every day 09:00"`）、`last_skip_reason`
+> （`"skipped: the previous run has not finished"` 他 2 種）、`stopped_reason`
+> （`"stopped after 3 consecutive failures"`）、`last_result`（`"succeeded"` /
+> `"failed"` / `"failed: {err}"`）。panel はこれを `join(" · ")` するだけなので、
+> 日本語 UI の 1 行が
+> `🕒 every day 09:00 · stopped after 3 consecutive failures · 最終 8/5 9:00 failed`
+> になっていた。**文は値ではない**ので frontend で翻訳し直す術も無く、
+> `example/scheduled-review/ptygrid.yml` と spec §6 が約束した画面（「前の run が
+> 終わっていません」「自動停止」）は実装から出ていなかった。
+>
+> **新しい `ScheduleView`（`list_schedules` の返り値）。** 判定は backend、文言は
+> frontend。camelCase は従来どおり。
+>
+> | フィールド | 変更 |
+> |---|---|
+> | `summary: string` | **削除。** 英訳不能な文を wire に残さないため。`Schedule::summary()` も削除 |
+> | `every: "day"\|"weekday"\|"hour"` / `at: string` | **追加。** 宣言そのもの。`at` は trim 済み。panel が「毎日 09:00」/「every day 09:00」を組む |
+> | `lastSkipReason` | `string` → **内部タグ付き enum**。`{kind:"overlap"}` / `{kind:"noRoom",occupied,cap,needed}` / `{kind:"late",lateMinutes}` |
+> | `stoppedReason` | `string` → `{kind:"consecutiveFailures",failures}`。1 変種だが enum（2 つ目の停止条件が additive で入るように） |
+> | `lastResult` | `string` → `{kind:"succeeded"\|"failed"\|"cancelled"}` / `{kind:"spawnFailed",error}` |
+> | `maxConsecutiveFailures: number` | **追加。** `consecutiveFailures` 単独では停止までの距離が読めない |
+>
+> `kind` によるタグ付けは `LogicalSession`（`project_state.rs`）と同じ書き方に揃えた。
+> `skip_serializing_if = "Option::is_none"` は 3 つの Option でそのまま。
+>
+> **`spawnFailed` を分けた理由。** 旧 `"failed: {err}"` は 2 つの別物を 1 つの文字列に
+> 詰めていた: run が走って失敗したのか、**そもそも起動しなかった**のか。後者は run が
+> 存在しない。`error` は spawn 経路が返す任意の文字列で**翻訳できない**ので、生のまま
+> 運んで panel が「起動に失敗しました: {err}」と包む。**1 行の中で英語のまま残るのは
+> この例外文だけ**で、それは元の例外文なので他に出しようがない。
+>
+> **判定は backend に残っている。** どの理由が当てはまるかを決めるのは
+> `tick_schedules` のままで、移したのは文言だけ。frontend にテストランナーが無い
+> （`package.json` は `svelte-check` のみ）ので、分岐は Rust 側の unit test で固定した。
+>
+> **panel 側の表示規則（新規、契約ではなく実装の記録）。** (i) カウントダウンは
+> `formatDurationMs` を通さない（あれは step 用で 0.1 秒まで出し、英語の形しか無い）。
+> 分に丸めて「時・分」を i18n に渡すので、日本語は「あと 3 時間 20 分」。
+> `formatDurationMs` 自体は無変更で、step 実行時間 / ペイン待ちの 2 箇所も無変更。
+> (ii) 「次回」は**今日でなければ日付も出す**。 (iii) 自動停止に**到達する前**の
+> 連続失敗を出す（「連続失敗 1/3（あと 2 回で自動停止）」）。
+>
+> **実測。** lib **520 → 523 passed / 0 failed**（追加 3 本:
+> `schedule_reasons_reach_the_wire_as_tags_and_numbers_not_sentences` /
+> `a_schedule_view_carries_the_declaration_and_the_stop_threshold` /
+> `a_padded_at_is_trimmed_before_it_reaches_the_panel`。既存の schedule テスト 6 本は
+> 文字列の `contains` 比較から enum の等値比較に置き換えた）。統合 14 不変。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**。
+> `svelte-check` **136 files 0 errors 0 warnings**、`npm run build` 成功。
+> i18n は **en / ja 両方に 11 本追加**（`wfScheduleEvery` / `wfScheduleUntil` /
+> skip 3 種 / stop / 連続失敗 / result 4 種）。
+>
+> **未実測。** 実機で画面を見た確認は**していない**（→ plan.md §2 U20）。日本語の
+> 文言が例文どおりに出ることは i18n テーブルと `scheduleLine` の読みからの帰結であって、
+> スクリーンショットでの確認ではない。
+>
+
+> 追記（2026-08-13、続報21）: **5.0.8 の最終レビューで出た 11 件の是正。wire は 1 バイトも
+> 動いていない。** 新しい Phase ではなく 5.0.8 の修正。経緯は
+> [plan.md](docs/design/plan.md) §6.22、仕様は
+> [spec-schedule-5.0.8.md](docs/spec/spec-schedule-5.0.8.md)（§3.1.1 / §3.1.2 / §3.5 /
+> §3.7 / §4.1 / §6.1 に追記）。`ScheduleView` / `list_schedules` / `ptygrid.yml` スキーマ /
+> `StepOutcome` / `WorkflowRun` / `workflow-state` / Queen MCP tools はすべて不変で、
+> frontend も無変更。**`schedule:` を書かない設定への影響は引き続きゼロ。**
+>
+> **(A) 続報19 (B) が確率的に破れていた（最も重い 1 件）。** 続報19 (B) は「自動停止の
+> 解除はその workflow / agent の宣言の変更でだけ起きる。**無関係な workflow の編集では
+> 解除されない**」と書いたが、宣言の fingerprint は `Debug` 表現をハッシュしており、
+> `AgentDef` の `env` は `HashMap` である。Rust の `HashMap` はインスタンスごとに違う
+> ハッシュキーを使うので、**同じバイト列を読み直しただけで `Debug` の並び順が変わる**
+> （env 2 キー以上で発現。レビュー担当の実測で 20 回中 19 回）。したがって自動停止した
+> schedule は、**まったく無関係な workflow を保存しただけで、およそ 6 回に 5 回の確率で
+> 解除されていた**（連続失敗カウンタも 0 に戻り、次回時刻も切り直されるので、続報19 (B) の
+> 副次効果「無関係な保存が due だった発火を捨てるのを解消した」も同時に破れる）。
+> 発現条件は `env:` を 2 個以上持つ agent — **`ptygrid init` が自分で生成する形**
+> （`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`）であり、`example/adaptive-orchestration`
+> も該当する。既存テストが捕まえなかったのは fixture が全部 `cmd:` だけの agent だった
+> ため。是正: `serde_json::to_value()` を通してからハッシュする（`serde_json::Map` は
+> `preserve_order` 無効時 `BTreeMap`。`to_string()` を struct に直接かけると `HashMap` を
+> そのまま辿るので直らない）。続報19 (B) は**是正後に初めて真になった**。
+>
+> **(B) 春の DST の日、正当に due な発火が消えていた（続報19 (E) の穴）。** 続報19 (E) の
+> TZ 変更の再アンカーはオフセットを見るので、**DST の遷移で必ず発動する**（巻き戻し側は
+> UTC 単調なので発動しない）。`America/New_York` の `{ every: day, at: "02:30" }` は
+> 2026-03-08 に 02:30 が存在しないため 03:00 EDT に着地するが、その瞬間がオフセットの
+> 変わり目なので、「オフセットが動いた」と「due である」が同じ tick で成立し、再アンカーが
+> 先に走ってその日の発火が消えていた。`lastSkipReason` も立たないので理由が 1 文字も
+> 出ない。`every: hour` でも春の飛びの直後の 1 回が同じ理由で消えていた。spec は §3.1.2 で
+> 「**前方向の跳びは扱わない。ここで再アンカーすると正当に due な発火まで飲み込む**」と
+> 自分で書いており、TZ 側にそれを適用し忘れていた形である。是正: 再アンカーは
+> `next_fire_at > now` の行だけを対象にし、すでに due の行は続報19 (A) の猶予判定に渡す。
+>
+> **(C) 続報18 (d) は失効している（escalation は配線済み）。** 続報18 の既知の限界 (d)
+> 「通知が無い — 外部へ知らせる経路は P3 の担当で**未配線のまま**」は、続報18 が
+> 2026-08-05 時点の記述として移設されたことによる残存で、escalation は
+> **続報16（Stage A-4、2026-08-13）で配線済み**である。**本項が (d) を上書きする。**
+> 正しくは「**`retry:` を使い切った step の失敗は外へ出る。`retry:` を書いていない step の
+> 失敗は出ない**」であり、加えてペイン異常終了由来の通知は 4.4.2 の経路から別に出るので、
+> 「このスケジューラは失敗を静かに溜める側に倒れうる」は二重に不正確だった。
+> `docs/guide/ptygrid-yml-guide.md` の同じ表で `schedule:` 行と escalation 行が矛盾して
+> いたのも同時に直した。
+>
+> **(D) 残る 7 件（いずれも文言・定数・端数）。** (1) `SCHEDULE_GRACE_HOURLY_MS` は
+> `WORKFLOW_DEFER_MAX_MS` と同じ数字の**別リテラル**で、続報19 (A) の「再利用」は
+> コード上は嘘だった → 定数そのものを参照するようにした。(2) `lateMinutes` が切り捨てで、
+> 見送りが起きる最小の遅れ（猶予 +1ms）が「15」と出ていた → 切り上げ。(3)
+> `current_arc()` が誰も使わない `PathBuf` を毎秒クローンしており、続報19 (F) /
+> spec §8.2 の「`Arc` のクローン 1 回と整数の比較 1 回」が厳密には偽だった → 返り値から
+> 外した。(4) `CLOCK_STEP_TOLERANCE_MS` の根拠が「driver tick 25 回ぶん」のままで、
+> 続報19 (F) の「1 秒に 1 回」適用後は 5 標本ぶんが正しい（結論は不変）。(5) spec §4.1 の
+> `Schedule` スニペットに `deny_unknown_fields` が無く、同じ文書の §4.2 S8 と矛盾していた。
+> (6) 続報20 の上書き宣言に**続報19 (G) が抜けていた**（(G) の 2 文は続報20 で両方とも
+> 偽になっている） → 続報20 の冒頭を補った。(7) `example/scheduled-review/ptygrid.yml` の
+> 画面例の日時スタンプは `toLocaleString(undefined, …)` すなわちシステムロケール依存なので
+> 例文と 1 字一致させることが原理的にできない → 例文に注記を足し、plan.md U20 (9) の
+> 1 字一致の対象から日時部分を外した。
+>
+> **実測。** lib **523 → 530 passed / 0 failed**（追加 7 本。うち **5 本は親コミットで
+> 実際に落ちることを確認済み**: `the_same_declaration_hashes_to_the_same_fingerprint_every_time`
+> は 20 回ループ — 1 回では 6 回に 1 回の確率で通ってしまうため —、
+> `editing_an_unrelated_workflow_does_not_restart_a_stopped_one_with_env`、
+> `saving_the_same_file_again_moves_nothing_in_the_table`、
+> `a_fire_due_in_the_very_tick_the_offset_moves_still_happens`、
+> `the_grace_window_is_closed_at_the_top_and_reports_a_whole_minute`。残る 2 本
+> `deleting_the_schedule_block_removes_the_row` /
+> `the_hour_that_happens_twice_loses_one_fire_and_never_gains_one` は既に正しかった挙動を
+> tick 経由で固定するもの）。統合 **14 不変**。`cargo clippy --all-targets` は既存の
+> `config.rs` の `nonminimal_bool` **1 件のみ**で新規警告ゼロ。`svelte-check`
+> **136 files 0 errors 0 warnings**。
+>
+> **未実測。** 実機検証は依然として**未実施**（→ plan.md §2 U20）。猶予の 2 つの数字も
+> 時計跳びの閾値も実測ではないという続報19 (h) はそのまま生きている。
+>
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 

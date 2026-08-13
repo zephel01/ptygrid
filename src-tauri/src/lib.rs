@@ -106,6 +106,7 @@ pub fn run() {
         .manage(AgentStatusManager::new())
         .manage(NotificationManager::new())
         .manage(orchestrator::WorkflowRegistry::new())
+        .manage(orchestrator::ScheduleRegistry::new())
         .setup(|app| {
             // macOS only: install the standard app/Edit/Window menus so the
             // WebView receives Cmd+C / Cmd+V (see build_app_menu).
@@ -178,6 +179,7 @@ pub fn run() {
             commands::spawn_workflow,
             commands::cancel_workflow,
             commands::list_workflow_runs,
+            commands::list_schedules,
             commands::resume_workflow,
             commands::abandon_workflow,
             commands::restart_session,

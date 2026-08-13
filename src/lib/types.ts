@@ -98,8 +98,60 @@ export type WorkflowDef = {
   onFailure?: OnFailure;
   /** fan-out ワークフロー起動時に Arena drawer を開く(Phase 5.0.5 予定、parse のみ)。 */
   arena?: boolean;
-  /** step ペインの終了時自動クローズ(agent 定義より優先)。既定 never。 */
+  /** step ペインの終了時自動クローズ(agent 定義より優先)。既定 never。
+   * ただし schedule を持つ workflow は既定が success になる(5.0.8)。 */
   autoClose?: AutoCloseMode;
+  /** 時刻で自分を起動する宣言(5.0.8)。アプリが起動している間だけ発火する。 */
+  schedule?: Schedule;
+};
+
+// Phase 5.0.8 (schedule: 時刻で workflow を起こす)
+export type ScheduleEvery = "day" | "weekday" | "hour";
+
+/** workflows.<name>.schedule。cron 式ではなく限定語彙。 */
+export type Schedule = {
+  every: ScheduleEvery;
+  /** day/weekday は "HH:MM"、hour は "MM"。 */
+  at: string;
+  enabled?: boolean;
+  maxConsecutiveFailures?: number;
+};
+
+/** 見送りの理由。**タグと数値だけ**で、文にはしない(5.0.8 修正)。
+ * backend は英語しか喋れないので、文を組み立てるのは i18n を持つこちら側。 */
+export type ScheduleSkip =
+  | { kind: "overlap" }
+  | { kind: "noRoom"; occupied: number; cap: number; needed: number }
+  | { kind: "late"; lateMinutes: number };
+
+/** 自動停止の理由。いまは 1 種類だが、増えても wire は additive。 */
+export type ScheduleStop = { kind: "consecutiveFailures"; failures: number };
+
+/** 最終実行の結果。spawnFailed だけは run が存在しない(起動そのものが失敗した)
+ * ケースで、error は翻訳できない backend 文字列なので生で来る。 */
+export type ScheduleResult =
+  | { kind: "succeeded" }
+  | { kind: "failed" }
+  | { kind: "cancelled" }
+  | { kind: "spawnFailed"; error: string };
+
+/** list_schedules の返り値。宣言そのものではなく「いま何が起きているか」。
+ * next だけでは「健全な予定」と「金曜から動いていない予定」が区別できないので、
+ * 最終発火・その結果・見送り理由・自動停止をまとめて持つ。 */
+export type ScheduleView = {
+  name: string;
+  /** 宣言そのもの。表示文言("毎日 09:00")はこの 2 つから panel が組む。 */
+  every: ScheduleEvery;
+  at: string;
+  enabled: boolean;
+  nextFireAtMs?: number;
+  lastFireAtMs?: number;
+  lastResult?: ScheduleResult;
+  lastSkipReason?: ScheduleSkip;
+  consecutiveFailures: number;
+  /** 何回連続で失敗したら止まるか。"1/3" と出すために必要。 */
+  maxConsecutiveFailures: number;
+  stoppedReason?: ScheduleStop;
 };
 
 /** ワークフロー全体のライフサイクル。 */
