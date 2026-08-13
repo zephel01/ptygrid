@@ -1959,8 +1959,8 @@ impl ConfigManager {
         }
     }
 
-    /// The same thing [`Self::current`] returns, without the deep clone, plus
-    /// the generation counter.
+    /// What [`Self::current`] returns minus the deep clone and minus the
+    /// directory, plus the generation counter.
     ///
     /// For callers that read the config on a timer rather than in response to
     /// a user action. `current()` copies every agent, process, workflow (every
@@ -1970,12 +1970,20 @@ impl ConfigManager {
     /// generation is the cheap "did anything change at all?" answer: equal
     /// means the very same `Config` value, so a poller can skip its own
     /// bookkeeping entirely.
-    pub fn current_arc(&self) -> Option<(Arc<Config>, PathBuf, u64)> {
+    ///
+    /// No `dir`: this is deliberately one `Arc` clone and one integer copy, so
+    /// it does not allocate a `PathBuf` nobody asked for — which is what
+    /// spec-schedule-5.0.8 §8.2 claims it costs. A caller that also needs the
+    /// directory is doing something per-user-action and can take `current()`.
+    /// `None` still means "no config loaded", directory included, so callers
+    /// keep the same "is the app configured at all?" answer.
+    pub fn current_arc(&self) -> Option<(Arc<Config>, u64)> {
         let inner = self.lock();
-        match (&inner.config, &inner.dir) {
-            (Some(c), Some(d)) => Some((Arc::clone(c), d.clone(), inner.generation)),
-            _ => None,
-        }
+        inner
+            .config
+            .as_ref()
+            .filter(|_| inner.dir.is_some())
+            .map(|c| (Arc::clone(c), inner.generation))
     }
 
     /// Look up an agent (then process) definition by name, together with the

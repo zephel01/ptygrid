@@ -4793,13 +4793,9 @@ impl ScheduleRegistry {
 /// with itself inside one process, and holding a debug rendering of every
 /// scheduled workflow for the life of the app buys nothing.
 fn schedule_decl_fingerprint(cfg: &Config, wf: &WorkflowDef) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // `Debug` covers every field of the declaration without this function
-    // having to be updated each time `WorkflowDef` grows one — which is the
-    // failure mode being fixed here, so a hand-written field list is exactly
-    // the wrong shape. Deterministic: `WorkflowDef` holds no maps.
-    format!("{wf:?}").hash(&mut hasher);
+    hash_declaration(wf, &mut hasher);
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for step in &wf.steps {
         if !seen.insert(step.agent.as_str()) {
@@ -4811,10 +4807,52 @@ fn schedule_decl_fingerprint(cfg: &Config, wf: &WorkflowDef) -> u64 {
             .chain(cfg.processes.iter())
             .find(|d| d.name == step.agent)
         {
-            format!("{def:?}").hash(&mut hasher);
+            hash_declaration(def, &mut hasher);
         }
     }
     hasher.finish()
+}
+
+/// Fold one declaration into `hasher` in a form that does not depend on how
+/// this process happened to lay out a `HashMap`.
+///
+/// The obvious spelling — `format!("{value:?}")` — is wrong here, and was
+/// wrong in a way no fixture in this file could see. `AgentDef::env` is a
+/// `HashMap`, `RandomState` seeds every instance differently, and each parse
+/// of `ptygrid.yml` builds fresh instances; so two parses of the *same bytes*
+/// rendered their env in different orders roughly five times in six, and the
+/// fingerprint of an untouched declaration moved on every save. That
+/// un-stopped a schedule that had stopped itself, at random, whenever some
+/// unrelated workflow was edited — the exact behaviour the per-schedule
+/// fingerprint exists to prevent. It needed two `env:` keys to show, which is
+/// what `ptygrid init` writes by itself (`ANTHROPIC_BASE_URL` plus
+/// `ANTHROPIC_AUTH_TOKEN`), while every fixture here declared `cmd:` alone.
+///
+/// `serde_json::to_value` fixes it because `serde_json::Map` is a `BTreeMap`
+/// unless the `preserve_order` feature is on (it is not, and
+/// `the_same_declaration_hashes_to_the_same_fingerprint_every_time` fails
+/// loudly if a future dependency turns it on). `to_string` on the *value* is
+/// therefore key-ordered; `serde_json::to_string` on the struct is NOT — it
+/// walks the `HashMap` directly and reproduces the defect exactly.
+///
+/// Serialization still covers every field without this function being edited
+/// each time a struct grows one, which is the property the `Debug` version was
+/// reached for in the first place.
+///
+/// On `Err` — unreachable for these types, which serialize to plain objects —
+/// fall back to `Debug`. That errs wide on purpose: for a map-bearing value
+/// the fallback is unstable, so the row rebuilds on every save, and per the
+/// paragraph above clearing a stop too eagerly is the cheap mistake.
+fn hash_declaration<T, H>(value: &T, hasher: &mut H)
+where
+    T: serde::Serialize + std::fmt::Debug,
+    H: std::hash::Hasher,
+{
+    use std::hash::Hash;
+    match serde_json::to_value(value) {
+        Ok(v) => v.to_string().hash(hasher),
+        Err(_) => format!("{value:?}").hash(hasher),
+    }
 }
 
 /// How late a fire may be and still count as that fire.
@@ -4835,7 +4873,9 @@ fn schedule_decl_fingerprint(cfg: &Config, wf: &WorkflowDef) -> u64 {
 ///   a late fire lands on top of the next one. 5 minutes is also the number
 ///   this file already uses for "how long is it still reasonable to wait for
 ///   something that should have happened by now" (`WORKFLOW_DEFER_MAX_MS`),
-///   and reusing it beats inventing a second answer to the same question.
+///   and reusing it beats inventing a second answer to the same question —
+///   so it is that constant, not a second literal that happens to agree with
+///   it today.
 /// - **`day` / `weekday` → 15 minutes.** Same reasoning, one interval up:
 ///   three times the hourly grace, still 1% of the interval, and still inside
 ///   what anybody who wrote `at: "09:00"` would call "the nine o'clock run".
@@ -4844,7 +4884,7 @@ fn schedule_decl_fingerprint(cfg: &Config, wf: &WorkflowDef) -> u64 {
 /// yet (plan.md §2 U20). They are bounds chosen so that being wrong is cheap:
 /// too small only turns a very late fire into a visible skip with a reason,
 /// which is the shape 1.3 asks for anyway.
-const SCHEDULE_GRACE_HOURLY_MS: u64 = 5 * 60 * 1000;
+const SCHEDULE_GRACE_HOURLY_MS: u64 = WORKFLOW_DEFER_MAX_MS;
 const SCHEDULE_GRACE_DAILY_MS: u64 = 15 * 60 * 1000;
 
 fn schedule_grace_ms(every: Every) -> u64 {
@@ -4857,13 +4897,20 @@ fn schedule_grace_ms(every: Every) -> u64 {
 /// A backward step of the wall clock larger than this is treated as the clock
 /// having been corrected, not as scheduling jitter.
 ///
-/// The driver ticks every 200ms, so 5 seconds is 25 ticks — nothing in the
-/// loop can produce that. ntpd steps (rather than slews) the clock when it is
-/// more than 128ms out, so an ordinary correction stays far below this and
-/// leaves the table alone; a manual change or a large NTP step trips it.
+/// `last_tick_ms` is written by `tick_schedules` and by nothing else, and that
+/// runs one driver tick in `SCHEDULE_TICK_EVERY` — once a second. So 5 seconds
+/// is five consecutive samples' worth of drift, not scheduling jitter, and
+/// nothing in the loop can produce it. ntpd steps (rather than slews) the
+/// clock when it is more than 128ms out, so an ordinary correction stays far
+/// below this and leaves the table alone; a manual change or a large NTP step
+/// trips it.
+///
 /// Forward jumps deliberately do NOT trip it: a forward jump and a suspended
 /// machine are the same observation, and the grace window above is the answer
-/// to both.
+/// to both. The zone-change branch beside this one has the same obligation and
+/// meets it differently — it cannot tell a daylight-saving edge from a flight
+/// to another country, so it skips any row that is already due and leaves that
+/// row to the grace window too.
 const CLOCK_STEP_TOLERANCE_MS: i64 = 5_000;
 
 /// The next local instant matching `schedule` that is STRICTLY after `now`.
@@ -5006,7 +5053,7 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
     // `current_arc`, not `current`: this runs on a timer, and deep-copying
     // every agent / process / workflow / team preset to answer "is anything
     // due?" is a cost with no reader (spec §3.7).
-    let Some((cfg, _dir, generation)) = config.current_arc() else {
+    let Some((cfg, generation)) = config.current_arc() else {
         return false;
     };
     let Some(workflows) = cfg.workflows.as_ref() else {
@@ -5121,6 +5168,20 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
         inner.last_offset_seconds = Some(offset_now);
         if stepped_back || zone_moved {
             for (name, state) in inner.states.iter_mut() {
+                // A row that is ALREADY due is not re-anchored, and daylight
+                // saving is why. `stepped_back` cannot fire on a DST edge —
+                // `timestamp_millis()` is UTC and never goes backwards — but
+                // `zone_moved` always does, because the offset is exactly what
+                // changes. On 2026-03-08 in New York a `02:30` daily is
+                // anchored at 03:00 EDT, the first instant after the gap, and
+                // that instant IS the offset change: without this guard the
+                // re-anchor ran first, moved the fire to tomorrow, and the day
+                // lost its run with no `last_skip_reason` to show for it —
+                // the one shape spec §1.3 rules out. A due row is left for the
+                // grace check below, which either fires it or says why not.
+                if state.next_fire_at_ms.is_some_and(|t| t <= now_ms_val) {
+                    continue;
+                }
                 let recomputed = workflows
                     .get(name)
                     .and_then(|wf| wf.schedule.as_ref())
@@ -5220,7 +5281,13 @@ fn tick_schedules<R: Runtime, Tz: TimeZone>(
                 .any(|run| run.name == name);
         let skip = if late_ms > grace_ms {
             Some(ScheduleSkip::Late {
-                late_minutes: late_ms / 60_000,
+                // Rounded UP, not truncated. This number is read next to a
+                // documented window ("15 minutes"), and the smallest lateness
+                // that gets here is one millisecond past it — which truncation
+                // renders as `15`, i.e. "skipped for being exactly as late as
+                // the window allows". Rounding up keeps the reported number
+                // strictly larger than the window it exceeded.
+                late_minutes: late_ms.div_ceil(60_000),
             })
         } else if overlapping {
             Some(ScheduleSkip::Overlap)
@@ -12353,5 +12420,497 @@ workflows:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 5.0.8 final-review fixes (2026-08-13). See plan.md §6.21.
+
+    /// An agent carrying more than one `env:` key, which is the shape
+    /// `ptygrid init` writes by itself (`ANTHROPIC_BASE_URL` +
+    /// `ANTHROPIC_AUTH_TOKEN`). Anything that hashes a `HashMap`'s iteration
+    /// order is unstable here and stable for the `cmd:`-only fixtures the
+    /// rest of this file uses.
+    const SCHED_YAML_WITH_ENV: &str = "agents:
+  - name: a
+    cmd: /bin/cat
+    env:
+      ANTHROPIC_BASE_URL: http://127.0.0.1:8080
+      ANTHROPIC_AUTH_TOKEN: dummy-token
+      PTYGRID_ONE: one
+      PTYGRID_TWO: two
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+
+    #[test]
+    fn the_same_declaration_hashes_to_the_same_fingerprint_every_time() {
+        // The fingerprint is the whole of "fix it and save, and it starts
+        // again" — and of its other half, "an edit somewhere else is not a
+        // fix". Hashing a `Debug` rendering made the second half depend on
+        // `HashMap` iteration order: `AgentDef::env` is a `HashMap`, every
+        // parse builds a new one, and `RandomState` seeds each instance
+        // differently, so two parses of the SAME bytes rendered their env in
+        // different orders about five times in six. A schedule that had
+        // stopped itself would then un-stop when any unrelated workflow was
+        // saved, at random.
+        //
+        // Twenty rounds because one round passes by luck one time in six.
+        let baseline = {
+            let cfg = parse_config(SCHED_YAML_WITH_ENV).unwrap();
+            let wf = cfg.workflows.as_ref().unwrap()["timed"].clone();
+            schedule_decl_fingerprint(&cfg, &wf)
+        };
+        for round in 0..20 {
+            let cfg = parse_config(SCHED_YAML_WITH_ENV).unwrap();
+            let wf = cfg.workflows.as_ref().unwrap()["timed"].clone();
+            assert_eq!(
+                schedule_decl_fingerprint(&cfg, &wf),
+                baseline,
+                "round {round}: re-parsing the same bytes must not move the fingerprint"
+            );
+        }
+
+        // And it still MOVES when the declaration really moves — an env value
+        // is part of what the workflow will do, so editing one is a fix.
+        let edited = SCHED_YAML_WITH_ENV.replace("dummy-token", "a-different-token");
+        let cfg = parse_config(&edited).unwrap();
+        let wf = cfg.workflows.as_ref().unwrap()["timed"].clone();
+        assert_ne!(
+            schedule_decl_fingerprint(&cfg, &wf),
+            baseline,
+            "changing an agent's env is an edit to what this schedule runs"
+        );
+    }
+
+    #[test]
+    fn editing_an_unrelated_workflow_does_not_restart_a_stopped_one_with_env() {
+        // The same rule as `editing_an_unrelated_schedule_does_not_restart_a_
+        // stopped_one`, on a config whose agent carries `env:`. That test's
+        // fixture is `cmd:`-only, so it could never observe the `HashMap`
+        // ordering defect above.
+        let yaml = |cmd: &str| {
+            format!(
+                "agents:
+  - name: a
+    cmd: /bin/cat
+    env:
+      ANTHROPIC_BASE_URL: http://127.0.0.1:8080
+      ANTHROPIC_AUTH_TOKEN: dummy-token
+      PTYGRID_ONE: one
+      PTYGRID_TWO: two
+  - name: unrelated
+    cmd: {cmd}
+workflows:
+  timed:
+    schedule:
+      every: hour
+      at: \"05\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+  plain:
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: unrelated
+"
+            )
+        };
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(&yaml("/bin/cat"));
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        fail_until_stopped(
+            &handle, &manager, &config, &store, &registry, &schedules, "timed", 3,
+        );
+        assert!(
+            schedules.view()[0].stopped_reason.is_some(),
+            "three failures should have stopped it"
+        );
+
+        // Save an edit to the OTHER workflow's agent, twenty times. Not one
+        // byte of `timed` or of agent `a` changes.
+        for round in 0..20 {
+            let cmd = if round % 2 == 0 { "/bin/echo" } else { "/bin/true" };
+            config.set_for_test(dir.clone(), parse_config(&yaml(cmd)).unwrap());
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                local_at(2026, 8, 5, 17, 0),
+            );
+            let view = schedules.view();
+            let timed = view.iter().find(|v| v.name == "timed").unwrap();
+            assert!(
+                timed.stopped_reason.is_some(),
+                "round {round}: an edit somewhere else in the file is not a fix"
+            );
+            assert_eq!(timed.consecutive_failures, 3, "round {round}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_the_same_file_again_moves_nothing_in_the_table() {
+        // Ctrl-S on an unmodified buffer bumps the generation counter, so the
+        // rebuild gate opens; the fingerprints then have to close it again.
+        // If they do not, every stray save re-cuts `next_fire_at` and clears
+        // the streak.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML_WITH_ENV);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        fail_until_stopped(
+            &handle, &manager, &config, &store, &registry, &schedules, "timed", 3,
+        );
+        let before = schedules.view().into_iter().next().unwrap();
+        assert!(before.stopped_reason.is_some());
+
+        for round in 0..20 {
+            config.set_for_test(dir.clone(), parse_config(SCHED_YAML_WITH_ENV).unwrap());
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                local_at(2026, 8, 5, 17, 0),
+            );
+            let after = schedules.view().into_iter().next().unwrap();
+            assert_eq!(after.stopped_reason, before.stopped_reason, "round {round}");
+            assert_eq!(after.next_fire_at_ms, before.next_fire_at_ms, "round {round}");
+            assert_eq!(
+                after.consecutive_failures, before.consecutive_failures,
+                "round {round}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_the_schedule_block_removes_the_row() {
+        // `a_config_without_schedules_leaves_the_scheduler_inert` starts with
+        // no `schedule:` at all, so it never walks the path an operator takes:
+        // a schedule that existed and was then deleted. A row the config no
+        // longer declares must not stay in the panel, and must certainly not
+        // keep firing.
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(SCHED_YAML);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 0),
+        );
+        assert_eq!(schedules.view().len(), 1);
+
+        // The `schedule:` block is deleted; the workflow itself stays.
+        let unscheduled = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  timed:
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        config.set_for_test(dir.clone(), parse_config(unscheduled).unwrap());
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 1),
+        );
+        assert!(
+            schedules.view().is_empty(),
+            "a schedule the config no longer declares is not a schedule"
+        );
+
+        // And the time it used to fire at comes and goes with nothing on the
+        // grid.
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            local_at(2026, 8, 5, 14, 6),
+        );
+        assert!(registry.active_run_ids().is_empty());
+        assert_eq!(manager.occupied_pane_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fire_due_in_the_very_tick_the_offset_moves_still_happens() {
+        // Spring forward, through the tick rather than through `next_fire_at`.
+        //
+        // `moving_to_another_timezone_re_anchors_instead_of_firing_at_the_old_
+        // offset` uses two `FixedOffset`s and moves between them at a moment
+        // when nothing is due, so it never asks what the re-anchor does to a
+        // fire that IS due. Daylight saving asks exactly that: on 2026-03-08
+        // in New York the offset changes at 07:00Z, and a `02:30` daily whose
+        // last recompute landed on "the first instant after the gap" is due at
+        // 07:00Z too. Re-anchoring first threw that fire away and left no skip
+        // reason behind — the one shape spec §1.3 says never to build.
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  nightly:
+    schedule:
+      every: day
+      at: \"02:30\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        // The day before, in EST (-05:00).
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            ny_at(2026, 3, 7, 12, 0),
+        );
+        let anchored = ny_at(2026, 3, 8, 3, 0);
+        assert_eq!(
+            schedules.view()[0].next_fire_at_ms,
+            Some(anchored.timestamp_millis() as u64),
+            "02:30 does not exist on 2026-03-08, so the fire anchors at 03:00 EDT"
+        );
+
+        // 200ms past it: due, and the first tick whose offset differs from the
+        // last one (-18000 → -14400).
+        tick_schedules(
+            &handle,
+            &manager,
+            &config,
+            &store,
+            &registry,
+            &schedules,
+            anchored + ChronoDuration::milliseconds(200),
+        );
+        assert_eq!(
+            registry.active_run_ids().len(),
+            1,
+            "the fire was due 200ms ago; the clock moving is not a reason to drop it"
+        );
+        let view = schedules.view();
+        assert!(
+            view[0].last_skip_reason.is_none(),
+            "reason was: {:?}",
+            view[0].last_skip_reason
+        );
+        assert_eq!(
+            view[0].next_fire_at_ms,
+            Some(ny_at(2026, 3, 9, 2, 30).timestamp_millis() as u64),
+            "and the next one is tomorrow 02:30, which exists again"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hour_that_happens_twice_loses_one_fire_and_never_gains_one() {
+        // The autumn edge through the tick. The offset changes at 06:00Z, so
+        // the re-anchor branch runs in the middle of the 25-hour day; what it
+        // must not do is hand the repeated 01:30 a second run. The documented
+        // cost stays a cost: `every: hour` gets one fire fewer than there are
+        // hours, never one more.
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  hourly:
+    schedule:
+      every: hour
+      at: \"30\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(yaml);
+        let registry = WorkflowRegistry::new();
+        let schedules = ScheduleRegistry::new();
+
+        // 00:00 EDT on the fall-back day through 03:00 EST, a minute at a
+        // time. Each run is retired immediately so the overlap guard never
+        // masks a fire this test is counting.
+        let start = ny_at(2026, 11, 1, 0, 0);
+        let mut fired: Vec<i64> = Vec::new();
+        for minute in 0..=240 {
+            let now = start + ChronoDuration::minutes(minute);
+            tick_schedules(&handle, &manager, &config, &store, &registry, &schedules, now);
+            for id in registry.active_run_ids() {
+                let Some(mut run) = registry.get(&id) else {
+                    continue;
+                };
+                if run.name != "hourly" {
+                    continue;
+                }
+                fired.push(now.timestamp_millis());
+                run.state = WorkflowState::Succeeded;
+                run.ended_at_ms = Some(1);
+                registry.put(run);
+            }
+        }
+
+        let at = |h: u32, m: u32| {
+            chrono_tz::America::New_York
+                .from_utc_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                        .unwrap()
+                        .and_hms_opt(h, m, 0)
+                        .unwrap(),
+                )
+                .timestamp_millis()
+        };
+        assert_eq!(
+            fired,
+            vec![at(4, 30), at(5, 30), at(7, 30)],
+            "00:30 EDT, 01:30 EDT, then 02:30 EST — the second 01:30 (06:30Z) \
+             is the one documented loss, and there is no second run for it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_grace_window_is_closed_at_the_top_and_reports_a_whole_minute() {
+        // Both sides of the boundary, because the number in the skip reason is
+        // what the operator compares against the documented window. Truncating
+        // division rendered the smallest possible skip — one millisecond past
+        // fifteen minutes — as `15`, i.e. "skipped for being exactly as late
+        // as the window allows".
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let yaml = "agents:
+  - name: a
+    cmd: /bin/cat
+workflows:
+  daily:
+    schedule:
+      every: day
+      at: \"09:00\"
+    pattern: pipeline
+    steps:
+      - id: only
+        agent: a
+";
+        // Exactly at the window: it fires.
+        {
+            let (config, store, dir) = harness(yaml);
+            let registry = WorkflowRegistry::new();
+            let schedules = ScheduleRegistry::new();
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                local_at(2026, 8, 5, 8, 0),
+            );
+            let due = local_at(2026, 8, 5, 9, 0);
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                due + ChronoDuration::milliseconds(SCHEDULE_GRACE_DAILY_MS as i64),
+            );
+            assert_eq!(
+                registry.active_run_ids().len(),
+                1,
+                "fifteen minutes late is inside a fifteen-minute window"
+            );
+            assert!(schedules.view()[0].last_skip_reason.is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // One millisecond past it: skipped, and rounded UP so the number the
+        // operator reads is larger than the window, not equal to it.
+        {
+            let (config, store, dir) = harness(yaml);
+            let registry = WorkflowRegistry::new();
+            let schedules = ScheduleRegistry::new();
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                local_at(2026, 8, 5, 8, 0),
+            );
+            let due = local_at(2026, 8, 5, 9, 0);
+            tick_schedules(
+                &handle,
+                &manager,
+                &config,
+                &store,
+                &registry,
+                &schedules,
+                due + ChronoDuration::milliseconds(SCHEDULE_GRACE_DAILY_MS as i64 + 1),
+            );
+            assert_eq!(
+                schedules.view()[0].last_skip_reason,
+                Some(ScheduleSkip::Late { late_minutes: 16 }),
+                "reason was: {:?}",
+                schedules.view()[0].last_skip_reason
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
