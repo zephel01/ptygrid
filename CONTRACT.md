@@ -2474,6 +2474,71 @@ team_presets:
 > ゼロ。frontend 無変更。**実機検証は未実施**（続報12 と同じ手順に「中継 step に `kickoff:` を
 > 書かない chain」を 1 本足す → plan.md §2）。
 
+> 追記（2026-08-13、続報15）: **cancel / abandon された run が、誰も ack しない kickoff を
+> agent の mailbox に置き去りにしていたのを直した（Stage A-5）。** kickoff は durable inbox に
+> 入り、**エージェントが返信して初めて ack される**（`reply_inbox` がスレッド root を ack する）。
+> run が cancel / abandon されると誰も返信しないので、その kickoff は**未 ack のまま mailbox に
+> 残り続ける**。`onEach` のコピー以外は宛先が **agent 定義名** — 同じ agent を使う将来の全 run と
+> 共有される mailbox — なので、次の run のペインが `await` したとき**死んだ run の指示を自分宛の
+> 指示として読む**。2026-08-05 の実機で `coder` のペインが前日の run の kickoff 2 通（id=333 /
+> id=334）を報告したのがこれ（plan.md §6.14）。5.0.7 が作った問題ではなく **5.0.0 からの挙動**。
+> 誤完了ではない（返信は thread root で相関されるので、古い kickoff への返信が別 step を
+> 完了させることはない）。**取り消された作業をエージェントが実行してしまう**という穴である。
+>
+> 是正: `cancel_workflow` / `abandon_workflow` が、その run が送った kickoff のうち未 ack のものを
+> すべて ack する（`orchestrator::retire_run_kickoffs` → 新設の
+> `QueenStore::ack_inbox_from_sender`）。
+>
+> **選択キーは message id ではなく sender である。** これが要点で、理由は 2 つある:
+>
+> - `workflow_mailbox` が作る sender は `queen:workflow/<name>/<run_id>` で **run_id を含む**。
+>   したがって「この run の kickoff だけ」を文字列一致で正確に選べる。共有 mailbox に入った
+>   ものも `onEach` コピーの `wf/<run_id>/<step_id>` に入ったものも同じ 1 本の条件で拾え、
+>   **並行している別 run の kickoff を巻き込む余地が構造的に無い**。
+> - id 経由では両方の呼び出し元をカバーできない。`StepOutcome::kickoff_root_msg_id` は
+>   `#[serde(skip)]` なので、**DB から読み戻した run には id が 1 つも無い**。
+>   `abandon_workflow`（再起動後の「破棄」しか入口が無い）が見るのは常にその読み戻した run で
+>   あり、resume をまたいだ run も再起動前の id を失っている。sender 経由はこの穴を通らない。
+>   → **「resume をまたぐと id が消えるので abandon では何もできない」という縮退は発生しない。**
+>
+> **step の state を問わず、その run の kickoff を全部 ack する。** 終わった run の kickoff は
+> すべて用済みであり、しかも `Succeeded` の step の kickoff も未 ack で残っていることが多い —
+> route 1（PTY exit）/ route 2（semantic done）は返信なしで step を完了させるからで、次の run から
+> 見ればそれも同じだけ古い。
+>
+> **best-effort。** `retire_run_kickoffs` は値を返さず、store エラーは `eprintln!` に落とす。
+> cancel が mailbox の掃除に失敗したせいで失敗するのは本末転倒であり、失敗時の最悪ケースは
+> この修正以前の挙動そのものだから。順序も「主目的が先」で固定した: cancel は `persist_run` の
+> **後**、abandon は `mark_workflow_abandoned` が成功した**後**にだけ掃く。
+>
+> **wire 契約は無変更**。Tauri command `cancel_workflow` / `abandon_workflow` の引数・返り値・
+> エラー文字列、`workflow-state` イベントの形、MCP tool（`ack_inbox` を含む）のシグネチャは
+> いずれも不変。`ack_inbox_from_sender` は **Rust 内部 API で、MCP には出していない**
+> （エージェントに他人のメールボックスを一括 ack させる道具を渡す理由が無い）。frontend 無変更。
+>
+> **既知の限界。**
+>
+> - **メッセージは削除ではなく ack** である。`list_inbox(includeAcknowledged: true)` には
+>   従来どおり残る（履歴・監査のため）。「古い kickoff を読ませない」保証は `await` /
+>   未 ack 一覧の側にしか及ばない。
+> - **abandon は永続行から workflow 名を読む必要がある**ため、`mark_workflow_abandoned` の
+>   *前*に `list_running_workflow_runs` で引く。行が既に消えている run では掃除をせず、
+>   `mark_workflow_abandoned` の "not found" エラーをそのまま返す。
+> - **`Failed` で終端した run と、正常に `Succeeded` した run は掃かない。** 今回の入口は
+>   cancel / abandon の 2 つだけである。同じ滞留は「返信せずに終わった run」でも起きうるが、
+>   そこは A-6（retention）の範囲であり本 patch では触っていない。**未実測**。
+> - `inbox_messages` に `sender` の索引は無いので、この掃除は project のメッセージを走査する
+>   （`MAX_MESSAGES_PER_PROJECT` = 50,000 で上限）。cancel / abandon 1 回につき 1 度だけ走り、
+>   **driver の tick には乗らない**ので索引とそのスキーマ移行は見送った。
+>
+> 検証: `cargo test` **lib 479（475 + 新規 4）/ 統合 14、いずれも 0 failed**（新規 4 本 —
+> `acking_by_sender_closes_only_that_senders_unacknowledged_messages` /
+> `cancelling_a_run_acks_the_kickoff_its_agent_never_answered` /
+> `abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost` /
+> `retiring_one_runs_kickoffs_leaves_a_concurrent_runs_alone`）。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更。**実機検証は未実施**（→ plan.md §2 の U17）。
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。

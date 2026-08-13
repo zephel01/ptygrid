@@ -1239,6 +1239,53 @@ pub fn spawn_workflow<R: Runtime>(
     Ok(run)
 }
 
+/// Close out every kickoff this run ever delivered, so nothing it sent can be
+/// mistaken for live work once the run is over (Stage A-5).
+///
+/// A kickoff lives in the AGENT'S mailbox, and for every step except an
+/// `onEach` copy that mailbox is the agent's definition name — shared with
+/// every other run that ever used the same agent. An agent only clears one by
+/// replying (`reply_inbox` acks the thread root it answers). A run that ends
+/// with nobody replying therefore leaves its kickoffs behind, unacknowledged,
+/// and the next run's pane — which `await`s that same mailbox — reads a dead
+/// run's instructions as its own. Observed on hardware 2026-08-05 with two
+/// day-old kickoffs still queued for `coder` (plan.md §6.14). It is not a
+/// mis-completion — replies are correlated by thread root, so an answer to a
+/// stale kickoff cannot finish somebody else's step — it is an agent doing
+/// work that was called off.
+///
+/// Selected by SENDER, not by id, and that is the whole trick:
+/// `workflow_mailbox` embeds the run id, so `queen:workflow/<name>/<run_id>`
+/// names this run's kickoffs and no others, whether they went to a shared
+/// agent mailbox or to an `onEach` copy's private `wf/<run_id>/<step_id>`.
+/// Going through ids instead would have covered neither caller properly:
+/// `StepOutcome::kickoff_root_msg_id` is `#[serde(skip)]`, so `abandon_workflow`
+/// (which only ever sees a run read back from the DB) has none at all, and a
+/// resumed run has lost the ones from before the restart.
+///
+/// Deliberately indifferent to step state. Every kickoff of a finished run is
+/// spent, including those of steps that SUCCEEDED: routes 1 (PTY exit) and 2
+/// (semantic `done`) complete a step without any reply, so a successful step
+/// very often leaves its kickoff unacknowledged too, and that copy is just as
+/// stale to the next run as a cancelled step's.
+///
+/// Best-effort by construction — it returns nothing and swallows store errors
+/// into a log line. Cancelling a run must not fail because a mailbox could not
+/// be tidied; the run is over either way, and the worst case of a failure here
+/// is the pre-Stage A-5 behaviour.
+fn retire_run_kickoffs(
+    store: &QueenStore,
+    project_dir: &std::path::Path,
+    workflow_name: &str,
+    run_id: &str,
+) {
+    if let Err(error) =
+        store.ack_inbox_from_sender(project_dir, workflow_mailbox(workflow_name, run_id))
+    {
+        eprintln!("workflow {run_id}: could not ack leftover kickoffs: {error}");
+    }
+}
+
 /// Cancel a running workflow: kill every step's live PTY, mark remaining
 /// pending steps CANCELLED, and set the run to `Cancelled`. Idempotent —
 /// a terminal (Succeeded/Failed/Cancelled) run is a no-op that returns
@@ -1297,6 +1344,12 @@ pub fn cancel_workflow(
     // crash-interrupted run and re-offered as "resume?" after a restart.
     if let Ok(project_dir) = resolve_project_dir(config) {
         persist_run(store, &project_dir, &run);
+        // Stage A-5, AFTER the write-through: the durable record of the
+        // cancel is the thing worth having if the process dies mid-call, and
+        // this is best-effort cleanup that must not delay it. The early return
+        // above means a re-cancel never reaches here, which is fine — the
+        // first call already swept, and a sweep is idempotent anyway.
+        retire_run_kickoffs(store, &project_dir, &run.name, &run.run_id);
     }
     Ok(run)
 }
@@ -1578,6 +1631,13 @@ pub fn resume_workflow<R: Runtime>(
 /// registry entry to touch. `QueenStore::mark_workflow_abandoned` sets
 /// `state = 'cancelled'`, so `load_config`'s resume-detection query never
 /// surfaces this run_id again.
+///
+/// Stage A-5: it also retires the run's leftover kickoffs, and the workflow
+/// NAME that needs is read out of the persisted row before the row is marked —
+/// after `mark_workflow_abandoned` the run is no longer `running` and
+/// `list_running_workflow_runs` cannot find it. A run whose row has already
+/// vanished skips the sweep and lets `mark_workflow_abandoned` produce the
+/// "not found" error, which is the caller-visible failure that matters.
 pub fn abandon_workflow(
     config: &ConfigManager,
     store: &QueenStore,
@@ -1586,7 +1646,19 @@ pub fn abandon_workflow(
     let (_cfg, project_dir) = config
         .current()
         .ok_or_else(|| "no config loaded (call load_config first)".to_string())?;
-    store.mark_workflow_abandoned(&project_dir, run_id)
+    let name = store
+        .list_running_workflow_runs(&project_dir)
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|row| row.run_id == run_id))
+        .map(|row| row.name);
+    store.mark_workflow_abandoned(&project_dir, run_id)?;
+    // After the mark, and only once it succeeded: the point of abandoning is
+    // to stop the resume prompt re-offering the run, and that must not be
+    // held up — or undone — by mailbox tidying.
+    if let Some(name) = name {
+        retire_run_kickoffs(store, &project_dir, &name, run_id);
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -4514,6 +4586,135 @@ workflows:
         // Second cancel is idempotent.
         let again = cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
         assert_eq!(again.state, WorkflowState::Cancelled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage A-5. A cancelled run's kickoff must not survive in the agent's
+    /// mailbox: that mailbox is the agent's definition NAME, shared with every
+    /// future run using the same agent, and an `await` there returns the
+    /// oldest unacknowledged message — so the next run's pane would be handed
+    /// instructions from a run that was called off (plan.md §6.14).
+    #[test]
+    fn cancelling_a_run_acks_the_kickoff_its_agent_never_answered() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let run = spawn_workflow(
+            &handle, &manager, &config, &store, &registry, "demo", 80, 24,
+        )
+        .unwrap();
+        assert!(
+            run.steps[0].kickoff_root_msg_id.is_some(),
+            "step `first` declares a kickoff, so a thread was opened for it"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "and it is waiting, unacknowledged, in agent `a`'s mailbox"
+        );
+
+        cancel_workflow(&manager, &config, &store, &registry, &run.run_id).unwrap();
+
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "cancel retires the kickoff so no later pane can pick it up"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, true, 50)
+                .unwrap()
+                .len(),
+            1,
+            "the message itself is kept — acknowledged, not deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage A-5, and the reason the sweep selects by SENDER rather than by
+    /// the ids the run recorded: `abandon_workflow` only ever sees a run read
+    /// back out of the DB, and `kickoff_root_msg_id` is `#[serde(skip)]`, so
+    /// there are no ids to sweep with. The test asserts that loss explicitly
+    /// so a future change that starts persisting the field does not quietly
+    /// leave this rationale stale.
+    #[test]
+    fn abandoning_a_run_acks_kickoffs_whose_ids_the_persisted_run_has_lost() {
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        let root = deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+        let run = mk_run("demo", vec![mk_kicked("first", "a", root)]);
+        persist_run(&store, &dir, &run);
+
+        let reloaded = store
+            .list_running_workflow_runs(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.run_id == TEST_RUN_ID)
+            .expect("the run is persisted as running and therefore resumable");
+        let steps: Vec<StepOutcome> = serde_json::from_str(&reloaded.steps_json).unwrap();
+        assert_eq!(
+            steps[0].kickoff_root_msg_id, None,
+            "the kickoff thread id does not survive the round trip"
+        );
+
+        abandon_workflow(&config, &store, TEST_RUN_ID).unwrap();
+
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "discarding the run still retires its kickoff"
+        );
+        assert!(
+            store.list_running_workflow_runs(&dir).unwrap().is_empty(),
+            "and the run stops being offered for resume"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep's blast radius. `workflow_mailbox` embeds the run id, so the
+    /// sender string names one run's kickoffs exactly — cancelling run A must
+    /// not acknowledge the kickoff a concurrent run B of the SAME workflow is
+    /// still waiting on, even though both landed in the same agent mailbox.
+    #[test]
+    fn retiring_one_runs_kickoffs_leaves_a_concurrent_runs_alone() {
+        const RUN_A: &str = "wfr_0000000000000001000000aa";
+        const RUN_B: &str = "wfr_0000000000000002000000bb";
+
+        let (_config, store, dir) = harness(PIPELINE_YAML);
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        deliver_kickoff(&store, &dir, "demo", RUN_A, first, &first.agent, None).unwrap();
+        let root_b = deliver_kickoff(&store, &dir, "demo", RUN_B, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        retire_run_kickoffs(&store, &dir, "demo", RUN_A);
+
+        let left = store
+            .list_inbox(&dir, "a".to_string(), 0, false, 50)
+            .unwrap();
+        assert_eq!(left.len(), 1, "exactly one kickoff is still live");
+        assert_eq!(
+            left[0].root_message_id, root_b,
+            "and it is run B's, which nobody cancelled"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

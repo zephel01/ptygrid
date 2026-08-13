@@ -795,6 +795,51 @@ impl QueenStore {
         Ok(message)
     }
 
+    /// Acknowledge every still-unacknowledged message a given `sender` put in
+    /// somebody else's mailbox, and report how many that closed (Stage A-5).
+    ///
+    /// The sender-side counterpart of `ack_inbox`, which is recipient-side and
+    /// takes one id at a time. It exists for one caller shape: a workflow run
+    /// that ends without its agents ever answering — cancelled, or abandoned
+    /// after a restart — leaves its kickoffs sitting unread and unacknowledged
+    /// in the AGENT'S mailbox, where the next run's pane picks them up as live
+    /// instructions (observed on hardware 2026-08-05, plan.md §6.14). The
+    /// orchestrator cannot express that cleanup as a list of ids: the kickoff
+    /// thread roots it records are `#[serde(skip)]`, so a run read back from
+    /// the DB has none of them.
+    ///
+    /// `sender` is the whole selector, which is safe precisely because
+    /// `orchestrator::workflow_mailbox` embeds the run id in it — no string
+    /// other than that one run's own `queen:workflow/<name>/<run_id>` can
+    /// match, so this can never acknowledge a sibling run's kickoff. Callers
+    /// with a less specific sender get a less specific sweep; that is on them.
+    ///
+    /// Already-acknowledged messages are left exactly as they are (their
+    /// original `acknowledged_at_ms` stands) and are not counted, so calling
+    /// this twice on one run is a no-op the second time.
+    ///
+    /// COST: `inbox_messages` has no index on `sender`, so this is a scan of
+    /// the project's messages (bounded by `MAX_MESSAGES_PER_PROJECT`). It runs
+    /// once per cancel/abandon — never on the driver tick — so an index and
+    /// the schema migration it would need are not worth it.
+    pub fn ack_inbox_from_sender(&self, project: &Path, sender: String) -> Result<usize, String> {
+        let project = project_id(project)?;
+        let sender = validated_mailbox("sender", sender)?;
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let acked = transaction
+            .execute(
+                "UPDATE inbox_messages SET acknowledged_at_ms = ?3
+                 WHERE project_dir = ?1 AND sender = ?2 AND acknowledged_at_ms IS NULL",
+                params![project, sender, now_ms()],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(acked)
+    }
+
     pub fn reply_inbox(
         &self,
         project: &Path,
@@ -1496,6 +1541,88 @@ mod tests {
                 .list_inbox(&one, "codex-review".to_string(), 0, true, 50)
                 .unwrap(),
             vec![acknowledged]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Stage A-5. Three properties in one, because they are the three the
+    /// orchestrator's cancel/abandon sweep leans on:
+    ///
+    /// 1. the selector is the SENDER, so one sender's leftovers can be closed
+    ///    without touching another's — that is what keeps a cancelled run from
+    ///    acknowledging a live sibling run's kickoff;
+    /// 2. it is project-scoped like every other store method;
+    /// 3. it never re-stamps an already-acknowledged message, and reports 0
+    ///    the second time, so a repeat sweep is a genuine no-op.
+    #[test]
+    fn acking_by_sender_closes_only_that_senders_unacknowledged_messages() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let send = |project: &Path, sender: &str, recipient: &str| {
+            store
+                .send_inbox(
+                    project,
+                    sender.to_string(),
+                    recipient.to_string(),
+                    "kickoff".to_string(),
+                    format!("work for {recipient}"),
+                )
+                .unwrap()
+        };
+        send(&one, "queen:workflow/demo/run-a", "coder");
+        send(&one, "queen:workflow/demo/run-a", "reviewer");
+        let sibling = send(&one, "queen:workflow/demo/run-b", "coder");
+        send(&two, "queen:workflow/demo/run-a", "coder");
+        // Already answered, so already acknowledged: the sweep must leave its
+        // original timestamp alone rather than move it to "now".
+        let answered = send(&one, "queen:workflow/demo/run-a", "writer");
+        store
+            .reply_inbox(&one, answered.id, "writer".to_string(), "done".to_string())
+            .unwrap();
+        let answered_before = store
+            .list_inbox(&one, "writer".to_string(), 0, true, 50)
+            .unwrap();
+        assert!(answered_before[0].acknowledged_at_ms.is_some());
+
+        assert_eq!(
+            store
+                .ack_inbox_from_sender(&one, "queen:workflow/demo/run-a".to_string())
+                .unwrap(),
+            2,
+            "only the two unacknowledged messages of run-a are counted"
+        );
+        assert!(store
+            .list_inbox(&one, "reviewer".to_string(), 0, false, 50)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_inbox(&one, "writer".to_string(), 0, true, 50)
+                .unwrap(),
+            answered_before,
+            "an already-acknowledged message keeps its original stamp"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&one, "coder".to_string(), 0, false, 50)
+                .unwrap(),
+            vec![sibling],
+            "another run's kickoff is a different sender and is untouched"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&two, "coder".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "same sender in another project is untouched"
+        );
+        assert_eq!(
+            store
+                .ack_inbox_from_sender(&one, "queen:workflow/demo/run-a".to_string())
+                .unwrap(),
+            0,
+            "sweeping twice closes nothing the second time"
         );
         let _ = std::fs::remove_dir_all(root);
     }
