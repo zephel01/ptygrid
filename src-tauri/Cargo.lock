@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "ptygrid"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "arc-swap",
  "axum",
