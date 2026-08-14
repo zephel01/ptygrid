@@ -2776,4 +2776,49 @@ mod tests {
         assert!(ids_before.len() as i64 > remaining);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Wiring regression for the same §2.4 claim. The two tests above call
+    /// `prune_every_projects_terminal_workflow_runs` themselves, so deleting
+    /// the line in `QueenStore::open` that calls it would leave both of them —
+    /// and the rest of the suite — green while the sweep never ran on any real
+    /// install again. And the sweep only matters because it runs at startup:
+    /// the whole premise is a project that has STOPPED running workflows, so
+    /// nothing else is ever going to reach its rows.
+    ///
+    /// Goes through the file-backed `open` rather than `open_in_memory`
+    /// deliberately: that is the constructor the app uses, and it is the one
+    /// carrying the call. The store is dropped before reopening so the second
+    /// connection reads what the first one committed.
+    #[test]
+    fn opening_the_store_sweeps_history_a_previous_build_left_over_the_cap() {
+        let (root, one, two) = projects();
+        let db = root.join("queen.sqlite3");
+        let overshoot = 3;
+        let planted = MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + overshoot;
+        {
+            let store = QueenStore::open(&db).expect("a fresh database opens");
+            plant_finished_runs(&store, &one, "old", planted);
+            plant_finished_runs(&store, &two, "other", 2);
+            // Written directly, the way a pre-A-6 build left it: nothing has
+            // trimmed this yet, and nothing ever will unless startup does.
+            assert_eq!(stored_run_ids(&store, &one).len() as i64, planted);
+        }
+
+        let store = QueenStore::open(&db).expect("reopening the same file works");
+
+        assert_eq!(
+            stored_run_ids(&store, &one).len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+            "`open` must run the sweep — history over the cap has to shrink \
+             on the startup that finds it, not on the next run that happens"
+        );
+        assert_eq!(
+            stored_run_ids(&store, &two).len(),
+            2,
+            "and it trims rather than clears: a project under the cap is \
+             untouched"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -1261,11 +1261,16 @@ pub fn spawn_workflow<R: Runtime>(
     // v0.5.9 §2.3, the other producer of a terminal run. A run whose every
     // root failed to spawn is born `Failed` and is never handed to the driver
     // (`active_run_ids` skips terminal runs), so `advance_run`'s edge cannot
-    // see it — and this is exactly the shape a `schedule:`-fired run takes
-    // when the grid is full or an `agents:` entry has gone stale, i.e. the
-    // silence §2.3 exists to break. `Running` is the honest "previous" here:
-    // the run has just come into existence, so it cannot have been terminal
-    // before.
+    // see it. Reaching it needs EVERY step to be a root AND every one of those
+    // spawns to fail — a stale `agents:` entry is the realistic way in, and a
+    // `schedule:`-fired run hits it with nobody watching, which is the silence
+    // §2.3 exists to break. A FULL GRID is NOT this shape: a root that has no
+    // slot is pushed above as a `Pending` placeholder, and the `state` verdict
+    // below returns `Running` while any `Pending` remains, so a run deferred by
+    // the pane cap is born `Running` and reaches its end (if it ever fails)
+    // through the driver's edge instead. `Running` is the honest "previous"
+    // here: the run has just come into existence, so it cannot have been
+    // terminal before.
     if let Some(failure) = run_failure_escalation(WorkflowState::Running, &run) {
         notify_run_failure(app, workflow_name, &run_id, &failure);
     }
@@ -4059,6 +4064,19 @@ fn notify_escalation<R: Runtime>(
     );
 }
 
+// Test-only tap on the run-scope send below. `dispatch_ctx` returns
+// immediately when no `NotificationManager` sits in managed state, which is
+// exactly the case under `tauri::test::mock_app`, so a driver-level test has
+// nothing else it can observe: the run-scope escalation leaves no mark on the
+// run the way `StepOutcome::escalated` does for the step-scope one. Thread
+// local rather than a global so tests running in parallel cannot see each
+// other's sends — `advance_run` and this call are on the same thread.
+#[cfg(test)]
+thread_local! {
+    static RUN_FAILURE_SENDS: std::cell::RefCell<Vec<RunFailure>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// v0.5.9 §2.3, side-effecting half: hand one red RUN to the Phase 4.4.2
 /// notification layer.
 ///
@@ -4078,6 +4096,8 @@ fn notify_run_failure<R: Runtime>(
     run_id: &str,
     failure: &RunFailure,
 ) {
+    #[cfg(test)]
+    RUN_FAILURE_SENDS.with(|sent| sent.borrow_mut().push(failure.clone()));
     crate::notifications::dispatch_ctx(
         app,
         crate::notifications::NotifyEvent::Error,
@@ -6921,6 +6941,90 @@ workflows:
             snap.state,
             WorkflowState::Failed,
             "the exhausted step is the whole run, so this tick also ends it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty the thread-local tap and hand back what `notify_run_failure` was
+    /// called with on this thread since the last drain.
+    fn drain_run_failure_sends() -> Vec<RunFailure> {
+        RUN_FAILURE_SENDS.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+    }
+
+    /// Wiring regression for §2.3, the run-scope twin of
+    /// `advance_run_escalates_a_step_that_has_run_out_of_retries` above and of
+    /// `a_finished_run_sweeps_its_kickoffs_exactly_once` in §2.1. All four
+    /// §2.3 tests call the pure `run_failure_escalation` directly, so nothing
+    /// pins the one thing the driver has to get right: `previous_state` is
+    /// read BEFORE `run.state = new_state`. Move that single line below the
+    /// assignment and `previous` equals `run.state`, `just_reached_terminal`
+    /// is false for every run, and the run-scope escalation goes permanently
+    /// silent — with the whole suite still green, because the pure function
+    /// keeps its own tests and the compiler sees nothing wrong.
+    ///
+    /// The run here has no `retry:` anywhere (PIPELINE_YAML declares none), so
+    /// `take_escalations` collects nothing and the run-scope send is the ONLY
+    /// message this tick can produce — which is also the exact configuration
+    /// §2.3 exists for.
+    #[test]
+    fn advance_run_escalates_a_run_that_ends_failed_with_no_step_escalation() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+        let _ = drain_run_failure_sends();
+
+        // `first` failed and holds no session, so `detect_completions` /
+        // `check_timeouts` both skip it; `second` is still queued behind it.
+        // fail-fast (the default) skips `second` this tick, which is what
+        // makes every step terminal and ends the run.
+        let mut run = mk_run(
+            "demo",
+            vec![
+                mk_outcome("first", None, StepState::Failed),
+                mk_outcome("second", None, StepState::Pending),
+            ],
+        );
+        run.steps[0].error = Some("exit code 3".to_string());
+        registry.put(run.clone());
+
+        advance_run(
+            &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+        );
+
+        let snap = registry.get(&run.run_id).expect("the run is still held");
+        assert_eq!(
+            snap.state,
+            WorkflowState::Failed,
+            "precondition: this tick is the one that ends the run"
+        );
+        assert!(
+            !snap.steps[0].escalated,
+            "precondition: no `retry:` means no step-scope escalation, so \
+             nothing suppresses the run-scope one"
+        );
+
+        let sent = drain_run_failure_sends();
+        assert_eq!(
+            sent.len(),
+            1,
+            "a run that reaches `Failed` owes the operator exactly one \
+             run-scope message"
+        );
+        assert_eq!(sent[0].failed_steps, vec!["first".to_string()]);
+        assert_eq!(sent[0].error.as_deref(), Some("exit code 3"));
+
+        // The edge is one-shot: the run is terminal now, so a second tick must
+        // not re-send. (`advance_run` returns early on a terminal run — this
+        // pins that the early return is what the driver relies on here.)
+        advance_run(
+            &handle, &manager, &config, &store, &registry, &view, &run.run_id,
+        );
+        assert!(
+            drain_run_failure_sends().is_empty(),
+            "a run already terminal on entry has no edge left to report"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
