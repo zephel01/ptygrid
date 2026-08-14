@@ -21,6 +21,11 @@
 #   4. 3 ファイルを新しい version に書き換え
 #   5. `cargo check` を走らせ、src-tauri/Cargo.lock を追従させる
 #   6. 4 ファイルすべてを読み直し、新しい値になっていることを検証して表示
+#
+# 4 以降で異常が起きた場合（典型は 5 の `cargo check` 失敗）は、書き換えた 4 ファイルを
+# 退避しておいた原本から戻してから止まる。戻さないと「3 ファイルは新版・Cargo.lock は
+# 旧版」という、このスクリプトが防ぐために存在する食い違いがそのまま残り、しかも
+# 次の実行は 3 の dirty-tree ガードに弾かれて手で戻すしかなくなる。
 
 set -eu
 
@@ -166,14 +171,53 @@ write_cargo_toml_version() {
     mv "$tmp" "$file"
 }
 
+# 最初の 1 バイトを書く前に原本を退避する。ここから先の異常終了は、成功していない
+# 書き換えを残したまま抜けることになるので、EXIT trap で必ず元に戻す。Cargo.lock も
+# 対象に含める — (5) が通ったあとに (6) で落ちた場合、3 ファイルだけ戻すと今度は
+# Cargo.lock だけが新版になり、食い違いの向きが変わるだけになる。
+BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ptygrid-bump.XXXXXX")
+cp "$PKG_JSON" "$BACKUP_DIR/package.json"
+cp "$CARGO_TOML" "$BACKUP_DIR/Cargo.toml"
+cp "$TAURI_CONF" "$BACKUP_DIR/tauri.conf.json"
+if [ -f "$CARGO_LOCK" ]; then
+    cp "$CARGO_LOCK" "$BACKUP_DIR/Cargo.lock"
+fi
+
+restore_backup() {
+    cp "$BACKUP_DIR/package.json" "$PKG_JSON"
+    cp "$BACKUP_DIR/Cargo.toml" "$CARGO_TOML"
+    cp "$BACKUP_DIR/tauri.conf.json" "$TAURI_CONF"
+    if [ -f "$BACKUP_DIR/Cargo.lock" ]; then
+        cp "$BACKUP_DIR/Cargo.lock" "$CARGO_LOCK"
+    fi
+}
+
+on_exit() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        restore_backup
+        echo "  → 書き換えを取り消し、$CUR_VERSION の状態に戻しました。" >&2
+    fi
+    rm -f "$PKG_JSON.bump-tmp" "$CARGO_TOML.bump-tmp" "$TAURI_CONF.bump-tmp"
+    rm -rf "$BACKUP_DIR"
+    exit "$status"
+}
+trap on_exit EXIT
+# シグナルで死ぬときも EXIT trap を通す（POSIX sh は signal 単体では EXIT を走らせない）。
+trap 'exit 1' HUP INT TERM
+
 write_json_version "$PKG_JSON" "$NEW_VERSION"
 write_cargo_toml_version "$CARGO_TOML" "$NEW_VERSION"
 write_json_version "$TAURI_CONF" "$NEW_VERSION"
 
 # (5) Cargo.lock を追従させる（cargo check は、対象パッケージ自身の version の
 # 変更だけなら通常フルビルドを伴わず短時間で終わる。target/ が無い初回のみ遅い）。
+# 明示的に受けるのは、`set -e` に任せると理由が 1 行も出ないまま抜けるため。
 echo "cargo check で Cargo.lock を追従させています..."
-(cd "$ROOT_DIR/src-tauri" && cargo check --quiet)
+if ! (cd "$ROOT_DIR/src-tauri" && cargo check --quiet); then
+    echo "error: cargo check が失敗しました（version の書き換えとは無関係のビルドエラーの可能性があります）。" >&2
+    exit 1
+fi
 
 # --- 検証 -----------------------------------------------------------
 
