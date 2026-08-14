@@ -3,6 +3,13 @@
 > この文書は段階releaseごとの差分契約を時系列で保持する。前のPhaseと後のPhaseが競合する
 > 場合は、後のPhaseの「追加契約」が現在の有効仕様として優先される。現在の実装はPhase 4.0。
 > 操作方法と現在仕様の要約は[docs/guide/userguide.md](docs/guide/userguide.md)を参照。
+>
+> **（2026-08-14 追記）行番号の注記**: 本文中の `foo.rs:123-456` のような行番号参照は、
+> **その追記を書いた時点のもの**であり、以後のコード変更で実際の行番号とずれうる
+> （例: 続報13 が参照する `config.rs:850-856` は、その後の行追加で現在 `config.rs:963-1004`
+> になっている）。この文書は append-only（既存の続報本文は書き換えない）なので、ずれるたびに
+> 追いかけて直すことはしない。行番号は「おおまかな当たりをつける道具」として使い、正確な現在地は
+> シンボル名や関数名で `grep` して確認すること。
 
 ## Phase 0 (基本PTY)
 
@@ -3211,6 +3218,44 @@ team_presets:
 > (c) 起動時掃除が実際に何行削るか、その所要時間も未計測（削除対象ゼロのときは
 > `SELECT DISTINCT` 1 文と `count(*)` がプロジェクト数ぶんで、これは実測していない）。
 >
+> 追記（2026-08-13、続報23）: **SQLite `PRAGMA user_version` 4 の帰属を確定した — 5.6.0
+> （スキーマ分割）に割り当て、旧 Phase 6.0 の予約は 5 へ繰り下げる。** 実装値は依然 3
+> （Stage A-6 は消費していない、続報17 (6)）。
+>
+> **なぜ確定させる必要があったか。** `queen_store.rs` は `version > 3` の DB を開かずにエラーにする。
+> **一度でも 4 を書いたビルドがユーザーの `queen.sqlite3` に触れると、それ以前の全ビルドはそのファイルを
+> 二度と開けなくなる。** ダウングレード経路も自動修復も無い。番号を持っていくのは「先に出荷したほう」
+> であり、ドキュメント上の予約は 4 番を取り返せない。旧規約（plan.md §5.1、Phase 単位の予約表）は
+> 「4 は 5.6.0 と 6.0.0 の間で未決」と書いたまま両者に予約可能性を残していた
+> （`queen_store.rs` 側のコメントも同じ表現で未決と明記）。
+>
+> **5.6.0 に与える理由。** 5.6.0（`workflow_runs` の `steps_json` を step 行へ展開する破壊的
+> migration）だけが**既存データの移行**を伴う。`workflow_runs` は 5.0.1 から本番データが入っている
+> 唯一の対象である。旧 Phase 6.0 の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）と
+> 5.5.1 の `spans` テーブル（`spec-phase5-5.md` §3.4）は既存データゼロの純追加で、番号の前後で
+> 難易度が変わらない。難しいほうに小さい番号を先に取らせるほうが、`BEGIN IMMEDIATE` 一括 /
+> `IF NOT EXISTS` / ROLLBACK という migration の定型を素直に適用できる。加えて旧 Phase 6.0 は
+> 着手が最も遠く（plan.md §3 P6 の着手順で 5 番目。`sandbox.rs` / `secrets.rs` / `replay.rs` は
+> ソースが存在しない）、5.6.0 は Stage A-6 完了で今日から着手できる。
+>
+> **請求者は 2 者ではなく 3 者だった。** `spec-phase5-5.md` §3.4 の `spans` 表（5.5.1 OTel）が、
+> plan.md §5.1（旧表）にも `next-implementation-2026-08.md` §4.2 にも登場していなかった。
+> `observability.enabled: false` が既定なので「有効化時に `CREATE TABLE IF NOT EXISTS` するだけで
+> bump しない」という設計も選べるが、それは version 検証を無意味化する（同じ 3 でもスキーマが
+> 2 通り存在することになる）ので採らない。**潜在的には 4 人目もいる**: memory 系テーブルを
+> v3 内 additive で足すか v4 を切るかは、plan.md §3 P6 の着手時に決め直す必要があると
+> 書いたままで未決である。
+>
+> **規約そのものも書き換えた。** plan.md §5.1 を「Phase 単位の予約表」から「出荷実績表 + 次の
+> 空き番号 1 つ」へ変更した。`queen_store.rs` の挙動（未来の番号を開かない）は「番号 = 出荷順の
+> 単調台帳」を強制しており、Phase 単位の予約と原理的に噛み合わない。噛み合わない規約を維持していた
+> ことが、この衝突を生んだ原因そのものである。
+>
+> 本項が上書きするもの: 続報17 (6) の「5.6.0 と 6.0.0 で未決」という記述、および下の
+> 「# Phase 6.0 追加契約」ヘッダーが宣言する
+> 「`PRAGMA user_version` を 3 → 4 へ bump」は、いずれも**この続報の決定より前の記述**であり
+> 4 は 5.6.0 のものである。**wire 契約・コードともに変更なし**（決定の記録のみ）。
+> 詳細な経緯と根拠は `docs/design/next-release-v0.5.9.md` §1.1 を参照。
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
@@ -3639,7 +3684,10 @@ wire 上の引数は `{ dir?: string, target?: InitTarget, llm?: LocalLlmEndpoin
 > 状態: 未実装（設計のみ）。実装時に本節へ具体的な wire 契約を書き足す。
 > 本仕様は [docs/spec/spec-phase6-0.md](docs/spec/spec-phase6-0.md) を参照。
 > 対象 patch: 6.0.0 Foundation / 6.0.1 Sandbox filesystem-only / 6.0.2 Sandbox strict / 6.0.3 Secrets keychain / 6.0.4 Secrets derived + proxy / 6.0.5 Replay UI + Export。
-> SQLite `PRAGMA user_version` を **3 → 4** へ bump（6.0.0 で `replays` / `secrets_audit` / `sandbox_events` 追加）。
+> ~~SQLite `PRAGMA user_version` を **3 → 4** へ bump（6.0.0 で `replays` / `secrets_audit` / `sandbox_events` 追加）。~~
+> **（2026-08-14 追記、続報23 参照）失効**: `user_version` 4 は 5.6.0（スキーマ分割）に割り当て
+> 済み。本 Phase（旧 6.0.0）が消費するのは **5**。番号以外の内容（3 テーブルの schema・
+> 導入タイミングが 6.0.0 であること）は変わらない。
 
 ## 6.0.1 ptygrid.yml スキーマ追加（予約）
 

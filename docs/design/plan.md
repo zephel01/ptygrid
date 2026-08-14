@@ -68,7 +68,7 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.5.4 | Trace Waterfall + Cost Dashboard | ⬜ | — | 該当なし |
 | （無番号） | escalation: retry 枯渇時に外部へ通知する経路（4.4.2 の `notifications:` 基盤への配線）。枯渇判定は 5.0.4 で発火するようになったが配送経路が無い | ✅（2026-08-13、Stage A-4。→ §6.16） | v0.5.8 | 未（U18） |
 | （無番号） | `workflow_runs` の retention: project ごと **終端 run 500 件**の上限と DELETE。終端していない run は数えも消しもしない（resume を守る）。掃除は「run が終端に到達した書き込み」と abandon のときだけで、200ms tick には SQL を足さない。`user_version` は消費しない（3 のまま） | ✅（2026-08-13、Stage A-6。→ §6.17） | v0.5.8 | 未（U19） |
-| 6.0.0 | Security Foundation: `user_version` 4 の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）同時導入 | ⬜ | — | 該当なし |
+| 6.0.0 | Security Foundation: `user_version` **5**（2026-08-13 決定。4 は 5.6.0 に割り当て済み → §5.1）の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）同時導入 | ⬜ | — | 該当なし |
 | 6.0.1 | Sandbox filesystem-only プロファイル | ⬜ | — | 該当なし |
 | 6.0.2 | Sandbox strict プロファイル | ⬜ | — | 該当なし |
 | 6.0.3 | Secrets keychain backend | ⬜ | — | 該当なし |
@@ -255,7 +255,7 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
 | 2 | **5.0.5 Arena view** | fan-out + `joinOn: any` の straggler キャンセルが Arena の前提。spec-phase5-0 §2.4 が要求する「敗者が自動 CANCELLED」は 5.0.4 で満たされているので、いま作れば既存基盤の上に乗る |
 | 3 | **Memory + Provider** | ptygrid 単体で完結せず、embedding backend（Ollama / LM Studio 等）と `sqlite-vec` の配布方式が未決（spec-phase5-0 §10）。外部依存が最も重い。5.0.6 以降に付け直す（§1 の脚注※） |
 | 4 | **5.5.3 Agent Status Rings / 5.5.4 Trace Waterfall + Cost Dashboard** | どちらも frontend 中心で、5.5.1/5.5.2 のデータが無いと表示するものが無い。順序として後ろ |
-| 5 | **Phase 6.0 Security（6.0.0〜6.0.5）** | `user_version` 4 の 3 テーブル同時導入を伴い、`session.rs`（PTY hot path）に tee tap を入れる最も侵襲的な変更。§5.2 の規律どおり人手レビュー枠が要る。macOS/Linux の sandbox 実装差も大きい |
+| 5 | **Phase 6.0 Security（6.0.0〜6.0.5）** | `user_version` **5**（2026-08-13 決定。4 は 5.6.0 に割り当て済み → §5.1）の 3 テーブル同時導入を伴い、`session.rs`（PTY hot path）に tee tap を入れる最も侵襲的な変更。§5.2 の規律どおり人手レビュー枠が要る。macOS/Linux の sandbox 実装差も大きい |
 
 ### P7. Windows 移植 / Linux 実機検証の継続
 
@@ -329,8 +329,9 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
   spec-notifications.md は §7 で事故防止を掲げつつ**スロットリング / ダイジェストは §9 で
   v2 送り**にしているので、対処するならそこ。**A-4 が作った問題ではない**（`onEach` × `retry` を
   併用する設定でだけ起きる、通知層の v1 が既知で残している穴のほう）。今回は記録のみ。
-- **`feat/terminal-copy-paste` が push 未・PR 未**: ターミナルのコピー & ペースト（→ §4 の v0.5.8
-  項目 7）はローカルのブランチにしか無い。push と PR を出し、U13 の残り 4 点を消す
+- **（2026-08-14 訂正）この項目は古い**: 冒頭の訂正で記録済みのとおり `feat/terminal-copy-paste` は
+  PR #13 として `main` にマージ済み。残っているのは push/PR ではなく**実機検証の残り 4 点**のみで、
+  §2 の U13 行にすでに追跡されている（本項目は削除せず、矛盾に気づけるよう経緯として残す）
 - **`fanOut` を持つ step を root に置けない**: `spawn_workflow` の root ループは全コピーに枝番なしの
   同じ `step_id` を付ける一方、`spawn_ready` 経由のコピーだけが `race#0` のような枝番を持つ。パネルの
   step 一覧は `stepId` をキーにした keyed each なので、root fan-out だと同一キーが並ぶ。
@@ -397,13 +398,15 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
 
 実タグは `v0.4.2`〜`v0.4.9` / `v0.5.0` / `v0.5.1` / `v0.5.6` / `v0.5.7` / `v0.5.8` の **13 本**。
 **`v0.5.2`〜`v0.5.5` は存在しない**（`v0.5.6` のタグメッセージが Phase 5.0.2〜5.0.5 用に予約と宣言した
-まま実装が別の順序で進んだため）。次のタグは `v0.5.9`（未作成。
-[spec-phase5-5.md](../spec/spec-phase5-5.md) §9 の予約では Phase 5.5.1）。`v0.5.7` と `v0.5.8` を続けて
-Phase 5.0 系に充てたため、同 §9 の「バージョン割り当て」表の予約は
-**2 度繰り下がり**、現在は 5.5.1 = `v0.5.9` / 5.5.2 = `v0.5.10` / 5.5.3 = `v0.5.11` /
-5.5.4 = `v0.5.12` である（同 spec 側で対応済み。以前の対応表はもう有効でない）。作成日は
-v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / v0.5.1 / v0.5.6 が
-2026-07-23、`v0.5.7` が 2026-07-30、`v0.5.8` が 2026-08-13。
+まま実装が別の順序で進んだため）。次のタグは `v0.5.9`（未作成）。
+
+**（2026-08-14）タグ番号を先回りして予約する表は廃止した**（→ [spec-phase5-5.md](../spec/spec-phase5-5.md)
+§9）。`v0.5.7` と `v0.5.8` がいずれも Phase 5.5.1 用の予約を追い越して先に Phase 5.0 系へ充てられた
+（**2 度の繰り下げ**）ことがその廃止理由で、以前この段落にあった「5.5.1 = `v0.5.9` / 5.5.2 = `v0.5.10` /
+5.5.3 = `v0.5.11` / 5.5.4 = `v0.5.12`」という対応表はもう作らない。残るのは Phase 5.5 内の**順序**
+（5.5.1 → 5.5.2 → 5.5.3 → 5.5.4）だけで、**タグ番号の唯一の記録はこの表**（下記「タグ実績」表と
+本表）に一本化する。作成日は v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、
+v0.5.0 / v0.5.1 / v0.5.6 が 2026-07-23、`v0.5.7` が 2026-07-30、`v0.5.8` が 2026-08-13。
 
 | バージョン | 内容 |
 |---|---|
@@ -417,7 +420,7 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
 | **v0.4.8** | Phase 4.4.3 ssh 接続先表示（`session-resources` の foreground に `detail?` を追加し argv から宛先抽出。ヘッダーとサイドバーに `ssh user@host` を表示。`.ssh/config` alias・`-l` 畳み込み対応）。cargo test 214 / clippy 0 / svelte-check 0 |
 | **v0.4.9** | フォアグラウンド名解決の汎用化（opencode 等の node / python 起動エージェントを実体名で表示、`81ade5a`）+ 接続先表示ドキュメントの追随（sftp / scp / mosh / telnet / kubectl / docker、`e5b72d8`）。`v0.4.8..v0.4.9` は release コミット込みで 3 コミット |
 | **v0.5.0** | Phase 5.0.0 MVO（`0182988` + `b1b4f1f`）。cargo test 246。同区間にはクラウド LLM の API キー利用ドキュメント（`665ee82` / `461d2a9`）も含まれる |
-| **v0.5.1** | Phase 5.0.1 Workflow Resume。cargo test 251。**frontend（`src/`）はこの断面が最後の変更** |
+| **v0.5.1** | Phase 5.0.1 Workflow Resume。cargo test 251。**（2026-08-14 訂正）「frontend（`src/`）はこの断面が最後の変更」はここに書いていたが古い** — 実際には `v0.5.6`（5.5.0）以降も frontend は繰り返し変わっており、直近は `v0.5.8` に含まれる 5.0.8 の M5（§6.21、`schedule:` の表示文言を日本語化） |
 | **v0.5.6** | Phase 5.5.0 RC 互換ルータ。lib 286 + 統合 14 tests / clippy `-D warnings` clean。タグメッセージは「`v0.5.2`〜`v0.5.5` は Phase 5.0.2〜5.0.5 用に予約」と宣言している |
 | **v0.5.7** | Phase 5.0.2 `ptygrid init`（環境検出→テンプレート生成→自己検査、実機確認済み）+ Phase 5.0.4 Orchestrator 実行層（`retry:` / `timeoutMs` / `condition:` / `handoffTo` / `joinOn: reply`、supervisor・handoff の spawn ゲート撤去）+ `fanOut` 黙殺解消・straggler 協調キャンセル + ハードニング（pane 上限待ち行列化 / driver tick 軽量化 / inbox mailbox の run 単位分離）+ docs 公開/内部分離 + MIT license 宣言。lib 402 + 統合 14 tests |
 | **v0.5.8** | 3 系統。(1) `v0.5.7` 以降に `main` へ入っていたぶん: Phase 5.0.7 `onEach: reply` / `joinOn: stream`（per-copy mailbox の修正込み）+ 5.0.2 追補のローカル LLM プローブ + 5.0.6（案）の計測フィールドと合成 workflow + ターミナルのコピー & ペースト + タイトルバーのバージョン表示。(2) Stage A（`docs/design/next-implementation-2026-08.md` §3、新採番なし）: A-2/A-3 resume の carry 喪失ガードと `handoffTo` 合流 / A-4 retry 枯渇の escalation 配線 / A-5 cancel・abandon の kickoff ack / A-6 `workflow_runs` の retention。(3) Phase 5.0.8 `schedule:`（`every: day / weekday / hour` + `at:`、レビュー是正 3 巡ぶんを含む）。version 3 ファイルを `0.5.8` に揃えたコミットに打った最初のタグ。lib 530 + 統合 14 tests。**実機検証は 1 つも消えていない**（U14 残 3 点 / U17 / U18 / U19 / U20）、**CI は未確認**（→ §6.23） |
@@ -442,9 +445,11 @@ v0.4.2〜v0.4.6 が 2026-07-16〜17、v0.4.7〜v0.4.9 が 2026-07-18、v0.5.0 / 
 **2026-08-13 にリリース済み**（経緯と検証値は §6.23）。`v0.5.8` は spec-phase5-5.md §9 の予約では
 Phase 5.5.1（OTel + SQLite シンク）だったが、**`v0.5.7` のときと同じ判断（タグ順と時系列を一致させる
 = 先に完成した成果へ先の番号を与える）を通し**、下記の内容に割り当てた。5.5.1〜5.5.4 は
-`v0.5.9`〜`v0.5.12` へもう 1 つ繰り下げた（同 spec 側で対応済み）。なお項目 2 は Phase 5.5.1 の前段
-そのもの（5.5.1 の `observability.rs` が読む値を先に揃える）なので、繰り下げても 5.5.1 の着手は
-遅くならない。
+`v0.5.9`〜`v0.5.12` へもう 1 つ繰り下げた（当時は同 spec 側で対応済み。**この繰り下げが 2 回目**
+だったことが決め手になり、**2026-08-14 にタグ番号を先回りして予約する表そのものを廃止**した
+→ 上の「タグ実績」節・[spec-phase5-5.md](../spec/spec-phase5-5.md) §9）。なお項目 2 は
+Phase 5.5.1 の前段そのもの（5.5.1 の `observability.rs` が読む値を先に揃える）なので、繰り下げても
+5.5.1 の着手は遅くならない。
 
 **タグに載ったのは 3 系統**である: (1) 下記の実装項目 1〜8 のうち消化したぶん（= `v0.5.7` 以降に
 `main` へ入っていたもの。5.0.7 を含む）、(2) **予定に無かった Stage A**（項目 9）、
@@ -531,6 +536,18 @@ Phase 5.5.1（OTel + SQLite シンク）だったが、**`v0.5.7` のときと�
    `src-tauri/tauri.conf.json` の 3 つを `0.5.8` に揃え（`src-tauri/Cargo.lock` は `cargo check` で
    追従）、そのコミットに `v0.5.8` を打っている。（`.gitignore` への `src-tauri/target-basemain/`（2.2GB）と `ptygrid.yml-20260729`
    の追加は、ユーザーが `89411b9` で `main` に直接コミット済みのため本項目からは落とした。）
+   **（2026-08-14 追記）この記録は 2 件取りこぼしていた**: 13 本のタグ全数を実測で 3 ファイルとも
+   照合した結果、`v0.5.7` だけでなく **`v0.5.0` と `v0.5.1` も 3 ファイルとも `0.4.9` のまま**
+   タグが打たれていたことが分かった（13 本中 3 本 = **23%**）。したがって正確な現在地は
+   「解消した」ではなく、**「次回以降の再発を `v0.5.8` で 1 回だけ防いだ」**である —
+   防止策（下記リリース手順項目 5 の bump スクリプト）が無い間は、同じ食い違いがいつでも
+   再発しうる状態だった。**リリース手順の項目 5 は `v0.5.9` の準備で消化した**:
+   [`scripts/bump-version.sh`](../../scripts/bump-version.sh) を追加し、3 ファイルの現在値が
+   一致していることを先に確認してから書き換え、`cargo check` で `Cargo.lock` を追従させ、
+   書き換え後に 4 ファイルを読み直して新しい値になっていることを検証する。食い違いを検知したら
+   黙って上書きせず警告して止まる（食い違いを直すのではなく、そもそも起きないようにするための
+   スクリプトなので）。`0.5.8 → 0.5.9 → 0.5.8` の往復で `git diff`（`Cargo.lock` 含む）が
+   空に戻ることを確認済み。コミットとタグ付けは従来どおり人が行う。
 7. **（後から入った実装済みの項目）ターミナルのコピー & ペースト**。上の 1〜6 は依存関係の順に
    並んでいるが、本項目はその並びが決まったあとに入った成果で、先行項目の前提にも依存先にも
    なっていないため末尾に置く。**背景**: ターミナルペインで範囲選択したテキストをコピーできず
@@ -632,7 +649,11 @@ v0.5.9 として切る」は取られなかった** — U14 は残 3 点のま�
 ### リリース手順（タグ付けの作法）
 
 1. `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の `version` を一致させて
-   更新（`Cargo.lock` は `cargo check` で追従）
+   更新（`Cargo.lock` は `cargo check` で追従）。**（2026-08-14）
+   [`scripts/bump-version.sh`](../../scripts/bump-version.sh) で行う**:
+   `sh scripts/bump-version.sh <new-version>`。3 ファイルの現在値が食い違っていれば書き換え前に
+   止まり、書き換え後は 4 ファイルとも新しい値になったことを読み直して検証する（経緯は上の
+   「実装項目 6」の追記を参照）
 2. 全チェック（`cargo test` / `clippy` / `npm run check` / `npm run build`）通過を確認。
    **v0.5.8 断面の注意**: 項目 7（ターミナルのコピー & ペースト）で JS 側の依存が 1 つ増えたので、
    この断面を取り込んだら**チェックの前に `npm install` が必要**（未実行だと `vite` が
@@ -640,7 +661,8 @@ v0.5.9 として切る」は取られなかった** — U14 は残 3 点のま�
 3. `git tag -a vX.Y.Z -m "<リリース概要>"` → push（annotated タグのみ。軽量タグは使わない）
 4. 変更履歴は当面 CHANGELOG.md を作らず「タグメッセージ + `git log` + 本文書の表」で代替。License は
    `d3eac32` で MIT 確定済みなので、本格的な公開に踏み切るタイミングで CHANGELOG.md 化を再検討する
-5. 将来課題: 3 ファイルの version 同期を `scripts/` の bump スクリプトにする（未着手）
+5. ~~将来課題: 3 ファイルの version 同期を `scripts/` の bump スクリプトにする（未着手）~~
+   **（2026-08-14）`v0.5.9` の準備で消化した。** → 項目 1 に統合
 
 ---
 
@@ -651,44 +673,72 @@ v0.5.9 として切る」は取られなかった** — U14 は残 3 点のま�
 [spec-phase5-5.md](../spec/spec-phase5-5.md) / [spec-phase6-0.md](../spec/spec-phase6-0.md)）と
 `docs/inside/phase5-6.md`（git 管理外）を参照。
 
-### 5.1 SQLite `PRAGMA user_version` 予約表
+### 5.1 SQLite `PRAGMA user_version` 台帳
 
-migration は additive、既存 `queen.sqlite3` を壊さない。version bump は Phase 単位で予約する:
+**（2026-08-14 に規約を書き換えた）**。旧規約は「Phase 単位の予約表」で、まだ着手していない
+Phase に先回りして番号を割り当てていた。これが 2026-08-13 に衝突を起こした（5.6.0 と旧 Phase 6.0
+の両方が `user_version` 4 を欲しがった。詳細は下の「次の空き番号」の項と CONTRACT.md 続報23）ので、
+**「出荷実績表 + 次の空き番号 1 つ」**に変える。
 
-| user_version | Phase | 追加テーブル | patch |
+**理由**: `queen_store.rs` は `version > 実装値` の DB を開かずに拒否する（未知の新 version は
+黙って開かない、Phase 3.6 の規律を継承）。この挙動は「番号 = 出荷順の単調台帳」を強制する ——
+一度でも番号 N を書いたビルドがユーザーの `queen.sqlite3` に触れると、それより古い全ビルドは
+そのファイルを二度と開けなくなる。ダウングレード経路も自動修復も無い。**番号を持っていくのは
+「先に出荷したほう」であり、ドキュメント上の予約は取り返せない。** Phase 単位で予約するという
+旧規約は、この「単調台帳」という実装の性質と原理的に噛み合っていなかった。噛み合わない規約を
+維持していたことが、2026-08-13 の衝突を生んだ原因そのものである。
+
+**出荷実績**（実装済みで、これ以上動かない）:
+
+| user_version | 追加テーブル | 導入 patch | 出荷 |
 |---|---|---|---|
-| 1 | Phase 3.6 | pins / notes | 3.6 |
-| 2 | Phase 3.7 | inbox / reply | 3.7 |
-| **3** | **Phase 5.0** | `workflow_runs`（`queen_store.rs`: v0→v3 の新規作成、v1→v3、v2→v3 のいずれの経路も `WORKFLOW_RUNS_SCHEMA_SQL` を適用して `PRAGMA user_version = 3` に到達）／ `memory` + `memory_fts` + `memory_vec` | 5.0.0 / 5.0.1 / 5.0.2 |
-| **4** | **Phase 6.0** | `replays`、`secrets_audit`、`sandbox_events` | 6.0.0 |
+| 1 | pins / notes | 3.6 | 済 |
+| 2 | inbox / reply | 3.7 | 済 |
+| **3** | `workflow_runs`（`queen_store.rs`: v0→v3 の新規作成、v1→v3、v2→v3 のいずれの経路も `WORKFLOW_RUNS_SCHEMA_SQL` を適用して到達） | 5.0.0（skeleton 予定だった `memory` 系は 5.0.1 が Workflow Resume に充てられたため未着手のまま。v3 は `workflow_runs` のみで確定） | 済（現在の実装値） |
 
-> 実装値は `user_version` = 3。`queen_store.rs` は `version > 3` を「unsupported Queen database
-> version」で開かずに弾く（v4 の予約は表のみ）。なお「`workflow_runs` と `memory` を同じ v3 で
-> 導入し 5.0.0 で skeleton・5.0.1 で本格実装」という下の規律は、実際には **5.0.1 が Workflow
-> Resume に充てられ memory は着手されなかった**ため、v3 は `workflow_runs` のみで確定している。
-> memory 系テーブルを追加する場合は additive migration を v3 内で行うか v4 を切るかを、
-> 着手時に決め直す必要がある（§3 P6）。
+**次の空き番号**: **4**。**2026-08-13 にユーザーが 5.6.0（スキーマ分割: `workflow_runs` の
+`steps_json` を step 行へ展開する破壊的 migration）に割り当てることを決定した**（旧 Phase 6.0 の
+3 テーブル `replays` / `secrets_audit` / `sandbox_events` はここでは**使わず、5 に繰り下げる**）。
+記録は CONTRACT.md 続報23、`docs/design/next-release-v0.5.9.md` §1.1。
 
-**規律**: 未知の新 version は黙って開かない（明示 error でユーザーに再インストールを促す。Phase 3.6
-の規律を継承）/ migration は transactional で既存の pins/notes/inbox データを壊さない /
-Phase 5.0 の `workflow_runs` と `memory` は同じ v3 で導入し 5.0.0 で skeleton・5.0.1 で本格実装
-（2 patch にまたがる migration は 1 回のみ）/ Phase 6.0 の 3 テーブルは同じ v4 で同時導入（6.0.0）。
+- **5.6.0 に 4 を与える理由**: 5.6.0 だけが既存データの移行を伴う（`workflow_runs` は 5.0.1 から
+  本番データが入っている唯一の対象）。6.0.0 の 3 テーブルと 5.5.1 の `spans` テーブル
+  （`spec-phase5-5.md` §3.4）は既存データゼロの純追加で、番号の前後で難易度が変わらない。
+  難しいほうに小さい番号を先に取らせるほうが、`BEGIN IMMEDIATE` 一括 / `IF NOT EXISTS` /
+  ROLLBACK という migration の定型を素直に適用できる。加えて 6.0.x は着手が最も遠い
+  （§3 P6 の着手順で 5 番目。`sandbox.rs` / `secrets.rs` / `replay.rs` はソースが存在しない）が、
+  5.6.0 は A-6 完了で今日から着手できる。
+- **請求者は 2 者ではなく 3 者だった**（この整理での発見）。`spec-phase5-5.md` §3.4 の `spans` 表
+  （5.5.1 OTel）は本表にも `next-implementation-2026-08.md` §4.2 にも従来登場していなかった。
+  **潜在的には 4 人目もいる**: memory 系テーブルを v3 内 additive で足すか v4 を切るかは、
+  §3 P6 の着手時に決め直す必要があると書いたままなので未決である。
 
-### 5.2 Track 別 branch 命名規則
+**規律**（更新）: 未知の新 version は黙って開かない（Phase 3.6 の規律を継承）/ migration は
+transactional で既存データを壊さない / **新しい番号は着手が確定した patch にだけ、着手直前に
+割り当てる**（旧規約の「先回りで予約する」は採らない）/ 複数の候補（5.6.0 / 6.0.0 / 5.5.1 の
+`spans` / memory 系）が同じ番号を欲しがったときは、**既存データの移行を伴うほうを優先する**
+（5.6.0 の判断がそれ）。
 
-MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 patch = 1 branch を基本とし、
-以下の prefix を強制する:
+### 5.2 branch 命名規則
 
-| Track | prefix | 例 | 対応 patch |
-|---|---|---|---|
-| Track A(UI) | `track/a-ui-*` | `track/a-ui-5.5.3-status-rings` | 5.5.3 / 5.5.4 / 5.0.5 / 6.0.5 |
-| Track B(MCP+観測) | `track/b-mcp-*` | `track/b-mcp-5.5.0-rc-router` | 5.5.0 / 5.5.1 / 5.5.2 |
-| Track C(Memory+Provider+Orch完成) | `track/c-memory-*` | `track/c-memory-5.0.1-fts5` | 5.0.1 / 5.0.2 / 5.0.3 / 5.0.4 |
-| Track D(Security) | `track/d-security-*` | `track/d-security-6.0.2-strict-sandbox` | 6.0.0〜6.0.4 |
-| MVO(先行、Track に属さない) | `mvo/*` | `mvo/5.0.0-orchestrator` | 5.0.0 |
-| その他 | `main`(直マージ不可)、`bug/*` / `docs/*` | | |
+**（2026-08-14 に書き直した）**。旧規約は Track A/B/C/D への `track/*` prefix 強制 + `mvo/*` /
+`bug/*` / `docs/*` だったが、死文化していた実測がある: `git branch -a` の全ブランチがこの規約に
+従っておらず、**`feat/*` も `fix/*` も表に無い**（`bug/*` はあるが実際に使われているのは
+`fix/*`）。5.6.x / 5.7.x はどの Track にも割り当てられていない。Track A/B/C/D という並列トラック
+運用そのものが実際には採られず、機能単位のブランチ運用に落ち着いたため、**prefix 表は廃止**し、
+事実上運用されている命名を規約として書き直す:
 
-**コーディネーション制約**:
+| prefix | 用途 | 例 |
+|---|---|---|
+| `feat/<slug>-<patch>` | 新機能・patch の実装 | `feat/schedule-5.0.8` |
+| `fix/<slug>` | バグ修正 | `fix/retire-kickoffs-on-terminal` |
+| `docs/<slug>` | ドキュメントのみの変更 | `docs/numbering-and-bump` |
+| その他 | `main`（直マージ不可） | |
+
+1 branch は 1 まとまりの作業を基本とし、複数 patch にまたがってもよい（`feat/*` の `<patch>` は
+主目的の patch 番号を指す目安であり、厳密な 1:1 対応は求めない）。
+
+**コーディネーション制約**（Track 別運用時代からの内容だが、中身は現在も有効なので残す）:
 
 - `CONTRACT.md` の Phase 節は additive のみ。異なる Track が同時に同じ Phase 節を触ると merge 競合が
   起きるので、各 patch はその patch 用の subsection を先に予約する（スケルトンは用意済み）。

@@ -536,9 +536,12 @@ Phase 5.5 で仕込まれた OpenTelemetry GenAI トレースに、workflow run 
 
 ---
 
-## 9. 段階分割案（Phase 5.0.0 〜 4.5.5）
+## 9. 段階分割案（Phase 5.0.0 〜 5.0.5）
 
-[plan.md](../design/plan.md) の y=Phase、z=Phase 内連番規約に従い、4.5 を **6 段階**に分ける。1リリース = 1 patch。
+> **（2026-08-14 訂正）見出しの誤記**: 以前は「Phase 5.0.0 〜 4.5.5」と書いていたが、これは
+> Phase 5.0 が「4.5」と呼ばれていた時代の残骸。正しくは **5.0.0 〜 5.0.5**。
+
+[plan.md](../design/plan.md) の y=Phase、z=Phase 内連番規約に従い、5.0 を **6 段階**に分ける。1リリース = 1 patch。
 
 ### Phase 5.0.0 — Provider 統合の基盤
 
@@ -577,7 +580,17 @@ Phase 5.5 で仕込まれた OpenTelemetry GenAI トレースに、workflow run 
 - fan-out workflow から自動 open、Diff viewer、Vote → memory 記録。**Merge は含めない**。
 - completion gate: fan-out 済 workflow から Arena が自動起動、vote が `memory` に project scope で記録される、既存グリッド操作の非回帰。
 
-> バージョン割当（暫定）: Phase 5.0 は **`v0.5.0〜v0.5.5`**(MVO 5.0.0 → Arena 5.0.5)。1 patch = 1 stage。以降 Phase 5.5(Observable) が `v0.5.6〜v0.5.10`、Phase 6.0(Secure) が `v0.6.x` を消化する。Phase 5 系(=v0.5.z)の間は連番で埋め、Phase 6 系突入で `v0.6.0` へ minor bump。
+> **（2026-08-14 廃止）** 以前はここに「Phase 5.0 は `v0.5.0〜v0.5.5`、以降 Phase 5.5(Observable) が
+> `v0.5.6〜v0.5.10`」という具体的なタグ割当を書いていたが、これは**繰り下げ 0 回時点**の記述で、
+> 実際には `v0.5.7` / `v0.5.8` がいずれも Phase 5.5.1 用の予約を追い越して先に出た（2 度の
+> 繰り下げ）ため実態と食い違ったまま残っていた。**タグ番号を先回りして予約する運びそのものを
+> 廃止**し（→ [spec-phase5-5.md](spec-phase5-5.md) §9）、Phase 5.0.0 → 5.0.5 という**段階の順序**
+> だけをここに残す。実際の出荷は `v0.5.0`（5.0.0 MVO）/ `v0.5.1`（5.0.1 は本 spec の想定と異なり
+> Workflow Resume に充てられた。Memory の保存経路・embedding は未着手のまま）/ `v0.5.7`
+> （5.0.2 `ptygrid init` + 5.0.4 Orchestrator 実行層）で、**5.0.3（登録代行）と 5.0.5（Arena）は
+> 2026-08-14 時点でまだ未着手**。どのタグ番号に割り当たるかは実際に出荷するときに
+> [plan.md](../design/plan.md) §4 のタグ実績表へ一本化して記録する。Phase 5 系(=v0.5.z)の間は
+> 連番で埋め、Phase 6 系突入で `v0.6.0` へ minor bump、という大枠の規約自体は変わらない。
 
 ---
 
