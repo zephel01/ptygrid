@@ -4636,11 +4636,12 @@ fn advance_run<R: Runtime>(
 
     // LAST, after the run's own state is stored and emitted: the out-of-app
     // send is best-effort I/O that must not sit between the mutation and its
-    // persistence. `dispatch_ctx` itself is cheap on this thread (the webhook
-    // POST goes to a detached thread; only the OS toast is inline), and it is
-    // a no-op entirely when `notifications:` is absent or disabled — but it is
-    // still the one thing here that talks to the outside world, so it goes at
-    // the end. Empty on every tick except the one an exhaustion lands on.
+    // persistence. `dispatch_ctx` itself is cheap on this thread (v0.5.9 §2.2:
+    // every transport, the OS toast included, now goes to a detached thread),
+    // and it is a no-op entirely when `notifications:` is absent or disabled —
+    // but it is still the one thing here that talks to the outside world, so
+    // it goes at the end. Empty on every tick except the one an exhaustion
+    // lands on.
     for esc in &escalations {
         notify_escalation(app, &workflow_name, &run_id, esc);
     }

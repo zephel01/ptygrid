@@ -24,7 +24,8 @@
 // decision, channel selection, and message formatting — all unit-tested with no
 // I/O. The managed state, `${VAR}` expansion, OS-toast + webhook dispatch, and
 // the wiring from the event sources land in the dispatch layer (a follow-up
-// within this module) and never run on the reader hot path.
+// within this module) and never run on the reader hot path. Since v0.5.9 §2.2
+// EVERY transport leaves the calling thread — see `send_os`.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -372,10 +373,11 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, config: &Config) {
 }
 
 /// Route one edge event to every channel whose effective level includes it, and
-/// fire each: the OS toast inline, chat webhooks on a detached thread so blocking
-/// network I/O never touches the caller (the agent-status task, the PTY reader
-/// thread, or the 200ms workflow driver). A no-op when the feature is off or no
-/// channel matches. Session-sourced convenience wrapper over `dispatch_ctx`.
+/// fire each on a detached thread, so neither blocking network I/O nor the
+/// platform's own toast call ever touches the caller (the agent-status task, the
+/// PTY reader thread, or the 200ms workflow driver). A no-op when the feature is
+/// off or no channel matches. Session-sourced convenience wrapper over
+/// `dispatch_ctx`.
 pub fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     event: NotifyEvent,
@@ -438,10 +440,28 @@ fn send_channel<R: Runtime>(app: &AppHandle<R>, ch: &ChannelConfig, title: &str,
 
 /// Local desktop toast via tauri-plugin-notification. Failures (e.g. the OS has
 /// not granted permission) are logged, never propagated.
+///
+/// On a detached thread since v0.5.9 §2.2, for the reason `post_json` already
+/// was: the only caller that is not a user action is the orchestrator's 200ms
+/// driver tick, and `escalated` is a per-STEP flag, so one tick can legitimately
+/// produce up to `STREAM_MAX_UNITS` (64) escalations at once when an `onEach`
+/// fan-out's copies exhaust together. `show()` is a synchronous platform call —
+/// on macOS it goes through `UNUserNotificationCenter` — so 64 of them inline
+/// stalled the driver for every run in the registry, not just the one that
+/// escalated. Digesting a burst into one message per RUN is the real fix and
+/// belongs to spec-notifications v2; getting the burst off the tick thread does
+/// not need it.
+///
+/// Fire-and-forget like the webhooks: nothing waits on the toast, and the
+/// threads are short-lived and bounded by the burst that spawned them.
 fn send_os<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
-        eprintln!("notifications: OS toast failed: {e}");
-    }
+    let app = app.clone();
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = app.notification().builder().title(title).body(body).show() {
+            eprintln!("notifications: OS toast failed: {e}");
+        }
+    });
 }
 
 /// Slack / Mattermost / Discord incoming webhook. Missing or empty (post-expand)
