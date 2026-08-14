@@ -1258,6 +1258,17 @@ pub fn spawn_workflow<R: Runtime>(
     registry.put(run.clone());
     persist_run(store, &project_dir, &run);
     emit_workflow_state(app, &run);
+    // v0.5.9 §2.3, the other producer of a terminal run. A run whose every
+    // root failed to spawn is born `Failed` and is never handed to the driver
+    // (`active_run_ids` skips terminal runs), so `advance_run`'s edge cannot
+    // see it — and this is exactly the shape a `schedule:`-fired run takes
+    // when the grid is full or an `agents:` entry has gone stale, i.e. the
+    // silence §2.3 exists to break. `Running` is the honest "previous" here:
+    // the run has just come into existence, so it cannot have been terminal
+    // before.
+    if let Some(failure) = run_failure_escalation(WorkflowState::Running, &run) {
+        notify_run_failure(app, workflow_name, &run_id, &failure);
+    }
     Ok(run)
 }
 
@@ -1306,6 +1317,89 @@ fn retire_run_kickoffs(
     {
         eprintln!("workflow {run_id}: could not ack leftover kickoffs: {error}");
     }
+}
+
+/// v0.5.9 §2.1, pure half: did THIS transition end the run?
+///
+/// "The run is over" is a LEVEL — it stays true for as long as the row
+/// exists — and everything owed at the end of a run (retiring its kickoffs,
+/// §2.1; escalating a red run, §2.3) must happen once, not once per look. The
+/// same edge/level distinction `escalated` draws for a single step, drawn one
+/// level up, except that here no flag is needed: the previous state IS the
+/// memory, and `advance_all`/`advance_run` both refuse to tick a run that is
+/// already terminal, so the transition is observed exactly once per run.
+///
+/// `Cancelled` is deliberately not a destination here. It is never produced
+/// by `finalize_state`; the only writer is `cancel_workflow`, which does its
+/// own sweep inline and whose behaviour v0.5.9 leaves untouched.
+fn just_reached_terminal(previous: WorkflowState, current: WorkflowState) -> bool {
+    !matches!(
+        previous,
+        WorkflowState::Succeeded | WorkflowState::Failed | WorkflowState::Cancelled
+    ) && matches!(current, WorkflowState::Succeeded | WorkflowState::Failed)
+}
+
+/// v0.5.9 §2.3: one run that ended red, on its way to the out-of-app
+/// notification channels. Owned, so the dispatch happens after the caller is
+/// done mutating the run — same posture as `Escalation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunFailure {
+    /// Every step row that ended `Failed`, in declaration order. Can be empty:
+    /// `finalize_state` also returns `Failed` when nothing failed outright but
+    /// a Skip/Cancel was not benign (see `verdict`).
+    failed_steps: Vec<String>,
+    /// The first failed step's own `error` text, when any failed step has one.
+    error: Option<String>,
+}
+
+/// v0.5.9 §2.3, pure half: does this run owe the operator a message about the
+/// RUN, as opposed to about one step?
+///
+/// Stage A-4 wired exactly one door to `notifications:` — a step exhausting a
+/// declared `retry:` budget. A workflow whose steps declare no `retry:` (the
+/// common shape, and the default one) therefore had none at all: it could go
+/// red at 3am under `schedule:` and send nothing. That is the half of the
+/// 5.0.8 premise (plan.md §4 item 10) this closes.
+///
+/// Four decisions are encoded here.
+///
+/// **(a) Never both.** A run whose step already escalated is skipped. The step
+/// message already named the failing step, its agent, its attempt count and
+/// its error, and said that nothing would be retried; "and so the run is red"
+/// adds no action on top of that, while doubling the traffic of the one
+/// configuration (`onEach` × `retry`) that can already produce a burst. The
+/// suppression needs no new state: `escalated` is set on the outcome by
+/// `take_escalations` before this is consulted, including in the same tick.
+///
+/// **(b) `Cancelled` is not a failure to report.** The only writer of that
+/// state is `cancel_workflow`, i.e. an operator who just clicked cancel and
+/// does not need to be told what they did. `just_reached_terminal` already
+/// excludes it as a destination.
+///
+/// **(c) The edge, not the level.** Same argument as `escalated` one level up,
+/// and the same mechanism as §2.1: the previous state is the memory, so a run
+/// looked at twice is reported once. No new field, and in particular nothing
+/// new that `#[serde(skip)]` could drop across a resume.
+///
+/// **(d) Green runs say nothing.** `Succeeded` is not an event `critical` (the
+/// default level) subscribes to, and a per-run "it worked" toast is the
+/// notification flood spec-notifications.md §7 exists to avoid.
+fn run_failure_escalation(previous: WorkflowState, run: &WorkflowRun) -> Option<RunFailure> {
+    if !just_reached_terminal(previous, run.state) || run.state != WorkflowState::Failed {
+        return None;
+    }
+    if run.steps.iter().any(|outcome| outcome.escalated) {
+        return None;
+    }
+    let failed: Vec<&StepOutcome> = run
+        .steps
+        .iter()
+        .filter(|outcome| outcome.state == StepState::Failed)
+        .collect();
+    Some(RunFailure {
+        failed_steps: failed.iter().map(|o| o.step_id.clone()).collect(),
+        error: failed.iter().find_map(|o| o.error.clone()),
+    })
 }
 
 /// Cancel a running workflow: kill every step's live PTY, mark remaining
@@ -3956,8 +4050,48 @@ fn notify_escalation<R: Runtime>(
             origin: Some(crate::notifications::WorkflowOrigin {
                 workflow: workflow_name.to_string(),
                 run_id: run_id.to_string(),
-                step_id: esc.step_id.clone(),
-                attempts: esc.attempts,
+                scope: crate::notifications::OriginScope::Step {
+                    step_id: esc.step_id.clone(),
+                    attempts: esc.attempts,
+                },
+            }),
+        },
+    );
+}
+
+/// v0.5.9 §2.3, side-effecting half: hand one red RUN to the Phase 4.4.2
+/// notification layer.
+///
+/// Same `Error` event and same `dispatch_ctx` as `notify_escalation`, for the
+/// same reason: `critical` is the default `notifications.level` and it
+/// subscribes to `error` only, so anything quieter would be invisible in the
+/// configuration this exists for (nobody watching, `schedule:` fired it).
+/// No new config knob either — a run failing is not a different audience from
+/// a step exhausting its retries, and a second switch would only be a way to
+/// configure the two out of agreement.
+///
+/// `session_id: 0` / `name: None` are not omissions: a run is not a session,
+/// and the run-scope title/body never fall back to `NotifyContext::who()`.
+fn notify_run_failure<R: Runtime>(
+    app: &AppHandle<R>,
+    workflow_name: &str,
+    run_id: &str,
+    failure: &RunFailure,
+) {
+    crate::notifications::dispatch_ctx(
+        app,
+        crate::notifications::NotifyEvent::Error,
+        crate::notifications::NotifyContext {
+            session_id: 0,
+            name: None,
+            project: None, // filled in by the dispatch layer
+            detail: failure.error.clone(),
+            origin: Some(crate::notifications::WorkflowOrigin {
+                workflow: workflow_name.to_string(),
+                run_id: run_id.to_string(),
+                scope: crate::notifications::OriginScope::Run {
+                    failed_steps: failure.failed_steps.clone(),
+                },
             }),
         },
     );
@@ -4468,6 +4602,13 @@ fn advance_run<R: Runtime>(
     changed = !escalations.is_empty() || changed;
 
     let new_state = finalize_state(&wf, &run);
+    // v0.5.9 §2.1: the edge, captured before the assignment overwrites the
+    // state this tick started from. `advance_run` already returned early on a
+    // run that was terminal on entry, so `run.state` here is always
+    // non-terminal and `just_reached_terminal` can only be true on the single
+    // tick that ends the run.
+    let previous_state = run.state;
+    let reached_terminal = just_reached_terminal(run.state, new_state);
     if new_state != run.state {
         run.state = new_state;
         if matches!(new_state, WorkflowState::Succeeded | WorkflowState::Failed) {
@@ -4482,15 +4623,34 @@ fn advance_run<R: Runtime>(
         emit_workflow_state(app, &run);
     }
 
+    // Stage A-5 widened (v0.5.9 §2.1), AFTER the write-through for the same
+    // reason `cancel_workflow` puts it there: the durable record of the run's
+    // end is worth more than the mailbox tidying, and this is best-effort
+    // cleanup that must not delay it. One extra statement per FINISHED run,
+    // never per tick — the `reached_terminal` gate is a comparison of two
+    // enum values in Rust, the same shape as the Rust-side gate that keeps
+    // `prune_terminal_workflow_runs` off the hot path.
+    if reached_terminal {
+        retire_run_kickoffs(store, &project_dir, &workflow_name, &run_id);
+    }
+
     // LAST, after the run's own state is stored and emitted: the out-of-app
     // send is best-effort I/O that must not sit between the mutation and its
-    // persistence. `dispatch_ctx` itself is cheap on this thread (the webhook
-    // POST goes to a detached thread; only the OS toast is inline), and it is
-    // a no-op entirely when `notifications:` is absent or disabled — but it is
-    // still the one thing here that talks to the outside world, so it goes at
-    // the end. Empty on every tick except the one an exhaustion lands on.
+    // persistence. `dispatch_ctx` itself is cheap on this thread (v0.5.9 §2.2:
+    // every transport, the OS toast included, now goes to a detached thread),
+    // and it is a no-op entirely when `notifications:` is absent or disabled —
+    // but it is still the one thing here that talks to the outside world, so
+    // it goes at the end. Empty on every tick except the one an exhaustion
+    // lands on.
     for esc in &escalations {
         notify_escalation(app, &workflow_name, &run_id, esc);
+    }
+    // v0.5.9 §2.3, after the per-step sends and mutually exclusive with them
+    // (`run_failure_escalation` returns `None` once any step has escalated):
+    // at most one out-of-app message per run ends up attributable to the run
+    // rather than to a step.
+    if let Some(failure) = run_failure_escalation(previous_state, &run) {
+        notify_run_failure(app, &workflow_name, &run_id, &failure);
     }
 }
 
@@ -5729,6 +5889,272 @@ workflows:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.5.9 §2.1. The majority case Stage A-5 did not cover: a run nobody
+    /// cancelled and nobody abandoned, which simply finished. Routes 1 and 2
+    /// complete a step without any reply, so its kickoff is still sitting
+    /// unacknowledged in the agent's mailbox when the run ends — and the
+    /// agent mailbox is shared with every later run of the same agent.
+    #[test]
+    fn a_run_the_driver_finishes_retires_its_own_kickoffs() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        // Both steps already resolved: this tick is the one that finalizes
+        // the run, which is exactly the transition under test.
+        let run = mk_run(
+            "demo",
+            vec![
+                mk_outcome("first", Some(1), StepState::Succeeded),
+                mk_outcome("second", Some(2), StepState::Succeeded),
+            ],
+        );
+        registry.put(run.clone());
+
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        assert_eq!(
+            registry.get(TEST_RUN_ID).unwrap().state,
+            WorkflowState::Succeeded,
+            "precondition: this tick is the one that finalizes the run"
+        );
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "a run that reached a terminal state retires its kickoffs, cancelled or not"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of v0.5.9 §2.1: the sweep is bound to the TRANSITION,
+    /// not to "the driver looked at this run". A live run's kickoff is the
+    /// instruction its pane is still working from; acking it early would
+    /// hide the thread from the very agent it was addressed to.
+    #[test]
+    fn a_run_the_driver_leaves_running_keeps_its_kickoffs_live() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        // Only `first` has a row, so `all_terminal` is false and this tick
+        // spawns `second` instead of finalizing. (`second` declares no
+        // `kickoff:`, so that spawn adds no message of its own.)
+        let run = mk_run(
+            "demo",
+            vec![mk_outcome("first", Some(1), StepState::Succeeded)],
+        );
+        registry.put(run.clone());
+
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        assert_eq!(
+            registry.get(TEST_RUN_ID).unwrap().state,
+            WorkflowState::Running,
+            "precondition: the run has not finished"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "an unfinished run must not ack the kickoff its pane is working from"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.5.9 §2.1, the edge. `advance_run` returns early on a run that is
+    /// already terminal, so the sweep can only ever run on the tick that
+    /// moved it there. Proven by planting a fresh message from the same
+    /// sender AFTER the run finished: a level-triggered sweep would ack it
+    /// on the next tick, an edge-triggered one leaves it alone.
+    #[test]
+    fn a_finished_run_sweeps_its_kickoffs_exactly_once() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        let run = mk_run(
+            "demo",
+            vec![
+                mk_outcome("first", Some(1), StepState::Succeeded),
+                mk_outcome("second", Some(2), StepState::Succeeded),
+            ],
+        );
+        registry.put(run.clone());
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        let planted = deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        let live = store
+            .list_inbox(&dir, "a".to_string(), 0, false, 50)
+            .unwrap();
+        assert_eq!(live.len(), 1, "the second tick must not sweep again");
+        assert_eq!(live[0].root_message_id, planted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edge itself, without a driver around it. `Cancelled` is not a
+    /// destination: `finalize_state` never returns it, and `cancel_workflow`
+    /// owns that transition (and its own sweep) end to end.
+    #[test]
+    fn only_the_transition_into_a_terminal_state_counts_as_reaching_it() {
+        assert!(just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Succeeded
+        ));
+        assert!(just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Failed
+        ));
+        assert!(
+            !just_reached_terminal(WorkflowState::Failed, WorkflowState::Failed),
+            "a run that was already terminal has nothing left to settle"
+        );
+        assert!(
+            !just_reached_terminal(WorkflowState::Cancelled, WorkflowState::Failed),
+            "a cancelled run was settled by `cancel_workflow` already"
+        );
+        assert!(!just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Running
+        ));
+        assert!(
+            !just_reached_terminal(WorkflowState::Running, WorkflowState::Cancelled),
+            "`finalize_state` never produces Cancelled; that path is cancel_workflow's"
+        );
+    }
+
+    /// Build a run in a given terminal state out of `(step_id, state)` pairs.
+    /// Only the §2.3 tests need this shape, so it lives with them.
+    fn mk_terminal_run(state: WorkflowState, steps: &[(&str, StepState)]) -> WorkflowRun {
+        let mut run = mk_run(
+            "demo",
+            steps
+                .iter()
+                .map(|(id, s)| mk_outcome(id, Some(1), *s))
+                .collect(),
+        );
+        run.state = state;
+        run.ended_at_ms = Some(10);
+        run
+    }
+
+    /// v0.5.9 §2.3. Before this, the only door to `notifications:` was a step
+    /// exhausting a declared `retry:` budget — so a workflow whose steps
+    /// declare no `retry:` at all could go red and send nothing, which is the
+    /// configuration a `schedule:`-driven workflow most often has.
+    #[test]
+    fn a_run_that_fails_without_any_step_escalation_escalates_once() {
+        let run = mk_terminal_run(
+            WorkflowState::Failed,
+            &[("first", StepState::Failed), ("second", StepState::Skipped)],
+        );
+        let notice = run_failure_escalation(WorkflowState::Running, &run)
+            .expect("a red run with no step escalation must reach the operator");
+        assert_eq!(notice.failed_steps, vec!["first".to_string()]);
+        assert!(
+            run_failure_escalation(WorkflowState::Failed, &run).is_none(),
+            "and only on the tick that ended the run — the state is the edge, \
+             so a second look at the same terminal run sends nothing"
+        );
+    }
+
+    /// Decision (a): a run whose step already escalated is NOT escalated
+    /// again. The step message already named the cause and said nothing
+    /// further would be retried; a second toast saying "and therefore the run
+    /// is red" adds no action the operator can take, and an `onEach` fan-out
+    /// can produce up to `STREAM_MAX_UNITS` of the first kind in one tick.
+    #[test]
+    fn a_run_whose_step_already_escalated_is_not_escalated_again() {
+        let mut run = mk_terminal_run(
+            WorkflowState::Failed,
+            &[("first", StepState::Failed), ("second", StepState::Failed)],
+        );
+        run.steps[1].escalated = true;
+        assert!(
+            run_failure_escalation(WorkflowState::Running, &run).is_none(),
+            "one exhausted step is enough to have told the operator already"
+        );
+    }
+
+    /// Decision (b) plus the green case: a run that succeeded says nothing,
+    /// and a run the operator cancelled themselves says nothing either —
+    /// `cancel_workflow` is the only writer of `Cancelled`, and being told
+    /// about the outcome of one's own click is noise.
+    #[test]
+    fn a_succeeded_or_cancelled_run_is_never_escalated() {
+        let green = mk_terminal_run(WorkflowState::Succeeded, &[("first", StepState::Succeeded)]);
+        assert!(run_failure_escalation(WorkflowState::Running, &green).is_none());
+
+        let cancelled = mk_terminal_run(
+            WorkflowState::Cancelled,
+            &[("first", StepState::Cancelled), ("second", StepState::Failed)],
+        );
+        assert!(
+            run_failure_escalation(WorkflowState::Running, &cancelled).is_none(),
+            "a cancelled run is not a failure to report, even with a failed step in it"
+        );
+    }
+
+    /// The run-level notice carries the first failed step's own error text,
+    /// so the message is actionable without opening the app — and a run that
+    /// went red with no `Failed` row at all (a non-benign Skip / Cancel, see
+    /// `verdict`) still produces one, just without a step list.
+    #[test]
+    fn a_run_failure_notice_carries_the_first_failed_steps_error() {
+        let mut run = mk_terminal_run(
+            WorkflowState::Failed,
+            &[("first", StepState::Failed), ("second", StepState::Failed)],
+        );
+        run.steps[0].error = Some("agent process exited with code 2".to_string());
+        run.steps[1].error = Some("skipped: an upstream dependency failed".to_string());
+        let notice = run_failure_escalation(WorkflowState::Running, &run).unwrap();
+        assert_eq!(
+            notice.failed_steps,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(
+            notice.error.as_deref(),
+            Some("agent process exited with code 2")
+        );
+
+        let stepless = mk_terminal_run(WorkflowState::Failed, &[("first", StepState::Skipped)]);
+        let notice = run_failure_escalation(WorkflowState::Running, &stepless).unwrap();
+        assert!(notice.failed_steps.is_empty());
+        assert!(notice.error.is_none());
     }
 
     #[test]

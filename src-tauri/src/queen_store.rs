@@ -241,7 +241,22 @@ impl QueenStore {
             .map_err(|e| format!("cannot create Queen data directory: {e}"))?;
         let connection = Connection::open(path)
             .map_err(|e| format!("cannot open Queen database {}: {e}", path.display()))?;
-        Self::from_connection(connection, true)
+        let store = Self::from_connection(connection, true)?;
+        // Stage A-6, v0.5.9 §2.4: retention only ever ran when a run REACHED a
+        // terminal state, so a database fattened by a pre-A-6 build never
+        // shrank in a project that had stopped running workflows — the exact
+        // installs the cap was written for kept every row forever. One sweep
+        // per process start closes that. Best-effort: a store that opened is
+        // usable, and refusing to start over a failed tidy would be a strictly
+        // worse outcome than the oversized table it was tidying.
+        //
+        // Deliberately NO `VACUUM`: reclaiming the freed pages means rewriting
+        // the whole file on the startup path, and SQLite reuses free pages for
+        // subsequent writes anyway, so the growth this bounds stops either way.
+        if let Err(error) = store.prune_every_projects_terminal_workflow_runs() {
+            eprintln!("queen: startup workflow-run retention sweep failed: {error}");
+        }
+        Ok(store)
     }
 
     /// Test-support constructor, also used by the team_presets tests.
@@ -1199,6 +1214,55 @@ impl QueenStore {
         )?;
         transaction.commit().map_err(db_error)?;
         Ok(())
+    }
+
+    /// Stage A-6, v0.5.9 §2.4: apply the retention window to EVERY project in
+    /// the table at once. Called exactly once, from `open`.
+    ///
+    /// The two existing entry points are both driven by a run ending, which
+    /// means a project that has already stopped running workflows is out of
+    /// their reach forever — including every project whose history was grown
+    /// by a build that predates the cap. This is the only sweep that does not
+    /// need a run to happen first.
+    ///
+    /// Reads the project list out of `workflow_runs` rather than from the
+    /// config, and deliberately does NOT put it through `project_id`: the
+    /// column already holds the canonicalised path this table was written
+    /// with, and `project_id` would `canonicalize()` it again — failing, and
+    /// so skipping the sweep, for exactly the abandoned projects (deleted or
+    /// moved directories) whose rows are most likely to be the stale ones.
+    ///
+    /// One transaction for the whole sweep: it runs before any command handler
+    /// can be invoked, so there is nothing to contend with, and a partial
+    /// sweep is not a state worth being able to observe.
+    pub fn prune_every_projects_terminal_workflow_runs(&self) -> Result<usize, String> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let projects: Vec<String> = {
+            let [succeeded, failed, cancelled] = TERMINAL_WORKFLOW_STATES;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT project_dir FROM workflow_runs
+                     WHERE state IN (?1, ?2, ?3)",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![succeeded, failed, cancelled], |row| row.get(0))
+                .map_err(db_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db_error)?
+        };
+        for project in &projects {
+            prune_terminal_workflow_runs(
+                &transaction,
+                project,
+                MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT,
+            )?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(projects.len())
     }
 }
 
@@ -2609,6 +2673,107 @@ mod tests {
             !kept.contains(&"done-00000".to_string()),
             "the oldest finished run is what made room for it"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Plant finished runs the way a pre-Stage-A-6 build did: straight into
+    /// the table, with no retention pass behind them. `upsert_workflow_run`
+    /// cannot express this any more, and "history that is already over the
+    /// cap when the process starts" is the whole premise of the sweep.
+    fn plant_finished_runs(store: &QueenStore, project: &Path, prefix: &str, count: i64) {
+        let project = project_id(project).unwrap();
+        let connection = store.lock();
+        for n in 0..count {
+            let ended = 1_000 + n;
+            connection
+                .execute(
+                    "INSERT INTO workflow_runs(
+                       run_id, project_dir, name, state, started_at_ms, ended_at_ms,
+                       steps_json, error
+                     ) VALUES (?1, ?2, 'demo', 'succeeded', ?3, ?4, '[]', NULL)",
+                    params![format!("{prefix}-{n:05}"), project, ended - 1, ended],
+                )
+                .unwrap();
+        }
+    }
+
+    /// v0.5.9 §2.4. Retention used to need a run to REACH a terminal state,
+    /// so a project that had stopped running workflows kept every row it had
+    /// ever written, forever. One sweep at startup is the only thing that
+    /// reaches those, and it has to reach all of them, not just the project
+    /// that happens to be loaded.
+    #[test]
+    fn the_startup_sweep_trims_every_project_that_has_stopped_running_workflows() {
+        let (root, one, two) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        let overshoot = 4;
+        plant_finished_runs(
+            &store,
+            &one,
+            "old",
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + overshoot,
+        );
+        plant_finished_runs(&store, &two, "other", 3);
+        // A crash-interrupted run in the fat project: the sweep must not be
+        // the thing that eats the resume banner.
+        store
+            .upsert_workflow_run(&one, "still-going", "demo", "running", 1, None, "[]")
+            .unwrap();
+
+        let swept = store.prune_every_projects_terminal_workflow_runs().unwrap();
+        assert_eq!(swept, 2, "both projects with finished history are visited");
+
+        let kept = stored_run_ids(&store, &one);
+        assert_eq!(
+            kept.len() as i64,
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 1,
+            "trimmed to the cap, plus the running row the cap never counted"
+        );
+        assert!(kept.contains(&"still-going".to_string()));
+        for n in 0..overshoot {
+            assert!(
+                !kept.contains(&format!("old-{n:05}")),
+                "run {n} is older than the cap allows and should be gone"
+            );
+        }
+        assert_eq!(
+            stored_run_ids(&store, &two).len(),
+            3,
+            "a project under the cap loses nothing — the sweep trims, it does not clear"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The reason the sweep reads its project list out of the table instead of
+    /// putting each path back through `project_id`: a project directory that
+    /// has been deleted or moved cannot be canonicalised any more, and those
+    /// are precisely the installs whose rows nothing will ever come back to
+    /// prune.
+    #[test]
+    fn the_startup_sweep_still_trims_a_project_whose_directory_is_gone() {
+        let (root, one, _) = projects();
+        let store = QueenStore::open_in_memory().unwrap();
+        plant_finished_runs(
+            &store,
+            &one,
+            "old",
+            MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT + 2,
+        );
+        let ids_before = stored_run_ids(&store, &one);
+        std::fs::remove_dir_all(&one).unwrap();
+        assert!(
+            one.canonicalize().is_err(),
+            "precondition: the project path no longer resolves"
+        );
+
+        store.prune_every_projects_terminal_workflow_runs().unwrap();
+
+        let connection = store.lock();
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM workflow_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, MAX_TERMINAL_WORKFLOW_RUNS_PER_PROJECT);
+        assert!(ids_before.len() as i64 > remaining);
         let _ = std::fs::remove_dir_all(root);
     }
 }

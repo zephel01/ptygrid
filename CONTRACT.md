@@ -2089,7 +2089,7 @@ team_presets:
 > 経緯は [plan.md](docs/design/plan.md) §6.6。
 >
 
-> 追記（2026-07-30、続報11）: **step 単位の所要時間とペイン待ち時間を wire に載せた
+> 追記（2026-07-30、続報11a）: **step 単位の所要時間とペイン待ち時間を wire に載せた
 > （v0.5.8 項目2）。** 続報10 §(4) が「`StepOutcome` の serialize される公開フィールドを
 > 増減させていない」と記録した状態を、**本追記で初めて additive に更新する**。並列化が
 > どれだけ効いているかを事後に測れるようにするのが目的で、Phase 5.5.1（OTel）の前段でも
@@ -2215,7 +2215,7 @@ team_presets:
 
 > ---
 >
-> 追記（2026-08-04、続報11）: **`onEach: reply` / `joinOn: stream` — 上流の返信 1 本ごとに
+> 追記（2026-08-04、続報11b）: **`onEach: reply` / `joinOn: stream` — 上流の返信 1 本ごとに
 > 下流を 1 つ起こす（Phase 5.0.7）。** 仕様は
 > [docs/spec/spec-oneach-reply-5.0.7.md](docs/spec/spec-oneach-reply-5.0.7.md)。
 > **本追記は完全に additive** で、`StepOutcome` の JSON 形すら変わらない（下記 (7)）。
@@ -2342,7 +2342,7 @@ team_presets:
 > `u14-queue` の 2 本（→ plan.md §2 U14）。
 >
 > 追記（2026-08-07、続報12）: **`resume_workflow` は「すでに起きた step 間の受け渡し」を
-> 失った run も拒否する。** 続報11 (a) が `onEach` について書いた拒否と同じ判断を、
+> 失った run も拒否する。** 続報11b (a) が `onEach` について書いた拒否と同じ判断を、
 > `condition:` と `handoffTo:` にも広げる。原因は同じ 1 点で、`StepOutcome::reply_body` が
 > `#[serde(skip)]` であること — 再起動をまたぐと、**state は `Succeeded` のまま残るのに
 > 返信本文だけが消える**。下流の 2 か所はこれを「上流が返信せずに終わった」と区別できない:
@@ -2369,7 +2369,7 @@ team_presets:
 > frontend は既存の resume 失敗パスにそのまま落ちる（`onEach` の拒否で通っている経路と同じ）。
 > `StepOutcome` の serialize されるフィールドも不変。**恒久対策は「運ばれた本文を step と
 > 一緒に永続化する」ことで、それは別 patch**（→ docs/design/next-implementation-2026-08.md
-> の 5.6.1）。それまでは、誤った答えに resume するより拒否するほうがましという続報11 と
+> の 5.6.1）。それまでは、誤った答えに resume するより拒否するほうがましという続報11b と
 > 同じ判断を採る。
 >
 > 検証: `cargo test` **lib 466（461 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
@@ -2458,8 +2458,8 @@ team_presets:
 >   も挙動が変わらない（`handoff_bodies` はもともとエントリを出さない）ので、拒否は不要な
 >   ものだった。**判定できるようにするには inbox を見に行く設計変更が要り、本筋は
 >   「運ばれた本文を step と一緒に永続化する」Phase 5.6.1 なので今回は直さない。**
->   誤った答えに resume するより、不要に拒否するほうがましという続報11 / 続報12 と同じ判断。
-> - 偽陰性は今回の修正で 1 件塞がった（上記）。`onEach` / `joinOn: stream` は続報11 (a) の
+>   誤った答えに resume するより、不要に拒否するほうがましという続報11b / 続報12 と同じ判断。
+> - 偽陰性は今回の修正で 1 件塞がった（上記）。`onEach` / `joinOn: stream` は続報11b (a) の
 >   定義ベースの門が先に run ごと拒否するので、このガードの守備範囲外である。
 >
 > 検証: `cargo test` **lib 475（470 + 新規 5）/ 統合 14、いずれも 0 failed**（新規 5 本 —
@@ -2620,6 +2620,7 @@ team_presets:
 > - **run 全体の失敗は通知しない。** 入口は step の retry 枯渇 1 つだけである。`retry:` を
 >   書いていない step だけで構成された workflow は、run が red になっても escalation は
 >   出ない（ペイン exit 由来の通知は従来どおり出る）。
+>   **→ 続報22 (2) で解消。本項は失効。**
 > - **「枯渇 1 回につき 1 通」は step 単位の話で、run 単位ではバーストしうる。** `escalated` は
 >   **step（＝ `onEach` / `fanOut` のコピー 1 つ）ごと**のフラグなので、`reviewer#0`〜`#63` が
 >   同一 tick で枯渇すれば **その 1 tick で 64 通**出る。上限は `STREAM_MAX_UNITS` = 64
@@ -2628,6 +2629,8 @@ team_presets:
 >   なので、そのぶん 200ms tick が直接ブロックされる。`onEach` × `retry` を併用する設定でだけ
 >   起きる。spec-notifications.md は §7 で事故防止を掲げ、**スロットリング / ダイジェストは
 >   §9 で v2 送り**にしているので、対処するならそこ（→ plan.md §3 のバックログ）。
+>   **→ 続報22 (3) で「`send_os` が driver スレッド上でインライン」の部分だけ失効
+>   （detached thread に出した）。1 tick で最大 64 通という上限そのものは変わらない。**
 > - **実機検証は未実施。** 裏づけは unit test 5 本だけで、実際に OS トーストや Slack に
 >   届いたところは見ていない（→ plan.md §2 の U18）。
 >
@@ -3066,6 +3069,147 @@ team_presets:
 >
 > **未実測。** 実機検証は依然として**未実施**（→ plan.md §2 U20）。猶予の 2 つの数字も
 > 時計跳びの閾値も実測ではないという続報19 (h) はそのまま生きている。
+>
+
+> 追記（2026-08-14、続報22）: **v0.5.9 = 負債返済リリース（新機能ゼロ）。終端した run の
+> kickoff を ack する / run 全体の失敗にも escalation を出す / `send_os` を driver tick から
+> 外す、の 3 件と掃除。** 経緯と判断は
+> [next-release-v0.5.9.md](docs/design/next-release-v0.5.9.md) §2、実装記録は
+> [plan.md](docs/design/plan.md) §6.24。**wire 契約は 1 バイトも変わらない**:
+> `StepOutcome` / `WorkflowRun` / `workflow-state` / `ScheduleView` / `ptygrid.yml` スキーマ /
+> Queen MCP tools / Tauri command はすべて不変で、frontend も無変更。`notifications:` の
+> スキーマも変更なし。**新しい設定キーは 1 つも増えていない。**
+>
+> **(0) 採番の是正 — 「続報11」が 2 つあった。** 2026-07-30（計測フィールド）と 2026-08-04
+> （`onEach: reply`）が両方とも続報11 を名乗っており、続報12 / 続報14 の「続報11 (a)」が
+> どちらを指すか曖昧だった。**前者を続報11a、後者を続報11b に改めた**（末尾に振り直さず
+> 枝番にしたのは、この文書が時系列＝出現順で読まれるものであり、2026-08-04 の追記に
+> 22 以降の番号を与えると続報12 より前に大きい番号が現れるため）。参照側は
+> CONTRACT の 4 か所と `plan.md` §6.13 の 1 か所を **すべて 11b に直した**（「(a)」が付く
+> 参照はいずれも `onEach` の拒否を指しているため）。**内容は 1 文字も変えていない。**
+>
+> **(1) 終端した run の kickoff を ack する（Stage A-5 の入口を広げる）。** 続報15 が入れた
+> `retire_run_kickoffs` の呼び出し元は **cancel と abandon の 2 か所だけ**だった。ところが
+> `joinOn: reply` でない step は route 1（PTY exit）/ route 2（semantic done）で完了するので
+> **返信が無く、kickoff は未 ack のまま残る**。つまり**滞留するほうが多数派**で、続報17 の
+> retention は `workflow_runs` を DELETE するだけなので `inbox_messages` には効かない。
+> 行き着く先は `MAX_MESSAGES_PER_PROJECT` = 50,000 到達で、`enforce_limit` は**削除ではなく
+> `Err` を返す**ので `send_inbox` が拒否され、`deliver_kickoff` が失敗する
+> （`joinOn: reply` の step は `Failed`＋ペイン孤児化、それ以外は**無言のペインが 1 枚立つ**）。
+> 是正: `advance_run` が run を `Succeeded` / `Failed` に**遷移させた tick**でも同じ純関数を
+> 呼ぶ。**エッジの取り方は続報17 の retention と同じ形**（SQL の手前に Rust 側のゲートを
+> 置く）で、`advance_all` / `advance_run` はどちらも既に終端 run を tick しないので、
+> **1 run につき 1 回**しか通らない。**200ms tick に SQL は 1 文も増えていない**
+> （増えるのは「終わった run 1 本につき 1 文」）。cancel / abandon の既存経路は無変更。
+> sender（`queen:workflow/<name>/<run_id>`）で選ぶ性質も続報15 のまま — 並行する別 run の
+> kickoff は巻き込まない。
+>
+> **(2) run 全体の失敗にも escalation を出す。** 続報16 の既知の限界「**run 全体の失敗は
+> 通知しない**」を解消する（**本項がその 1 行を上書きする**）。入口が step の retry 枯渇
+> 1 つだけだったので、`retry:` を書いていない step だけの workflow は run が red で終わっても
+> **1 通も出ない**。`schedule:`（続報18）で無人起動する設定では、これは「失敗を静かに溜める
+> 装置」そのものである（続報21 (C) が「正しくは **`retry:` を書いていない step の失敗は
+> 出ない**」と書いた、まさにその穴）。是正: 純関数 `run_failure_escalation` を足し、
+> `advance_run` の末尾と `spawn_workflow`（root が全部 spawn 失敗して**生まれた瞬間に
+> `Failed`** の run。この run は driver に渡らないので `advance_run` のエッジでは拾えない）
+> の 2 か所から呼ぶ。**配送機構は新設していない** — 既存の `dispatch_ctx` / `NotifyEvent::Error`
+> にそのまま乗る。確定した 4 つの判断:
+>
+> - **(a) 二重は「抑止」。** step の枯渇 escalation が 1 通でも出た run では、run 単位の
+>   escalation を**出さない**（`StepOutcome::escalated` が 1 つでも立っていれば `None`）。
+>   step のメッセージは既に failing step / agent / 試行回数 / エラー本文を名乗っており、
+>   「よって run が赤い」は操作を 1 つも増やさない。しかも `onEach` × `retry` は 1 tick で
+>   最大 64 通を出しうる側なので、そこに run 単位を足す価値は無い。**新しい状態は不要**で、
+>   既存の `escalated` を読むだけ（同一 tick に立った分も含む）。
+> - **(b) `Cancelled` は対象外。** `finalize_state` は `Cancelled` を返さず、書き手は
+>   `cancel_workflow` だけ ＝ 自分で止めた操作者に結果を通知することになる。
+> - **(c) `origin` は run スコープを表す形に変えた。** `WorkflowOrigin` の `step_id` /
+>   `attempts` を `scope: OriginScope::{ Step { step_id, attempts }, Run { failed_steps } }`
+>   に置き換えた（**Rust 内部型で wire には出ない**）。run に試行回数は無く、step に
+>   失敗 step の一覧は無いので、空文字の `step_id` を番兵にすると
+>   「`demo/` exhausted its retries」が黙って出せてしまう。**step スコープの title / body は
+>   バイト単位で不変**（続報16 (4) の文面をそのまま維持。既存の整形テストも無改変で通る）。
+>   run スコープの文面は `[project] ⛔ <workflow> ended in failure` /
+>   `Workflow '<wf>' (run <id>) ended in a failed state. Failed steps: a, b. First error: …
+>   Nothing further will run for this run.`（`Failed` の行が 1 つも無い run — 非良性の
+>   Skip / Cancel で赤くなった run — では「Failed steps:」の 1 文を落とす）。
+> - **(d) レベルではなくエッジ。** `escalated` と同じ発想を 1 段上でやるが、**フラグは
+>   足していない**: 「遷移前の state」がそのまま記憶で、終端 run は二度と tick されない。
+>   `#[serde(skip)]` で resume 時に落ちる新フィールドを増やさないのが狙いでもある。
+>
+> **(3) `send_os` を detached thread へ出す。** 続報16 の既知の限界が書いた
+> 「`send_os` は driver スレッド上でインライン」を解消する（**本項がその記述を上書きする**）。
+> `escalated` は step（コピー）単位のフラグなので、`onEach` のコピーが同一 tick で一斉に
+> 枯渇すると **1 tick で最大 64 通**（`STREAM_MAX_UNITS` = 64）で、`show()` は同期の
+> プラットフォーム呼び出し（macOS なら `UNUserNotificationCenter`）だから、**64 発が 200ms
+> tick を直接ブロックし、escalation と無関係な run まで止めていた**。是正は webhook 側
+> （`post_json`）が既に採っている形をそのまま適用しただけで、**これで `dispatch_ctx` の
+> 全トランスポートが呼び出しスレッドを離れる**。**run 単位のダイジェスト化（本筋）は
+> やっていない** — spec-notifications.md §9 の v2 のままである。**したがって「1 tick で
+> 最大 64 通が外へ出る」こと自体は変わらない**（変わったのは tick を止めなくなったこと
+> だけ）。なお (2)(a) の抑止により、**その 64 通に run 単位の 1 通が上乗せされることはない**。
+>
+> **(4) retention の起動時一括掃除（続報17 の補強）。** 続報17 の retention は
+> **run が終端に到達した書き込み**でしか走らないので、「もう workflow を流さなくなった
+> プロジェクト」は A-6 以前のビルドが太らせた行を**永久に持ち続ける** ＝ 上限を書いた相手に
+> 上限が効かない。`QueenStore::open` から
+> `prune_every_projects_terminal_workflow_runs` を **プロセス起動につき 1 回**呼ぶ。
+> **`VACUUM` は入れない**（起動時にファイル全体を書き直すことになる。SQLite は空きページを
+> 再利用するので、増加が止まるという結論は変わらない）。プロジェクト一覧は
+> `workflow_runs.project_dir` から読み、**`project_id`（= `canonicalize`）を通さない** —
+> 消えた / 移動したディレクトリこそ掃除したい相手であり、そこで解決に失敗して読み飛ばすと
+> 目的が反転するため。失敗しても起動は続ける（best-effort）。**`user_version` は 3 のまま**で、
+> 新しい索引もスキーマ変更も無い。
+>
+> **(5) `PTYGRID_MAILBOX` の契約を明文化する（コード修正は無し）。** 現状の契約は
+> **「`PTYGRID_MAILBOX` は workflow が spawn したペインにしか存在しない」**である。
+> 注入は `spawn_step` の **fresh spawn 経路だけ**で、`resolve_def` が返した定義のコピーに
+> 書く形なので:
+>
+> - `autostart` / `spawn_agent` / `spawn_team`（`team_presets`）が立てたペインには**存在しない**。
+>   そのペインで `mailbox=$PTYGRID_MAILBOX` を書くと、シェルが**空文字に展開する**
+>   （`cmd` は `/bin/sh -c` 経由）。
+> - `spawn_step` の**ペイン再利用（`reuse_existing`）経路も通らない**ので、既存ペインを
+>   再利用した step の `PTYGRID_MAILBOX` は**前回 spawn 時の値のまま**である。
+> - 現状これで実害が出ていないのは、**`onEach` のコピーが常に `reuse_existing: false`**
+>   （＝必ず fresh spawn）だからにすぎない。**run スコープの mailbox を全 step に広げる案を
+>   採ると、最初に壊れるのがここである。**
+>
+> ユーザー向けの書き方（`mailbox=$PTYGRID_MAILBOX`）は続報11b / ガイド §1 のまま変わらない。
+> **workflow の step 以外のペインでは使えない**、が明文化された契約である。
+>
+> **(6) `src-tauri/src/orchestrator.rs.bak` を git から削除した。** 5.0.0 から追跡されたままで
+> **v0.5.8 のタグにも同梱されていた**。live source ではなく（`spawn_workflow` の
+> `not implemented in MVO` エラーなど、5.0.4 で消えた旧コードが残っているだけ）、
+> ビルドにも `cargo` の対象にも入っていないので**挙動は 1 つも変わらない**。CONTRACT
+> 続報2 の脚注（1728 行目付近）と `ptygrid-yml-guide.md` §1 supervisor 行が、
+> 「commit 済みの `.bak` に旧コードが残るが実行系とは無関係」という注記を置かざるを
+> 得なくなっていた元凶で、**その注記の対象自体が無くなった**（ガイド側には追記済み）。
+>
+> **実測。** `cargo test` **lib 530 → 543 passed / 0 failed**（新規 13 本）、**統合 14 不変**。
+> **修正前に落ちることを確認した新規テスト**: `a_run_the_driver_finishes_retires_its_own_kickoffs`
+> ((1) の本体。逆側の `a_run_the_driver_leaves_running_keeps_its_kickoffs_live` は修正前から
+> 緑で、これは正しい — 修正が「生きている run の kickoff を巻き込まない」ことの固定である)、
+> `a_run_that_fails_without_any_step_escalation_escalates_once` /
+> `a_run_failure_notice_carries_the_first_failed_steps_error`（(2) の本体。逆側の
+> `a_run_whose_step_already_escalated_is_not_escalated_again` /
+> `a_succeeded_or_cancelled_run_is_never_escalated` は抑止側なので修正前も緑）。
+> 残る新規は `only_the_transition_into_a_terminal_state_counts_as_reaching_it` /
+> `a_finished_run_sweeps_its_kickoffs_exactly_once` /
+> `a_run_failure_names_the_workflow_and_the_steps_that_failed` /
+> `a_run_failure_with_no_failed_step_row_still_reads_cleanly` /
+> `a_run_failure_with_one_failed_step_is_not_pluralised` /
+> `the_startup_sweep_trims_every_project_that_has_stopped_running_workflows` /
+> `the_startup_sweep_still_trims_a_project_whose_directory_is_gone`。
+> `cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool` **1 件のみ**で
+> 本作業起因の新規警告はゼロ。frontend 無変更（`npm run check` は未実行 — 触っていない）。
+>
+> **未実測。** (a) **実機検証は未実施** — OS トーストが detached thread から出るところも、
+> run 単位の escalation が実際に届くところも見ていない（→ plan.md §2 の U18）。
+> (b) `inbox_messages` が 50,000 に到達するまでの実時間は依然として**未計測**（毎時 1 run ×
+> kickoff 3 step なら 72 行/日で約 690 日、という算数はできるが返信ぶんが加算される）。
+> (c) 起動時掃除が実際に何行削るか、その所要時間も未計測（削除対象ゼロのときは
+> `SELECT DISTINCT` 1 文と `count(*)` がプロジェクト数ぶんで、これは実測していない）。
 >
 
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
