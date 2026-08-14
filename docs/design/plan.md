@@ -1020,7 +1020,7 @@ MVO（5.0.0）完成後、Track A/B/C/D を並列に走らせる。branch は 1 
   検証 V1〜V10）と `orchestrator.rs`（`detect_reply_completions` の unit 切り出し、新設の
   `mint_stream_copies` / `close_stream_targets` / `stream_closed_for`、`spawn_ready` の 1 コピー
   1 スロット spawn、`fire_due_retries` の unit 再配送、`defer_step` の打ち切り条件、
-  `resume_workflow` の拒否）。CONTRACT.md に**先行追記**（続報11）、
+  `resume_workflow` の拒否）。CONTRACT.md に**先行追記**（続報11b）、
   `example/review-as-you-go` を 1 本追加、`docs/guide/ptygrid-yml-guide.md` §1 に 2 行追加。
   `queen_store.rs` / `queen.rs` / frontend は**無変更**。
 - **設計上、いちばん危なかった箇所**（いずれも spec §3.6 / §3.4.4 が名指ししていたもの）:
