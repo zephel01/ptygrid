@@ -67,7 +67,10 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.5.3 | Agent Status Rings（通知リング / 要承認ハイライト。出自は competitive-landscape の「次に取る UX」で、4.0 の teammate permission 表示の汎用化。設計は spec-phase5-5.md §2.3 / §3.7） | ⬜ | — | 該当なし |
 | 5.5.4 | Trace Waterfall + Cost Dashboard | ⬜ | — | 該当なし |
 | （無番号） | escalation: retry 枯渇時に外部へ通知する経路（4.4.2 の `notifications:` 基盤への配線）。枯渇判定は 5.0.4 で発火するようになったが配送経路が無い | ✅（2026-08-13、Stage A-4。→ §6.16） | v0.5.8 | 未（U18） |
-| （無番号） | `workflow_runs` の retention: project ごと **終端 run 500 件**の上限と DELETE。終端していない run は数えも消しもしない（resume を守る）。掃除は「run が終端に到達した書き込み」と abandon のときだけで、200ms tick には SQL を足さない。`user_version` は消費しない（3 のまま） | ✅（2026-08-13、Stage A-6。→ §6.17） | v0.5.8 | 未（U19） |
+| （無番号） | `workflow_runs` の retention: project ごと **終端 run 500 件**の上限と DELETE。終端していない run は数えも消しもしない（resume を守る）。掃除は「run が終端に到達した書き込み」と abandon のときだけで、200ms tick には SQL を足さない。`user_version` は消費しない（3 のまま）。**（2026-08-14）v0.5.9 で `QueenStore::open` からの起動時一括掃除を追加**（プロセス起動につき 1 回、全プロジェクト。「掃除は終端書き込みと abandon のときだけ」はこの行で失効。200ms tick に SQL を足さない点と `user_version` 3 のままである点は不変。→ §6.24） | ✅（2026-08-13、Stage A-6。→ §6.17） | v0.5.8 | 未（U19） |
+| （無番号） | 終端した run の kickoff を ack する: `retire_run_kickoffs` の呼び出し元が cancel / abandon の 2 か所だけで、route 1 / route 2 で完了する多数派の step の kickoff が `inbox_messages` に溜まり続けていた。`advance_run` が run を終端させた tick でも呼ぶ | ✅（2026-08-14、v0.5.9 §2.1。→ §6.24） | — | 未（U18 と同じ実機枠） |
+| （無番号） | `send_os`（OS トースト）を detached thread へ出す: `onEach` × `retry` は 1 tick で最大 64 通を出しうるのに同期呼び出しで 200ms tick をブロックしていた。webhook 側と同じ形にしただけで、**run 単位のダイジェスト化はしていない** | ✅（2026-08-14、v0.5.9 §2.2。→ §6.24） | — | 未（U18） |
+| （無番号） | run 全体の失敗にも escalation を出す: 入口が step の retry 枯渇 1 つだけだったので、`retry:` を書いていない step だけの workflow は run が red でも 1 通も出なかった。純関数 `run_failure_escalation` を `advance_run` 末尾と `spawn_workflow` から呼ぶ。step の枯渇 escalation が出た run では出さない（二重抑止） | ✅（2026-08-14、v0.5.9 §2.3。→ §6.24） | — | 未（U18） |
 | 6.0.0 | Security Foundation: `user_version` **5**（2026-08-13 決定。4 は 5.6.0 に割り当て済み → §5.1）の 3 テーブル（`replays` / `secrets_audit` / `sandbox_events`）同時導入 | ⬜ | — | 該当なし |
 | 6.0.1 | Sandbox filesystem-only プロファイル | ⬜ | — | 該当なし |
 | 6.0.2 | Sandbox strict プロファイル | ⬜ | — | 該当なし |
@@ -365,6 +368,9 @@ U18 が済むまでこの節は「コード上は完了」として残す。以�
   （5.0.5 は Arena view 用に予約済みで、採番の食い違い自体は §1 の脚注※で決着済み）
 - **`src-tauri/src/orchestrator.rs.bak` が git に追跡されたまま**: live source ではないが、ガイド §1 が
   「commit 済みの `.bak` に旧コードが残るが実行系とは無関係」と注記せざるを得ない。次の整理コミットで削除
+  - **（2026-08-14 訂正）この項目は済んだ**: v0.5.9 の掃除で `git rm` 済み（→ §6.24 / CONTRACT 続報22 (6)）。
+    ガイド §1 supervisor 行と CONTRACT 続報2 の脚注が置かざるを得なかった注記も、対象自体が無くなった。
+    本項目は削除せず、経緯として残す
 - **anthropics/claude-code#26572**（CustomPaneBackend 公式化）: 採用されたら
   シム撤去 + `CLAUDE_PANE_BACKEND_SOCKET` 広告へ移行（teams-backend はそのまま使える）
 - 残りの Defer 項目（backend M5/M8/L3/L4/L6/L7/L11 系、frontend BUG-8/10、
@@ -1854,6 +1860,83 @@ CONTRACT.md **続報22**。ブランチは `fix/retire-kickoffs-on-terminal`。
   `workflow_runs.error`、resume 拒否の偽陽性、秋の DST、schedule の自動停止解除、
   `orchestrator.rs` の「phase 5.0.5」表記 17 か所）には一切手を付けていない。
   version 3 ファイルも触っていない。
+
+#### 6.24 追記（2026-08-14）: 4 ブランチ統合後の最終レビューで出た 7 件の是正
+
+上記 4 件を `feat/v0.5.9` に統合したあとのレビューで、**統合したことで初めて偽になった記述**が
+出た。新機能は引き続きゼロで、コードの挙動を変えた修正は 1 件も無い（コメント 1 件 +
+シェルスクリプト 1 件 + テスト 2 本 + ドキュメント）。
+
+- **ドキュメントの是正 5 件**。
+  1. **userguide の「`retry:` の無い step の失敗は通知されない」2 か所**（§「失敗にどう備えるか」と
+     §`schedule:` の引用ブロック）。§2.3 で偽になっていた。前者は run 単位の 1 通を別項目として
+     足し、後者からは「step に `retry:` を書いてください」という**操作指示そのもの**を削除した。
+     `ptygrid-yml-guide.md` §1 の 2 行（schedule / escalation）は同じ統合の中で既に訂正済みで、
+     **userguide だけが取り残されていた**。
+  2. **userguide の「`PTYGRID_MAILBOX` は workflow が起動する全セッションに注入される」**。
+     CONTRACT 続報22 (5) と正反対だった。注入は `spawn_step` の fresh spawn 経路だけ
+     （ペイン再利用の early return が env を書く手前にある）。同名 agent のペインが既に
+     立っている状態で singular step を走らせると既存ペインを adopt するので、ガイドが防ごうと
+     している「指示を受け取れない」と同じ形で詰まる。訂正に加えて**回避策**（workflow で使う
+     agent を `autostart: true` にしない / 走らせる前に閉じる）を 1 文添えた。
+  3. **userguide の notifications イベント一覧**に run 単位の失敗が無かった（偽ではなく不完全）。
+     1 行追記。
+  4. **plan.md §1 の retention 行**が §2.4（起動時一括掃除）で偽になっていた。§1 は「この文書で
+     状態を宣言するのはこの表だけ」と自称しているので、そこを直した。あわせて §2.1〜§2.3 の
+     3 件を（無番号）行として §1 に追加した（リリース列は `—`）。**§4 のタグ実績表は正しい**
+     （v0.5.9 は未作成なので行を持たないのが正）。
+  5. **plan.md §3 の `.bak` 項目**が「次の整理コミットで削除」のまま残っていた。§6.24 が
+     「§3 の該当項目はこれで消える」と宣言している側だったので、隣の `feat/terminal-copy-paste`
+     項目と同じ書式で in-place 訂正した（削除はしない）。
+- **コードのコメント 1 件**。`spawn_workflow` 末尾の §2.3 コメントが「born-`Failed` は
+  **グリッドが満杯のとき**に取る形」と書いていたが、**満杯の root は `Pending` プレースホルダ**
+  として積まれ、`state` 判定は `Pending` があれば `Running` を返すので**満杯では `Failed` に
+  ならない**。born-`Failed` は「全 step が root かつ全 spawn が失敗」の場合だけ。
+  **コメントのみの誤りで挙動には影響しない。**
+- **`scripts/bump-version.sh` の失敗パス**。ヘッダーは「途中で異常があれば何も書き換えずに
+  止まる」と宣言していたが、`cargo check` が非ゼロで終わると `set -eu` が即 exit し、
+  **3 ファイルは新版・`Cargo.lock` は旧版**という**このスクリプトが防ぐために存在する状態**が
+  残っていた。しかも説明が 1 行も出ず、再実行は自分の dirty-tree ガードに弾かれる。是正:
+  書き換えの直前に 4 ファイル（`Cargo.lock` を含む）を退避し、EXIT trap で非ゼロ終了時に
+  必ず戻す。`cargo check` は `if !` で明示的に受けて理由を出す。**実測**（作業ツリーの外に
+  複製し、失敗する `cargo` を PATH に差し込んで確認）: (a) `cargo check` 失敗 → 4 ファイルとも
+  原状復帰・`git status` clean・`.bump-tmp` と退避ディレクトリの残骸ゼロ、(b) `cargo` 成功だが
+  `Cargo.lock` が追従しない場合（検証 (6) で落ちる経路）→ 同じく全戻し、(c) 成功パスは
+  4 ファイルとも新版で trap は何もしない、(d) 既存の早期停止パス（引数 0/2 個、`1.2`、
+  `1.2.3-rc1`、`v0.5.9`、現在値と同一、3 ファイル食い違い、dirty tree）は**全部これまでどおり
+  exit 1**。`dash` でも同じ結果（POSIX `sh` 適合は維持）。
+- **追加したテスト 2 本**（いちばん静かに壊れうる 2 点の配線を固定する）。
+  1. `advance_run_escalates_a_run_that_ends_failed_with_no_step_escalation`（orchestrator）。
+     §2.3 の既存 4 本はすべて純関数 `run_failure_escalation` を直接呼んでおり、
+     `advance_run` 側の配線 — `let previous_state = run.state;` が**代入の手前**にあること —
+     を固定するテストが無かった。この 1 行を代入の下に動かすと `previous == new` になり、
+     run 単位の escalation が**完全に沈黙するのに全テストが緑のまま通る**。§2.1 には driver
+     経由の `a_finished_run_sweeps_its_kickoffs_exactly_once` があるので非対称でもあった。
+     観測のために `notify_run_failure` に **`#[cfg(test)]` の thread-local タップ**を足した
+     （`dispatch_ctx` は `NotificationManager` が managed state に無いと即 return するので、
+     `mock_app` では送信そのものを観測できず、run 単位は `escalated` のような痕跡も残さない
+     ため）。**製品コードの挙動は変えていない。**
+  2. `opening_the_store_sweeps_history_a_previous_build_left_over_the_cap`（queen_store）。
+     §2.4 の既存 2 本はどちらも `prune_every_projects_terminal_workflow_runs` を直接呼ぶので、
+     **`QueenStore::open` から呼び出し行を消しても全テストが緑のまま通る**。ファイル実体の
+     `open`（`open_in_memory` ではなく、アプリが使うほう）を 2 回通し、2 回目で件数が
+     上限まで縮むことを固定した。
+  - **配線を潰したら落ちることを両方とも実測した**: (1) は `previous_state` の取得を代入の下へ
+     一時移動 → その 1 本だけ FAILED（544 passed / 1 failed）、(2) は `open` の呼び出し行を
+     一時削除 → その 1 本だけ FAILED（544 passed / 1 failed）。**どちらも直後に元へ戻した。**
+- **CONTRACT.md**。続報22 / 続報23 の本文は書き換えていない（append-only）。**続報22 (2)(a) に
+  但し書きを 1 行だけ足した**: `StepOutcome::escalated` は `#[serde(skip)]` なので二重抑止は
+  プロセス内では真だが run の生涯では真とは限らず、クラッシュ → resume 後に再 escalate が
+  起きない tick で run が終端すると 1 通多く出うる、という指摘。**コード形状からの推測で
+  未検証**である旨を明記した。
+- **検証値（実測）**。`cargo test` は **lib 543 → 545 passed / 0 failed**（追加は上記 2 本のみ）、
+  **統合 14 → 14（不変）**。`cargo clippy --all-targets` は既存の `config.rs` の `nonminimal_bool`
+  **1 件のみ**で新規警告ゼロ。`npm run check` は **136 files / 0 errors / 0 warnings**
+  （frontend は無変更だが、統合ブランチとして基準値を実測した）。`cargo fmt` は走らせていない。
+- **やっていないこと**。`docs/guide/userguide.en.md` は**触っていない** — 日本語版の上記 3 件の
+  訂正が英語版に反映されていないので、**英語版は現時点で未追随**である（対訳としての等価性が
+  崩れている。今回のスコープ外として記録のみ）。§2.5「入れないもの」と version 3 ファイルにも
+  引き続き手を付けていない。実機検証は依然 1 件も行っていない（→ U18 / U19）。
 
 ---
 

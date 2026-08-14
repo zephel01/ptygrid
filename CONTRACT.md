@@ -3128,6 +3128,13 @@ team_presets:
 >   「よって run が赤い」は操作を 1 つも増やさない。しかも `onEach` × `retry` は 1 tick で
 >   最大 64 通を出しうる側なので、そこに run 単位を足す価値は無い。**新しい状態は不要**で、
 >   既存の `escalated` を読むだけ（同一 tick に立った分も含む）。
+>   **但し書き（2026-08-14、最終レビューでの指摘。コード形状からの推測であり未検証）**:
+>   `StepOutcome::escalated` は `#[serde(skip)]` なので、この二重抑止が成立するのは
+>   **プロセス内**であって、**run の生涯にわたって成立するとは限らない**。クラッシュ →
+>   resume を挟むと `escalated` は落ちた状態で復元されるため、resume 後に再 escalate が
+>   起きない tick で run が終端すると、run 単位の 1 通が「余分に」出うる。**実際に
+>   起こるかは検証していない**（resume 経路を通した確認も、そのケースを固定するテストも
+>   無い）。
 > - **(b) `Cancelled` は対象外。** `finalize_state` は `Cancelled` を返さず、書き手は
 >   `cancel_workflow` だけ ＝ 自分で止めた操作者に結果を通知することになる。
 > - **(c) `origin` は run スコープを表す形に変えた。** `WorkflowOrigin` の `step_id` /
