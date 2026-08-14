@@ -14,12 +14,18 @@
 //     here: `take_escalations` flips a once-only `StepOutcome::escalated` flag
 //     and only hands this module the steps that flipped on that tick. This
 //     module's "never dedups" premise therefore still holds.
+//   - workflow run failure (`orchestrator::run_failure_escalation`, v0.5.9
+//     §2.3): a whole RUN ended `Failed` => `Error`. Same tick, same rule: the
+//     edge is the run's state transition, made in `advance_run`, and the
+//     source suppresses itself entirely on a run that already escalated a
+//     step, so the two orchestrator sources never both fire for one run.
 //
 // This file is the PURE core: the event model, the (event × level) routing
 // decision, channel selection, and message formatting — all unit-tested with no
 // I/O. The managed state, `${VAR}` expansion, OS-toast + webhook dispatch, and
-// the wiring from the three event sources land in the dispatch layer (a
-// follow-up within this module) and never run on the reader hot path.
+// the wiring from the event sources land in the dispatch layer (a follow-up
+// within this module) and never run on the reader hot path. Since v0.5.9 §2.2
+// EVERY transport leaves the calling thread — see `send_os`.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -84,10 +90,11 @@ pub fn channels_for(
         .filter(move |c| should_send(c.effective_level(global), event))
 }
 
-/// Which workflow step a notification is about, when the event came from the
-/// orchestrator rather than from a session (Stage A-4). `None` for the two
-/// session-centric sources, which is what keeps their messages byte-identical
-/// to what they were before this existed.
+/// Which workflow step — or, since v0.5.9 §2.3, which whole run — a
+/// notification is about, when the event came from the orchestrator rather
+/// than from a session (Stage A-4). `None` for the two session-centric
+/// sources, which is what keeps their messages byte-identical to what they
+/// were before this existed.
 ///
 /// Deliberately additive rather than a change to `NotifyContext::session_id`:
 /// an escalating step may have NO session at all (its spawn never got a pane,
@@ -101,10 +108,33 @@ pub struct WorkflowOrigin {
     pub workflow: String,
     /// Run id (`wfr_…`), so a message can be matched to a row in the panel.
     pub run_id: String,
-    /// Step id, suffixed (`review#2`) for a fan-out / `onEach` copy.
-    pub step_id: String,
-    /// Spawn attempts made before the budget ran out (1 = the original spawn).
-    pub attempts: u32,
+    /// What in that run the message is about.
+    pub scope: OriginScope,
+}
+
+/// Which of the two orchestrator-sourced events a `WorkflowOrigin` describes
+/// (v0.5.9 §2.3 adds the second).
+///
+/// An enum rather than an optional step id, because the two carry genuinely
+/// different payloads — an attempt count says nothing about a whole run, and a
+/// list of failed steps says nothing about a single one — and because a
+/// sentinel empty `step_id` would let one silently render under the other's
+/// wording ("`demo/` exhausted its retries").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginScope {
+    /// Stage A-4: one step ran out of `retry:` budget.
+    Step {
+        /// Step id, suffixed (`review#2`) for a fan-out / `onEach` copy.
+        step_id: String,
+        /// Spawn attempts made before the budget ran out (1 = original spawn).
+        attempts: u32,
+    },
+    /// v0.5.9 §2.3: the run as a whole ended `Failed`.
+    Run {
+        /// Step rows that ended `Failed`. May be empty — a run can go red on a
+        /// non-benign Skip/Cancel with nothing `Failed` in it.
+        failed_steps: Vec<String>,
+    },
 }
 
 /// Owned session context for a notification message. Owned strings so a
@@ -120,7 +150,7 @@ pub struct NotifyContext {
     /// rule / prompt hint for `NeedsAttention`, the step's own error text for a
     /// workflow escalation.
     pub detail: Option<String>,
-    /// Set only by the workflow-escalation source; see `WorkflowOrigin`.
+    /// Set only by the two orchestrator sources; see `WorkflowOrigin`.
     pub origin: Option<WorkflowOrigin>,
 }
 
@@ -152,14 +182,21 @@ fn glyph(event: NotifyEvent) -> &'static str {
 /// (`demo/review#2`) and gets its own verb: "exited abnormally" would be a lie
 /// twice over — the step may never have had a process to exit, and the point of
 /// the message is that the automatic recovery is over, not that something ended.
+/// A run-level failure (v0.5.9 §2.3) names the WORKFLOW for the same reason —
+/// there is no one step to blame, and often no process that exited at all.
 pub fn format_title(event: NotifyEvent, ctx: &NotifyContext) -> String {
     if let Some(origin) = &ctx.origin {
-        let mut title = format!(
-            "{} {}/{} exhausted its retries",
-            glyph(event),
-            origin.workflow,
-            origin.step_id
-        );
+        let mut title = match &origin.scope {
+            OriginScope::Step { step_id, .. } => format!(
+                "{} {}/{} exhausted its retries",
+                glyph(event),
+                origin.workflow,
+                step_id
+            ),
+            OriginScope::Run { .. } => {
+                format!("{} {} ended in failure", glyph(event), origin.workflow)
+            }
+        };
         if let Some(project) = ctx.project.as_deref().filter(|p| !p.is_empty()) {
             title = format!("[{project}] {title}");
         }
@@ -187,7 +224,12 @@ pub fn format_title(event: NotifyEvent, ctx: &NotifyContext) -> String {
 /// step's own error text as the tail rather than letting it replace all of that.
 pub fn format_body(event: NotifyEvent, ctx: &NotifyContext) -> String {
     if let Some(origin) = &ctx.origin {
-        return escalation_body(origin, ctx);
+        return match &origin.scope {
+            OriginScope::Step { step_id, attempts } => {
+                escalation_body(origin, step_id, *attempts, ctx)
+            }
+            OriginScope::Run { failed_steps } => run_failure_body(origin, failed_steps, ctx),
+        };
     }
     if let Some(detail) = ctx.detail.as_deref().filter(|d| !d.is_empty()) {
         return detail.to_string();
@@ -202,11 +244,16 @@ pub fn format_body(event: NotifyEvent, ctx: &NotifyContext) -> String {
 
 /// Body for a retry-exhaustion escalation. Ends with what the operator is being
 /// asked to do, because nothing in ptygrid will try this step again.
-fn escalation_body(origin: &WorkflowOrigin, ctx: &NotifyContext) -> String {
-    let plural = if origin.attempts == 1 { "" } else { "s" };
+fn escalation_body(
+    origin: &WorkflowOrigin,
+    step_id: &str,
+    attempts: u32,
+    ctx: &NotifyContext,
+) -> String {
+    let plural = if attempts == 1 { "" } else { "s" };
     let mut body = format!(
         "Workflow '{}' (run {}): step '{}' failed after {} attempt{} and has no retry budget left.",
-        origin.workflow, origin.run_id, origin.step_id, origin.attempts, plural
+        origin.workflow, origin.run_id, step_id, attempts, plural
     );
     if let Some(agent) = ctx.name.as_deref().filter(|n| !n.is_empty()) {
         body.push_str(&format!(" Agent: {agent}."));
@@ -215,6 +262,38 @@ fn escalation_body(origin: &WorkflowOrigin, ctx: &NotifyContext) -> String {
         body.push_str(&format!(" Last error: {detail}"));
     }
     body.push_str(" No further automatic retry will happen.");
+    body
+}
+
+/// Body for a run-level failure (v0.5.9 §2.3). Same composing posture as the
+/// step escalation: workflow, run, which steps failed and the first one's
+/// error, ending with the fact that decides what the operator does next —
+/// nothing else in this run is going to run.
+///
+/// The step list can be empty, and the sentence is simply omitted then: a run
+/// finalized `Failed` on a non-benign Skip/Cancel has no `Failed` row to name,
+/// and printing "Failed steps: ." would read as a bug in the message.
+fn run_failure_body(
+    origin: &WorkflowOrigin,
+    failed_steps: &[String],
+    ctx: &NotifyContext,
+) -> String {
+    let mut body = format!(
+        "Workflow '{}' (run {}) ended in a failed state.",
+        origin.workflow, origin.run_id
+    );
+    if !failed_steps.is_empty() {
+        let plural = if failed_steps.len() == 1 { "" } else { "s" };
+        body.push_str(&format!(
+            " Failed step{}: {}.",
+            plural,
+            failed_steps.join(", ")
+        ));
+    }
+    if let Some(detail) = ctx.detail.as_deref().filter(|d| !d.is_empty()) {
+        body.push_str(&format!(" First error: {detail}"));
+    }
+    body.push_str(" Nothing further will run for this run.");
     body
 }
 
@@ -294,10 +373,11 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, config: &Config) {
 }
 
 /// Route one edge event to every channel whose effective level includes it, and
-/// fire each: the OS toast inline, chat webhooks on a detached thread so blocking
-/// network I/O never touches the caller (the agent-status task, the PTY reader
-/// thread, or the 200ms workflow driver). A no-op when the feature is off or no
-/// channel matches. Session-sourced convenience wrapper over `dispatch_ctx`.
+/// fire each on a detached thread, so neither blocking network I/O nor the
+/// platform's own toast call ever touches the caller (the agent-status task, the
+/// PTY reader thread, or the 200ms workflow driver). A no-op when the feature is
+/// off or no channel matches. Session-sourced convenience wrapper over
+/// `dispatch_ctx`.
 pub fn dispatch<R: Runtime>(
     app: &AppHandle<R>,
     event: NotifyEvent,
@@ -360,10 +440,28 @@ fn send_channel<R: Runtime>(app: &AppHandle<R>, ch: &ChannelConfig, title: &str,
 
 /// Local desktop toast via tauri-plugin-notification. Failures (e.g. the OS has
 /// not granted permission) are logged, never propagated.
+///
+/// On a detached thread since v0.5.9 §2.2, for the reason `post_json` already
+/// was: the only caller that is not a user action is the orchestrator's 200ms
+/// driver tick, and `escalated` is a per-STEP flag, so one tick can legitimately
+/// produce up to `STREAM_MAX_UNITS` (64) escalations at once when an `onEach`
+/// fan-out's copies exhaust together. `show()` is a synchronous platform call —
+/// on macOS it goes through `UNUserNotificationCenter` — so 64 of them inline
+/// stalled the driver for every run in the registry, not just the one that
+/// escalated. Digesting a burst into one message per RUN is the real fix and
+/// belongs to spec-notifications v2; getting the burst off the tick thread does
+/// not need it.
+///
+/// Fire-and-forget like the webhooks: nothing waits on the toast, and the
+/// threads are short-lived and bounded by the burst that spawned them.
 fn send_os<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
-        eprintln!("notifications: OS toast failed: {e}");
-    }
+    let app = app.clone();
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = app.notification().builder().title(title).body(body).show() {
+            eprintln!("notifications: OS toast failed: {e}");
+        }
+    });
 }
 
 /// Slack / Mattermost / Discord incoming webhook. Missing or empty (post-expand)
@@ -640,8 +738,10 @@ mod tests {
             origin: Some(WorkflowOrigin {
                 workflow: "demo".to_string(),
                 run_id: "wfr_abc".to_string(),
-                step_id: "review#2".to_string(),
-                attempts: 3,
+                scope: OriginScope::Step {
+                    step_id: "review#2".to_string(),
+                    attempts: 3,
+                },
             }),
         }
     }
@@ -674,8 +774,10 @@ mod tests {
             origin: Some(WorkflowOrigin {
                 workflow: "demo".to_string(),
                 run_id: "wfr_abc".to_string(),
-                step_id: "first".to_string(),
-                attempts: 1,
+                scope: OriginScope::Step {
+                    step_id: "first".to_string(),
+                    attempts: 1,
+                },
             }),
             ..escalation_ctx()
         };
@@ -683,6 +785,96 @@ mod tests {
         assert!(body.contains("1 attempt and"), "no plural for one: {body}");
         assert!(!body.contains("Agent:"), "no agent clause when unnamed: {body}");
         assert!(!body.contains("Last error:"), "no error clause when none: {body}");
+    }
+
+    // ---- run-level failure (v0.5.9 §2.3) ----
+
+    /// A run-level failure names the WORKFLOW, never a step and never `#0`.
+    /// The step-scope wording ("exhausted its retries") would be false for the
+    /// case this exists for: a workflow that declares no `retry:` anywhere.
+    #[test]
+    fn a_run_failure_names_the_workflow_and_the_steps_that_failed() {
+        let ctx = NotifyContext {
+            session_id: 0,
+            name: None,
+            project: Some("my-app".to_string()),
+            detail: Some("agent process exited with code 2".to_string()),
+            origin: Some(WorkflowOrigin {
+                workflow: "nightly".to_string(),
+                run_id: "wfr_abc".to_string(),
+                scope: OriginScope::Run {
+                    failed_steps: vec!["build".to_string(), "test".to_string()],
+                },
+            }),
+        };
+        assert_eq!(
+            format_title(NotifyEvent::Error, &ctx),
+            "[my-app] ⛔ nightly ended in failure"
+        );
+        let body = format_body(NotifyEvent::Error, &ctx);
+        for needle in [
+            "nightly",
+            "wfr_abc",
+            "Failed steps: build, test.",
+            "agent process exited with code 2",
+            "Nothing further will run",
+        ] {
+            assert!(body.contains(needle), "body must mention {needle}: {body}");
+        }
+        assert!(
+            !body.contains("retry budget"),
+            "a run-level failure must not claim a retry budget ran out: {body}"
+        );
+    }
+
+    /// A run can finalize `Failed` with no `Failed` step row at all (a
+    /// non-benign Skip / Cancel). The message stays usable: the step-list
+    /// sentence is dropped rather than printed empty.
+    #[test]
+    fn a_run_failure_with_no_failed_step_row_still_reads_cleanly() {
+        let ctx = NotifyContext {
+            session_id: 0,
+            name: None,
+            project: None,
+            detail: None,
+            origin: Some(WorkflowOrigin {
+                workflow: "nightly".to_string(),
+                run_id: "wfr_abc".to_string(),
+                scope: OriginScope::Run {
+                    failed_steps: Vec::new(),
+                },
+            }),
+        };
+        assert_eq!(
+            format_title(NotifyEvent::Error, &ctx),
+            "⛔ nightly ended in failure",
+            "no project prefix when the config names no project"
+        );
+        let body = format_body(NotifyEvent::Error, &ctx);
+        assert!(!body.contains("Failed step"), "no empty step list: {body}");
+        assert!(!body.contains("First error:"), "no empty error: {body}");
+        assert!(body.contains("ended in a failed state"), "{body}");
+    }
+
+    /// One failed step is not pluralised, matching the step escalation's own
+    /// "1 attempt" rule.
+    #[test]
+    fn a_run_failure_with_one_failed_step_is_not_pluralised() {
+        let ctx = NotifyContext {
+            session_id: 0,
+            name: None,
+            project: None,
+            detail: None,
+            origin: Some(WorkflowOrigin {
+                workflow: "nightly".to_string(),
+                run_id: "wfr_abc".to_string(),
+                scope: OriginScope::Run {
+                    failed_steps: vec!["build".to_string()],
+                },
+            }),
+        };
+        let body = format_body(NotifyEvent::Error, &ctx);
+        assert!(body.contains("Failed step: build."), "{body}");
     }
 
     #[test]
