@@ -1716,6 +1716,95 @@ wire が変わるので CONTRACT.md に**続報20**を立てた。spec は §6.1
   「バージョン割り当て」表は**通算 2 度**繰り下がり、5.5.1 = `v0.5.9` になっている
   （同 spec 側で対応済み）。`user_version` は 3 のままで、このタグでは消費していない。
 
+### 6.24 2026-08-14: v0.5.9 の負債返済 3 件と掃除（新機能ゼロ）
+
+`next-release-v0.5.9.md` §2 の担当ぶん。**新機能は 1 つも足していない**。契約の先行追記は
+CONTRACT.md **続報22**。ブランチは `fix/retire-kickoffs-on-terminal`。
+
+- **入ったもの（コード 3 件）**。
+  1. **終端した run の kickoff を ack する**（§2.1）。`retire_run_kickoffs`（続報15 の純関数）の
+     呼び出し元が **cancel と abandon の 2 か所だけ**だったので、`joinOn: reply` でない step —
+     route 1 / route 2 で完了する多数派 — の kickoff が**未 ack のまま `inbox_messages` に
+     溜まり続けていた**。A-6 の retention は `workflow_runs` を DELETE するだけでこの表に
+     効かない。`advance_run` が run を終端させた tick でも同じ関数を呼ぶようにした。
+  2. **run 全体の失敗にも escalation を出す**（§2.3）。escalation の入口が step の retry 枯渇
+     1 つだけだったので、`retry:` を書いていない step だけの workflow は run が red でも
+     **1 通も出なかった**。純関数 `run_failure_escalation` を足し、`advance_run` の末尾と
+     `spawn_workflow`（root が全部 spawn 失敗して**生まれた瞬間に `Failed`** の run）から呼ぶ。
+     配送機構は新設せず、既存の `dispatch_ctx` にそのまま乗せた。
+  3. **`send_os` を detached thread へ出す**（§2.2）。`escalated` は step 単位のフラグなので
+     `onEach` のコピーが同一 tick で一斉に枯渇すると **1 tick で最大 64 通**（`STREAM_MAX_UNITS`）
+     になり、同期のトースト呼び出しが **200ms tick を直接ブロックしていた**。webhook 側
+     （`post_json`）と同じ形にしただけ。**run 単位のダイジェスト化はやっていない**
+     （spec-notifications v2 のまま。1 tick で 64 通「出る」こと自体は変わらない）。
+
+- **入ったもの（掃除 4 件）**。
+  1. **retention の起動時一括掃除**。`QueenStore::open` から
+     `prune_every_projects_terminal_workflow_runs` をプロセス起動につき 1 回。**`VACUUM` は
+     入れていない**（起動時にファイル全体を書き直すことになるため）。
+  2. **`src-tauri/src/orchestrator.rs.bak` を `git rm`**。5.0.0 から追跡されたままで v0.5.8 にも
+     同梱されていた。live source ではないので**挙動は変わらない**。§3 の該当項目はこれで消える。
+  3. **CONTRACT.md の「続報11」が 2 つあった問題**を、**続報11a（2026-07-30）/ 続報11b
+     （2026-08-04）**の枝番で解消。参照側は CONTRACT 4 か所と本文書 §6.13 の 1 か所。
+  4. **`ptygrid-yml-guide.md` の前文の陳腐化 2 件**（「`orchestrator.rs` の実行系配線は未完了」
+     「`timeoutMs` / `retry:` 行の ❌ 判定は有効」）を訂正。表の当該行は 5.0.4 で既に ✅ で、
+     前文と本文が矛盾していた。加えて §2.3 で内容が変わる §1 の 2 行（`schedule:` /
+     escalation）と、`.bak` を前提にしていた supervisor 行の注記も追記した。
+  5. **`PTYGRID_MAILBOX` の契約を CONTRACT に明文化**（続報22 (5)、**コード修正は無し**）。
+     env 注入は `spawn_step` の fresh spawn 経路にしか無く、`autostart` / `spawn_agent` /
+     `spawn_team` が立てたペインには**存在しない**（`$PTYGRID_MAILBOX` が空文字に展開される）。
+     ペイン再利用経路も通らないので、再利用した step の値は前回 spawn 時のまま。現状実害が
+     出ていないのは `onEach` のコピーが常に `reuse_existing: false` だからにすぎない。
+
+- **設計判断（§2.3 で決めたもの）**。
+  - **(a) 二重通知は「抑止」を採った**。step の枯渇 escalation が 1 通でも出た run では run 単位を
+    出さない。step のメッセージは既に failing step / agent / 試行回数 / エラー本文を名乗って
+    いるので「よって run が赤い」は操作を増やさず、`onEach` × `retry` は 1 tick で最大 64 通を
+    出しうる側でもある。**新しい状態は足していない** — 既存の `StepOutcome::escalated` を読むだけ。
+  - **(b) `Cancelled` は対象外**。`finalize_state` は `Cancelled` を返さず、書き手は
+    `cancel_workflow` だけ ＝ 自分で止めた操作者に結果を通知することになるため。
+  - **(c) `origin` は `scope: OriginScope::{ Step { step_id, attempts }, Run { failed_steps } }`
+    に変えた**（Rust 内部型で wire には出ない）。run に試行回数は無く step に失敗一覧は無いので、
+    空文字 `step_id` を番兵にすると「`demo/` exhausted its retries」が黙って出せてしまう。
+    **step スコープの文面はバイト単位で不変**。
+  - **(d) エッジの取り方**は §2.1 と共有した（`just_reached_terminal`）。**フラグは足していない** —
+    「遷移前の state」がそのまま記憶で、`advance_all` / `advance_run` はどちらも終端 run を
+    tick しない。`#[serde(skip)]` で resume 時に落ちる新フィールドを増やさない狙いもある。
+  - **200ms tick への追加コストはゼロ**。§2.1 / §2.3 のどちらのゲートも Rust 側の enum 比較で、
+    SQL が増えるのは「終わった run 1 本につき 1 文」だけ。A-6 の
+    `prune_terminal_workflow_runs` が同じ形で終端書き込みに乗っているのに倣った。
+
+- **検証値（実測）**。`cargo test` は **lib 530 → 543 passed / 0 failed**（新規 13 本）、
+  **統合 14 → 14（不変）**。`cargo clippy --all-targets` は既存の `config.rs` の
+  `nonminimal_bool` **1 件のみ**で、本作業起因の新規警告ゼロ。frontend 無変更のため
+  `npm run check` は**走らせていない**。`cargo fmt` も走らせていない（規律どおり）。
+- **修正前に落ちることを確認したテスト**（それぞれ親の断面で実行して確認した）:
+  `a_run_the_driver_finishes_retires_its_own_kickoffs`（§2.1）、
+  `a_run_that_fails_without_any_step_escalation_escalates_once` /
+  `a_run_failure_notice_carries_the_first_failed_steps_error`（§2.3）。
+  逆側（`a_run_the_driver_leaves_running_keeps_its_kickoffs_live` /
+  `a_run_whose_step_already_escalated_is_not_escalated_again` /
+  `a_succeeded_or_cancelled_run_is_never_escalated`）は**修正前から緑**で、これは正しい —
+  「出るべきでないときに出ない」を固定するテストだからである。
+
+- **未実測（推測で埋めていないもの）**。
+  - **実機検証は 1 件も行っていない**。OS トーストが detached thread から実際に出るところも、
+    run 単位の escalation が Slack / トーストに届くところも見ていない（→ §2 の U18）。
+    本作業は Linux コンテナ上で行われ、**macOS の CI も回していない**。
+  - `inbox_messages` が `MAX_MESSAGES_PER_PROJECT` = 50,000 に到達するまでの実時間は**未計測**。
+    毎時 1 run × kickoff 3 step なら 72 行/日で約 690 日、という算数はできるが、返信ぶんが
+    加算されるので実測が要る（→ U19 (4) のついでに行数を測ること）。
+  - **起動時掃除が実際に何行削るか、その所要時間も未計測**。削除対象ゼロなら
+    `SELECT DISTINCT` 1 文 + プロジェクト数ぶんの `count(*)` だが、これも実測していない。
+  - **§2.2 の効果を数字で示していない**。「64 発のトーストが tick をブロックする」も
+    「ブロックしなくなった」も、コードの形からの帰結であって計測ではない。
+
+- **やっていないこと**。`next-release-v0.5.9.md` §2.5 の表にある項目（lost-update race、
+  `condition:` の多依存 AND、root の `fanOut`、straggler の `close_on_exit`、`arena`、
+  `workflow_runs.error`、resume 拒否の偽陽性、秋の DST、schedule の自動停止解除、
+  `orchestrator.rs` の「phase 5.0.5」表記 17 か所）には一切手を付けていない。
+  version 3 ファイルも触っていない。
+
 ---
 
 ## 7. 運用メモ
