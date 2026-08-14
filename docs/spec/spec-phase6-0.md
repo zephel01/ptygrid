@@ -480,27 +480,43 @@ Firecracker/VZ Framework の cold start は 400-1200 ms。人が sandbox pane �
 
 Phase 6.0 は下記 6 段階で順に投入する。各段階で **CI green + spec 章の対応 tick すべて閉** を release ゲートとする。
 
-- **5.0.0 — Foundation**  
-  `src-tauri/src/sandbox.rs` 骨格、`src-tauri/src/secrets.rs` 骨格、`src-tauri/src/replay.rs` 骨格、SQLite schema migration。Queen tool は空実装（`unimplemented!()`）。CI に 3 バイナリの link を追加。
+> **（2026-08-14 訂正）見出しの誤記**: 以前は「5.0.0〜5.0.5」と書いていたが、これは Phase 5.0
+> が「4.5」と呼ばれていた時代の残骸で、正しくは **6.0.0〜6.0.5**。`5.0.0` は MVO、`5.0.1` は
+> Workflow Resume、`5.0.2` は `ptygrid init`、`5.0.3` は Queen MCP 登録代行、`5.0.4` は
+> Orchestrator 実行層、`5.0.5` は Arena view 予約と、いずれも実在する別物である
+> （[spec-phase5-0.md](spec-phase5-0.md) 参照）。下の段階名は 6.0.0〜6.0.5 に付け直した。
 
-- **5.0.1 — Sandbox: filesystem-only**  
+- **6.0.0 — Foundation**  
+  `src-tauri/src/sandbox.rs` 骨格、`src-tauri/src/secrets.rs` 骨格、`src-tauri/src/replay.rs` 骨格、SQLite schema migration。Queen tool は空実装（`unimplemented!()`）。CI に 3 バイナリの link を追加。
+  **SQLite `PRAGMA user_version` は 5 へ bump する**（`replays` / `secrets_audit` /
+  `sandbox_events` の 3 テーブル追加。**4 ではない** — 2026-08-13 の決定で 4 は Phase 5.6.0
+  （スキーマ分割）に割り当て済み。→ CONTRACT.md 続報23、plan.md §5.1）。
+
+- **6.0.1 — Sandbox: filesystem-only**  
   Linux bwrap 実装、macOS 版は `sandbox-exec` fallback。プロファイル解決テーブル、ptygrid.yml key parse、`sandbox.info` tool 実装。統合テスト T-504 の一部。
 
-- **5.0.2 — Sandbox: strict**  
+- **6.0.2 — Sandbox: strict**  
   Firecracker + gVisor 実装、Virtualization.framework 実装、ウォームプール、vsock queen_relay。統合テスト T-501, T-504 全通。既定は依然 `filesystem-only`。
 
-- **5.0.3 — Secrets: keychain + short_lived**  
+- **6.0.3 — Secrets: keychain + short_lived**  
   keychain backend 完成、`static` / `short_lived` 型、`secrets.get` / `secrets.revoke`。`secrets_audit` テーブル埋め込み。統合テスト T-502。
 
-- **5.0.4 — Secrets: derived + proxy**  
+- **6.0.4 — Secrets: derived + proxy**  
   `derived` 型（STS/OpenAI service key）、`src-tauri/src/proxy.rs` MITM 実装、Infisical/Vault backend。`sandbox.proxy.enabled` フラグ。redteam T セット走破。
 
-- **5.0.5 — Replay UI + Export**  
+- **6.0.5 — Replay UI + Export**  
   Svelte 5 timeline UI、`replay_open` / `replay_export`、OTel span ↔ `m` marker 結合、`agg` 経由 cast エクスポート、`ffmpeg` 経由 mp4 エクスポート。Phase 5.0 DAG との step 単位 record 切替 UI。
 
 各段階終了時に **`docs/CHANGELOG.md`** に entry を追加する。ptygrid.yml の未来互換のため、Phase 6.0 の各キーは Phase 4.x 系 config で "unknown key" 扱いにならないよう、`config.rs` の `#[serde(deny_unknown_fields)]` は該当 struct から外し、`#[serde(default)]` を伴う許容モードで forward-compat する。
 
-> バージョン割当（暫定）: Phase 5.5 の `v0.5.10` を消化した後、Phase 6.0 は **`v0.6.0〜v0.6.5`** で1 patch = 1 stage。**6.0.5 の完了で `v1.0.0` 昇格を検討**する（monorepo規約の "Secure & Auditable" 到達がメジャー 1.0 の妥当な基準）。
+> **（2026-08-14 廃止）** 以前はここに「Phase 5.5 の `v0.5.10` を消化した後、Phase 6.0 は
+> `v0.6.0〜v0.6.5`」という具体的なタグ割当を書いていたが、これは 2 度の繰り下げ（`v0.5.7` /
+> `v0.5.8` がいずれも Phase 5.5.1 用の予約を追い越して先に出た）のどちらも反映しておらず、
+> 実態と食い違ったまま残っていた。**タグ番号を先回りして予約する運びそのものを廃止**し
+> （→ [spec-phase5-5.md](spec-phase5-5.md) §9）、6.0.0〜6.0.5 という**段階の順序**だけをここに残す。
+> どのタグ番号に割り当たるかは、実際に出荷するときに [plan.md](../design/plan.md) §4 の
+> タグ実績表へ一本化して記録する。**6.0.5 の完了で `v1.0.0` 昇格を検討**する、という判断基準
+> （monorepo 規約の "Secure & Auditable" 到達がメジャー 1.0 の妥当な基準）自体は有効なので残す。
 
 ---
 
