@@ -1308,6 +1308,26 @@ fn retire_run_kickoffs(
     }
 }
 
+/// v0.5.9 §2.1, pure half: did THIS transition end the run?
+///
+/// "The run is over" is a LEVEL — it stays true for as long as the row
+/// exists — and everything owed at the end of a run (retiring its kickoffs,
+/// §2.1; escalating a red run, §2.3) must happen once, not once per look. The
+/// same edge/level distinction `escalated` draws for a single step, drawn one
+/// level up, except that here no flag is needed: the previous state IS the
+/// memory, and `advance_all`/`advance_run` both refuse to tick a run that is
+/// already terminal, so the transition is observed exactly once per run.
+///
+/// `Cancelled` is deliberately not a destination here. It is never produced
+/// by `finalize_state`; the only writer is `cancel_workflow`, which does its
+/// own sweep inline and whose behaviour v0.5.9 leaves untouched.
+fn just_reached_terminal(previous: WorkflowState, current: WorkflowState) -> bool {
+    !matches!(
+        previous,
+        WorkflowState::Succeeded | WorkflowState::Failed | WorkflowState::Cancelled
+    ) && matches!(current, WorkflowState::Succeeded | WorkflowState::Failed)
+}
+
 /// Cancel a running workflow: kill every step's live PTY, mark remaining
 /// pending steps CANCELLED, and set the run to `Cancelled`. Idempotent —
 /// a terminal (Succeeded/Failed/Cancelled) run is a no-op that returns
@@ -4468,6 +4488,12 @@ fn advance_run<R: Runtime>(
     changed = !escalations.is_empty() || changed;
 
     let new_state = finalize_state(&wf, &run);
+    // v0.5.9 §2.1: the edge, captured before the assignment overwrites the
+    // state this tick started from. `advance_run` already returned early on a
+    // run that was terminal on entry, so `run.state` here is always
+    // non-terminal and `just_reached_terminal` can only be true on the single
+    // tick that ends the run.
+    let reached_terminal = just_reached_terminal(run.state, new_state);
     if new_state != run.state {
         run.state = new_state;
         if matches!(new_state, WorkflowState::Succeeded | WorkflowState::Failed) {
@@ -4480,6 +4506,17 @@ fn advance_run<R: Runtime>(
         registry.put(run.clone());
         persist_run(store, &project_dir, &run);
         emit_workflow_state(app, &run);
+    }
+
+    // Stage A-5 widened (v0.5.9 §2.1), AFTER the write-through for the same
+    // reason `cancel_workflow` puts it there: the durable record of the run's
+    // end is worth more than the mailbox tidying, and this is best-effort
+    // cleanup that must not delay it. One extra statement per FINISHED run,
+    // never per tick — the `reached_terminal` gate is a comparison of two
+    // enum values in Rust, the same shape as the Rust-side gate that keeps
+    // `prune_terminal_workflow_runs` off the hot path.
+    if reached_terminal {
+        retire_run_kickoffs(store, &project_dir, &workflow_name, &run_id);
     }
 
     // LAST, after the run's own state is stored and emitted: the out-of-app
@@ -5729,6 +5766,172 @@ workflows:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.5.9 §2.1. The majority case Stage A-5 did not cover: a run nobody
+    /// cancelled and nobody abandoned, which simply finished. Routes 1 and 2
+    /// complete a step without any reply, so its kickoff is still sitting
+    /// unacknowledged in the agent's mailbox when the run ends — and the
+    /// agent mailbox is shared with every later run of the same agent.
+    #[test]
+    fn a_run_the_driver_finishes_retires_its_own_kickoffs() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        // Both steps already resolved: this tick is the one that finalizes
+        // the run, which is exactly the transition under test.
+        let run = mk_run(
+            "demo",
+            vec![
+                mk_outcome("first", Some(1), StepState::Succeeded),
+                mk_outcome("second", Some(2), StepState::Succeeded),
+            ],
+        );
+        registry.put(run.clone());
+
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        assert_eq!(
+            registry.get(TEST_RUN_ID).unwrap().state,
+            WorkflowState::Succeeded,
+            "precondition: this tick is the one that finalizes the run"
+        );
+        assert!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .is_empty(),
+            "a run that reached a terminal state retires its kickoffs, cancelled or not"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of v0.5.9 §2.1: the sweep is bound to the TRANSITION,
+    /// not to "the driver looked at this run". A live run's kickoff is the
+    /// instruction its pane is still working from; acking it early would
+    /// hide the thread from the very agent it was addressed to.
+    #[test]
+    fn a_run_the_driver_leaves_running_keeps_its_kickoffs_live() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+        deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+
+        // Only `first` has a row, so `all_terminal` is false and this tick
+        // spawns `second` instead of finalizing. (`second` declares no
+        // `kickoff:`, so that spawn adds no message of its own.)
+        let run = mk_run(
+            "demo",
+            vec![mk_outcome("first", Some(1), StepState::Succeeded)],
+        );
+        registry.put(run.clone());
+
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        assert_eq!(
+            registry.get(TEST_RUN_ID).unwrap().state,
+            WorkflowState::Running,
+            "precondition: the run has not finished"
+        );
+        assert_eq!(
+            store
+                .list_inbox(&dir, "a".to_string(), 0, false, 50)
+                .unwrap()
+                .len(),
+            1,
+            "an unfinished run must not ack the kickoff its pane is working from"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.5.9 §2.1, the edge. `advance_run` returns early on a run that is
+    /// already terminal, so the sweep can only ever run on the tick that
+    /// moved it there. Proven by planting a fresh message from the same
+    /// sender AFTER the run finished: a level-triggered sweep would ack it
+    /// on the next tick, an edge-triggered one leaves it alone.
+    #[test]
+    fn a_finished_run_sweeps_its_kickoffs_exactly_once() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+        let view = StatusView::new();
+
+        let wf = parse_wf(PIPELINE_YAML, "demo");
+        let first = wf.steps.iter().find(|s| s.id == "first").unwrap();
+
+        let run = mk_run(
+            "demo",
+            vec![
+                mk_outcome("first", Some(1), StepState::Succeeded),
+                mk_outcome("second", Some(2), StepState::Succeeded),
+            ],
+        );
+        registry.put(run.clone());
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        let planted = deliver_kickoff(&store, &dir, "demo", TEST_RUN_ID, first, &first.agent, None)
+            .unwrap()
+            .unwrap();
+        advance_run(&handle, &manager, &config, &store, &registry, &view, TEST_RUN_ID);
+
+        let live = store
+            .list_inbox(&dir, "a".to_string(), 0, false, 50)
+            .unwrap();
+        assert_eq!(live.len(), 1, "the second tick must not sweep again");
+        assert_eq!(live[0].root_message_id, planted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edge itself, without a driver around it. `Cancelled` is not a
+    /// destination: `finalize_state` never returns it, and `cancel_workflow`
+    /// owns that transition (and its own sweep) end to end.
+    #[test]
+    fn only_the_transition_into_a_terminal_state_counts_as_reaching_it() {
+        assert!(just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Succeeded
+        ));
+        assert!(just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Failed
+        ));
+        assert!(
+            !just_reached_terminal(WorkflowState::Failed, WorkflowState::Failed),
+            "a run that was already terminal has nothing left to settle"
+        );
+        assert!(
+            !just_reached_terminal(WorkflowState::Cancelled, WorkflowState::Failed),
+            "a cancelled run was settled by `cancel_workflow` already"
+        );
+        assert!(!just_reached_terminal(
+            WorkflowState::Running,
+            WorkflowState::Running
+        ));
+        assert!(
+            !just_reached_terminal(WorkflowState::Running, WorkflowState::Cancelled),
+            "`finalize_state` never produces Cancelled; that path is cancel_workflow's"
+        );
     }
 
     #[test]
