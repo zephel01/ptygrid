@@ -13,15 +13,19 @@ ptygrid のインストールから、`ptygrid.yml` の書き方、Queen(内蔵 
 4. [ペイン操作](#ペイン操作)
 5. [Git status / diff](#git-status--diff)
 6. [ptygrid.yml リファレンス](#ptygridyml-リファレンス)
-7. [Worktree 分離](#worktree-分離)
-8. [セッション復元](#セッション復元)
-9. [Queen のセットアップ](#queen-のセットアップ)
-10. [Teammates(hooks 受信)](#teammateshooks-受信)
-11. [Queen ツールリファレンス](#queen-ツールリファレンス)
-12. [チームプリセット(team_presets)](#チームプリセットteam_presets)
-13. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
-14. [保存データと安全性](#保存データと安全性)
-15. [困ったときは](#困ったときは)
+7. [設定ファイルの自動生成(ptygrid init)](#設定ファイルの自動生成ptygrid-init)
+8. [Worktree 分離](#worktree-分離)
+9. [セッション復元](#セッション復元)
+10. [エージェント状態バッジ(agent_status)](#エージェント状態バッジagent_status)
+11. [Queen のセットアップ](#queen-のセットアップ)
+12. [Teammates(hooks 受信)](#teammateshooks-受信)
+13. [Queen ツールリファレンス](#queen-ツールリファレンス)
+14. [チームプリセット(team_presets)](#チームプリセットteam_presets)
+15. [ワークフロー(workflows)](#ワークフローworkflows)
+16. [スケジュール実行(schedule)と外部通知(notifications)](#スケジュール実行scheduleと外部通知notifications)
+17. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
+18. [保存データと安全性](#保存データと安全性)
+19. [困ったときは](#困ったときは)
 
 ---
 
@@ -123,6 +127,28 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
   複数coreを使うsessionでは100%を超える場合があります。メモリはPTY childと全子孫の
   resident memory合計です。ツールバー右側の`Σ CPU`表示は、現在監視できている
   全running sessionの合計です。
+
+### コピー & ペースト
+
+ペイン内のテキストはドラッグで範囲選択し、キーボードまたは右クリックメニューで
+コピー & ペーストできます。
+
+| 操作 | macOS | Linux / Windows |
+|---|---|---|
+| コピー | Cmd+C(選択があるときだけ) | Ctrl+Shift+C |
+| 貼り付け | Cmd+V | Ctrl+Shift+V |
+
+- 選択が無いときの Ctrl+C はこれまでどおり PTY へ届きます(SIGINT を奪いません)。
+- 右クリックで「コピー / 貼り付け」メニューが出ます。選択が無いときはコピーが
+  無効表示になり、ツールチップが選択のしかたを案内します。
+- 貼り付けは bracketed paste 経由なので、対応シェルでは複数行を貼っても
+  **Enter を押すまで実行されません**(貼った瞬間に走り出しません)。
+- vim や対話型エージェント CLI などの TUI がマウスを握っている間は、
+  **macOS では Option+ドラッグ、Linux / Windows では Shift+ドラッグ**で選択できます
+  (この差は端末エミュレータ(xterm.js)側の仕様で、設定では揃えられません)。
+
+> 実機確認は macOS のみ(ペインをまたいだコピー & 貼り付けと右クリックメニュー)。
+> Linux / Windows のキー割り当ては実装済みですが実機未検証です。
 
 ## Git status / diff
 
@@ -242,6 +268,46 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 > 注入されます(認証トークン込み)。ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を
 > 実行してください。
 
+## 設定ファイルの自動生成(ptygrid init)
+
+`ptygrid.yml` を手書きしなくても、作業フォルダと環境を走査して**意味のある設定を
+コメント付きで生成**できます(Phase 5.0.2)。入口は2つあります:
+
+1. **ツールバーの「設定を作る」ボタン** — 設定ファイルが見つからない(バッジが
+   `設定: 既定`)ときだけ表示されます。設定の無いフォルダを読み込んだ直後がこの状態です。
+2. **⚙ 設定メニューの「設定ファイル: 設定を作る」** — フッター右端の ⚙ から。
+   こちらは設定を読み込んだ後でも使えます。
+
+パネルを開くと作業フォルダを走査し、検出結果(PATH 上のエージェント CLI、プロジェクト
+種別(cargo / npm / python / go)、git リポジトリかどうか、既存設定の有無)と生成される
+YAML のプレビューが表示されます。プレビューは書き込む前に自由に編集できます。
+
+- **書き込まれる内容は必ず設定パーサの検証を通っています。** プレビューを編集した場合も
+  書き込み直前にもう一度検証され、通らなければ 1 バイトも書きません。
+- **既存の `ptygrid.yml` は上書きしません。** 既にある場合は別名 `ptygrid.init.yml` に
+  書き(この名前は設定探索の対象外なので、読み込みには影響しません)、内容を見比べてから
+  自分で取り込みます。旧名 `mterm.yml` だけが残っているフォルダへの書き込みは拒否されます
+  (新しい `ptygrid.yml` が旧設定を黙って無効化しないため)。
+- 生成される定義はすべて `autostart: false` なので、書き込んだ直後に何かが勝手に起動する
+  ことはなく、[信頼確認](#信頼確認未確認フォルダの自動起動ガード)も出ません。プレビューを
+  `autostart: true` に編集して書き込んだ場合だけ、次の読み込みで信頼確認が出ます。
+
+### ローカル LLM プローブ
+
+パネルの「**探す**」ボタンで、ローカル LLM サーバが動いているかを問い合わせられます。
+
+- 対象は `127.0.0.1` の既定 3 ポート(11434 = Ollama / 1234 = LM Studio /
+  3456 = claude-code-router)+ 手入力の追加ポート最大 4 つ。レンジスキャンはしません。
+  ディスクには何も書きません。
+- 応答したサーバのうち、**Anthropic Messages API 互換の確証が取れたもの**(現状は
+  version 0.14.0 以上の Ollama)は「Anthropic API 確証あり」と表示され、生成 YAML に
+  `agents:` の有効な定義(`ANTHROPIC_BASE_URL` などの `env` 付き、検出モデルの選択可)
+  として載ります。確証が取れないもの(OpenAI 互換の応答があっただけのサーバ等)は
+  コメントアウトされた形で載り、注記が付きます。
+
+> 生成フロー一式(検出・生成・sidecar・信頼確認との連動)と Ollama の検出は macOS 実機で
+> 確認済みです。プローブが生成した定義で実際に CLI が起動するところまでは未確認です。
+
 ## Worktree 分離
 
 同じrepositoryで複数agentが同時編集すると競合する場合、定義ごとにworktree分離を
@@ -352,7 +418,7 @@ agent_status:
 
 Queen はアプリ内に常駐する MCP サーバーです(streamable HTTP、bind は 127.0.0.1 のみ)。
 各エージェント CLI に MCP サーバーとして登録すると、そのエージェントが
-[18個のツール](#queen-ツールリファレンス)を使えるようになります。
+[22個のツール](#queen-ツールリファレンス)を使えるようになります。
 
 > 🔑 **認証トークンについて（重要）**
 > Queen は 127.0.0.1 限定ですが、同一ホストの別プロセスや DNS リバインディングした Web ページ
@@ -392,7 +458,7 @@ url = "http://127.0.0.1:39237/mcp?token=<token>"
 
 ```bash
 grok mcp add -s user -t http queen "http://127.0.0.1:39237/mcp?token=<token>"
-grok mcp doctor    # 接続確認(handshake OK / 18 tools discovered が出れば成功)
+grok mcp doctor    # 接続確認(handshake OK / 22 tools discovered が出れば成功)
 ```
 
 > ℹ️ トークンは URL クエリで渡すため、CLI 側で `--header` などの追加設定は不要です。
@@ -578,6 +644,9 @@ agents:
 | `send_message` | `agent`, `text`, `submit?`(default true) | 指定ペインの stdin へ書き込み。`submit: true` で末尾に Enter を付与 |
 | `spawn_agent` | `name` | **ptygrid.yml で定義された名前のみ**起動可(許可リスト方式) |
 | `spawn_team` | `preset` | `team_presets:` で宣言したチームを一括起動(詳細は[チームプリセット](#チームプリセットteam_presets))。起動レポートを返す |
+| `spawn_workflow` | `name` | `workflows:` で宣言したワークフローを DAG run として起動(詳細は[ワークフロー](#ワークフローworkflows))。root step の spawn 直後のスナップショットを返す |
+| `join_workflow` | `runId`, `timeoutMs?`(default 600000, clamp 1000..3600000) | run が終端(succeeded / failed / cancelled)に達するまで待つ。`{timedOut, run}` を返し、timeout はエラーではない |
+| `cancel_workflow` | `runId` | 実行中 run の全ペインを止めて Cancelled にする。終端済み run には冪等(現状スナップショットを返すだけ) |
 | `notify` | `title`, `message` | アプリ内トースト通知を表示 |
 | `set_pin` | `key`, `value`, `expectedRevision?` | project内の短い共有値を作成・安全に更新。既存値の更新には現在のrevisionが必須 |
 | `list_pins` | なし | project内のpinとrevisionをkey順で一覧表示 |
@@ -781,6 +850,335 @@ MCP 登録(`-s user`)も1回で全ペインに効きます。
 > `.claude/settings.json` に base URL を書く方法は、**同じ作業フォルダで動くクラウド側の
 > ペインにも効いてしまう**ため使わないでください。設定ファイル例と着弾確認の手順は
 > [verify-team-preset.md](verify-team-preset.md) の A-2b / R1 を参照。
+
+## ワークフロー(workflows)
+
+`workflows:` ブロックに step の依存グラフ(DAG)を宣言すると、ptygrid が起動・完了判定・
+次段への進行を自動で進めます(Phase 5.0)。[チームプリセット](#チームプリセットteam_presets)が
+「全員を一括起動して自由に協調させる」道具なのに対し、workflows は「A が終わってから B、
+B が3並列で終わったら C」という**順序と集約を機械に守らせる**道具です。
+
+本章は日常操作の手順と考え方を扱います。フィールドの網羅表・バリデーション規則・
+「書けるが動かないフィールド」の線引きは
+[ptygrid-yml-guide.md](ptygrid-yml-guide.md)(特に §1 の実装マトリクス)が正です。
+
+### 起動のしかたと観察のしかた
+
+- **ツールバー**: 設定に `workflows:` があると 🔀 チップが並びます。▶ で起動します。
+- **左ドックの Workflows タブ**: 宣言済みワークフローの一覧(▶ Run)と、run の履歴
+  (state バッジ、step ごとの進行、⏹ Cancel)が見られます。step 行には所要時間と、
+  ペイン枠待ちがあれば「待ち」が別々に表示されます(`5.0s(待ち 8.0s)` のように出ます。
+  **2つは別物なので足さないでください** — 所要は spawn されてから終わるまで、待ちは
+  9面上限が空くのを待った累計です)。
+- **Queen tool**: エージェント自身も `spawn_workflow {name: "<ワークフロー名>"}` で起動
+  できます。完了待ちは `join_workflow`、停止は `cancel_workflow`
+  ([ツールリファレンス](#queen-ツールリファレンス)参照)。
+- step が起動できるのは **`agents:` に定義された名前だけ**です(`processes:` は不可。
+  `spawn_agent` と同じ許可リスト方式)。
+
+### 動く前提: Queen 登録と「待ち受けループ」
+
+つまずきどころの大半はここです。**step の `kickoff:` は Queen の永続 inbox に配送される
+だけで、ペインには何も打ち込まれません。** したがって:
+
+1. **使う CLI に Queen MCP が登録済みであること**([Queen のセットアップ](#queen-のセットアップ))。
+   未登録だと 1 段目のペインは開くのに指示を受け取れず、`timeoutMs` まで Running のまま
+   止まります。
+2. **エージェントの `cmd` に「起動直後に inbox を待ち受けるループ」を埋めること。**
+   素の `claude` を起動しても自分から inbox を見にいきません。定型は
+   「Queen の `await` を `mailbox=$PTYGRID_MAILBOX` で呼ぶ → 届いた指示に従う →
+   `reply_inbox`(`sender=$PTYGRID_MAILBOX`)で結果を返信」です。環境変数
+   `PTYGRID_MAILBOX` は workflow が起動する全セッションに注入され、通常の step では
+   agent 定義名、後述の `onEach` のコピーではコピー専用の mailbox 名が入るので、
+   **どの役割でも同じ書き方が使えます**。
+
+この2点まで全部埋まった雛形が [example/review-starter/](../../example/review-starter/README.md)
+です(実装 → レビュー → ジャッジの3段。`kickoff` の TODO 3 か所を埋めるだけで動きます)。
+初めての1本はこれをコピーするのが確実です。
+
+### pattern と dependsOn
+
+`pattern` は pipeline / fan-out / supervisor / handoff の4つです。実行エンジンは実質
+pattern を見ておらず(fan-out の並列数展開だけが例外)、**pattern は「この形の DAG しか
+書けない」というロード時の検証**として効きます。
+
+| pattern | 形の制約 | 使いどころ |
+|---|---|---|
+| `pipeline` | 各 step の `dependsOn` は最大1件(線形の鎖。独立した鎖が複数並ぶのは可) | 設計→実装→レビューの直列 |
+| `fan-out` | `fanOut: N`(N≥2)の step を1つ以上含む | 同じ定義を N 並列で走らせ `joinOn` で集約 |
+| `supervisor` | root がちょうど1つ、**他の全 step が root を `dependsOn` に含む** | 1つの実装を別モデル2体が並行レビューする形など |
+| `handoff` | 1本鎖 + `handoffTo` で本文を運ぶ | 返信本文をそのまま次段に渡すリレー |
+
+- `fanOut` は**同じ agent 定義**を複製します。**別モデルを並べたいなら fanOut ではなく
+  supervisor の兄弟 step** にします(完全な実例:
+  [example/cross-model-review/](../../example/cross-model-review/ptygrid.yml)。supervisor の
+  「合流 step の `dependsOn` に root も書く」という直感に反する必須制約もそこで説明されています)。
+- 依存の循環・未知 step 参照・`agents:` に無い名前などは**読み込みの時点で**エラーになり、
+  設定全体が読み込めなくなります(エラーは該当箇所を名指しします)。
+
+### 完了をどう判定するか(joinOn)
+
+step の完了判定は3経路あります: **(1) PTY が exit code 0 で終了**、**(2) 状態バッジが
+done になる**([エージェント状態バッジ](#エージェント状態バッジagent_status)の検出)、
+**(3) 自分の kickoff スレッドへの inbox 返信**(`joinOn: reply`)。
+
+対話型 CLI はタスクが終わっても自然終了しないため、**確実なのは (3) の `joinOn: reply`**
+です。使うときの前提と注意:
+
+- **同じ step に非空の `kickoff:` が必須**です(無いと読み込みエラー。返信すべきスレッドが
+  存在しないため)。
+- **最初の返信 = 回答**として扱われます(reply-once)。「了解しました」を先に返すと
+  その時点で step が完了し、次の段が始まってしまいます。kickoff とエージェントへの指示に
+  「返信は1回だけ・結果を返すこと」を明記してください。
+- (2) だけに頼ると、kickoff の無い step が起動直後に「inbox は空です」と応答して
+  **何もしていないのに完了扱いになる**事故(空振り done)が起きます。すべての step に
+  具体的な kickoff を書くのが原則です。
+
+fan-out の集約は `joinOn: all`(既定。全コピー成功) / `any`(最初の1本) / 数値 `N`
+(N 本成功)です。`any` / `N` で勝敗が決まると、**残りのコピーは自動でキャンセル**されます
+(走行中なら kill。負けたコピーが失敗していても run は赤くなりません。`joinOn: N` で
+N 本に届かなかった本当の失敗は従来どおり赤くなります)。
+
+### step の間で文脈を渡す(kickoff / handoffTo / condition)
+
+- **`kickoff:`** — step の spawn 直後に inbox へ配送される初回指示。何を読み・何をし・
+  どこに結果を書き・完了条件は何か、まで書きます(「よしなに」は書きかけ停止のもと)。
+- **`handoffTo: <step id>`** — この step の**返信本文**を、宛先 step の kickoff の前に
+  連結して渡します。複数の step が同じ宛先を指した場合は**宣言順に全部**連結されます
+  (上限 48 KiB は source 間で分配)。宛先 step は「この step だけを `dependsOn` する」
+  形でなければなりません(読み込み時に検証)。長文の受け渡しはファイル経由
+  (共有ディレクトリに書いてパスを渡す)のほうが確実です — cross-model-review が
+  その形の実例です。
+- **`condition: "<正規表現>"`** — 依存先の**返信本文**にマッチしたときだけこの step を
+  実行するゲートです。挙動は3分岐: マッチ→通常どおり実行 / 非マッチ→Skipped
+  (宣言どおり降りたブランチとして run は green のまま) / **依存先が返信を残さずに
+  完了していた→Failed**(評価不能。依存先に `kickoff:` + `joinOn: reply` を持たせて
+  ください)。**`condition:` は `dependsOn` 1件の step にしか書けません**(本リリース
+  v0.5.8 時点)。したがって「レビュアー2体とも ACCEPT なら進む」のような複数依存の判定は
+  まだ書けません。
+
+### 失敗にどう備えるか(timeoutMs / retry / onFailure / 通知)
+
+- **`timeoutMs`**(100ms〜24時間) — 超過した step はプロセスごと止められ Failed に
+  なります。**ペイン枠の空き待ち時間は含まれません**(カウントは実行開始から)。
+  長時間走る step、無人で走らせる step には必ず書いてください。詰まったときの唯一の
+  自動の脱出装置です。
+- **`retry: { max: 1..10, backoffMs: 0..60000 }`** — Failed になった step を backoff 後に
+  同じ step として再起動します。kickoff は再配送されるので、再試行の回も指示を持って
+  起動します。
+- **`onFailure: fail-fast | continue`**(workflow 直下、既定 fail-fast) — fail-fast は
+  失敗 step の下流を Skipped にして run を畳みます。continue は他のブランチを走らせ
+  続けます。
+- **retry を使い切った step は、外部通知(次章の `notifications:`)へ `error` として
+  1通だけ出ます**(escalation)。既定の `level: critical` のままで届きます。注意点が2つ:
+  **`retry:` を書いていない step の失敗はこの通知の対象外**です(使い切る予算が無いため。
+  ペインの異常終了そのものの通知は別経路で従来どおり出ます)。また最後の試行がペインを
+  持っていた場合は「プロセスが落ちた」通知と「この step はもう自動では戻らない」通知の
+  **2通が届きます**(仕様どおりで、バグではありません)。
+
+> escalation 通知の経路は自動テストで裏づけられていますが、実機で OS トースト /
+> チャットに届くところまでは未確認です(2026-08-14 時点)。
+
+### 落ちたあとの再開(resume)
+
+アプリのクラッシュ・再起動をまたいでも、実行中だった run は検出されます。設定の読み込みに
+成功すると「前回のワークフロー run『<名前>』が途中で中断されています。再開しますか?」の
+バナーが出て、**再開**(実行中だった step だけを最初からやり直し、完了済み step は保持)か
+**破棄**を選べます。
+
+ただし、**再開が拒否される run が3種類あります**(エラーバナーに
+`cannot be resumed` を含む理由が出ます):
+
+1. **`onEach:` を持つ step を含む run**(常に)。
+2. **`condition:` を持つ step がまだ走っておらず、その依存先が中断前に完了済みだった run**。
+3. **`handoffTo:` の宛先がまだ走っておらず、渡す側が中断前に完了済みだった run**。
+
+2 と 3 の原因は共通で、**step 間で運ばれる返信本文が再起動をまたいで保存されない**ためです。
+中途半端に再開すると「約束された文脈を持たない下流」が黙って走ってしまうので、拒否する側に
+倒してあります。**同じ定義でも、クラッシュがどこで起きたかによって再開できる run と
+できない run があります**。拒否されたら「破棄」を選び、run を最初から流し直してください。
+なお実行中の run がある間に該当ワークフローの定義を `ptygrid.yml` から消すと、resume は
+「定義なし」で失敗します。定義の編集は run が無いときに。
+
+### 上流の返信1本ごとに下流を起こす(onEach: reply / joinOn: stream)
+
+通常の `dependsOn` は「上流が**全部**終わるまで下流を動かさない」関門です。
+「実装が1ファイル書き終えるたびにレビュアーを1体ずつ起こしたい」形は、
+上流に `joinOn: stream`、下流に `onEach: reply` を書きます(Phase 5.0.7)。
+
+- 上流は生き続けたまま、仕事の単位ごとに自分の kickoff スレッドへ**何度も返信**します。
+  返信1本 = 1 unit で、unit ごとに下流のコピー(`reviewer#0` / `reviewer#1` …。
+  1本しか来なくても `#0` が付きます)が1つ spawn されます。
+- 終わり方は2層です。第1層は**番兵**: trim 後の本文が `[[end]]` と**完全一致**する返信
+  1通(部分一致では閉じません。番兵はコピーを生みません)。第2層は上流 step 自体の終端
+  (PTY exit / done / `timeoutMs` / cancel)。**`joinOn: stream` の step には `timeoutMs` を
+  必ず書いてください** — 番兵を送り忘れたエージェントを待ち続けない唯一の脱出装置です。
+- コピーはそれぞれ**専用の mailbox**(`wf/<run id>/<step id>#<k>` 系)で kickoff を受け取り、
+  自分の mailbox 名は `$PTYGRID_MAILBOX` で知ります。`await` と `reply_inbox` の `sender` に
+  必ずこの値を使わせてください(でないと返信の相関が取れません)。
+- unit の総数は 1 run あたり **64 が上限**(超えると上流が Failed になって閉じます)。
+  9面を超えるコピーは待ち行列に入りますが、兄弟コピーが1つでも走っている間は
+  5分の打ち切りは適用されません。
+- **この step を含む run は resume できません**(前節)。また番兵で完了した上流のペインは
+  exit しないので、`autoClose` では閉じません(手で閉じます)。
+
+書き方の全体は [example/review-as-you-go/](../../example/review-as-you-go/ptygrid.yml) を
+そのまま使ってください(前提条件・書けない組み合わせ・返信の作法のテンプレートまで
+コメントで揃っています)。macOS 実機で 5 unit → 番兵 → まとめ役1回、という一連の完走を
+確認済みですが、「1件ごとに返信を刻む」動きそのものはエージェントのモデル次第で、
+本数どおりに刻まれない回もあります。
+
+### ペインの後始末(autoClose / close_on_exit)
+
+終了したセッションのペインは、既定では残ります(exit code と最終出力を見落とさないため)。
+自動で閉じたい場合は2つのフィールドがあります(**階層も綴りも違うので注意**):
+
+- `workflows.<名前>.autoClose: never | success | always`(既定 never) — その run の
+  step 由来のペイン。workflow 由来のセッションでは**こちらだけ**が評価されます。
+- `agents[].close_on_exit: never | success | always`(既定 never) — workflow に属さない
+  通常起動のペイン。
+
+`success` は exit code 0 のときだけ閉じ、failed / cancelled のペインは**絶対に閉じません**
+(デバッグ用)。クローズは判定から3秒後で、最大化中のペインは閉じません。
+`joinOn: reply` / `stream` で完了した step はペインが生きたまま残るので、閉じたいなら
+エージェントへの指示に「返信したら終了してよい」を入れます(そうすれば exit 0 →
+`autoClose: success` が効きます)。詳細は
+[ptygrid-yml-guide.md](ptygrid-yml-guide.md) §4。
+
+### 9面の上限とどう付き合うか
+
+グリッドは最大9面で、workflow もこの枠を使います。運用上の要点:
+
+- **終了済み(Exited)のペインも枠を数えます。** 大きめの run を流す前はグリッドを
+  空にしてください。前の run の残骸が原因の枠不足がいちばん多い詰まり方です。
+- 空きが無い step は失敗せず **Pending のまま待ちます**。step 行に
+  `waiting for a free pane slot (N/9 occupied)` と理由が出て、空きが出ると自動で
+  spawn されます。待ちは最大5分で、それでも空かなければ Failed です(`retry:` があれば
+  再試行対象)。`Pending` のまま動かない step を見たら、まずこの理由表示で
+  「依存待ち」か「枠待ち」かを見分けてください。
+- fan-out は **all-or-nothing** です(空きがコピー数に足りなければ1本も spawn しません)。
+- **`fanOut` を持つ step は root に置かず、手前に軽い step を1段挟んでください。**
+  root に置いても動きますが、全コピーが同じ step_id になってパネル上で区別できなく
+  なります。仕事をしない `gate` step(sleep 0 のシェル)を root にして fan-out step に
+  `dependsOn: [gate]` させるのが定石です — 実例と理由の詳細は
+  [example/measure-parallelism/](../../example/measure-parallelism/ptygrid.yml)
+  (並列化の効きと orchestration のコストを測る計測サンプル。spawn し直しのコストは
+  [example/measure-coldstart/](../../example/measure-coldstart/ptygrid.yml)で測れます)。
+
+## スケジュール実行(schedule)と外部通知(notifications)
+
+### 時刻で自分から始める(schedule:)
+
+workflow の起動方法は「人が ▶ を押す」「エージェントが `spawn_workflow` を呼ぶ」に加えて、
+**時刻が来たら自分で始まる** `schedule:` があります(Phase 5.0.8)。workflow 直下に書きます:
+
+```yaml
+agents:
+  - name: reviewer
+    cmd: "claude"       # 実物は起動直後に await する指示を cmd に埋める(example を参照)
+
+workflows:
+  scheduled-review:
+    schedule:
+      every: day        # day | weekday | hour の3語彙だけ。cron 式は書けない
+      at: "09:00"       # day / weekday は "HH:MM"、hour は "MM"(毎時 MM 分)
+      # enabled: false            # 消さずに止めたいとき
+      # maxConsecutiveFailures: 3 # 既定 3(1〜10)
+    pattern: pipeline
+    steps:
+      - id: review
+        agent: reviewer
+        joinOn: reply
+        timeoutMs: 1800000     # 無人で走るので上限は必ず書く
+        kickoff: >-
+          昨日からの変更を確認し、気になった点を返信してください。
+```
+
+- **cron 式は書けません。** 書けるのは `every: day / weekday / hour` + `at:` の3語彙だけで、
+  書けないことが機能です(タイプミスが実行時まで運ばれない)。`every: dayly` も
+  `at: "9時"` も保存した時点で読み込みエラーになります。さらに `schedule:` の下は
+  **キー名も閉じています**(`enable: false` のような1文字違いは黙って無視されず、
+  読み込みで落ちます。「未知フィールドは無視」というこの設定ファイルの原則の唯一の例外)。
+  時刻はローカルタイムです。
+- **アプリが起動している間だけ発火し、起動していなかった分は追いません**(これは仕様です。
+  朝アプリを開いた瞬間に溜まった数本が同時に走り出すほうが事故のため)。代わりに
+  Workflows パネルの 🕒 行に「次回」と「最終実行」が常に出ます — 最終実行が数日前で
+  止まっていたら、それは「アプリを開いていなかった」の表示です。
+- **見送りの条件**は3つで、どれも発火の前に判定され、理由がパネルに出ます:
+  (1) 同じ workflow の前の run がまだ終わっていない(積みません)、
+  (2) グリッドに root ぶんの空きが無い(始めてから5分待って赤くする形にはしません)、
+  (3) 予定時刻を大きく過ぎていた(猶予は `hour` が5分、`day` / `weekday` が15分。
+  スリープ復帰で「毎朝9時のレビュー」が夕方に始まるのを防ぎます。数分の遅れなら
+  普通に走ります)。見送った回は次の予定時刻まで再試行しません。
+- **`autoClose` の既定が変わります。** `schedule:` を持つ workflow は `autoClose` 未宣言の
+  とき `success` として扱われます(昨日のペインが残って今日の発火が枠不足で飛ぶのを
+  避けるため)。明示宣言があればそちらが優先です。
+- **連続で失敗すると自動停止します**(既定3回、`maxConsecutiveFailures` で 1〜10。
+  cancel は失敗に数えません)。止まる前も「連続失敗 1/3(あと2回で自動停止)」が
+  パネルに出ます。停止状態はアプリが覚えているだけで **`ptygrid.yml` は書き換えません**
+  (再起動でカウンタは0に戻ります)。**解除は、その workflow(またはそれが使う agent)の
+  宣言を編集して保存すること**で起きます。kickoff の書き間違いを直して保存すれば、
+  また動き出します。無関係な workflow を編集しても解除されません。再開ボタンはありません。
+- 細かい規則: 同じ時刻に複数のスケジュールが due のときは名前の昇順で処理します。
+  時計の巻き戻しや OS のタイムゾーン変更を検知すると次回時刻を計算し直します。
+  パネルの表示は60秒間隔の更新なので、設定を保存してから 🕒 行が変わるまで最大1分
+  かかります(再読み込み自体は即座です)。
+
+動く実例とコメントは [example/scheduled-review/](../../example/scheduled-review/ptygrid.yml)
+にあります。試すときは `at` を「いまから2分後」にして保存してください
+(**保存した瞬間には発火しません**。設定を書いている最中に走り出さないためです)。
+
+> `schedule:` は実装と自動テストは入っていますが、**実機で時刻発火を待った検証はまだ
+> 行われていません**(2026-08-14 時点)。無人運用に載せる前に、上の「2分後」の手順で
+> 発火・見送り・自動停止を一度自分の環境で確かめることをおすすめします。
+> また無人の失敗を外へ知らせたい場合は、次節の `notifications:` を有効にした上で
+> **step に `retry:` を書いてください**(外部へ出るのは retry を使い切った失敗だけです。
+> 前章「失敗にどう備えるか」参照)。
+
+### アプリの外へ通知する(notifications:)
+
+セッションの異常終了・承認待ち・完了を、デスクトップ通知やチャット
+(Slack / Mattermost / Discord / Telegram)へ届けられます(Phase 4.4.2)。
+**opt-in** で、ブロックを書かなければ何も送りません。
+
+```yaml
+notifications:
+  enabled: true            # 既定 false
+  level: critical          # 全チャネル共通の既定。silent | critical | needs-attention | all
+  channels:
+    - type: os             # デスクトップトースト
+      level: all           #   チャネル個別に上書き可(省略時は上の level)
+    - type: slack
+      webhook: "${SLACK_WEBHOOK_URL}"   # ${VAR} は送信時にホスト環境変数から展開
+    - type: telegram
+      bot_token: "${TELEGRAM_BOT_TOKEN}"
+      chat_id: "123456789"
+      level: needs-attention
+```
+
+イベントは自動で判定されます: `error`(exit code 非0などの異常終了、および workflow の
+retry 枯渇) / `needs-attention`(状態バッジが blocked = 承認・入力待ち) /
+`complete`(exit 0 または done)。`level` はチャネルが購読する束です:
+
+| level | 届くもの | 想定 |
+|---|---|---|
+| `silent` | なし | 明示的に無音にしたいとき |
+| `critical`(既定) | error のみ | 「壊れたときだけ」 |
+| `needs-attention` | error + needs-attention | 「止まってたら教えて」 |
+| `all` | すべて(完了含む) | 短いタスクの監視 |
+
+- 既定が `silent` ではなく `critical` なのは、「全部切ったつもりが異常終了まで
+  握り潰していた」を避けるためです。
+- チャネルごとに `level` を上書きできるので、「共有 Slack は critical で静かに、
+  手元の Telegram は needs-attention で細かく」ができます。
+- `webhook` / `bot_token` の欠落や `${VAR}` 展開後の空文字は、**そのチャネルだけ**
+  送信時にスキップされます(設定全体の読み込みは失敗しません)。
+- `autorestart` による再起動ループの途中のクラッシュは通知されず、打ち切り後の最後の
+  終了だけが1通になります。
+- macOS の OS 通知は、バンドル済み・署名済みアプリ + OS の通知許可が前提です。
+  `npm run tauri dev` の素の起動では表示されないことがあります(webhook 側は影響なし)。
+
+全チャネルの注釈付き設定例は [ptygrid.example.yml](../../ptygrid.example.yml) にあります。
 
 ## 実践レシピ: エージェント間協調
 
