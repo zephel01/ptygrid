@@ -1,0 +1,18 @@
+# ptygrid — direnv 設定のテンプレート
+#
+# 使い方:
+#   cp .envrc.example .envrc  してから .envrc 側を自分の値に書き換え、
+#   direnv allow を実行する。.envrc は git 管理外（.gitignore 済み）。
+#
+# 前提: brew install direnv && ~/.zshrc に eval "$(direnv hook zsh)"
+
+export AWS_PROFILE=CHANGE_ME              # ~/.aws/config のプロファイル名
+export AWS_REGION=ap-northeast-1
+export AWS_DEFAULT_REGION="$AWS_REGION"
+export AWS_PAGER=""
+
+# 認証は IAM Identity Center (SSO) を推奨:
+#   aws configure sso --profile "$AWS_PROFILE"   # 初回
+#   aws sso login     --profile "$AWS_PROFILE"   # 以降
+#
+# 長期アクセスキーをこのファイルに書かないこと。
