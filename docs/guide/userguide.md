@@ -17,15 +17,16 @@ ptygrid のインストールから、`ptygrid.yml` の書き方、Queen(内蔵 
 8. [Worktree 分離](#worktree-分離)
 9. [セッション復元](#セッション復元)
 10. [エージェント状態バッジ(agent_status)](#エージェント状態バッジagent_status)
-11. [Queen のセットアップ](#queen-のセットアップ)
-12. [Teammates(hooks 受信)](#teammateshooks-受信)
-13. [Queen ツールリファレンス](#queen-ツールリファレンス)
-14. [チームプリセット(team_presets)](#チームプリセットteam_presets)
-15. [ワークフロー(workflows)](#ワークフローworkflows)
-16. [スケジュール実行(schedule)と外部通知(notifications)](#スケジュール実行scheduleと外部通知notifications)
-17. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
-18. [保存データと安全性](#保存データと安全性)
-19. [困ったときは](#困ったときは)
+11. [接続コンテキスト表示(pane_context)](#接続コンテキスト表示pane_context)
+12. [Queen のセットアップ](#queen-のセットアップ)
+13. [Teammates(hooks 受信)](#teammateshooks-受信)
+14. [Queen ツールリファレンス](#queen-ツールリファレンス)
+15. [チームプリセット(team_presets)](#チームプリセットteam_presets)
+16. [ワークフロー(workflows)](#ワークフローworkflows)
+17. [スケジュール実行(schedule)と外部通知(notifications)](#スケジュール実行scheduleと外部通知notifications)
+18. [実践レシピ: エージェント間協調](#実践レシピ-エージェント間協調)
+19. [保存データと安全性](#保存データと安全性)
+20. [困ったときは](#困ったときは)
 
 ---
 
@@ -413,6 +414,44 @@ agent_status:
 
 > 注: バッジ UI 自体は本リリースのヘッダー表示から段階的に拡充します(状態一覧サイドバー・
 > 承認待ち通知は後続)。`agent_status` の設定は今のリリースから有効です。
+
+## 接続コンテキスト表示(pane_context)
+
+各ペインの**向き先**を、ヘッダーと画面下部のステータスバーに常時表示します。既定で有効で、
+設定は不要です。
+
+```
+ ● ▪ claude #2   ⇄ deploy@web-01   ☁ prod-admin · ap-northeast-1   ◍ qwen3-coder   ⑂ main   ▸ …/project/ptygrid
+```
+
+| チップ | 内容 |
+|---|---|
+| `⇄` | `ssh` / `kubectl` などの接続先 |
+| `☁` | AWS のプロファイルとリージョン |
+| `◍` | エージェント CLI が話している LLM のモデル / エンドポイント |
+| `⑂` | git ブランチ（detached HEAD は `@a1b2c3d`） |
+| `▸` | 作業ディレクトリ |
+
+並び順は「実行結果を変える度合いの高い順」で、ペインが狭いときは右から欠けます。
+ステータスバーには**最後にフォーカスしたペイン**の内容が省略なしで出ます。
+
+止めたい・追従を速くしたいときだけ `ptygrid.yml` に書きます。
+
+```yaml
+pane_context:
+  enabled: true       # 既定 true。false で表示とサンプリングを停止
+  interval_ms: 5000   # 既定 5000、1000〜60000 にクランプ
+```
+
+読み取る環境変数は固定の許可リスト（`AWS_PROFILE` / `AWS_REGION` / `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_MODEL` ほか計 10 個）だけで、名前が `*_KEY` / `*_TOKEN` / `*_SECRET` などの
+資格情報らしいキーは許可リストに載っていても読みません。
+
+> 注意: OS はプロセスの環境変数を**起動時の値**しか公開しないため、direnv などで
+> 後から export した値は、そのペインで何かコマンドを実行した時点から表示されます。
+> 作業ディレクトリとブランチにこの遅延はありません。
+
+詳細・レシピ・切り分け手順は [pane-context.md](pane-context.md) を参照してください。
 
 ## Queen のセットアップ
 

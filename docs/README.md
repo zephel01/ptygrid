@@ -28,6 +28,7 @@ backend ⇄ frontend / Queen の正確な wire 仕様は [../CONTRACT.md](../CON
 | ドキュメント | 内容 |
 |---|---|
 | [guide/ptygrid-yml-guide.md](guide/ptygrid-yml-guide.md) | `ptygrid.yml` 執筆マニュアル（agents / workflows / team_presets 編）。userguide.md に無い `workflows:` ブロックの書き方、フィールド網羅表、**「書けるが動かないフィールド」の実装状況の線引き**、実運用で踏んだ落とし穴 |
+| [guide/pane-context.md](guide/pane-context.md) | 接続コンテキスト表示（`pane_context`）のマニュアル。ペインヘッダーとステータスバーに出る「どこに繋がっているか」（ssh 接続先 / AWS プロファイル / LLM エンドポイント / git ブランチ / 作業ディレクトリ）の読み方、有効化と間隔設定、**環境変数が起動時の値しか読めないことによる表示タイミングの制約**、秘密情報の扱い、切り分け手順 |
 | [guide/autonomous-operation-guide.md](guide/autonomous-operation-guide.md) | 自主運用ガイド。エージェントに日々の実装を任せるときの原則。基本サイクル、統合担当（integrator）の inbox 応対規約。実運用で実際に起きたことに基づく運用マニュアル |
 | [guide/secrets.md](guide/secrets.md) | 秘密（APIキー）の書き方 3系統マニュアル。複数の AI CLI（aider / opencode / claude / pi 等）を1つの `ptygrid.yml` で束ねるときの、キーの置き場所と GUI 起動時の env の扱い |
 | [guide/verify-team-preset.md](guide/verify-team-preset.md) | チームプリセットの手動検証手順書。ゴール定義（G1–G4）、起動順序チェックリスト、機能テスト T1–T6、実機偵察 R1–R3、E2E 受け入れシナリオ |
