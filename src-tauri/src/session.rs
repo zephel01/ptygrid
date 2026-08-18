@@ -786,6 +786,26 @@ impl PtyManager {
             .collect()
     }
 
+    /// Snapshot the inputs the Phase 4.4.4 pane-context sampler needs, for every
+    /// running PTY session: the foreground process group leader (whose cwd +
+    /// environment describe what the user is actually pointed at), the PTY's
+    /// direct child as a fallback, and the cwd the session was spawned with as
+    /// the last resort. Everything here is an in-memory / cheap-ioctl read, so
+    /// the sessions lock is never held across an OS query.
+    pub(crate) fn context_probes(&self) -> Vec<crate::pane_context::Probe> {
+        let sessions = self.lock_sessions();
+        sessions
+            .iter()
+            .filter(|(_, s)| s.state == SessionState::Running && s.kind == SessionKind::Pty)
+            .map(|(id, s)| crate::pane_context::Probe {
+                id: *id,
+                foreground_pid: foreground_pid(s),
+                root_pid: s.live.as_ref().and_then(|live| live.child.process_id()),
+                spawn_cwd: s.spec.cwd.clone(),
+            })
+            .collect()
+    }
+
     /// Resolver-injected variant used to keep process lookup independently
     /// testable on restricted hosts where `ps` or `/proc` is unavailable.
     fn list_sessions_with<F>(&self, resolve_process: F) -> Vec<SessionInfo>

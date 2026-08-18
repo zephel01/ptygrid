@@ -21,6 +21,7 @@
     markPaneClosed,
     focusPane,
     clearAgentStatus,
+    contextChips,
     type LayoutMode,
   } from "./lib/stores.svelte";
   import { disposeTermHandle, writeToTerm } from "./lib/terminals";
@@ -1272,6 +1273,20 @@
     statusRows.filter((r) => r.status === "blocked").length,
   );
 
+  // Phase 4.4.4: which pane the status bar describes. Normally the pane the
+  // user last typed in; a single-pane grid needs no focus at all to be
+  // unambiguous, which also covers the moment right after launch when nothing
+  // has been clicked yet. A stale id (pane since closed) falls back the same way.
+  let activeContextId = $derived.by(() => {
+    const id = ui.activeId;
+    if (id !== null && ui.panes.includes(id)) return id;
+    return ui.panes.length === 1 ? ui.panes[0] : null;
+  });
+
+  let activeContextChips = $derived(
+    activeContextId === null ? [] : contextChips(activeContextId),
+  );
+
   // ---- sidebar row actions ----
   function sidebarFocus(id: number): void {
     focusPane(id);
@@ -1611,6 +1626,18 @@
 </script>
 
 <main>
+  {#snippet contextChipRow(id: number, skipBranch: boolean)}
+    <!-- Phase 4.4.4: "where is this pane pointed?" — the header shows as many
+         chips as fit (CSS truncates from the right, so the most consequential
+         one, the remote host, is never the one that disappears); the status bar
+         below shows the focused pane's chips in full. -->
+    {#each contextChips(id, { skipBranch }) as chip (chip.kind)}
+      <span class="ctx-chip ctx-{chip.kind}" title={chip.title}>
+        <span class="ctx-icon" aria-hidden="true">{chip.icon}</span>{chip.text}
+      </span>
+    {/each}
+  {/snippet}
+
   {#snippet astatusBadge(id: number)}
     {#if showAstatus(id)}
       <span
@@ -1953,6 +1980,9 @@
                         <span class="lead-ref" title={m.leadRefTitle}>
                           ↳#{session.teammate.leadId}
                         </span>
+                        {#if session?.state === "running"}
+                          {@render contextChipRow(id, false)}
+                        {/if}
                         {#if session?.state === "exited"}
                           <span
                             class="finished-tag"
@@ -2032,6 +2062,9 @@
                             ⑂ {session.worktree.branch}
                           </span>
                         {/if}
+                        {#if session?.state === "running"}
+                          {@render contextChipRow(id, !!session?.worktree)}
+                        {/if}
                         {#if session?.state === "exited"}
                           <span class="exit-code">
                             exit {session.code ?? "?"}
@@ -2106,6 +2139,30 @@
         </span>
       {/if}
     </button>
+    <!-- Phase 4.4.4: connection context of the focused pane. Sits at the left
+         of the bar (next to the pane it describes) rather than beside the queen
+         / teammates badges, which are app-global rather than per-pane. -->
+    <div class="ctx-bar" aria-label={m.ctxBarAria}>
+      {#if activeContextId === null}
+        <span class="ctx-muted">{m.ctxBarEmpty}</span>
+      {:else}
+        <button
+          class="ctx-pane"
+          title={m.ctxPaneFocusTitle}
+          onclick={() => focusPane(activeContextId)}
+        >
+          {paneTitle(activeContextId)}
+        </button>
+        {#each activeContextChips as chip (chip.kind)}
+          <span class="ctx-chip ctx-{chip.kind}" title={chip.title}>
+            <span class="ctx-icon" aria-hidden="true">{chip.icon}</span>{chip.text}
+          </span>
+        {/each}
+        {#if activeContextChips.length === 0}
+          <span class="ctx-muted">{m.ctxBarUnknown}</span>
+        {/if}
+      {/if}
+    </div>
     <span class="sb-spacer"></span>
     <div class="teammates-wrap">
       <button
@@ -3332,6 +3389,81 @@
     color: #9cdcfe;
     font-family: Menlo, monospace;
     font-size: 10px;
+  }
+
+  /* ---- connection-context chips (Phase 4.4.4) ---- */
+
+  /* Shared by the pane header and the status bar so one pane reads the same in
+     both places. `min-width: 0` + ellipsis means a narrow pane drops characters
+     off the *last* chip rather than pushing the pane buttons off the header. */
+  .ctx-chip {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    max-width: 22ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #a8b3bd;
+    font-family: Menlo, monospace;
+    font-size: 10px;
+  }
+
+  .ctx-icon {
+    flex: 0 0 auto;
+    opacity: 0.75;
+  }
+
+  /* A remote host and a cloud profile are the two chips that change what a
+     command actually does, so they get colour; directory and branch stay
+     muted, because they repeat what the pane already implies. */
+  .ctx-remote {
+    color: #e5c07b;
+  }
+
+  .ctx-aws {
+    color: #d19a66;
+  }
+
+  .ctx-model {
+    color: #9cdcfe;
+  }
+
+  .ctx-branch {
+    color: #8fbc8f;
+  }
+
+  .ctx-bar {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
+  }
+
+  .ctx-pane {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #d0d0d0;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .ctx-pane:hover {
+    color: #fff;
+    text-decoration: underline;
+  }
+
+  .ctx-muted {
+    color: #6f6f6f;
+    font-size: 11px;
   }
 
   .resource-usage {

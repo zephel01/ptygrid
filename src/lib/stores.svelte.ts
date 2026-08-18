@@ -7,9 +7,11 @@ import type {
   AgentStatusPayload,
   ConfigChangedPayload,
   ConfigInfo,
+  PaneContext,
   PtyExitPayload,
   QueenNotifyPayload,
   QueenStatus,
+  SessionContextPayload,
   SessionResourcesPayload,
   SessionResourceUsage,
   SessionInfo,
@@ -84,6 +86,13 @@ export const ui = $state({
    * destination, e.g. `user@host`). Updated every resource tick; entries are
    * removed when the tick reports no detail and on exit/close. */
   foregroundDetail: {} as Record<number, string>,
+  /** Phase 4.4.4: connection context per session id (`session-context` event).
+   * Sampled on its own slower clock, so entries persist between resource ticks;
+   * cleared when the session leaves `running` and on close. */
+  paneContext: {} as Record<number, PaneContext>,
+  /** Phase 4.4.4: session id of the pane that last held keyboard focus. Drives
+   * which pane the status bar describes. null until a pane is focused. */
+  activeId: null as number | null,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
   /** Phase 5.0.1: runs left "running" from before a crash/restart, awaiting
@@ -162,6 +171,17 @@ export function clearAgentStatus(id: number): void {
   delete ui.agentStatusRule[id];
   // Foreground detail is only meaningful while running; same lifecycle.
   delete ui.foregroundDetail[id];
+  // Same for the connection context: a stale "aws: prod" chip on an exited
+  // pane is worse than no chip at all.
+  delete ui.paneContext[id];
+}
+
+/** Remember which pane the user is typing in (drives the status bar). Called
+ * from the pane's focus handler; clearing happens only when the pane closes,
+ * so the bar keeps describing the last pane touched rather than blanking out
+ * every time focus moves to a toolbar button. */
+export function setActivePane(id: number): void {
+  ui.activeId = id;
 }
 
 const NOTICE_TTL_MS = 5000;
@@ -298,6 +318,18 @@ export async function initGlobalListeners(): Promise<void> {
     }
   });
 
+  await listen<SessionContextPayload>("session-context", (event) => {
+    // Phase 4.4.4: one map assignment per context tick, same shape as the
+    // resource tick. The backend omits panes whose context resolved to nothing,
+    // so a missing entry means "unknown", not "empty" — the UI shows no chips
+    // rather than an empty chip row.
+    const next: Record<number, PaneContext> = {};
+    for (const ctx of event.payload.sessions) {
+      if (ui.sessions[ctx.id]?.state === "running") next[ctx.id] = ctx;
+    }
+    ui.paneContext = next;
+  });
+
   await listen<PtyExitPayload>("pty-exit", (event) => {
     const session = ui.sessions[event.payload.id];
     delete ui.resources[event.payload.id];
@@ -397,6 +429,104 @@ export async function initGlobalListeners(): Promise<void> {
     // whenever any field changes; last-write-wins keyed by runId (no merge).
     ui.workflowRuns[event.payload.runId] = event.payload;
   });
+}
+
+// ---- Phase 4.4.4: connection-context chips ----
+
+export type ContextChipKind = "remote" | "aws" | "model" | "branch" | "dir";
+
+/** One rendered chip. `text` is what fits in a pane header; `title` carries the
+ * full, unabbreviated value for the tooltip. */
+export type ContextChip = {
+  kind: ContextChipKind;
+  icon: string;
+  text: string;
+  title: string;
+};
+
+/** Keep a path chip readable in a narrow pane header: last two segments, with
+ * a leading ellipsis when anything was dropped. `~/a` and shorter are kept whole. */
+export function shortenPath(path: string): string {
+  const parts = path.split("/").filter((part) => part.length > 0);
+  if (parts.length <= 2) return path;
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
+/**
+ * Compose the ordered chips for one pane: most-surprising-first, because a
+ * pane header only has room for the first couple of them. A remote host or a
+ * non-default AWS profile is what makes a command dangerous; the directory is
+ * the thing you can already infer from the pane you opened.
+ *
+ * `skipBranch` is passed by callers that already render a worktree badge for
+ * the same session — the badge and this chip would say the same thing.
+ */
+export function contextChips(
+  id: number,
+  options: { skipBranch?: boolean } = {},
+): ContextChip[] {
+  const m = msg();
+  const chips: ContextChip[] = [];
+
+  const remote = ui.foregroundDetail[id];
+  if (remote) {
+    chips.push({
+      kind: "remote",
+      icon: "⇄",
+      text: remote,
+      title: m.ctxRemoteTitle(remote),
+    });
+  }
+
+  const ctx = ui.paneContext[id];
+  if (!ctx) return chips;
+
+  if (ctx.aws) {
+    const { profile, region } = ctx.aws;
+    const text = profile ?? region ?? "";
+    if (text) {
+      chips.push({
+        kind: "aws",
+        icon: "☁",
+        text: profile && region ? `${profile} · ${region}` : text,
+        title: m.ctxAwsTitle(profile ?? "", region ?? "") + "\n" + m.ctxStaleNote,
+      });
+    }
+  }
+
+  if (ctx.model) {
+    const { provider, model, endpoint, local } = ctx.model;
+    chips.push({
+      kind: "model",
+      icon: "◍",
+      text: model ?? endpoint ?? provider,
+      title:
+        m.ctxModelTitle(provider, model ?? "", endpoint ?? "") +
+        (local ? m.ctxModelLocalNote : "") +
+        "\n" +
+        m.ctxStaleNote,
+    });
+  }
+
+  if (ctx.branch && !options.skipBranch) {
+    chips.push({
+      kind: "branch",
+      icon: "⑂",
+      text: ctx.branch,
+      title: m.ctxBranchTitle(ctx.repo ?? "", ctx.branch),
+    });
+  }
+
+  if (ctx.cwd) {
+    chips.push({
+      kind: "dir",
+      icon: "▸",
+      text: shortenPath(ctx.cwd),
+      title: m.ctxDirTitle(ctx.cwd),
+    });
+  }
+
+  return chips;
 }
 
 export function paneTitle(id: number): string {

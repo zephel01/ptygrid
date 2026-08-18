@@ -88,6 +88,27 @@ queen:
 #       level: needs-attention
 #       label: mobile          # cosmetic; shown to tell channels apart
 
+# pane_context: ペインごとの「どこに繋がっているか」表示（Phase 4.4.4）。
+# 各 running ペインの header と、フォーカス中ペインについては下部ステータスバーに、
+# 作業ディレクトリ + git ブランチ / AWS プロファイル・リージョン / エージェント CLI が
+# 話している LLM エンドポイント・モデルを表示する。ssh / kubectl の接続先は
+# Phase 4.4.3 のペインタイトル（`ssh user@host #2`）が引き続き担当する。
+#
+# 読み取る環境変数は固定の許可リストのみ（AWS_PROFILE / AWS_VAULT /
+# AWS_DEFAULT_PROFILE / AWS_REGION / AWS_DEFAULT_REGION / ANTHROPIC_BASE_URL /
+# ANTHROPIC_MODEL / OPENAI_BASE_URL / OPENAI_MODEL / OLLAMA_HOST）。名前が
+# *_KEY / *_TOKEN / *_SECRET などの資格情報らしいキーは無条件で捨て、エンドポイント
+# URL からは userinfo を落としてから表示する。
+#
+# 注意: 環境変数はプロセス起動時の値しか読めないため、ペインのシェル起動後に
+# export された値（direnv など）は、そのペインで何かコマンドを実行した時点から
+# 表示される。作業ディレクトリにこの遅延はない。
+#
+# 省略可（既定値を以下に示す）。
+# pane_context:
+#   enabled: true       # false で sampling と session-context イベントを停止
+#   interval_ms: 5000   # clamp 1000..60000（CPU/メモリの sampler は 1 秒間隔）
+
 agents:
   - name: claude
     cmd: "claude"

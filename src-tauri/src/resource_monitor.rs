@@ -7,6 +7,7 @@ use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
+use crate::pane_context::{self, ContextBatch};
 use crate::session::PtyManager;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -118,6 +119,10 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     std::thread::spawn(move || {
         let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
         let mut system = System::new();
+        // Phase 4.4.4: when the next connection-context sample is due. Starts at
+        // zero so the first tick emits one immediately — a pane that opens and
+        // then sits idle should not wait a whole interval for its chips.
+        let mut context_due_in = Duration::ZERO;
 
         // CPU usage is a delta and needs two refreshes. Prime the shared
         // System once, then leave a full sample interval before the first emit.
@@ -148,6 +153,35 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                         sampled_at_ms,
                         sessions,
                         foreground,
+                    },
+                )
+                .is_err()
+            {
+                break;
+            }
+
+            // Phase 4.4.4: connection context on its own (much slower) clock.
+            // Reading a process' cwd + environment is the expensive refresh
+            // kind, and the answers change on human timescales — so it rides
+            // this thread rather than adding one, but never every tick.
+            let (context_enabled, context_interval_ms) = pane_context::settings(&app);
+            if !context_enabled {
+                // Re-arm so re-enabling mid-run emits on the next tick.
+                context_due_in = Duration::ZERO;
+                continue;
+            }
+            context_due_in = context_due_in.saturating_sub(SAMPLE_INTERVAL);
+            if !context_due_in.is_zero() {
+                continue;
+            }
+            context_due_in = Duration::from_millis(context_interval_ms);
+            let contexts = pane_context::sample(&manager.context_probes());
+            if app
+                .emit(
+                    "session-context",
+                    ContextBatch {
+                        sampled_at_ms,
+                        sessions: contexts,
                     },
                 )
                 .is_err()

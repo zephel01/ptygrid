@@ -11,7 +11,7 @@
     type TermHandle,
   } from "./terminals";
   import { msg } from "./i18n.svelte";
-  import { ui } from "./stores.svelte";
+  import { setActivePane, ui } from "./stores.svelte";
 
   let { sessionId, title }: { sessionId: number; title: string } = $props();
 
@@ -92,11 +92,22 @@
     h?.term.focus();
   }
 
+  // Phase 4.4.4: the status bar describes the pane you are typing in. `focusin`
+  // (not `focus`) because the element that actually takes focus is xterm's
+  // hidden textarea, several levels down inside this container.
+  function markActive(): void {
+    setActivePane(sessionId);
+  }
+
   onMount(async () => {
     // Bound imperatively (and removed in onDestroy): as a Svelte attribute an
     // `oncontextmenu` on this plain <div> would demand an ARIA role it should
     // not carry — xterm builds its own accessible tree inside it.
     containerEl.addEventListener("contextmenu", openMenu);
+    containerEl.addEventListener("focusin", markActive);
+    // A click that lands on the pane counts too: selecting text with the mouse
+    // does not always move focus, but it does mean this is the pane in view.
+    containerEl.addEventListener("mousedown", markActive);
 
     handle = await ensureTermHandle(sessionId);
     if (destroyed) return;
@@ -116,6 +127,8 @@
     if (debounceTimer) clearTimeout(debounceTimer);
     resizeObserver?.disconnect();
     containerEl?.removeEventListener("contextmenu", openMenu);
+    containerEl?.removeEventListener("focusin", markActive);
+    containerEl?.removeEventListener("mousedown", markActive);
     // Detach only (keeps the xterm instance + scrollback alive across grid
     // re-layouts). getTermHandle is undefined if App already disposed it.
     getTermHandle(sessionId)?.detach(containerEl);
