@@ -1461,6 +1461,89 @@ type AgentStatusPayload = {
 - reader hot path の追加は「dirty マーク（atomic + unbounded channel send）」のみ。`agent_status` 未 manage
   の経路（session 単体テスト等）では dirty マークは no-op。
 
+# Phase 4.4.4 追加契約（pane connection context: 「このペインはどこに繋がっているか」）
+
+Phase 4.4.4 は running PTY pane ごとに「向き先」を解決し、pane header と status bar
+に表示する受動的な表示レイヤ。SessionState（プロセス生死）/ agent-status（意味的状態）/
+session-resources（CPU・メモリ）とは独立した別レイヤで、いずれの既存契約も変更しない。
+
+## Tauri Event
+
+| event | payload | 発火タイミング |
+|---|---|---|
+| `session-context` | `SessionContextPayload` | `pane_context.interval_ms`（既定5000ms）ごとに全running PTY sessionを1 batchでemit |
+
+```ts
+type AwsContext = { profile?: string; region?: string };
+type ModelContext = {
+  provider: string;      // "anthropic" | "openai" | "ollama"
+  model?: string;
+  endpoint?: string;     // authority のみ（scheme/path/userinfo は落とす）
+  local: boolean;        // endpoint が loopback / *.local を指す
+};
+type PaneContext = {
+  id: number;
+  cwd?: string;          // 表示形（home は `~` に畳む）
+  repo?: string;         // cwd を含む repository root の directory 名
+  branch?: string;       // detached HEAD は `@<短縮sha>`
+  aws?: AwsContext;
+  model?: ModelContext;
+};
+type SessionContextPayload = { sampledAtMs: number; sessions: PaneContext[] };
+```
+
+- 全 field optional。1つも解決しなかった pane は batch から丸ごと省略する（空オブジェクトはemitしない）。
+- リモート接続先（ssh / kubectl 等）は本 event に載せない。Phase 4.4.3 の
+  `session-resources.foreground[].detail` が唯一の供給元で、二重配線しない。
+
+## ptygrid.yml スキーマ（`pane_context:` ブロック、すべて任意）
+
+- `enabled`: 既定 true。false で sampling と `session-context` を停止する。
+- `interval_ms`: 既定 5000、clamp 1000..=60000。
+- ブロック省略時は既定値。`load_config` ごとに反映され、実行中でも次tickから効く。
+
+## Sampling semantics
+
+- resource sampler（Phase 3.5）の1秒threadに相乗りし、`interval_ms` ごとにのみ走る。専用threadは作らない。
+- cwd と environ は sysinfo の高コストな refresh kind なので、1秒tickの `System` とは分離し、
+  tickごとに使い捨ての `System` で対象PIDだけを refresh する（死んだPIDのstale entryを引かないため）。
+- cwd の解決順は foreground process → PTY直下child → spawn時 cwd。macOS で sysinfo が
+  cwd を返せない場合のみ `lsof -a -w -d cwd -Fn -p <pid>` に fallback する。
+- environ は foreground process のものを優先する（direnv 等で後から export された値を最も拾いやすい）。
+  空なら PTY直下child のものを使う。
+- git は `.git` を上位へ探索し `HEAD` を読むだけで、`git` subprocess は起動しない。linked worktree の
+  `.git` file（`gitdir:` ポインタ）も辿る。
+- session map lock 中は PID と spawn cwd の snapshot だけを取り、OS 問い合わせ中は保持しない。
+
+## Secrets 境界（必須）
+
+- 読み取る環境変数は固定 allowlist のみ:
+  `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` / `AWS_VAULT` / `AWS_REGION` / `AWS_DEFAULT_REGION` /
+  `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `OPENAI_BASE_URL` / `OPENAI_MODEL` / `OLLAMA_HOST`。
+- 加えて、名前に `KEY` / `TOKEN` / `SECRET` / `PASSWORD` / `PASSWD` / `CREDENTIAL` / `SESSION`
+  を含むキーは allowlist に載っていても無条件で捨てる（allowlist 編集ミスへの二重の防壁。
+  allowlist 自体がこの規則に違反しないことも test で検証する）。
+- endpoint URL は scheme / path / **userinfo** を落とした authority だけを出す
+  （`https://tok@host:8443/v1` → `host:8443`）。
+
+## 既知の制約（挙動として保証する）
+
+- 環境変数は OS からプロセス起動時の値しか読めない（Linux `/proc/<pid>/environ`、macOS `KERN_PROCARGS2`）。
+  したがって pane の shell 起動後に export された値（direnv 等）は、その pane で何か
+  コマンドを実行した時点から表示される。cwd にこの遅延はない（毎tickライブに読む）。
+
+## Frontend
+
+- pane header: remote → aws → model → branch → dir の順に chip を並べる。幅が足りないときは
+  末尾から欠ける（最も実行結果を変える remote / aws を残すため）。worktree バッジを持つ pane では
+  branch chip を出さない（同一内容の二重表示回避）。
+- status bar: 最後にフォーカスした pane（1ペイン時はその pane）の chip を表示する。pane 名クリックで
+  該当 pane をハイライトする（`focusPane` の再利用）。
+- `ui.paneContext` は batch ごとに1回だけ置換し、exit/restart/close 時に該当値を削除する。
+- 解決値が無い pane には chip を出さない（空の chip 行は出さない）。
+
+---
+
 # Phase 4.3 追加契約（Queen team preset: 一括起動）
 
 複数エージェントの名前付きチーム構成を `ptygrid.yml` に宣言し、1操作で一括起動する。

@@ -38,3 +38,7 @@ _to_delete/
 
 src-tauri/target-basemain/
 
+
+# direnv のローカル作業コンテキスト（共有用テンプレートは .envrc.example）
+/.envrc
+/.envrc.local

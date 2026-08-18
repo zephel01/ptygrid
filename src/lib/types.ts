@@ -338,6 +338,37 @@ export type SessionResourcesPayload = {
   foreground?: SessionForeground[];
 };
 
+// Phase 4.4.4 (pane-context: 「このペインはどこに繋がっているか」)
+/** AWS の向き先。どちらか一方だけ解決することがあるので両方 optional。 */
+export type AwsContext = { profile?: string; region?: string };
+
+/** エージェント CLI が話している LLM の向き先。`local` は endpoint が
+ * ループバック / `*.local`（llama.cpp・ollama・claude-code-router 等）を指す。 */
+export type ModelContext = {
+  provider: string;
+  model?: string;
+  endpoint?: string;
+  local: boolean;
+};
+
+/** 1ペイン分の接続コンテキスト。全フィールド optional（解決できたものだけ届く）。
+ * リモートホスト（ssh 等）はここではなく Phase 4.4.3 の foreground detail
+ * （`ui.foregroundDetail`）が持つ — 二重に配線しない。 */
+export type PaneContext = {
+  id: number;
+  cwd?: string;
+  repo?: string;
+  branch?: string;
+  aws?: AwsContext;
+  model?: ModelContext;
+};
+
+/** `session-context` イベント。resource tick より遅い独自周期で届く。 */
+export type SessionContextPayload = {
+  sampledAtMs: number;
+  sessions: PaneContext[];
+};
+
 // Phase 2 (Queen: 内蔵MCPサーバー)
 export type QueenStatus = {
   enabled: boolean;

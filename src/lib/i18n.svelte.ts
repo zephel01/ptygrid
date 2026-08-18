@@ -386,6 +386,23 @@ const en = {
   ssEmpty: "No running panes",
   ssMaxToggle: "Toggle maximize",
 
+  // ---- connection context (Phase 4.4.4) ----
+  ctxRemoteTitle: (destination: string) =>
+    `Connected to ${destination} (foreground process)`,
+  ctxAwsTitle: (profile: string, region: string) =>
+    `AWS: ${profile || "(no profile)"} / ${region || "(no region)"} — from the pane's environment`,
+  ctxModelTitle: (provider: string, model: string, endpoint: string) =>
+    `Model: ${provider}${model ? ` ${model}` : ""}${endpoint ? ` via ${endpoint}` : ""}`,
+  ctxModelLocalNote: " (local endpoint)",
+  ctxBranchTitle: (repo: string, branch: string) => `Git: ${repo} on ${branch}`,
+  ctxDirTitle: (path: string) => `Working directory: ${path}`,
+  ctxBarAria: "Connection context of the focused pane",
+  ctxPaneFocusTitle: "Highlight this pane in the grid",
+  ctxBarEmpty: "No pane focused",
+  ctxBarUnknown: "context not resolved yet",
+  ctxStaleNote:
+    "Environment values are read from the process as it was started; a variable exported later (direnv) appears once the pane runs a command.",
+
   // ---- footer ----
   sbCollapse: "Collapse the status sidebar",
   sbOpen: "Open the status sidebar",
@@ -886,6 +903,23 @@ const ja: Messages = {
   ssAria: "ステータス一覧",
   ssEmpty: "実行中のペインはありません",
   ssMaxToggle: "最大化トグル",
+
+  // ---- connection context (Phase 4.4.4) ----
+  ctxRemoteTitle: (destination: string) =>
+    `接続先: ${destination}（foreground プロセス）`,
+  ctxAwsTitle: (profile: string, region: string) =>
+    `AWS: ${profile || "(プロファイル未設定)"} / ${region || "(リージョン未設定)"} — ペインの環境変数より`,
+  ctxModelTitle: (provider: string, model: string, endpoint: string) =>
+    `モデル: ${provider}${model ? ` ${model}` : ""}${endpoint ? ` @ ${endpoint}` : ""}`,
+  ctxModelLocalNote: "（ローカルエンドポイント）",
+  ctxBranchTitle: (repo: string, branch: string) => `Git: ${repo} / ${branch}`,
+  ctxDirTitle: (path: string) => `作業ディレクトリ: ${path}`,
+  ctxBarAria: "フォーカス中ペインの接続コンテキスト",
+  ctxPaneFocusTitle: "このペインをグリッド上でハイライトします",
+  ctxBarEmpty: "フォーカス中のペインがありません",
+  ctxBarUnknown: "コンテキスト未解決",
+  ctxStaleNote:
+    "環境変数はプロセス起動時の値を読みます。起動後に export された値（direnv 等）はそのペインでコマンドを実行した時点で反映されます。",
 
   // ---- footer ----
   sbCollapse: "ステータスサイドバーを畳む",

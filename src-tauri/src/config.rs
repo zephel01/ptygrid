@@ -55,6 +55,41 @@ pub struct Config {
     /// Phase 5.5.0 top-level `mcp:` block (the `/mcp` RC-compat router).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpConfig>,
+    /// Phase 4.4.4 global `pane_context:` block (per-pane connection context).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_context: Option<PaneContextConfig>,
+}
+
+/// Phase 4.4.4 global `pane_context:` block. Governs the passive sampler that
+/// resolves "where is this pane pointed?" (cwd / git branch / AWS profile /
+/// LLM endpoint) for every running PTY pane. Everything is optional; omitting
+/// the block leaves sampling enabled at the default cadence.
+///
+/// Sampling reads a fixed allowlist of environment variables — see
+/// [`crate::pane_context::ENV_ALLOWLIST`] — and never any credential-shaped
+/// key. Set `enabled: false` to switch the whole layer (and its
+/// `session-context` events) off.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PaneContextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
+impl PaneContextConfig {
+    /// Default true: context sampling + `session-context` events run unless
+    /// explicitly disabled.
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Default 5000ms, clamped into 1000..=60000. Deliberately much slower than
+    /// the 1s resource tick: reading a process' cwd + environment is the
+    /// expensive kind of refresh, and the answers change on human timescales.
+    pub fn effective_interval_ms(&self) -> u64 {
+        self.interval_ms.unwrap_or(5000).clamp(1000, 60000)
+    }
 }
 
 /// `queen: { enabled?: bool (default true), port?: u16 (default 39237) }`.
@@ -2492,6 +2527,36 @@ agents:
         )
         .unwrap();
         assert!(cfg.agents[0].teams.clone().unwrap().effective_enabled());
+    }
+
+    #[test]
+    fn pane_context_block_defaults_and_clamp() {
+        // No block at all -> None; effective defaults come from Default.
+        let cfg = parse_config("agents: []").unwrap();
+        assert!(cfg.pane_context.is_none());
+        let d = PaneContextConfig::default();
+        assert!(d.effective_enabled()); // default TRUE
+        assert_eq!(d.effective_interval_ms(), 5000);
+
+        // Empty block -> same effective defaults.
+        let cfg = parse_config("agents: []\npane_context: {}").unwrap();
+        let p = cfg.pane_context.unwrap();
+        assert_eq!(p.enabled, None);
+        assert!(p.effective_enabled());
+        assert_eq!(p.effective_interval_ms(), 5000);
+
+        // Out-of-range values clamp; enabled: false is honored.
+        let cfg =
+            parse_config("agents: []\npane_context:\n  enabled: false\n  interval_ms: 1\n").unwrap();
+        let p = cfg.pane_context.unwrap();
+        assert!(!p.effective_enabled());
+        assert_eq!(p.effective_interval_ms(), 1000);
+
+        let cfg = parse_config("agents: []\npane_context:\n  interval_ms: 999999\n").unwrap();
+        assert_eq!(
+            cfg.pane_context.unwrap().effective_interval_ms(),
+            60000
+        );
     }
 
     #[test]

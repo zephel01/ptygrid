@@ -7,6 +7,7 @@ mod git_service;
 mod init;
 mod notifications;
 mod orchestrator;
+mod pane_context;
 mod project_state;
 mod pty;
 mod queen;
@@ -27,6 +28,7 @@ use agent_status::AgentStatusManager;
 use config::ConfigManager;
 use queen::QueenStatus;
 use notifications::NotificationManager;
+use pane_context::PaneContextSettings;
 use session::PtyManager;
 use tauri::Manager;
 use teams_hooks::TeamsHooks;
@@ -104,6 +106,7 @@ pub fn run() {
         .manage(ConfigManager::new())
         .manage(TeamsHostManager::new())
         .manage(AgentStatusManager::new())
+        .manage(PaneContextSettings::new())
         .manage(NotificationManager::new())
         .manage(orchestrator::WorkflowRegistry::new())
         .manage(orchestrator::ScheduleRegistry::new())
