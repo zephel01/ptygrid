@@ -6,6 +6,12 @@
 `feat/step-timing-5.0.6` は origin へ push 済みで `main` より 9 コミット先行（PR は未マージ）。
 本文中に残る「push 未・PR 未作成」の記述はこの日より前のもので、§4 項目 1 / 項目 7 と
 §6.10 / §6.11 に該当箇所がある。作業中のブランチは `feat/step-timing-5.0.6`。
+**2026-08-20 時点の訂正**: 最新タグは `v0.5.9`（2026-08-14 → §6.25）。同日以降に
+(1) `feat/pane-connection-context` が `main` にマージ済み（PR #20、`d31a43a`）、
+(2) **U10 を消化**（2026-08-20、GUI 不要の枠。→ §2 U10・§6.26。5.5.0 の RC ルートに
+穴が 3 件見つかった）、(3) **並行 run 間のペイン横取りを修正**
+（`fix/cross-run-pane-adoption` = `ccbdf9b`。→ §6.26・CONTRACT.md 続報24）。
+本文中の「実機検証は 1 件も消えていない」という記述はこの日より前のものである。
 **2026-08-13 時点の訂正**: 最新タグは `v0.5.8`（2026-08-13 作成 → §4・§6.23）。
 `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の 3 ファイルを
 `0.5.8` に揃えたコミットに打った。**タグ `v0.5.7` が指すコミットは 3 ファイルとも `0.5.6` の
@@ -61,7 +67,8 @@ Phase 0 から 6.0 までを 1 本の表にした（時系列かつ patch 番号
 | 5.0.6（案） | Orchestrator の計測とパイプライン化: `StepOutcome` に step 単位の終了時刻とペイン待ち時間を additive 追加 / 合成 workflow（直列・鎖分割・9 面待ち・fan-out + `joinOn: any` の 4 本）で orchestration の効きだけを測る / cold start（ペイン再利用 vs 毎回 spawn）の実測。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | 🚧 | v0.5.8 | 合成 workflow 4 本の実走と実測 済（2026-07-31、同じ回で U2 も消化）/ cold start 実測 済（2026-07-31、`example/measure-coldstart`）/ U4 は未 |
 | 5.0.7（案） | ストリーミング依存 `onEach: reply` / `joinOn: stream`: 上流が生き続けたまま返信 1 本ごとに「unit」を送り、下流はその 1 本ごとにコピー `<id>#<k>` を 1 つ spawn する。番兵 `[[end]]` と上流終端の 2 層で stream を閉じ、unit 0 本は `Failed`、`STREAM_MAX_UNITS` = 64 で暴走を止める。load 時検証 V1〜V10 と resume 拒否。`StepOutcome` の wire は不変（unit 本文は `#[serde(skip)]`）で frontend も無変更。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2。5.0.6 が確定するまで 5.0.7 も確定しない） | 🚧 | v0.5.8 | 未（U14）。自動テストのみ（lib 459 / 統合 14） |
 | 5.0.8（案） | 時刻で workflow を起こす `schedule:`: cron 式ではなく `every: day / weekday / hour` + `at:` の 3 語彙のみ。**アプリが起動している間だけ発火し、取りこぼしは追わない**（契約であって実装の限界ではない）。見送りは 2 条件（前の run が未終端 / 9 面に空きが無い）で、どちらも発火の前に判定して理由を残す。`schedule` を持つ workflow は `autoClose` の既定が `success` に変わる。連続 3 回失敗で自動停止（`ptygrid.yml` は書き換えない）。新 wire は読み取り専用の Tauri command `list_schedules` 1 本のみ。**patch 番号は提案でありユーザー判断で確定**（→ 脚注※2） | 🚧 | v0.5.8 | 未（U20）。自動テストのみ（lib 530 / 統合 14） |
-| 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | 記録なし（U10） |
+| 5.5.0 | MCP 2026-07-28 RC 互換ルータ（`queen_compat`: header / route / capabilities / deprecation / initialize / meta、hot-swap 可能な `McpCompatHandle`、legacy 2025-06 併存） | 🚧 | v0.5.6（`21d1367`） | **済（2026-08-20、U10）。legacy は完動（tools 22 本・`tools/call` 実行まで確認）だが、RC ルートは実 rmcp に到達できない**（→ §2 U10 / 次行） |
+| （無番号）| **5.5.0 の完成**: RC ルートを実 rmcp に到達させる 3 件 — (F-1) RC の `initialize` を短絡しているため rmcp の session が未初期化で、RC の passthrough は全部 422。(F-2) `header::validate` が `tools/*` すべてに `Mcp-Name` を要求し `params.name` と比べるので `tools/list` が原理的に通らない。(F-3) 実 rmcp は常に `text/event-stream` で返すので `_meta.traceparent` の echo が一度も発火しない。**5.5.1 OTel はこの受け口の上に載る予定なので、F-3 は 5.5.1 の前提**（→ §3 P6・CONTRACT.md 続報25）| ⬜ | — | 該当なし |
 | 5.5.1 | OTel GenAI 計装 + SQLite シンク（span の書き出し先） | ⬜ | — | 該当なし |
 | 5.5.2 | Cost 計算 + `agent-cost` イベント | ⬜ | — | 該当なし |
 | 5.5.3 | Agent Status Rings（通知リング / 要承認ハイライト。出自は competitive-landscape の「次に取る UX」で、4.0 の teammate permission 表示の汎用化。設計は spec-phase5-5.md §2.3 / §3.7） | ⬜ | — | 該当なし |
@@ -138,7 +145,7 @@ U9（frontend チェック）だけは特定の patch に紐づかない横断�
 | U7 | Linux 実機での常用 | build / `.deb` / AppImage は Ubuntu 22.04 CI で検証済み（Phase 3.9）。実機常用は beta 表記のまま |
 | U8 | Windows | [porting.md](porting.md) の「Windows 対応チェックリスト」が全項目未着手。`process_name()` が `None` を返すため foreground 名解決 / agent-status / ssh 接続先表示が機能しない |
 | U9 | frontend チェック（`svelte-check` / `npm run build`） | **2026-08-04、実測済み**。`npm install` からやり直して `npm run check` = **136 files / 0 errors / 0 warnings**、`npm run build` = **成功**。これで「v0.5.1 時点の 0 errors から変わっていないはず」という推測は実測に置き換わった。なお実行環境は Linux コンテナなので、macOS 限定のメニュー定義（`#[cfg(target_os = "macos")]`）はこのチェックの対象外である |
-| U10 | 5.5.0（RC 互換ルータ）の実機検証 | **記録が無く判定不能**。CONTRACT.md の実装状況節も自動テスト（unit 35 + 統合 14）しか挙げていない。実機で RC / legacy 双方のクライアントを繋いだ記録は見当たらない |
+| U10 | 5.5.0（RC 互換ルータ）の実機検証 | **2026-08-20、macOS で完了**（`_OUTPUTS/u10-verify/` の probe 30 本 + 追加 probe 8 本、生ログと結果は同フォルダ）。**PASS 29 / FAIL 0**。消えたもの: (1) **本番の層順**（`mcp_auth` 最外 → compat → rmcp）が実機で裏づけられた — 誤トークン 401 / 非 loopback Host・Origin 403 / `?token=` 経路。`queen_compat_integration.rs` は `queen` が private module なので `mcp_auth` に構造的に到達できず、この 4 本は自動テストでは原理的に書けない。(2) RC の判定ロジック 10 本（版チェック・ヘッダ/body 一致・batch 拒否・`Mcp-Name` 一致・session id を混ぜない）。(3) 廃止予定 capability 7 本（値・日付とも pin どおり）。(4) **legacy ルートは完動** — `initialize` で session id 発行 → `notifications/initialized`（202）→ `tools/list` で **Queen の 22 tools 全部** → `tools/call`（`list_agents`）が実際に動く。**ただし RC ルートは実 rmcp 相手に実用にならないことが判明した（3 件、→ §1 の「5.5.0 の完成」行 / §6.26 / CONTRACT.md 続報25）**。3 件とも「middleware 単体では正しく、実 rmcp と組んだときだけ壊れる」種類で、偽 downstream の前で middleware を回す現在のテスト設計では**原理的に検出できない**。integration test 自身が冒頭で「production wiring は design pin の completion gate の手動 curl で見る」と書いており、**その手動 curl で書いてあったとおりの穴が出た**。**U10 は完了**（実測して記録するのが枠の目的であり、3 件の修正は別項目）|
 | U11 | `ptygrid init`（5.0.2）の実機検証 | **2026-07-30、macOS で実施**（すべてスクリーンショットで確認済み）。(1) 設定の無いフォルダで起動→シェル 1 枚→「設定を作る」ボタンが出て、検出結果（opencode/claude/codex/gemini/qwen/grok/aider の 7 体・npm・git あり・ローカル LLM ルータ未検出・既存設定なし）が実環境と一致することを確認、(2) 通常生成で `ptygrid.yml`（2,060 バイト）が生成され agents チップ 7 体が並び、生成物は autostart 全 false のため trust プロンプトは出ずペインも自動起動しないことを確認、(4) 既存設定ありの状態では副入口の書き込み先が `ptygrid.init.yml` に切り替わり、書き込み後も既存 `ptygrid.yml` は mtime・内容とも無変更であることを確認（上書き禁止の実測裏付け）、(5) 書き込み直後に init 自身の通知と watcher `config-changed` による再読み込みトーストが二重に出る競合を実測（spec §9 で推測としていた箇所が確認され、直後に自己書き込みエコー抑制（`ui.selfWrite` + 3 秒窓）を別コミットで修正済み）。(3) プレビューを手編集して `autostart: true` にしてから書き込むと**今度は trust プロンプトが出て**、「信頼して起動」で当該エージェントが実際に起動することを確認（`init_write` → `loadConfig` → `maybeAutostart` の順序の実証）。**U11 は完了**。Global 選択時の `~/.ptygrid/` 作成のみ今回の範囲外（必要になった時点で確認する）。詳細な経緯は §6.4 |
 | U12 | ローカル LLM プローブ（5.0.2 追補）の実機検証 | **2026-07-30、macOS で 1 回目を実施**（スクリーンショットで確認済み）。検出フォルダ `~/works/tmp/ptygrid`、PATH 上の CLI 7 体（opencode / claude / codex / gemini / qwen / grok / aider）、プロジェクト種別 npm、git リポジトリあり、既存設定ありのため書き込み先が `ptygrid.init.yml` に切り替わることを確認。プローブは 1234 / 3456 / 11434 を叩き、3456 は無応答、**11434 で `Ollama 0.32.1` が応答して「Anthropic API 確証あり」バッジが出てモデル 20 件を取得**（先頭は `x/flux2-klein:latest`）。**まだ確認していないことが 3 点**: (1) モデル選択 `<select>` の実機動作（実装は 2 つ目のコミット `8931464` で入ったが押していない）、(2) 生成された `local-11434` の定義で実際に Claude Code が起動するか、(3) LM Studio を上げたときに未確証の分岐（コメント行出力）へ落ちるか。**U12 は一部済**（この 3 点が残る）。詳細な経緯は §6.9 |
 | U13 | ターミナルのコピー & ペーストの実機検証 | **2026-07-31、macOS で 1 回目を実施**（下記はすべてスクリーンショットで確認済み）。(1) **ペインをまたいだコピー & ペースト**: 1 枚目のペインでファイル名を範囲選択 → Cmd+C → 2 枚目の zsh ペインで Cmd+V し、同じ文字列が入ることを確認。(2) **右クリックメニューの 2 状態**: 選択があるときは「コピー ⌘C」「貼り付け ⌘V」がどちらも有効、**選択が無いときはコピーが無効表示**になり、ツールチップに「選択範囲がありません — ドラッグで選択してください / TUI がマウスを使っている間は macOS なら Option ドラッグ、それ以外は Shift ＋ドラッグ」が出ることを確認。**まだ確認していないことが 4 点**: (1) TUI（Claude Code や vim）がマウスレポートを有効にしている状態での Option ドラッグ選択、(2) 複数行の貼り付けが bracketed paste 対応シェルで Enter を押すまで実行されないこと、(3) Linux / Windows の Ctrl+Shift+C / Ctrl+Shift+V（U7 / U8 の範囲）、(4) macOS のメニューバーに Edit メニューが実際に出ていること（貼り付けが動いた以上は出ている可能性が高いが、**目視の記録は無い**ので未確認扱い）。**U13 は一部済**（この 4 点が残る）。詳細な経緯は §6.10 |
@@ -269,7 +276,7 @@ step の retry 枯渇だけでなく **run 全体が `Failed` で終端したと
 
 | 順 | 内容 | 根拠 |
 |---|---|---|
-| 1 | **5.5.1 OTel 計装 + SQLite シンク** → **5.5.2 Cost 計算 + `agent-cost`** | 5.5.0 で RC ルータと `_meta.traceparent` の受け口だけ作って**エクスポート先が無い**（span を落としているだけ）。半端な状態を先に閉じる。バックエンド完結で UI 変更が要らず、P1/P2 と衝突しにくい |
+| 1 | **5.5.0 の完成（F-1 / F-2 / F-3）** → **5.5.1 OTel 計装 + SQLite シンク** → **5.5.2 Cost 計算 + `agent-cost`** | 5.5.0 で RC ルータと `_meta.traceparent` の受け口だけ作って**エクスポート先が無い**（span を落としているだけ）。半端な状態を先に閉じる。バックエンド完結で UI 変更が要らず、P1/P2 と衝突しにくい。**（2026-08-20 追記）順序を 1 段増やした** — U10 で「RC ルートは実 rmcp に到達できず、`_meta.traceparent` の echo は一度も発火しない」ことが実測で分かったため（→ §2 U10）。**受け口が空振りのまま OTel を載せると、載せたものが動かない**。F-3 は 5.5.1 の中で片付く話ではなく、その前提である |
 | 2 | **5.0.5 Arena view** | fan-out + `joinOn: any` の straggler キャンセルが Arena の前提。spec-phase5-0 §2.4 が要求する「敗者が自動 CANCELLED」は 5.0.4 で満たされているので、いま作れば既存基盤の上に乗る |
 | 3 | **Memory + Provider** | ptygrid 単体で完結せず、embedding backend（Ollama / LM Studio 等）と `sqlite-vec` の配布方式が未決（spec-phase5-0 §10）。外部依存が最も重い。5.0.6 以降に付け直す（§1 の脚注※） |
 | 4 | **5.5.3 Agent Status Rings / 5.5.4 Trace Waterfall + Cost Dashboard** | どちらも frontend 中心で、5.5.1/5.5.2 のデータが無いと表示するものが無い。順序として後ろ |
@@ -286,6 +293,20 @@ step の retry 枯渇だけでなく **run 全体が `Failed` で終端したと
 
 いずれも「優先度は P1〜P7 より下だが忘れると困る」もの。完了・失効した項目はここから削除し、
 実績は §1 の表と §4 のタグ表に残す。
+
+- **ordinary step の mailbox は agent 定義名のままで、並行 run で共有される**
+  （2026-08-20、並行 run の調査中に確認 → §6.26）。`kickoff_recipient` が run スコープの
+  mailbox（`wf/<run_id>/<step_id>`）を配るのは `onEach` のコピーだけで、それ以外の step は
+  agent 定義名をそのまま使う。**同名 workflow を 2 本並行に流すと、2 つのペインが同じ
+  mailbox を await する**。返信の相関はスレッド root id なので run は両方とも完走するが、
+  **どのペインがどの kickoff を取るかは早い者勝ち**で、step の所要時間は他人の仕事を
+  測ることになる。5.0.7 が `onEach` について直したのと**同じ race の一段上**であり、
+  5.0.7 のコメント自身が「二つの並行 run が一つを共有すると同じ race が再発する」と
+  書いている。**直していない理由**: `example/cross-model-review` /
+  `example/measure-coldstart` / `example/review-starter` が `mailbox=implementer` のように
+  **agent 名を直書き**しているので、全 step を run スコープにすると同梱サンプルが動かなく
+  なる。移行方針（`$PTYGRID_MAILBOX` へ寄せる書き換え + guide の更新）とセットでないと
+  入れられない。実機の観測は U4 で行う。
 
 - **返信せずに終わった run の kickoff は誰も ack しない（A-5 の入口が 2 つしかない）**
   （2026-08-13、Stage A の最終レビューで確認 → §6.15 / CONTRACT.md 続報15 の既知の限界）。
@@ -2065,6 +2086,66 @@ CONTRACT.md **続報22**。ブランチは `fix/retire-kickoffs-on-terminal`。
   version ファイル 4 つを揃えたコミットにタグを打つのは `v0.5.8` に続いて **2 回目**で、
   今回はその揃え自体がスクリプト経由になった。`docs/guide/userguide.en.md` は**未追随のまま**である
   （→ §6.24 追記の「やっていないこと」）。
+
+### 6.26 2026-08-20: U10 の消化と、並行 run 間のペイン横取りの修正
+
+v0.5.9 が「実機検証ゼロが 2 タグ続いた」（→ §6.25）状態で終わったため、
+`next-release-v0.5.9.md` §3.5 の順序に戻り、**別枠で先に消せる U10 から**着手した回。
+併せて、同 §4 が「コード経路としては確認したが実機再現は未実施」と書いていた
+並行 run のペイン横取りを、実機セッションの前に塞いだ。
+
+- **並行 run 間のペイン横取り（`ccbdf9b`、ブランチ `fix/cross-run-pane-adoption`）。**
+  `agent_claimed_by_other_step` は `&run.steps` を渡されるので**自分の run しか見えない**のに、
+  同名ペインの探索は `PtyManager` 全体を舐める。したがって同名 workflow の 2 本目の run は、
+  singular な step で **1 本目の run のペインを adopt** していた。2 つの run の 2 つの outcome が
+  1 つの `session_id` を持つので、**そのペインが 1 回 exit すると両方の run の step が同時に完了**
+  する（route 1 は `session_id` で完了判定する）。さらに `slots_needed` がそれを 0 スロットと
+  数えるので **9 面上限も抜ける**。
+  直し方は `WorkflowRegistry::panes_claimed_by_other_runs`（他の**生きている** run が握っている
+  `session_id` の集合）を adopt 候補から外すこと。**終端した run のペインは claim しない** —
+  `autoClose` を書かない run が残したペインを再利用するのは 5.0.0 以来の冪等な reuse であって
+  衝突ではない。フィルタは `find` の**中**で効かせる（同名ペインが 2 枚あって片方だけ claim
+  されている場合、空いているほうはまだ adopt 可能で、`find` の答えを後から弾くと取り逃す）。
+  ついでに「再利用するか、どのペインか」の判定を `adoptable_session` 1 か所に集約し、
+  `slots_needed` と `spawn_step` が手で足並みを揃える必要をなくした（`spawn_step` は
+  `bool` ではなく `Option<u32>` を受け取る）。**wire 契約は無変更**。
+- **再現テスト**。`a_second_run_does_not_adopt_a_live_runs_pane` は `spawn_workflow` を
+  2 回呼んで **`session_id` が異なること**と**ペインが 2 枚立つこと**を見る。枚数だけでは
+  「2 本目が spawn に失敗した」場合も通ってしまうので、id の比較を主にしてある。
+  **フィルタを無効化するとこのテストだけが落ちる**ことを確認済み（＝空振りしない）。
+  併せて `panes_claimed_by_other_runs_ignores_terminal_runs_and_this_run` で、終端 run を
+  claim しないこと・`Succeeded` の step は何も握らないこと・**backoff 中の retry は握っている**
+  こと（`holds_a_pane`）・自分自身の run を問い合わせても自分のペインは claim されないことを固定した。
+- **検証値（Linux コンテナ、実測）**。`cargo test` は lib **567 passed**（既存 565 + 新規 2）
+  + 統合 **14 passed** / 0 failed。`cargo clippy --all-targets` は既存の `config.rs` の
+  `nonminimal_bool` **1 件のみ**で新規警告ゼロ。**macOS 実機ビルドは未実施**
+  （macOS 限定コードはコンテナではコンパイルもされない）。
+- **U10 の消化（→ §2 U10、CONTRACT.md 続報25）。** GUI を使わない probe を書いて `/mcp` に
+  当てた。**PASS 29 / FAIL 0**。legacy ルートは完動（22 tools・`tools/call` まで）。
+  一方で **RC ルートは実 rmcp 相手に実用にならない**ことが 3 件の形で確定した:
+  (F-1) RC の `initialize` は middleware が短絡して rmcp に渡さない設計なので rmcp の session が
+  永久に未初期化で、RC の passthrough は **422 `Unexpected message, expect initialize request`**。
+  ただし **legacy で取った `Mcp-Session-Id` を RC 要求に添えると 200 で通る**（ヘッダは
+  `parts` ごと素通ししているため）＝ 置き換える側が置き換えられる側に依存している。しかも
+  middleware は RC **応答**から session id を剥がすので、RC クライアントは持ち回るべき id を
+  教えてもらえない。
+  (F-2) `header::validate` が `tools/*` すべてに `Mcp-Name` を要求し `params.name` と比べるので、
+  `params.name` を持たない `tools/list` は**常に 400**。MCP クライアントは初手で `tools/list` を
+  呼ぶので、RC からは道具を 1 つも発見できない。`Mcp-Name` が要るのは実際には `tools/call` だけ。
+  (F-3) rmcp の streamable-http は `Accept` に `application/json` と `text/event-stream` の
+  **両方**を要求し（片方だけだと 406）、常に SSE で返す。`echo_traceparent_if_json` は
+  `application/json` 以外では no-op なので、**`_meta.traceparent` の echo は実運用で一度も
+  発火しない**。5.5.1 の OTel はこの受け口の上に載る予定だった（→ §3 P6 の順序を 1 段増やした）。
+- **3 件が自動テストで見えなかった理由**。`queen_compat_integration.rs` は偽の downstream の
+  前で middleware を回す設計で、その偽 downstream は **`application/json` で返す**。
+  実 rmcp が SSE でしか返さないという 1 点が抜けていた。F-1 も同様で、偽 downstream は
+  session の有無を見ないので常に 200 を返す。**同ファイルの冒頭は「production wiring は
+  design pin の completion gate の手動 curl で見る」と自分で書いており、そのとおりになった。**
+- **やっていないこと**。3 件の修正は**この回では入れていない**（→ §1 の「5.5.0 の完成」行）。
+  F-1 は「RC の `initialize` を rmcp に通すか、RC 応答に session id を返すか」という設計判断を
+  含み、v0.5.10 のスコープ（pane-context + 上記のペイン修正）とは別枠にする判断をした。
+  バンドル1（U4 / U16 / U17）・バンドル2（U18 / U19）も未実施で、検証キットは
+  `_OUTPUTS/{u10-verify,bundle1-verify,bundle2-verify}` に用意してある。
 
 ---
 
