@@ -405,6 +405,41 @@ impl WorkflowRegistry {
             .unwrap_or_default()
     }
 
+    /// Session ids currently held by steps of every live run OTHER than
+    /// `run_id` — the panes a step of `run_id` must NOT adopt.
+    ///
+    /// This is the cross-run half of the rule `agent_claimed_by_other_step`
+    /// enforces within a single run. That function is handed `&run.steps`, so
+    /// it is structurally blind to other runs, while `adoptable_session_id`
+    /// searches the whole `PtyManager`: without this set, two concurrent runs
+    /// of one workflow collapse onto one pane (see `adoptable_session_id`).
+    ///
+    /// Terminal runs are skipped: their panes may linger (no `autoClose`) and
+    /// adopting one is the ordinary idempotent reuse, not a collision. Only
+    /// the id `u32`s are copied — no run is cloned, and the lock is released
+    /// before the caller spawns anything.
+    pub fn panes_claimed_by_other_runs(&self, run_id: &str) -> Vec<u32> {
+        self.inner
+            .lock()
+            .map(|g| {
+                g.values()
+                    .filter(|run| {
+                        run.run_id != run_id
+                            && !matches!(
+                                run.state,
+                                WorkflowState::Succeeded
+                                    | WorkflowState::Failed
+                                    | WorkflowState::Cancelled
+                            )
+                    })
+                    .flat_map(|run| run.steps.iter())
+                    .filter(|o| holds_a_pane(o))
+                    .filter_map(|o| o.session_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Replace or insert a run. Callers must have prepared the full snapshot
     /// they want to publish; the registry does not merge fields. Also runs
     /// `evict_terminal` under the same lock, trimming old terminal runs
@@ -445,18 +480,62 @@ fn new_run_id() -> WorkflowRunId {
     format!("wfr_{:016x}{:08x}", ts, ctr)
 }
 
-/// The live session id for a definition name, if one exists (any state
-/// except Exited). Same helper as `team_presets::live_session_id`; kept
-/// duplicated to avoid a fragile cross-module coupling at MVO scope.
+/// The live session id for a definition name that the caller may adopt, if
+/// one exists (any state except Exited) and it is not already spoken for.
+/// Same helper as `team_presets::live_session_id`; kept duplicated to avoid a
+/// fragile cross-module coupling at MVO scope.
 /// Uses `session_states()` rather than `list_sessions()`: this only needs
 /// id/name/state, not the foreground-process `ps` lookup or the other
 /// per-slot clones `list_sessions` pays for.
-fn live_session_id(manager: &PtyManager, name: &str) -> Option<u32> {
+///
+/// `claimed` is `WorkflowRegistry::panes_claimed_by_other_runs` — the panes
+/// held by steps of OTHER live runs. Without it this function answers "is
+/// there a pane called `x`", which is the wrong question the moment two runs
+/// exist: `agent_claimed_by_other_step` only sees one run's outcomes, so a
+/// second concurrent run of the same workflow would adopt the first run's
+/// pane, both outcomes would track one `session_id`, and that pane's single
+/// exit would complete a step in each run (route 1 keys completion on the
+/// session id). `slots_needed` would return 0 for the adopting step as well,
+/// walking the run past the 9-pane cap. Filtering inside the `find` rather
+/// than after it matters: with two same-named panes alive, one claimed and
+/// one free, the free one is still adoptable and a post-hoc check on
+/// `find`'s answer would miss it.
+///
+/// A pane belonging to a TERMINAL run is deliberately not claimed — that is
+/// the ordinary idempotent reuse (`team_presets`-style) this has always done,
+/// and so is a pane nobody opened through a workflow at all.
+fn adoptable_session_id(manager: &PtyManager, name: &str, claimed: &[u32]) -> Option<u32> {
     manager
         .session_states()
         .into_iter()
-        .find(|s| s.state != SessionState::Exited && s.name.as_deref() == Some(name))
+        .find(|s| {
+            s.state != SessionState::Exited
+                && s.name.as_deref() == Some(name)
+                && !claimed.contains(&s.id)
+        })
         .map(|s| s.id)
+}
+
+/// The one answer to "will this step adopt a pane, and which one" — shared by
+/// `slots_needed` (which must charge 0 slots exactly when a step adopts) and
+/// `spawn_step` (which does the adopting). These were two conditions that had
+/// to be kept in step by hand; making the decision once removes the class of
+/// bug where they disagree.
+fn adoptable_session(
+    manager: &PtyManager,
+    step: &WorkflowStep,
+    copies: usize,
+    reuse_existing: bool,
+    claimed: &[u32],
+) -> Option<u32> {
+    // Idempotent reuse is only valid for singular steps (pipeline). A fan-out
+    // copy must ALWAYS get a fresh pane — the whole point of `fanOut: 3` is 3
+    // parallel sessions of the same definition, so the team_presets-style
+    // "live same-name session -> skip" rule would collapse the fan to 1.
+    if !reuse_existing || copies != 1 {
+        return None;
+    }
+    adoptable_session_id(manager, &step.agent, claimed)
 }
 
 /// Steps whose `dependsOn` list is empty — the DAG's roots. These are the
@@ -485,20 +564,15 @@ fn spawn_step<R: Runtime>(
     config: &ConfigManager,
     step: &WorkflowStep,
     recipient: &str,
-    reuse_existing: bool,
+    reusable: Option<u32>,
     cols: u16,
     rows: u16,
 ) -> StepOutcome {
     let agent = step.agent.clone();
-    // Idempotent reuse is only valid for singular steps (pipeline). A fan-out
-    // copy must ALWAYS get a fresh pane — the whole point of `fanOut: 3` is 3
-    // parallel sessions of the same definition, so the team_presets-style
-    // "live same-name session -> skip" rule would collapse the fan to 1.
-    let reusable = if reuse_existing {
-        live_session_id(manager, &agent)
-    } else {
-        None
-    };
+    // `reusable` is `adoptable_session`'s answer, taken by the caller because
+    // the caller had to take it anyway to budget panes (`slots_needed`).
+    // Re-deriving it here would reintroduce the two-conditions-kept-in-step
+    // problem that helper exists to remove.
     if let Some(existing) = reusable {
         // Same idempotent skip as team_presets — a workflow re-launching a
         // step whose session already exists reuses the existing pane rather
@@ -615,16 +689,18 @@ fn pane_budget(manager: &PtyManager) -> usize {
 /// Slots a step costs against the budget. A singular step that will adopt an
 /// existing live pane costs nothing — that pane is already counted in the
 /// occupancy `pane_budget` subtracted — while everything else costs one slot
-/// per copy. Must mirror `spawn_step`'s own reuse decision exactly: claiming
-/// 0 for a step that then spawns fresh overshoots the cap, and claiming
-/// `copies` for one that reuses defers a step that would have fit.
+/// per copy. Mirrors `spawn_step`'s own reuse decision by construction (both
+/// go through `adoptable_session`): claiming 0 for a step that then spawns
+/// fresh overshoots the cap, and claiming `copies` for one that reuses defers
+/// a step that would have fit.
 fn slots_needed(
     manager: &PtyManager,
     step: &WorkflowStep,
     copies: usize,
     reuse_existing: bool,
+    claimed: &[u32],
 ) -> usize {
-    if reuse_existing && copies == 1 && live_session_id(manager, &step.agent).is_some() {
+    if adoptable_session(manager, step, copies, reuse_existing, claimed).is_some() {
         0
     } else {
         copies
@@ -1140,6 +1216,12 @@ pub fn spawn_workflow<R: Runtime>(
     // One grid snapshot for the whole loop, decremented as roots commit —
     // see `pane_budget`.
     let mut budget = pane_budget(manager);
+    // …and one registry snapshot, for the same reason: the panes other live
+    // runs are holding, which no root of THIS run may adopt. `run_id` was
+    // minted above and is not in the registry yet, so this is simply "every
+    // live run" — passed by name anyway so the call reads the same here as it
+    // does in `advance_run`, where the exclusion is load-bearing.
+    let claimed = registry.panes_claimed_by_other_runs(&run_id);
     for step in root_steps(&wf) {
         let copies = copies_for(wf.pattern, step);
         // copies == 1 -> singular step: keep the idempotent pane reuse,
@@ -1152,7 +1234,8 @@ pub fn spawn_workflow<R: Runtime>(
         // below needs it, and it is loop-invariant — `copies == 1` means the
         // loop body runs exactly once anyway.
         let reuse_existing = copies == 1 && !agent_claimed_by_other_step(&outcomes, step);
-        let needed = slots_needed(manager, step, copies, reuse_existing);
+        let reusable = adoptable_session(manager, step, copies, reuse_existing, &claimed);
+        let needed = slots_needed(manager, step, copies, reuse_existing, &claimed);
         if needed > budget {
             // Grid full: leave the root exactly where a non-root step starts,
             // as ONE bare-id `Pending` placeholder even for a fan-out (the
@@ -1201,7 +1284,7 @@ pub fn spawn_workflow<R: Runtime>(
                 config,
                 step,
                 &recipient,
-                reuse_existing,
+                reusable,
                 cols,
                 rows,
             );
@@ -3589,6 +3672,7 @@ fn spawn_ready<R: Runtime>(
     now: u64,
     cols: u16,
     rows: u16,
+    claimed: &[u32],
 ) -> bool {
     let ready: Vec<WorkflowStep> = ready_steps(wf, run).into_iter().cloned().collect();
     // Snapshot the carried `handoff_to` bodies BEFORE the spawn loop mutates
@@ -3650,7 +3734,7 @@ fn spawn_ready<R: Runtime>(
                 let banked = run.steps[index].waited_for_pane_ms;
                 let recipient = kickoff_recipient(step, &copy_id, run_id);
                 let mut outcome =
-                    spawn_step(app, manager, config, step, &recipient, false, cols, rows);
+                    spawn_step(app, manager, config, step, &recipient, None, cols, rows);
                 outcome.step_id = copy_id;
                 outcome.waited_for_pane_ms = banked;
                 outcome.stream_body = carried.clone();
@@ -3677,7 +3761,8 @@ fn spawn_ready<R: Runtime>(
         // Computed BEFORE the `retain` below, which is safe because
         // `agent_claimed_by_other_step` ignores this step's own outcomes.
         let reuse_existing = copies == 1 && !agent_claimed_by_other_step(&run.steps, step);
-        let needed = slots_needed(manager, step, copies, reuse_existing);
+        let reusable = adoptable_session(manager, step, copies, reuse_existing, claimed);
+        let needed = slots_needed(manager, step, copies, reuse_existing, claimed);
         if needed > budget {
             changed = defer_step(run, step, now, budget) || changed;
             continue;
@@ -3723,7 +3808,7 @@ fn spawn_ready<R: Runtime>(
                 config,
                 step,
                 &recipient,
-                reuse_existing,
+                reusable,
                 cols,
                 rows,
             );
@@ -3864,7 +3949,7 @@ fn respawn_fresh<R: Runtime>(
     // identity across retries, so the fresh pane awaits where its redelivered
     // unit is actually sent (5.0.7).
     let recipient = kickoff_recipient(step, step_id, run_id);
-    let mut fresh = spawn_step(app, manager, config, step, &recipient, false, cols, rows);
+    let mut fresh = spawn_step(app, manager, config, step, &recipient, None, cols, rows);
     fresh.step_id = step_id.to_string();
     fresh.attempts = prev_attempts + 1;
     fresh.waited_for_pane_ms = prev_waited_for_pane_ms;
@@ -4584,6 +4669,14 @@ fn advance_run<R: Runtime>(
     // (rightly) refuses `&run.cols` and `&mut run` in one call.
     // (`workflow_name` is already hoisted above, for the retry pass.)
     let (cols, rows) = (run.cols, run.rows);
+    // Panes the OTHER live runs are holding. Taken here, once per tick, for
+    // the same reason `pane_budget` is: one lock rather than one per step,
+    // and a stable view so a fan-out cannot be split across two of them. The
+    // exclusion of `run_id` is what keeps this run's own steps answerable by
+    // `agent_claimed_by_other_step` alone (which knows about retry backoff
+    // windows and sibling copies; this set deliberately does not duplicate
+    // that logic).
+    let claimed = registry.panes_claimed_by_other_runs(&run_id);
     let spawned = spawn_ready(
         app,
         manager,
@@ -4597,6 +4690,7 @@ fn advance_run<R: Runtime>(
         now,
         cols,
         rows,
+        &claimed,
     );
     changed = changed || spawned;
 
@@ -6300,6 +6394,109 @@ workflows:
             StepState::Running
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two concurrent runs of one workflow must not end up on one pane.
+    ///
+    /// `agent_claimed_by_other_step` is handed `&run.steps`, so it can only
+    /// see the run it is called for, while `adoptable_session_id` searches the
+    /// whole `PtyManager`. Before the `panes_claimed_by_other_runs` filter, a
+    /// second run's singular root therefore adopted the first run's live pane:
+    /// two outcomes in two runs holding one `session_id`, so that pane's
+    /// single exit completed a step in each (route 1 keys on the session id),
+    /// and `slots_needed` charged the adopting step 0 slots on top.
+    ///
+    /// The assertion is on the ids rather than the pane count because the
+    /// count alone would also pass if the second run had failed to spawn at
+    /// all — the bug and one of its plausible mis-fixes look identical there.
+    #[test]
+    fn a_second_run_does_not_adopt_a_live_runs_pane() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let (config, store, dir) = harness(PIPELINE_YAML);
+        let registry = WorkflowRegistry::new();
+
+        let first = spawn_workflow(&handle, &manager, &config, &store, &registry, "demo", 80, 24)
+            .expect("first run spawns");
+        let second = spawn_workflow(&handle, &manager, &config, &store, &registry, "demo", 80, 24)
+            .expect("a second concurrent run of the same workflow is legal");
+
+        let first_pane = first.steps[0].session_id.expect("run 1 root has a pane");
+        let second_pane = second.steps[0].session_id.expect("run 2 root has a pane");
+        assert_ne!(
+            first_pane, second_pane,
+            "the second run adopted the first run's pane: one exit would then \
+             complete a step in both runs, and both panes would await the same \
+             mailbox"
+        );
+        assert_ne!(first.run_id, second.run_id);
+        assert_eq!(
+            manager.occupied_pane_count(),
+            2,
+            "two runs, two panes — `slots_needed` must charge the second one a \
+             slot rather than the 0 an adoption costs"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same rule, from the other side: once a run is terminal its pane is
+    /// ordinary again. A pane left behind by a finished run (no `autoClose`)
+    /// is exactly what the idempotent same-name reuse was always for, and
+    /// claiming it forever would make every later run of the workflow open a
+    /// second pane beside a perfectly good one.
+    #[test]
+    fn panes_claimed_by_other_runs_ignores_terminal_runs_and_this_run() {
+        let registry = WorkflowRegistry::new();
+
+        let mut live = mk_run("demo", vec![mk_outcome("a", Some(11), StepState::Running)]);
+        live.run_id = "wfr_live".to_string();
+        registry.put(live);
+
+        let mut done = mk_run("demo", vec![mk_outcome("a", Some(12), StepState::Running)]);
+        done.run_id = "wfr_done".to_string();
+        done.state = WorkflowState::Succeeded;
+        registry.put(done);
+
+        // A backing-off retry still owns its pane (see `holds_a_pane`), a
+        // Pending row never had one, and a Succeeded step has let go.
+        let mut mixed = mk_run(
+            "demo",
+            vec![
+                mk_outcome("p", None, StepState::Pending),
+                mk_outcome("s", Some(13), StepState::Succeeded),
+                {
+                    let mut o = mk_outcome("r", Some(14), StepState::Failed);
+                    o.next_retry_at_ms = Some(999);
+                    o
+                },
+            ],
+        );
+        mixed.run_id = "wfr_mixed".to_string();
+        registry.put(mixed);
+
+        let claimed = registry.panes_claimed_by_other_runs("wfr_asking");
+        assert!(claimed.contains(&11), "a live run's Running pane is claimed");
+        assert!(
+            !claimed.contains(&12),
+            "a terminal run's leftover pane is adoptable again — that is the \
+             pre-existing idempotent reuse, not a collision"
+        );
+        assert!(!claimed.contains(&13), "a Succeeded step holds nothing");
+        assert!(
+            claimed.contains(&14),
+            "an armed retry still owns its pane: `fire_due_retries` will \
+             respawn into it"
+        );
+
+        // Asking about yourself never claims your own panes — inside one run
+        // that is `agent_claimed_by_other_step`'s job, and duplicating it here
+        // would block a step from the pane it is entitled to reuse.
+        assert!(registry
+            .panes_claimed_by_other_runs("wfr_live")
+            .iter()
+            .all(|id| *id != 11));
     }
 
     // ------------------------------------------------------------------
@@ -9468,7 +9665,7 @@ workflows:
         // 5.0.5: capacity is the scheduler's business. `spawn_step` itself is
         // now unconditional — it spawns even past the cap, which is exactly
         // why every call site has to budget first.
-        let outcome = spawn_step(&handle, &manager, &config, first, &first.agent, false, 80, 24);
+        let outcome = spawn_step(&handle, &manager, &config, first, &first.agent, None, 80, 24);
         assert_eq!(
             outcome.state,
             StepState::Running,
@@ -9500,7 +9697,7 @@ workflows:
             ],
         );
         let changed = spawn_ready(
-            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24, &[],
         );
 
         assert!(changed, "the FIRST deferral is worth emitting: it is new information");
@@ -9518,7 +9715,7 @@ workflows:
         // A second identical tick re-observes the same wait: no emit, no persist.
         let changed_again = spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run,
-            now + 200, 80, 24,
+            now + 200, 80, 24, &[],
         );
         assert!(
             !changed_again,
@@ -9554,7 +9751,7 @@ workflows:
             ],
         );
         spawn_ready(
-            &handle, &manager, &config, &store, &dir, "gate", TEST_RUN_ID, &wf, &mut run, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "gate", TEST_RUN_ID, &wf, &mut run, now, 80, 24, &[],
         );
 
         assert_eq!(
@@ -9593,7 +9790,7 @@ workflows:
             ],
         );
         spawn_ready(
-            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24, &[],
         );
         assert_eq!(
             run.steps.iter().find(|o| o.step_id == "second").unwrap().state,
@@ -9604,7 +9801,7 @@ workflows:
 
         let changed = spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run,
-            now + 400, 80, 24,
+            now + 400, 80, 24, &[],
         );
         assert!(changed);
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
@@ -9910,7 +10107,7 @@ workflows:
         run.steps[1].attempts = 0;
 
         let changed = spawn_ready(
-            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24, &[],
         );
 
         assert!(changed);
@@ -9939,7 +10136,7 @@ workflows:
         );
         still_waiting.steps[1].deferred_since_ms = Some(now - WORKFLOW_DEFER_MAX_MS);
         spawn_ready(
-            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut still_waiting, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut still_waiting, now, 80, 24, &[],
         );
         assert_eq!(still_waiting.steps[1].state, StepState::Pending);
 
@@ -9984,7 +10181,7 @@ workflows:
             ],
         );
         spawn_ready(
-            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24,
+            &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80, 24, &[],
         );
 
         let expected = format!(
@@ -10088,7 +10285,7 @@ workflows:
         );
         let changed = spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now, 80,
-            24,
+            24, &[],
         );
 
         assert!(changed, "the first deferral is new information");
@@ -10139,7 +10336,7 @@ workflows:
             &mut run,
             now + 1_000,
             80,
-            24,
+            24, &[],
         );
         assert!(changed, "the freed cell is a real state change");
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
@@ -10355,7 +10552,7 @@ workflows:
 
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now,
-            80, 24,
+            80, 24, &[],
         );
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
         assert_eq!(second.deferred_since_ms, Some(now));
@@ -10371,7 +10568,7 @@ workflows:
         free_one_slot(&manager, fillers[0]);
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run,
-            now + 5_000, 80, 24,
+            now + 5_000, 80, 24, &[],
         );
 
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
@@ -10491,7 +10688,7 @@ workflows:
         run.steps[1].attempts = 0;
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "chain", TEST_RUN_ID, &wf, &mut run, now,
-            80, 24,
+            80, 24, &[],
         );
         let second = run.steps.iter().find(|o| o.step_id == "second").unwrap();
         assert_eq!(second.state, StepState::Failed);
@@ -11146,7 +11343,7 @@ workflows:
         let before = manager.occupied_pane_count();
         assert!(spawn_ready(
             &handle, &manager, &config, &store, &dir, "stream", TEST_RUN_ID, &wf, &mut run,
-            TEST_NOW, 80, 24,
+            TEST_NOW, 80, 24, &[],
         ));
         assert_eq!(
             manager.occupied_pane_count() - before,
@@ -11226,7 +11423,7 @@ workflows:
         occupy_grid(&handle, &manager, WORKFLOW_SESSION_CAP);
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "stream", TEST_RUN_ID, &wf, &mut run,
-            TEST_NOW, 80, 24,
+            TEST_NOW, 80, 24, &[],
         );
         let queued = run
             .steps
@@ -11247,7 +11444,7 @@ workflows:
         }
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "stream", TEST_RUN_ID, &wf, &mut run,
-            TEST_NOW, 80, 24,
+            TEST_NOW, 80, 24, &[],
         );
         let queued = run
             .steps
@@ -11331,7 +11528,7 @@ workflows:
         pump_stream(&store, &dir, &view, &wf, &mut run);
         spawn_ready(
             &handle, &manager, &config, &store, &dir, "stream", TEST_RUN_ID, &wf, &mut run,
-            TEST_NOW, 80, 24,
+            TEST_NOW, 80, 24, &[],
         );
         let mailbox = format!("wf/{TEST_RUN_ID}/reviewer#0");
         let first_delivery = store
