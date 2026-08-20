@@ -3347,6 +3347,43 @@ team_presets:
 > 4 は 5.6.0 のものである。**wire 契約・コードともに変更なし**（決定の記録のみ）。
 > 詳細な経緯と根拠は `docs/design/next-release-v0.5.9.md` §1.1 を参照。
 
+> 追記（2026-08-20、続報24）: **並行 run 間でペインが横取りされうる穴を塞いだ。**
+> `next-release-v0.5.9.md` §4 が「コード経路としては確認したが実機再現は未実施」と書いていた
+> ものの実体。実装記録は [plan.md](docs/design/plan.md) §6.26。**wire 契約は 1 バイトも
+> 変わらない**: `StepOutcome` / `WorkflowRun` / `workflow-state` / `ptygrid.yml` スキーマ /
+> Queen MCP tools / Tauri command はすべて不変で、frontend も無変更。
+>
+> **何が起きていたか。** `agent_claimed_by_other_step` は呼び出し側から `&run.steps` を渡される
+> ので**その run の outcomes しか見えない**。一方で同名ペインの探索（旧 `live_session_id`）は
+> `PtyManager` 全体を名前一致で舐める。したがって同名 workflow の run A と run B が同時に走り、
+> ある step が singular（`copies == 1`）のとき、**run B の step が run A のペインを adopt して
+> 同じ `session_id` を持つ**。完了判定は route 1 が `session_id` キーなので、**そのペインが
+> 1 回 exit すると両方の run の step が同時に完了する**。加えて `slots_needed` は adopt を
+> 0 スロットと数えるので、**9 面上限（`WORKFLOW_SESSION_CAP`）も抜ける**。
+>
+> **契約として固定すること。** ある step が adopt してよいのは、(a) `reuse_existing` かつ
+> `copies == 1` で、(b) 生きている（`state != Exited`）同名ペインのうち、(c) **他の
+> 非終端 run のどの step にも握られていない**ものである。(c) の集合は
+> `WorkflowRegistry::panes_claimed_by_other_runs(run_id)` が返す — 自分の run は除外され
+> （run 内の衝突は従来どおり `agent_claimed_by_other_step` の担当で、あちらは retry backoff 中の
+> 保持や兄弟コピーまで見ている）、**終端した run のペインは claim しない**（`autoClose` を
+> 書かない run が残したペインの再利用は 5.0.0 以来の冪等な挙動であって衝突ではない）。
+> 判定は `find` の**内側**で効かせる: 同名ペインが 2 枚あって片方だけ claim されている場合、
+> 空いているほうはまだ adopt 可能であり、`find` の答えを後から弾くと取り逃す。
+>
+> **`slots_needed` と `spawn_step` は同じ答えを使う。** 従来この 2 つは同値の条件を別々に
+> 書いており、手で足並みを揃える前提だった（旧コメントも「Must mirror `spawn_step`'s own
+> reuse decision exactly」と書いていた）。判定を `adoptable_session` 1 か所に集約し、
+> `spawn_step` は `bool` ではなく**その答え（`Option<u32>`）を受け取る**形にしたので、
+> 両者が食い違う余地が構造的に消えた。
+>
+> **裏づけ。** unit test 2 本（`a_second_run_does_not_adopt_a_live_runs_pane` /
+> `panes_claimed_by_other_runs_ignores_terminal_runs_and_this_run`）。前者はフィルタを
+> 無効化すると落ちることを確認済み。**実機検証は未実施**（→ plan.md §2 の U4。同じ回で
+> 「ordinary step の mailbox が並行 run で共有される」ことも観測する）。
+> Linux コンテナで lib **567 passed** + 統合 **14 passed** / 0 failed、clippy は既存の
+> `config.rs` 1 件のみ。**macOS 実機ビルドは未実施。**
+
 ## 5.0.1 ptygrid.yml スキーマ追加（予約）
 
 - `workflows:` ブロック — pipeline / fan-out / supervisor / handoff の 4 パターン、`steps[].agent` は既存 `agents:` allowlist 参照のみ。
@@ -3750,6 +3787,57 @@ wire 上の引数は `{ dir?: string, target?: InitTarget, llm?: LocalLlmEndpoin
   値は実カレンダーで検証済み（2026-07-28 = 火曜、2027-07-28 = 水曜）。[docs/spec/spec-phase5-5.md](docs/spec/spec-phase5-5.md) §3.6 の例示は曜日表記に誤りがあり（`Deprecation` 行が `Sat, 28 Jul 2027` 表記）、本節の値がその補正版（実装コメント `queen_compat/deprecation.rs` 参照）。ログは `deprecated_route` 警告を per-day dedupe で最大1行/日。
 - **RC top-level array**（batch）は 400 `batch_not_supported`（5.5.0 は single-request only）。
 - 応答 body の buffer 上限は 16 MiB（`echo_into_result` 埋込用。超過時は空応答— 壊れた応答よりは無応答が安全という判断）。`Content-Type: text/event-stream` は buffer せず passthrough。
+
+> 追記（2026-08-20、続報25）: **U10（5.5.0 の実機検証）を消化した。上の実装状況節は
+> middleware の挙動としては正しいが、実 rmcp と組んだときの姿を書いていない — RC ルートは
+> 実運用では使えない。** 実測は `_OUTPUTS/u10-verify/`（probe 30 本 + 追加 8 本、
+> PASS 29 / FAIL 0）、経緯は [plan.md](docs/design/plan.md) §6.26 / §2 U10。
+> **コードは 1 行も変えていない（実測の記録）。**
+>
+> **裏づけられたもの。** 本番の層順（`mcp_auth` 最外 → compat → rmcp）が実機で確認できた
+> — 誤トークン 401 / 非 loopback Host・Origin 403 / `?token=` 経路。RC の判定ロジック
+> （版チェック・ヘッダ/body 一致・batch 拒否・`Mcp-Name` 一致・RC 応答に `Mcp-Session-Id` を
+> 混ぜないこと）と、廃止予定 capability の 3 分岐 + Deprecation trio（値・日付とも本節どおり）。
+> **legacy 経路は完動** — `initialize` で session id 発行 → `notifications/initialized`（202）→
+> `tools/list` で **22 tools 全部** → `tools/call`（`list_agents`）が実際に動く。
+>
+> **(F-1) RC ルートは自分だけでは起動できない。** 本節の「`initialize`: RC 経路は 200 no-op
+> （rmcp 到達なし）」は、**rmcp の `LocalSessionManager` に session が一生できない**ことを
+> 意味する。その結果、RC で rmcp に到達する要求は **422 `Unexpected message, expect initialize
+> request`** になる。一方、**legacy で `initialize` して得た `Mcp-Session-Id` を RC 要求に
+> 添えると 200 で通る**（本節「`Mcp-Session-Id`: 受理はする（forward）」のとおりヘッダは
+> `parts` ごと rmcp に渡るため）。つまり **RC が使えるのは廃止予定の legacy 経路で先に
+> 初期化した場合だけ**で、「RC は stateless」という前提は実装では成立していない。しかも
+> 応答側では RC から session id を strip するので、**RC クライアントは持ち回るべき id を
+> 教えてもらえない**。純 RC クライアントは `initialize` が 200 で返るため成功したと思い込み、
+> 次の要求で 422 を食う。
+>
+> **(F-2) RC クライアントは tool 一覧を取れない。** 本節「`tools/*` 呼び出しは `Mcp-Name` も
+> body `params.name` と一致必須」は `tools/` で始まる**すべての** method に適用される。
+> `tools/list` は `params.name` を持たないので、何を送っても `ToolNameMismatch` →
+> **400 `header_body_mismatch`**。session id を添えても同じ（判定は rmcp より手前）。
+> MCP クライアントは初手で `tools/list` を呼ぶので、RC からは道具を 1 つも発見できない。
+> `Mcp-Name` が実際に要るのは `tools/call` だけである。
+>
+> **(F-3) `_meta.traceparent` の echo は実運用で一度も発火しない。** rmcp の streamable-http は
+> `Accept` に `application/json` と `text/event-stream` の**両方**を要求し（片方だけだと
+> **406 `Not Acceptable`**）、応答は常に `text/event-stream`。本節末尾の
+> 「`Content-Type: text/event-stream` は buffer せず passthrough」がそのまま効くので、
+> `echo_traceparent_if_json` は**常に no-op**。実測でも、`traceparent` ヘッダを添えた RC
+> `tools/call` の応答に `_meta` は無かった。middleware が自分で組み立てて返す応答
+> （initialize / capability の no-op、各種エラー）は `echo_into_result` より手前で短絡するので、
+> **結局どの経路でも載らない**。**5.5.1（OTel GenAI 計装）はこの受け口の上に載る設計なので、
+> F-3 はその前提**（→ plan.md §3 P6 で順序を 1 段増やした）。
+>
+> **3 件が自動テストで見えなかった理由。** `src-tauri/tests/queen_compat_integration.rs` は
+> 偽 downstream の前で middleware を回す設計で、その偽 downstream は **`application/json` で
+> 返し、session の有無も見ない**。実 rmcp は SSE でしか返さず、未初期化 session を拒む。
+> 同ファイル冒頭は「production wiring は design pin の completion gate の手動 curl で見る」と
+> 自ら書いており、**その手動 curl で書いてあったとおりの穴が出た**。
+>
+> **本項は上の実装状況節を失効させない** — あそこに書かれた middleware の挙動は実機でも
+> そのとおりだった。**足りていないのは「その先」の記述**であり、本項がそれである。
+> 3 件の修正は別項目（→ plan.md §1「5.5.0 の完成」行）。
 
 ## 5.5.2 新 Tauri Command（予約）
 
