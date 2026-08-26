@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::config::{self, AgentDef, AutoRestart};
 use crate::pty;
+use crate::remote::{self, RemoteInfo, RemoteSpec};
 use crate::worktree::{self, WorktreeInfo};
 
 /// Give up after this many consecutive automatic restarts.
@@ -48,6 +49,33 @@ struct OutputPayload {
 struct ExitPayload {
     id: u32,
     code: Option<i32>,
+}
+
+/// Payload for the `ssh-reconnect` event (Phase 4.4.5): emitted when a
+/// definition with an `.ssh` block lost its link (ssh exit 255) and a delayed
+/// reconnect has been scheduled. `attempt` counts consecutive reconnects
+/// (reset by a stable link); `maxAttempts` 0 = unlimited.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconnectPayload {
+    id: u32,
+    destination: String,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+}
+
+/// Payload for the `ssh-disconnected` event (Phase 4.4.5): an ad-hoc `ssh`
+/// typed into a shell pane ended and the shell is back in the foreground. The
+/// exit status of a foreground child is not observable from outside the
+/// shell, so this is a proposal ("reconnect?"), never an automatic action.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SshDisconnectedPayload {
+    pub id: u32,
+    pub destination: String,
+    /// The exact command line to re-run (argv joined with spaces).
+    pub command: String,
 }
 
 /// `"starting" | "running" | "exited" | "restarting"`.
@@ -107,6 +135,10 @@ pub struct SessionInfo {
     /// Phase 4.1: present only on `transcript` sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teammate: Option<TeammateInfo>,
+    /// Phase 4.4.5: present only on sessions launched from a definition with
+    /// an `.ssh` block (destination, multiplexer, session name, reconnect).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteInfo>,
 }
 
 // ---------- internal types ----------
@@ -129,6 +161,8 @@ struct LaunchSpec {
     env: Vec<(String, String)>,
     autorestart: AutoRestart,
     worktree: Option<WorktreeInfo>,
+    /// Phase 4.4.5: resolved `.ssh` settings; None for everything else.
+    remote: Option<RemoteSpec>,
 }
 
 /// The live PTY half of a slot; replaced wholesale on restart.
@@ -163,6 +197,10 @@ struct SessionSlot {
     state: SessionState,
     code: Option<i32>,
     restart_count: u32,
+    /// Phase 4.4.5: consecutive ssh reconnects (reset by a stable link).
+    /// Independent of `restart_count` so `autorestart`'s 5-cap never
+    /// interferes with a long outage.
+    reconnect_count: u32,
     /// Set by kill_pty; suppresses autorestart.
     manual_kill: bool,
     live: Option<LivePty>,
@@ -247,6 +285,7 @@ fn session_info(id: u32, slot: &SessionSlot) -> SessionInfo {
             lead_id: m.lead_id,
             mode: m.mode,
         }),
+        remote: slot.spec.remote.as_ref().map(RemoteSpec::info),
     }
 }
 
@@ -444,6 +483,7 @@ impl PtyManager {
             env: Vec::new(),
             autorestart: AutoRestart::Never,
             worktree: None,
+            remote: None,
         };
         self.create_session(app, spec, cols, rows)
     }
@@ -504,15 +544,29 @@ impl PtyManager {
         if def.teams.as_ref().is_some_and(|t| t.is_host()) {
             env.extend(crate::teams_host::setup_lead(&app, id, def, &cwd, &env));
         }
+        // Phase 4.4.5: an `.ssh` block rewrites the command into its
+        // persistent (tmux/screen) + keepalive form and pins the reconnect
+        // policy on the slot. The rewrite is pure; a malformed cmd is a launch
+        // error, not a silently non-persistent pane.
+        let base_cmd = command_for_definition(def, logical_resume).to_string();
+        let (cmd, remote) = match def.ssh.as_ref() {
+            Some(ssh) => {
+                let wrapped = remote::wrap_ssh_command(&base_cmd, &def.name, ssh)
+                    .map_err(|e| format!("{}: {e}", def.name))?;
+                (wrapped.command, Some(wrapped.spec))
+            }
+            None => (base_cmd, None),
+        };
         let spec = LaunchSpec {
             name: Some(def.name.clone()),
-            cmd: command_for_definition(def, logical_resume).to_string(),
+            cmd,
             args: Vec::new(),
             shell_wrap: true,
             cwd: Some(cwd),
             env,
             autorestart: def.autorestart.unwrap_or_default(),
             worktree,
+            remote,
         };
         let preserved_worktree = spec.worktree.as_ref().map(|info| info.path.clone());
         self.create_session_with_id(app, spec, cols, rows, id)
@@ -556,6 +610,7 @@ impl PtyManager {
                     state: SessionState::Starting,
                     code: None,
                     restart_count: 0,
+                    reconnect_count: 0,
                     manual_kill: false,
                     live: None,
                     cols,
@@ -575,6 +630,36 @@ impl PtyManager {
                 Err(e)
             }
         }
+    }
+
+    /// Test-only: a shell-wrapped session carrying a `RemoteSpec`, so the
+    /// reconnect state machine can be exercised with a local command that
+    /// fakes ssh exit statuses (no real ssh/tmux needed).
+    #[cfg(test)]
+    pub(crate) fn spawn_remote_probe<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        cmd: &str,
+        remote: RemoteSpec,
+    ) -> Result<u32, String> {
+        let spec = LaunchSpec {
+            name: Some("probe".into()),
+            cmd: cmd.to_string(),
+            args: Vec::new(),
+            shell_wrap: true,
+            cwd: None,
+            env: Vec::new(),
+            autorestart: AutoRestart::Never,
+            worktree: None,
+            remote: Some(remote),
+        };
+        self.create_session(app, spec, 80, 24)
+    }
+
+    /// Test-only: the slot's consecutive-reconnect counter.
+    #[cfg(test)]
+    pub(crate) fn reconnect_count(&self, id: u32) -> Option<u32> {
+        self.lock_sessions().get(&id).map(|s| s.reconnect_count)
     }
 
     pub fn write_pty(&self, id: u32, data: String) -> Result<(), String> {
@@ -680,6 +765,7 @@ impl PtyManager {
             slot.code = None;
             slot.manual_kill = false;
             slot.restart_count = 0;
+            slot.reconnect_count = 0;
             (slot.live.take(), session_info(id, slot), new_gen)
         };
         // Reap the old child outside the lock. Dropping old_live (master,
@@ -1069,6 +1155,19 @@ impl PtyManager {
             .collect()
     }
 
+    /// Phase 4.4.5: per running PTY session, the foreground pid (cheap ioctl)
+    /// and whether the session is definition-managed ssh (has an `.ssh`
+    /// block, so the reconnect state machine owns it and the ad-hoc watcher
+    /// must leave it alone). Same snapshot rules as `foreground_names`.
+    pub(crate) fn foreground_pids(&self) -> Vec<(u32, Option<i32>, bool)> {
+        let sessions = self.lock_sessions();
+        sessions
+            .iter()
+            .filter(|(_, s)| s.state == SessionState::Running && s.kind == SessionKind::Pty)
+            .map(|(id, s)| (*id, foreground_pid(s), s.spec.remote.is_some()))
+            .collect()
+    }
+
     /// (total sessions, total transcript sessions, transcript-count-per-lead).
     /// Cheap snapshot under the lock for the pane-limit checks.
     pub fn transcript_stats(&self) -> (usize, usize, HashMap<u32, usize>) {
@@ -1115,12 +1214,14 @@ impl PtyManager {
                         env: Vec::new(),
                         autorestart: AutoRestart::Never,
                         worktree: None,
+                        remote: None,
                     },
                     generation,
                     // A transcript is "active" (Running) until SubagentStop.
                     state: SessionState::Running,
                     code: None,
                     restart_count: 0,
+                    reconnect_count: 0,
                     manual_kill: false,
                     live: None,
                     cols: 0,
@@ -1214,11 +1315,13 @@ impl PtyManager {
                         env,
                         autorestart: AutoRestart::Never,
                         worktree: None,
+                        remote: None,
                     },
                     generation: 0,
                     state: SessionState::Starting,
                     code: None,
                     restart_count: 0,
+                    reconnect_count: 0,
                     manual_kill: false,
                     live: None,
                     cols,
@@ -1528,6 +1631,8 @@ enum EofOutcome {
     Stale,
     Exited(SessionInfo, Option<i32>),
     Restarting(SessionInfo, Option<i32>),
+    /// Phase 4.4.5: ssh link lost; respawn after the given backoff delay.
+    Reconnecting(SessionInfo, Option<i32>, ReconnectPayload, Duration),
 }
 
 /// Reader-thread EOF: reap the child, then either mark exited or schedule an
@@ -1570,6 +1675,27 @@ fn handle_eof<R: Runtime>(
             Some(slot) => {
                 slot.code = code;
                 let stable_run = slot.spawned_at.elapsed() >= STABLE_RUN;
+                // Phase 4.4.5: a lost ssh link is a reconnect, never an
+                // ordinary autorestart (different counter, backoff, cap).
+                if let Some((attempt, delay)) = remote::decide_reconnect(
+                    slot.spec.remote.as_ref(),
+                    slot.manual_kill,
+                    code,
+                    slot.reconnect_count,
+                    stable_run,
+                ) {
+                    let spec = slot.spec.remote.as_ref().expect("checked by decide_reconnect");
+                    slot.reconnect_count = attempt;
+                    slot.state = SessionState::Restarting;
+                    let payload = ReconnectPayload {
+                        id,
+                        destination: spec.destination.clone(),
+                        attempt,
+                        max_attempts: spec.max_reconnects,
+                        delay_ms: delay.as_millis() as u64,
+                    };
+                    EofOutcome::Reconnecting(session_info(id, slot), code, payload, delay)
+                } else {
                 match decide_eof(
                     slot.spec.autorestart,
                     slot.manual_kill,
@@ -1591,6 +1717,7 @@ fn handle_eof<R: Runtime>(
                         }
                         EofOutcome::Exited(info, code)
                     }
+                }
                 }
             }
         }
@@ -1621,6 +1748,22 @@ fn handle_eof<R: Runtime>(
                 Arc::clone(generations),
                 id,
                 generation,
+                AUTORESTART_DELAY,
+            );
+        }
+        EofOutcome::Reconnecting(info, code, payload, delay) => {
+            let _ = app.emit("pty-exit", ExitPayload { id, code });
+            let _ = app.emit("session-state", &info);
+            // Emitted AFTER session-state(restarting) so the frontend already
+            // holds the restarting state when it stores the reconnect badge.
+            let _ = app.emit("ssh-reconnect", &payload);
+            schedule_autorestart(
+                app.clone(),
+                Arc::clone(sessions),
+                Arc::clone(generations),
+                id,
+                generation,
+                delay,
             );
         }
     }
@@ -1635,9 +1778,10 @@ fn schedule_autorestart<R: Runtime>(
     generations: Arc<AtomicU64>,
     id: u32,
     generation: u64,
+    delay: Duration,
 ) {
     std::thread::spawn(move || {
-        std::thread::sleep(AUTORESTART_DELAY);
+        std::thread::sleep(delay);
 
         let proceed = {
             let sessions_guard = lock_map(&sessions);
@@ -2417,6 +2561,262 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].0, id);
         assert!(roots[0].1 > 0);
+        manager.kill_pty(id).unwrap();
+    }
+
+    // ----- Phase 4.4.5: ssh reconnect state machine -----
+
+    fn probe_spec(reconnect: bool, max: u32) -> RemoteSpec {
+        RemoteSpec {
+            destination: "me@gpu".into(),
+            persist: crate::config::SshPersist::Tmux,
+            session: "ptygrid-probe".into(),
+            reconnect,
+            max_reconnects: max,
+        }
+    }
+
+    fn wait_state(manager: &PtyManager, id: u32, want: SessionState, secs: u64) -> SessionInfo {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(info) = manager.list_sessions().into_iter().find(|s| s.id == id) {
+                if info.state == want {
+                    return info;
+                }
+                if Instant::now() >= deadline {
+                    panic!("session {id}: wanted {want:?}, still {:?} (code {:?})", info.state, info.code);
+                }
+            } else if Instant::now() >= deadline {
+                panic!("session {id} vanished while waiting for {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    #[test]
+    fn ssh_exit_255_reconnects_with_backoff_until_the_cap() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        // Fakes ssh's "connection error" status every time.
+        let id = manager
+            .spawn_remote_probe(handle, "exit 255", probe_spec(true, 2))
+            .unwrap();
+        let info = manager.list_sessions().into_iter().find(|s| s.id == id).unwrap();
+        let remote = info.remote.expect("remote info rides SessionInfo");
+        assert_eq!(remote.destination, "me@gpu");
+        assert_eq!(remote.session.as_deref(), Some("ptygrid-probe"));
+        assert!(remote.reconnect);
+
+        // 1st drop → restarting (reconnect #1, 1s backoff), never `exited`.
+        let info = wait_state(&manager, id, SessionState::Restarting, 5);
+        assert_eq!(info.code, Some(255));
+        assert_eq!(manager.reconnect_count(id), Some(1));
+        // The respawn exits 255 again → reconnect #2 (2s backoff) → then the
+        // cap (2) is reached and the slot settles as exited with code 255,
+        // keeping its pane (no removal: only a manual kill removes).
+        let info = wait_state(&manager, id, SessionState::Exited, 15);
+        assert_eq!(info.code, Some(255));
+        assert_eq!(manager.reconnect_count(id), Some(2));
+        manager.kill_pty(id).unwrap();
+    }
+
+    #[test]
+    fn ssh_clean_exit_and_remote_command_failure_do_not_reconnect() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        // Operator detached / typed exit: 0 → plain exit.
+        let id0 = manager
+            .spawn_remote_probe(handle.clone(), "exit 0", probe_spec(true, 0))
+            .unwrap();
+        // tmux missing on the remote: the login shell answers 127.
+        let id127 = manager
+            .spawn_remote_probe(handle.clone(), "exit 127", probe_spec(true, 0))
+            .unwrap();
+        // reconnect: false → 255 is a plain exit too.
+        let id_off = manager
+            .spawn_remote_probe(handle, "exit 255", probe_spec(false, 0))
+            .unwrap();
+        assert_eq!(wait_state(&manager, id0, SessionState::Exited, 5).code, Some(0));
+        assert_eq!(wait_state(&manager, id127, SessionState::Exited, 5).code, Some(127));
+        assert_eq!(wait_state(&manager, id_off, SessionState::Exited, 5).code, Some(255));
+        for id in [id0, id127, id_off] {
+            assert_eq!(manager.reconnect_count(id), Some(0));
+            manager.kill_pty(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn manual_kill_during_reconnect_backoff_removes_the_slot() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let id = manager
+            .spawn_remote_probe(handle, "exit 255", probe_spec(true, 0))
+            .unwrap();
+        wait_state(&manager, id, SessionState::Restarting, 5);
+        // ✕ while the backoff timer is pending: slot dropped, no respawn.
+        manager.kill_pty(id).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(manager.list_sessions().iter().all(|s| s.id != id));
+    }
+
+    #[test]
+    fn manual_restart_resets_the_reconnect_counter() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let id = manager
+            .spawn_remote_probe(handle.clone(), "exit 255", probe_spec(true, 0))
+            .unwrap();
+        wait_state(&manager, id, SessionState::Restarting, 5);
+        assert_eq!(manager.reconnect_count(id), Some(1));
+        manager.restart_session(handle, id).unwrap();
+        // The manual restart itself ran with count 0; its exit starts over at 1.
+        wait_state(&manager, id, SessionState::Restarting, 5);
+        assert!(manager.reconnect_count(id).is_some_and(|c| c <= 1));
+        manager.kill_pty(id).unwrap();
+    }
+
+    /// End-to-end against a real sshd + tmux (or screen): the remote process
+    /// survives a dropped link and the pane re-attaches to it. Opt-in:
+    ///
+    /// ```sh
+    /// PTYGRID_SSH_E2E="-p 2222 -o StrictHostKeyChecking=no localhost" \
+    ///   cargo test --lib -- --ignored ssh_e2e
+    /// ```
+    ///
+    /// The "drop" is a SIGKILL of the client-side ssh's *server* session
+    /// (`sshd: <user>@pts/N`), which is what a real link loss looks like to
+    /// the client: "Connection closed by remote host", exit 255.
+    fn ssh_e2e(persist: &str) {
+        let Ok(target) = std::env::var("PTYGRID_SSH_E2E") else {
+            eprintln!("PTYGRID_SSH_E2E not set; skipping");
+            return;
+        };
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let session_name = format!("ptygrid-e2e-{}-{}", persist, std::process::id());
+        // The remote command prints a marker containing ITS pid once, then
+        // sleeps: the marker must be visible after reconnect (same tmux
+        // window scrollback), and the pid must still be alive.
+        let cfg = config::parse_config(&format!(
+            "agents:\n  - name: e2e\n    cmd: ssh {target}\n    ssh:\n      persist: {persist}\n      session: {session_name}\n      remote_cmd: \"echo MARK-$$-MARK; sleep 120\"\n"
+        ))
+        .unwrap();
+        let id = manager
+            .spawn_agent(handle.clone(), &cfg.agents[0], std::env::temp_dir().as_path(), 100, 30)
+            .unwrap();
+        let info = manager.list_sessions().into_iter().find(|s| s.id == id).unwrap();
+        eprintln!("cmd: {}", info.cmd);
+        assert!(info.cmd.contains("ServerAliveInterval="), "{}", info.cmd);
+
+        // Wait for the marker.
+        let marker = {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let (out, _, _) = manager.output_snapshot(id).unwrap();
+                if let Some(start) = out.find("MARK-") {
+                    if let Some(end) = out[start + 5..].find("-MARK") {
+                        break out[start + 5..start + 5 + end].to_string();
+                    }
+                }
+                assert!(Instant::now() < deadline, "no marker in output: {out}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let remote_pid: u32 = marker.trim().parse().expect("marker carries the remote pid");
+        eprintln!("remote pid {remote_pid} inside {persist}:{session_name}");
+        let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+        assert!(alive(remote_pid));
+
+        // Drop the link from the server side: kill the sshd session process
+        // that owns the pty of our connection. Find it as the parent of the
+        // shell running `tmux`/`screen` attached to our session — simplest
+        // robust way: the newest `sshd:` process with a pts.
+        let ps = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ps -eo pid,etimes,args --sort=-pid | grep -E 'sshd: .*@pts' | grep -v grep | head -1 | awk '{print $1}'")
+            .output()
+            .unwrap();
+        let sshd_pid = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+        assert!(!sshd_pid.is_empty(), "no sshd session process found");
+        eprintln!("killing server-side session sshd pid {sshd_pid}");
+        let spawned_at_before = Instant::now();
+        std::process::Command::new("sudo").args(["kill", "-9", &sshd_pid]).status().unwrap();
+
+        // Client sees the drop → exit 255 → restarting, then back to running.
+        let info = wait_state(&manager, id, SessionState::Restarting, 20);
+        assert_eq!(info.code, Some(255), "a dropped link is ssh exit 255");
+        assert_eq!(manager.reconnect_count(id), Some(1));
+        let info = wait_state(&manager, id, SessionState::Running, 20);
+        eprintln!("reconnected after {:?}", spawned_at_before.elapsed());
+        assert_eq!(info.state, SessionState::Running);
+
+        // The remote process survived and the pane shows the same session
+        // (tmux/screen redraw the window, so the original marker reappears).
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(alive(remote_pid), "remote process must survive the drop");
+        let (out, _, _) = manager.output_snapshot(id).unwrap();
+        let after_reconnect = &out[out.rfind("ServerAlive").map(|_| 0).unwrap_or(0)..];
+        assert!(
+            after_reconnect.matches(&format!("MARK-{remote_pid}-MARK")).count() >= 2,
+            "marker should be redrawn after re-attach; output tail: {}",
+            &out[out.len().saturating_sub(600)..]
+        );
+
+        // Cleanup: kill the pane, then the remote session.
+        manager.kill_pty(id).unwrap();
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "tmux kill-session -t {session_name} 2>/dev/null; screen -S {session_name} -X quit 2>/dev/null; kill {remote_pid} 2>/dev/null; true"
+            ))
+            .status();
+    }
+
+    #[test]
+    #[ignore = "needs PTYGRID_SSH_E2E=<ssh args> and tmux on the target"]
+    fn ssh_e2e_tmux_reconnect_keeps_remote_process() {
+        ssh_e2e("tmux");
+    }
+
+    #[test]
+    #[ignore = "needs PTYGRID_SSH_E2E=<ssh args> and screen on the target"]
+    fn ssh_e2e_screen_reconnect_keeps_remote_process() {
+        ssh_e2e("screen");
+    }
+
+    /// Phase 4.4.5 plumbing for the ad-hoc watcher: `foreground_pids` yields
+    /// the pgrp leader of a shell pane and `pty::process_argv` recovers its
+    /// exact command line (Linux /proc, macOS ps).
+    #[test]
+    #[cfg(unix)]
+    fn foreground_pids_and_process_argv_recover_the_command_line() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let id = manager
+            .spawn_shell(handle, 80, 24, Some("/bin/sh".to_string()), None)
+            .unwrap();
+        manager.write_pty(id, "sleep 7 && echo done\n".to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let argv = loop {
+            let row = manager.foreground_pids().into_iter().find(|(sid, _, _)| *sid == id);
+            if let Some((_, Some(pid), managed)) = row {
+                assert!(!managed, "a plain shell is never definition-managed ssh");
+                if let Some(argv) = pty::process_argv(pid) {
+                    if argv.first().is_some_and(|a| a.ends_with("sleep")) {
+                        break argv;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "foreground `sleep` never resolved");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(argv[1], "7");
         manager.kill_pty(id).unwrap();
     }
 }

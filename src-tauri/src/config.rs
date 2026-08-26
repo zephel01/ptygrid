@@ -1643,6 +1643,154 @@ pub struct AgentDef {
     /// frontend (see stores.svelte.ts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_on_exit: Option<AutoCloseMode>,
+    /// Phase 4.4.5: ssh persistence + reconnect for a definition whose `cmd`
+    /// is an `ssh …` invocation. The remote side is kept alive in a tmux /
+    /// screen session and the pane reconnects on connection loss (ssh exit
+    /// 255). Parsed and validated here; the command rewrite and the reconnect
+    /// state machine live in `remote.rs` / `session.rs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
+}
+
+/// `.ssh` block of a definition (Phase 4.4.5). Every field is optional:
+///
+/// ```yaml
+/// ssh:
+///   persist: tmux            # tmux | screen | none   (default tmux)
+///   session: ptygrid-build   # remote multiplexer session name
+///                            # (default "ptygrid-<definition name>")
+///   remote_cmd: claude       # command run INSIDE the persistent session
+///                            # (default: the remote login shell)
+///   reconnect: true          # reconnect on connection loss (default true)
+///   keepalive: 15            # ServerAliveInterval seconds (default 15)
+///   max_reconnects: 0        # 0 = unlimited (default)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SshConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist: Option<SshPersist>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_reconnects: Option<u32>,
+}
+
+/// `tmux | screen | none` (default tmux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SshPersist {
+    #[default]
+    Tmux,
+    Screen,
+    None,
+}
+
+/// Default `ServerAliveInterval` (seconds) when `.ssh.keepalive` is omitted.
+pub const SSH_DEFAULT_KEEPALIVE: u32 = 15;
+/// `ServerAliveCountMax` is fixed: a dead link is declared after
+/// `keepalive * SSH_KEEPALIVE_COUNT` seconds without a reply.
+pub const SSH_KEEPALIVE_COUNT: u32 = 3;
+
+impl SshConfig {
+    pub fn effective_persist(&self) -> SshPersist {
+        self.persist.unwrap_or_default()
+    }
+
+    /// Multiplexer session name: explicit `session`, else `ptygrid-<name>`
+    /// with characters tmux/screen reject (`.`, `:`, whitespace) folded to `-`.
+    pub fn effective_session(&self, def_name: &str) -> String {
+        match self.session.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => format!("ptygrid-{}", sanitize_session_name(def_name)),
+        }
+    }
+
+    pub fn effective_reconnect(&self) -> bool {
+        self.reconnect.unwrap_or(true)
+    }
+
+    /// Clamped into 1..=3600 so a typo can neither disable the probe nor
+    /// hammer the link.
+    pub fn effective_keepalive(&self) -> u32 {
+        self.keepalive.unwrap_or(SSH_DEFAULT_KEEPALIVE).clamp(1, 3600)
+    }
+
+    /// 0 = unlimited.
+    pub fn effective_max_reconnects(&self) -> u32 {
+        self.max_reconnects.unwrap_or(0)
+    }
+}
+
+/// Fold anything tmux (`.`/`:`) or screen (whitespace) cannot take in a
+/// session name to `-`.
+pub fn sanitize_session_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Phase 4.4.5: an `.ssh` block only makes sense on an `ssh …` command, and
+/// an explicit session name must be something tmux/screen accept verbatim.
+/// Fails the config load (like `team_presets:` / `workflows:`) because a
+/// silently ignored block would leave the operator believing the pane is
+/// persistent when it is not.
+fn validate_ssh(config: &Config) -> Result<(), String> {
+    for (kind, defs) in [("agents", &config.agents), ("processes", &config.processes)] {
+        for def in defs {
+            let Some(ssh) = def.ssh.as_ref() else {
+                continue;
+            };
+            let ctx = format!("{kind}.{}.ssh", def.name);
+            let first = def.cmd.split_whitespace().next().unwrap_or("");
+            let base = first.rsplit('/').next().unwrap_or(first);
+            if base != "ssh" {
+                return Err(format!(
+                    "{ctx}: `cmd` must be an `ssh …` invocation (got '{first}')"
+                ));
+            }
+            if let Some(resume) = def.resume.as_deref() {
+                let r = resume.split_whitespace().next().unwrap_or("");
+                if r.rsplit('/').next().unwrap_or(r) != "ssh" {
+                    return Err(format!(
+                        "{ctx}: `resume` must also be an `ssh …` invocation when `.ssh` is set"
+                    ));
+                }
+            }
+            if let Some(session) = ssh.session.as_deref() {
+                let s = session.trim();
+                if s.is_empty() {
+                    return Err(format!("{ctx}.session: must not be empty"));
+                }
+                if s != sanitize_session_name(s) {
+                    return Err(format!(
+                        "{ctx}.session: '{s}' may only contain [A-Za-z0-9_-] \
+                         (tmux rejects '.' and ':', screen rejects whitespace)"
+                    ));
+                }
+            }
+            if let Some(cmd) = ssh.remote_cmd.as_deref() {
+                if cmd.trim().is_empty() {
+                    return Err(format!("{ctx}.remote_cmd: must not be empty"));
+                }
+            }
+            if ssh.keepalive == Some(0) {
+                return Err(format!("{ctx}.keepalive: must be >= 1 second"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Optional per-definition linked-worktree isolation (Phase 3.3).
@@ -1741,6 +1889,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
     let mut config: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
     validate_team_presets(&config)?;
     validate_workflows(&config)?;
+    validate_ssh(&config)?;
     apply_schedule_defaults(&mut config);
     Ok(config)
 }
@@ -4509,4 +4658,65 @@ agents:
         );
     }
 
+    // ---- Phase 4.4.5: `.ssh` block ----
+    #[test]
+    fn ssh_block_parses_with_defaults() {
+        let cfg = parse_config(
+            "agents:\n  - name: gpu box\n    cmd: ssh -p 2222 me@gpu\n    ssh: {}\n",
+        )
+        .unwrap();
+        let ssh = cfg.agents[0].ssh.as_ref().unwrap();
+        assert_eq!(ssh.effective_persist(), SshPersist::Tmux);
+        assert_eq!(ssh.effective_session("gpu box"), "ptygrid-gpu-box");
+        assert!(ssh.effective_reconnect());
+        assert_eq!(ssh.effective_keepalive(), SSH_DEFAULT_KEEPALIVE);
+        assert_eq!(ssh.effective_max_reconnects(), 0);
+        // A definition without the block is untouched.
+        let cfg = parse_config("agents:\n  - name: a\n    cmd: claude\n").unwrap();
+        assert_eq!(cfg.agents[0].ssh, None);
+    }
+
+    #[test]
+    fn ssh_block_explicit_values() {
+        let cfg = parse_config(
+            "processes:\n  - name: w\n    cmd: ssh host\n    ssh:\n      persist: screen\n      session: my_sess-1\n      remote_cmd: claude --continue\n      reconnect: false\n      keepalive: 9000\n      max_reconnects: 3\n",
+        )
+        .unwrap();
+        let ssh = cfg.processes[0].ssh.as_ref().unwrap();
+        assert_eq!(ssh.effective_persist(), SshPersist::Screen);
+        assert_eq!(ssh.effective_session("w"), "my_sess-1");
+        assert_eq!(ssh.remote_cmd.as_deref(), Some("claude --continue"));
+        assert!(!ssh.effective_reconnect());
+        assert_eq!(ssh.effective_keepalive(), 3600, "clamped");
+        assert_eq!(ssh.effective_max_reconnects(), 3);
+    }
+
+    #[test]
+    fn ssh_block_rejects_non_ssh_cmd_bad_session_and_zero_keepalive() {
+        let err = parse_config("agents:\n  - name: a\n    cmd: claude\n    ssh: {}\n")
+            .unwrap_err();
+        assert!(err.contains("agents.a.ssh") && err.contains("ssh"), "{err}");
+        let err = parse_config(
+            "agents:\n  - name: a\n    cmd: ssh h\n    ssh:\n      session: \"bad.name\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("session"), "{err}");
+        let err = parse_config(
+            "agents:\n  - name: a\n    cmd: ssh h\n    ssh:\n      keepalive: 0\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("keepalive"), "{err}");
+        let err = parse_config(
+            "agents:\n  - name: a\n    cmd: ssh h\n    resume: claude\n    ssh: {}\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("resume"), "{err}");
+        let err = parse_config(
+            "agents:\n  - name: a\n    cmd: ssh h\n    ssh:\n      persist: dtach\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("dtach") || err.contains("variant"), "{err}");
+        // A full path to ssh is fine.
+        parse_config("agents:\n  - name: a\n    cmd: /usr/bin/ssh h\n    ssh: {}\n").unwrap();
+    }
 }

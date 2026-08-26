@@ -157,6 +157,21 @@ agents:
     cwd: "."
     autostart: false
 
+  # Phase 4.4.5: an agent on a remote host, kept alive across dropped links.
+  # `ssh:` on an `ssh …` cmd makes ptygrid attach to a named tmux (or screen)
+  # session on the remote side and reconnect automatically when the link
+  # drops (ssh exit 255) — 1s/2s/4s… backoff, capped at 30s. Your own ssh
+  # options stay exactly as written. Requires tmux (or screen) on the remote.
+  # - name: gpu-claude
+  #   cmd: "ssh -p 2222 me@gpu-box"
+  #   ssh:
+  #     persist: tmux                # tmux | screen | none   (default tmux)
+  #     session: ptygrid-gpu         # default "ptygrid-<name>"
+  #     remote_cmd: "claude --continue"   # default: remote login shell
+  #     reconnect: true              # default true (only on ssh exit 255)
+  #     keepalive: 15                # ServerAliveInterval seconds (default 15)
+  #     max_reconnects: 0            # 0 = unlimited (default)
+
 processes:
   - name: web
     cmd: "npm run dev"

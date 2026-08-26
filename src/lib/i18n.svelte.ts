@@ -162,6 +162,19 @@ const en = {
   titleRestart: "Restart",
   tauriOnly: "Available only in the Tauri runtime.",
 
+  // ---- Phase 4.4.5: ssh persistence / reconnect ----
+  remotePersistTitle: (persist: string, session: string, destination: string) =>
+    `Remote ${persist} session "${session}" on ${destination} — processes survive a dropped link; the pane re-attaches on reconnect`,
+  sshReconnecting: (attempt: number, max: number) =>
+    max > 0 ? `reconnecting ${attempt}/${max}` : `reconnecting (${attempt})`,
+  sshReconnectTitle: (destination: string, attempt: number, max: number, delayMs: number) =>
+    `Link to ${destination} lost (ssh exit 255). Reconnect attempt ${attempt}${max > 0 ? ` of ${max}` : ""} in ${Math.round(delayMs / 1000)}s. Restart (⟳) reconnects now; close (✕) stops.`,
+  sshDroppedDivider: "ended — click ⇄ in the header to reconnect",
+  sshDroppedReconnect: (destination: string) => `reconnect ${destination}`,
+  sshDroppedTitle: (command: string) => `Re-run in this pane: ${command}`,
+  sshReconnectFailed: (destination: string, err: unknown) =>
+    `Failed to reconnect to ${destination}: ${err}`,
+
   // ---- errors / banners ----
   clipboardCopyFailed: (err: unknown) => `Failed to copy to clipboard: ${err}`,
   clipboardPasteFailed: (err: unknown) =>
@@ -675,6 +688,19 @@ const ja: Messages = {
   titleUnmaximize: "最大化解除",
   titleRestart: "再起動",
   tauriOnly: "Tauri 実行環境でのみ利用できます。",
+
+  // ---- Phase 4.4.5: ssh persistence / reconnect ----
+  remotePersistTitle: (persist: string, session: string, destination: string) =>
+    `${destination} 上の ${persist} セッション「${session}」— 接続が切れてもリモートのプロセスは残り、再接続時に同じセッションへ再アタッチします`,
+  sshReconnecting: (attempt: number, max: number) =>
+    max > 0 ? `再接続中 ${attempt}/${max}` : `再接続中 (${attempt}回目)`,
+  sshReconnectTitle: (destination: string, attempt: number, max: number, delayMs: number) =>
+    `${destination} への接続が切れました (ssh exit 255)。${Math.round(delayMs / 1000)}秒後に再接続します (${attempt}回目${max > 0 ? ` / 上限${max}` : ""})。⟳ で今すぐ再接続、✕ で停止。`,
+  sshDroppedDivider: "が終了しました — ヘッダーの ⇄ で再接続",
+  sshDroppedReconnect: (destination: string) => `${destination} に再接続`,
+  sshDroppedTitle: (command: string) => `このペインで再実行: ${command}`,
+  sshReconnectFailed: (destination: string, err: unknown) =>
+    `${destination} への再接続に失敗しました: ${err}`,
 
   // ---- errors / banners ----
   clipboardCopyFailed: (err: unknown) =>

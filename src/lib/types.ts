@@ -245,6 +245,37 @@ export type SessionInfo = {
   kind?: SessionKind;
   /** Phase 4.1/4.2: teammate セッション（observe transcript / host PTY）に付与 */
   teammate?: TeammateInfo;
+  /** Phase 4.4.5: `.ssh` ブロック付き定義から起動したセッションにのみ付与 */
+  remote?: RemoteInfo;
+};
+
+/** Phase 4.4.5: 定義の `.ssh` ブロックを解決した結果（wire 追加フィールド）。 */
+export type RemoteInfo = {
+  /** 表示用接続先（user@host / alias） */
+  destination: string;
+  persist: "tmux" | "screen" | "none";
+  /** persist が none のとき省略 */
+  session?: string;
+  reconnect: boolean;
+};
+
+/** ssh-reconnect: 接続断（ssh exit 255）を検知し、遅延再接続を予約したとき。
+ * session-state(restarting) の後に emit。attempt は連続回数、maxAttempts 0=無制限。 */
+export type SshReconnectPayload = {
+  id: number;
+  destination: string;
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+};
+
+/** ssh-disconnected: シェルペインで手打ちした ssh が終了しシェルに戻ったとき
+ * （1 回だけ）。終了コードは観測できないため「再接続しますか」の提案止まり。 */
+export type SshDisconnectedPayload = {
+  id: number;
+  destination: string;
+  /** 再実行用のコマンドライン（argv を空白結合） */
+  command: string;
 };
 
 export type SessionKind = "pty" | "transcript";

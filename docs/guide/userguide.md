@@ -264,6 +264,12 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.worktree.enabled` | - | `false` | 定義の起動ごとにlinked worktreeと専用branchを作る |
 | `.worktree.base` | - | `HEAD` | worktree branchの起点となるbranch/tag/commit |
 | `.worktree.setup` | - | - | worktree作成後、agent cwdで一度だけ実行するsetup command |
+| `.ssh.persist` | - | `tmux` | `.cmd` が `ssh …` の定義で、接続先のプロセスを `tmux` / `screen` セッション内に置く(`none` = keepalive のみ)。[ssh 接続の永続化と再接続](#ssh-接続の永続化と再接続) |
+| `.ssh.session` | - | `ptygrid-<name>` | 接続先の tmux / screen セッション名(`[A-Za-z0-9_-]` のみ) |
+| `.ssh.remote_cmd` | - | ログインシェル | セッション内で実行するコマンド(例 `claude --continue`)。`.cmd` の宛先の後ろに書いたコマンドでも可(両方は不可) |
+| `.ssh.reconnect` | - | `true` | 接続断(ssh exit 255)で自動再接続 |
+| `.ssh.keepalive` | - | `15` | `ServerAliveInterval` 秒(`CountMax` は 3 固定 → 約 45 秒で切断検知) |
+| `.ssh.max_reconnects` | - | `0` | 連続再接続の上限。`0` = 無制限。安定して接続していた後の切断はカウントをリセット |
 
 > すべてのセッションには環境変数 `QUEEN_URL`(例: `http://127.0.0.1:39237/mcp?token=<token>`)が
 > 注入されます(認証トークン込み)。ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を
@@ -1082,6 +1088,55 @@ N 本に届かなかった本当の失敗は従来どおり赤くなります)�
 コメントで揃っています)。macOS 実機で 5 unit → 番兵 → まとめ役1回、という一連の完走を
 確認済みですが、「1件ごとに返信を刻む」動きそのものはエージェントのモデル次第で、
 本数どおりに刻まれない回もあります。
+
+### ssh 接続の永続化と再接続
+
+`cmd: ssh …` の定義に `ssh:` ブロックを付けると、ptygrid は接続先で **tmux(または screen)の
+名前付きセッションにアタッチ**する形で ssh を起動します。回線が切れてもリモート側のプロセスは
+tmux の中で生き続け、ペインは自動的に再接続して同じセッションへ戻ります。tmux を自前で
+再実装するのではなく、「起動コマンドの書き換え・切断検知・再接続・状態表示」だけを ptygrid が
+担当します。
+
+```yaml
+agents:
+  - name: gpu-claude
+    cmd: ssh -p 2222 me@gpu-box        # 従来どおりの ssh コマンド(オプションはそのまま残る)
+    ssh:
+      persist: tmux                    # tmux | screen | none(既定 tmux)
+      session: ptygrid-gpu             # 省略時 ptygrid-<name>
+      remote_cmd: claude --continue    # 省略時はリモートのログインシェル
+      reconnect: true                  # 既定 true
+      keepalive: 15                    # ServerAliveInterval 秒(既定 15)
+      max_reconnects: 0                # 0 = 無制限(既定)
+```
+
+実際に実行されるコマンド(ペインの `cmd` 表示にもこの形で出ます):
+
+```
+ssh -p 2222 -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu-box \
+    'tmux new-session -A -s ptygrid-gpu '\''claude --continue'\'''
+```
+
+- **書き換えの規則**: 自分で書いたオプションは元の位置・元の表記のまま残ります(`~` や `${VAR}` は
+  今までどおり展開)。`-o ServerAliveInterval=…` を自分で書いていればそちらが優先されます
+  (ssh は最初の値を採用)。`persist: none` は keepalive だけを足し、tmux も `-t` も付けません。
+- **再接続の条件**: ssh の終了コードが **255(接続エラー)** のときだけ再接続します。`exit` や
+  tmux からの detach(終了コード 0)、接続先に tmux が無い(`127`)などは通常の終了として扱い、
+  再接続しません。`autorestart` とは独立で、こちらの「連続 5 回」上限は適用されません。
+- **バックオフ**: 1 秒 → 2 秒 → 4 秒 … 最大 30 秒。10 秒以上つながっていた後の切断は 1 秒から
+  やり直します(`max_reconnects` のカウントもリセット)。
+- **表示**: 接続中はヘッダーに `⇄ tmux:ptygrid-gpu` バッジ(hover で接続先)、切断後は黄色の
+  `⇄ 再接続中 (n回目)` バッジ。⟳ ボタンで今すぐ再接続、✕ で止められます。
+- **手打ちの ssh**: シェルペインで `ssh host` と打って接続していた場合、その ssh が終了して
+  シェルに戻ると、ヘッダーに赤い `⇄ host に再接続` ボタンが出ます(ペイン内にも区切り線を
+  表示)。押すと同じコマンドラインをそのペインに再入力します。シェルの子プロセスの終了コードは
+  外から見えないため、こちらは**提案止まり**で自動では再接続しません。`exit` で自分で抜けた
+  ときも出るので、不要なら無視してください(次に ssh すると消えます)。手打ちの場合、接続先の
+  プロセスを残したいなら `ssh -t host tmux new -A -s work` のように自分で tmux を付けてください。
+- **制限**: 接続先に tmux / screen が入っている必要があります(無いと `127` で終了し、その旨が
+  ペインに出ます)。認証失敗・ホストダウンも ssh は 255 を返すので、`max_reconnects: 0` の
+  ままだと 30 秒間隔で再試行し続けます(✕ で止める、または上限を設定)。`cmd` に `$(…)` や
+  パイプなどシェル構文を含める書き方は非対応です。mosh は対象外です。
 
 ### ペインの後始末(autoClose / close_on_exit)
 

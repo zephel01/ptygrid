@@ -1461,6 +1461,55 @@ type AgentStatusPayload = {
 - reader hot path の追加は「dirty マーク（atomic + unbounded channel send）」のみ。`agent_status` 未 manage
   の経路（session 単体テスト等）では dirty マークは no-op。
 
+# Phase 4.4.5 追加契約（ssh 永続化と再接続）
+
+`cmd` が `ssh …` の定義に `ssh:` ブロックを付けると、接続先の tmux / screen セッションへ
+アタッチする形で起動し、接続断（ssh exit 255）で同じコマンドを指数バックオフで再起動する。
+tmux の再実装はしない。既存契約はすべて不変（additive）。
+
+## ptygrid.yml スキーマ追加
+
+`agents[].ssh` / `processes[].ssh`（任意）: `persist: tmux|screen|none`（既定 tmux）/
+`session`（既定 `ptygrid-<name>`、`[A-Za-z0-9_-]` のみ）/ `remote_cmd` / `reconnect`（既定 true）/
+`keepalive`（`ServerAliveInterval` 秒、既定 15、`CountMax` は 3 固定）/ `max_reconnects`（既定 0 = 無制限）。
+`cmd` が ssh でない・`session` が不正・`keepalive: 0`・`resume` が ssh でない場合は **config load が失敗**する
+（`team_presets:` / `workflows:` と同じ扱い）。
+
+## コマンド書き換え（`remote::wrap_ssh_command`、純関数）
+
+`ssh <利用者のオプション（原文のまま）> [-t] -o ServerAliveInterval=K -o ServerAliveCountMax=3 -- <dest> '<multiplexer cmd>'`。
+利用者のオプションが先（ssh は最初の `-o` 値を採用するので手書きが勝つ）。宛先の後ろにあった
+コマンドは multiplexer 内で実行するコマンドになる（`remote_cmd` と両方は error）。
+`SessionInfo.cmd` にはこの書き換え後の文字列が載る。
+
+## SessionInfo（additive）
+
+- `remote?: { destination, persist: "tmux"|"screen"|"none", session?, reconnect }` — `ssh:` 付き定義から起動した
+  session にのみ付与。`list_sessions` / `session-state` の両方に載る。
+
+## Tauri Event（新規 2 本）
+
+| event | payload | 発火タイミング |
+|---|---|---|
+| `ssh-reconnect` | `{ id, destination, attempt, maxAttempts, delayMs }` | `ssh:` 付き session が exit 255 で終了し再接続を予約したとき。`pty-exit` → `session-state(restarting)` → 本 event の順 |
+| `ssh-disconnected` | `{ id, destination, command }` | シェルペインで foreground だった `ssh` が終了し、foreground が ssh 以外の解決済みプロセスに戻った tick に 1 回。`ssh:` 付き定義の session では発火しない |
+
+## 状態機械（`session.rs::handle_eof`）
+
+`decide_eof`（autorestart）の **前**に `remote::decide_reconnect` を評価する。
+条件: `remote.reconnect && code == Some(255) && !manual_kill`、かつ `max_reconnects` 未満
+（10 秒以上の安定稼働でカウントは 0 に戻る）。遅延は `min(1s·2^n, 30s)`。
+それ以外（0 / 127 / None / reconnect:false）は従来どおり `autorestart` の判定へ。
+`restart_session`（手動 ⟳）はカウントを 0 に戻す。`kill_pty`（✕）は予約済み再接続を無効化する
+（generation guard、従来の autorestart と同じ）。
+
+## 非回帰
+
+- `ssh:` を持たない定義・adhoc shell・teammate・transcript session の挙動は不変。
+- `restart_count` と `MAX_AUTORESTARTS=5` は ssh 再接続には使わない（別カウンタ `reconnect_count`）。
+- `session-resources.foreground[].detail` は不変。ad-hoc 検知はそれと同じ tick の解決結果を再利用し、
+  foreground が `ssh` のペインに対してのみ argv を追加取得する。
+
 # Phase 4.4.4 追加契約（pane connection context: 「このペインはどこに繋がっているか」）
 
 Phase 4.4.4 は running PTY pane ごとに「向き先」を解決し、pane header と status bar

@@ -21,6 +21,7 @@
     markPaneClosed,
     focusPane,
     clearAgentStatus,
+    reconnectAdhocSsh,
     contextChips,
     type LayoutMode,
   } from "./lib/stores.svelte";
@@ -1149,6 +1150,7 @@
     delete ui.resources[id];
     delete ui.sessions[id];
     delete ui.transcripts[id];
+    delete ui.sshReconnect[id];
     clearAgentStatus(id);
   }
 
@@ -2069,6 +2071,33 @@
                           <span class="exit-code">
                             exit {session.code ?? "?"}
                           </span>
+                        {/if}
+                        {#if session?.state === "running" && session?.remote?.session}
+                          <span
+                            class="remote-badge"
+                            title={m.remotePersistTitle(session.remote.persist, session.remote.session, session.remote.destination)}
+                          >
+                            ⇄ {session.remote.persist}:{session.remote.session}
+                          </span>
+                        {/if}
+                        {#if session?.state === "restarting" && ui.sshReconnect[id]}
+                          {@const rc = ui.sshReconnect[id]}
+                          <span
+                            class="remote-badge reconnecting"
+                            title={m.sshReconnectTitle(rc.destination, rc.attempt, rc.maxAttempts, rc.delayMs)}
+                          >
+                            ⇄ {m.sshReconnecting(rc.attempt, rc.maxAttempts)}
+                          </span>
+                        {/if}
+                        {#if session?.state === "running" && ui.sshDropped[id]}
+                          {@const dropped = ui.sshDropped[id]}
+                          <button
+                            class="remote-badge dropped"
+                            title={m.sshDroppedTitle(dropped.command)}
+                            onclick={() => reconnectAdhocSsh(id)}
+                          >
+                            ⇄ {m.sshDroppedReconnect(dropped.destination)}
+                          </button>
                         {/if}
                         {#if resources && session?.state === "running"}
                           <span
@@ -3478,6 +3507,36 @@
   .exit-code {
     color: #e06c75;
     font-variant-numeric: tabular-nums;
+  }
+
+  /* Phase 4.4.5: ssh persistence / reconnect badges in the pane header. */
+  .remote-badge {
+    font-size: 11px;
+    color: #9cdcfe;
+    border: 1px solid #3a4a58;
+    border-radius: 4px;
+    padding: 0 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
+    background: transparent;
+    font-family: inherit;
+  }
+
+  .remote-badge.reconnecting {
+    color: #e5c07b;
+    border-color: #6b5a2b;
+  }
+
+  .remote-badge.dropped {
+    color: #e06c75;
+    border-color: #6e3a3f;
+    cursor: pointer;
+  }
+
+  .remote-badge.dropped:hover {
+    background: #3a2a2c;
   }
 
   .pane-btn {
