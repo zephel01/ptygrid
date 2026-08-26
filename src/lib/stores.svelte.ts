@@ -14,6 +14,8 @@ import type {
   SessionContextPayload,
   SessionResourcesPayload,
   SessionResourceUsage,
+  SshDisconnectedPayload,
+  SshReconnectPayload,
   SessionInfo,
   TeammateBannerPayload,
   TeammateFallbackPayload,
@@ -95,6 +97,16 @@ export const ui = $state({
   activeId: null as number | null,
   /** Stacked auto-dismiss toasts (top-right). */
   notices: [] as Notice[],
+  /** Phase 4.4.5: pending ssh reconnect per session id (`ssh-reconnect`
+   * event). Only meaningful while the session is `restarting`; cleared on
+   * the next running/exited session-state and on close. `at` = receipt time
+   * (ms) so the header can count down `delayMs`. */
+  sshReconnect: {} as Record<number, SshReconnectPayload & { at: number }>,
+  /** Phase 4.4.5: ad-hoc ssh that ended in a shell pane (`ssh-disconnected`
+   * event) — the header offers a one-click re-run of `command`. Cleared when
+   * the user acts on it, when the pane's foreground becomes ssh again, and
+   * on exit/close. */
+  sshDropped: {} as Record<number, SshDisconnectedPayload>,
   /** Phase 5.0.1: runs left "running" from before a crash/restart, awaiting
    * the user's resume/discard decision (workflow-resume-pending event). */
   workflowResumePrompts: [] as WorkflowRun[],
@@ -169,6 +181,10 @@ export function focusPane(id: number): void {
 export function clearAgentStatus(id: number): void {
   delete ui.agentStatus[id];
   delete ui.agentStatusRule[id];
+  // An ad-hoc reconnect offer belongs to a running shell; nothing to re-run
+  // once the pane itself left `running`. (The reconnect badge is cleared by
+  // the session-state handler itself: it must survive running→restarting.)
+  delete ui.sshDropped[id];
   // Foreground detail is only meaningful while running; same lifecycle.
   delete ui.foregroundDetail[id];
   // Same for the connection context: a stale "aws: prod" chip on an exited
@@ -195,6 +211,22 @@ export function addNotice(title: string, message = ""): void {
 
 export function dismissNotice(key: number): void {
   ui.notices = ui.notices.filter((n) => n.key !== key);
+}
+
+/** Phase 4.4.5: act on an `ssh-disconnected` offer — re-type the remembered
+ * command into the same shell pane. The offer is dropped first so a failed
+ * write cannot leave a stale button (the error goes to the banner). */
+export async function reconnectAdhocSsh(id: number): Promise<void> {
+  const dropped = ui.sshDropped[id];
+  if (!dropped) return;
+  delete ui.sshDropped[id];
+  if (!isTauri()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke<void>("write_pty", { id, data: `${dropped.command}\n` });
+  } catch (err) {
+    ui.errorBanner = msg().sshReconnectFailed(dropped.destination, err);
+  }
 }
 
 /** Fetch queen_status (startup + after each successful load_config). */
@@ -264,6 +296,9 @@ export async function initGlobalListeners(): Promise<void> {
 
     if (known) {
       ui.sessions[payload.id] = payload;
+      // Phase 4.4.5: a reconnect badge lives exactly as long as `restarting`;
+      // the matching ssh-reconnect event (if any) arrives right after this.
+      if (payload.state !== "restarting") delete ui.sshReconnect[payload.id];
       if (payload.state !== "running") {
         delete ui.resources[payload.id];
         // Semantic status only applies to a running PTY: drop it on
@@ -314,6 +349,9 @@ export async function initGlobalListeners(): Promise<void> {
         // detail clears the stored one so `ssh host` → back-to-shell is clean.
         if (fg.detail) ui.foregroundDetail[fg.id] = fg.detail;
         else delete ui.foregroundDetail[fg.id];
+        // Phase 4.4.5: back inside ssh (user reconnected by hand, or clicked
+        // the offer) — the "reconnect?" offer is moot.
+        if (fg.name === "ssh" && fg.detail) delete ui.sshDropped[fg.id];
       }
     }
   });
@@ -361,6 +399,24 @@ export async function initGlobalListeners(): Promise<void> {
       ui.selfWrite = null;
     }
     ui.configChangedPath = event.payload.path;
+  });
+
+  await listen<SshReconnectPayload>("ssh-reconnect", (event) => {
+    // Phase 4.4.5: only while restarting (a late event after a manual restart
+    // or close must not paint a stale badge on a live pane).
+    const id = event.payload.id;
+    if (ui.sessions[id]?.state !== "restarting") return;
+    ui.sshReconnect[id] = { ...event.payload, at: Date.now() };
+  });
+
+  await listen<SshDisconnectedPayload>("ssh-disconnected", (event) => {
+    const id = event.payload.id;
+    if (ui.sessions[id]?.state !== "running") return;
+    ui.sshDropped[id] = event.payload;
+    writeToTerm(
+      id,
+      `\r\n\x1b[2m— ssh ${event.payload.destination} ${msg().sshDroppedDivider} —\x1b[0m\r\n`,
+    );
   });
 
   await listen<QueenNotifyPayload>("queen-notify", (event) => {

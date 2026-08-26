@@ -8,7 +8,9 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::pane_context::{self, ContextBatch};
+use crate::pty;
 use crate::session::PtyManager;
+use crate::ssh_watch;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -123,6 +125,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         // zero so the first tick emits one immediately — a pane that opens and
         // then sits idle should not wait a whole interval for its chips.
         let mut context_due_in = Duration::ZERO;
+        let mut ssh_tracker = ssh_watch::AdhocSshTracker::default();
 
         // CPU usage is a delta and needs two refreshes. Prime the shared
         // System once, then leave a full sample interval before the first emit.
@@ -135,8 +138,36 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             let sessions = aggregate_process_trees(&process_samples(&system), &roots);
             // Resolve foreground names for the same tick so the frontend can
             // label / badge hand-started CLIs live (rides this existing poll).
-            let foreground = manager
-                .foreground_names()
+            let foreground_rows = manager.foreground_names();
+            // Phase 4.4.5: ad-hoc ssh drop detection rides the same resolved
+            // names. argv is looked up only for panes whose foreground is ssh
+            // (one /proc read or `ps` per such pane per tick).
+            let pids: HashMap<u32, (Option<i32>, bool)> = manager
+                .foreground_pids()
+                .into_iter()
+                .map(|(id, pid, managed)| (id, (pid, managed)))
+                .collect();
+            let observations: Vec<ssh_watch::Observation> = foreground_rows
+                .iter()
+                .map(|(id, name, detail)| {
+                    let (pid, managed) = pids.get(id).copied().unwrap_or((None, false));
+                    let argv = match (name.as_deref(), detail.is_some(), pid) {
+                        (Some("ssh"), true, Some(pid)) if !managed => pty::process_argv(pid),
+                        _ => None,
+                    };
+                    ssh_watch::Observation {
+                        id: *id,
+                        name: name.clone(),
+                        detail: detail.clone(),
+                        argv,
+                        managed,
+                    }
+                })
+                .collect();
+            for drop in ssh_tracker.tick(&observations) {
+                let _ = app.emit("ssh-disconnected", &drop);
+            }
+            let foreground = foreground_rows
                 .into_iter()
                 .filter_map(|(id, name, detail)| {
                     name.map(|name| SessionForeground { id, name, detail })

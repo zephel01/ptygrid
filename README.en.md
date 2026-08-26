@@ -43,6 +43,7 @@ Run Claude Code / Codex / Grok simultaneously in split panes, and let the agents
 - 💾 **Logical session restore** — saves the project, pane order, layout, and definitions, and restarts via a `resume` command of your choosing
 - 🧹 **Readable output sharing** — `read_output` returns text reconstructed to match the pane's dimensions, resolving ANSI cursor moves, screen clears, and the alternate screen (handling TUI full-screen redraws and leftover spinner artifacts)
 - 🔭 **ssh destination display** — panes running ssh show `ssh user@host` in the header/sidebar, so you never type into the wrong host
+- 🔌 **ssh persistence + auto-reconnect** — a definition with an `ssh:` block attaches to a tmux / screen session on the remote host; if the link drops the remote processes survive and the pane reconnects with exponential backoff, landing back in the same session. A hand-typed ssh that ends offers a one-click reconnect in the pane header
 - 🌐 **English/Japanese UI** — switch via the ⚙ settings menu: Auto/English/日本語 (defaults to the OS language)
 - 🪶 **Native and lightweight** — no Electron. Rust + Tauri v2 + portable-pty
 

@@ -369,7 +369,30 @@ const SSH_VALUE_FLAGS: &[&str] = &[
 /// None for an argv with no destination (e.g. `ssh -Q cipher`... still returns
 /// the query token — acceptable: ssh exits immediately and the next 1s tick
 /// clears it).
-fn ssh_destination(args: &[String]) -> Option<String> {
+/// Index in `args` of the ssh destination token (see [`ssh_destination`]),
+/// for callers that need to split "local options" from "remote command"
+/// (Phase 4.4.5 `remote::wrap_ssh_command`). Same option-skipping rules.
+pub(crate) fn ssh_destination_index(args: &[String]) -> Option<usize> {
+    let mut i = 1;
+    while i < args.len() {
+        let tok = &args[i];
+        if tok.starts_with("ssh://") {
+            return Some(i);
+        }
+        if tok == "-l" || SSH_VALUE_FLAGS.contains(&tok.as_str()) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+pub(crate) fn ssh_destination(args: &[String]) -> Option<String> {
     let mut login: Option<String> = None;
     let mut iter = args.iter().skip(1);
     while let Some(tok) = iter.next() {
@@ -638,34 +661,41 @@ pub fn process_name(_pid: i32) -> Option<String> {
 /// allowlist check runs first so non-matching processes cost nothing. Linux
 /// reads /proc/<pid>/cmdline; macOS runs `ps -o command=`.
 /// Windows / lookup failure: None.
-#[cfg(target_os = "linux")]
 pub fn process_detail(pid: i32, name: &str) -> Option<String> {
     if !has_destination_detail(name) {
         return None;
     }
+    let args = process_argv(pid)?;
+    destination_detail(name, &args)
+}
+
+/// Full argv of a process (Phase 4.4.5: the ad-hoc ssh reconnect proposal
+/// needs the exact command line to offer re-running it). Linux reads
+/// /proc/<pid>/cmdline; macOS runs `ps -o command=` (argv joined with spaces,
+/// so a quoted argument containing whitespace is not reconstructed exactly —
+/// documented limitation). Windows / lookup failure: None.
+#[cfg(target_os = "linux")]
+pub fn process_argv(pid: i32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let args: Vec<String> = raw
         .split(|b| *b == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
-    destination_detail(name, &args)
+    (!args.is_empty()).then_some(args)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn process_detail(pid: i32, name: &str) -> Option<String> {
-    if !has_destination_detail(name) {
-        return None;
-    }
+pub fn process_argv(pid: i32) -> Option<Vec<String>> {
     // `command=` joins argv with spaces; ssh destinations/flags never contain
     // spaces themselves, so whitespace-splitting reconstructs argv well enough.
     let command = ps_field(pid, "command=")?;
     let args: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-    destination_detail(name, &args)
+    (!args.is_empty()).then_some(args)
 }
 
 #[cfg(not(unix))]
-pub fn process_detail(_pid: i32, _name: &str) -> Option<String> {
+pub fn process_argv(_pid: i32) -> Option<Vec<String>> {
     None
 }
 
@@ -845,6 +875,18 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ssh_destination_index_splits_local_options_from_remote_command() {
+        assert_eq!(ssh_destination_index(&argv(&["ssh", "user@host"])), Some(1));
+        assert_eq!(
+            ssh_destination_index(&argv(&["ssh", "-p", "2222", "-l", "root", "-4A", "host", "uptime"])),
+            Some(6)
+        );
+        assert_eq!(ssh_destination_index(&argv(&["ssh", "-p2222", "ssh://h:22/x"])), Some(2));
+        assert_eq!(ssh_destination_index(&argv(&["ssh", "-p", "22"])), None);
+        assert_eq!(ssh_destination_index(&argv(&["ssh"])), None);
     }
 
     #[test]
