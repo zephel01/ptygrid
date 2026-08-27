@@ -265,7 +265,7 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.worktree.base` | - | `HEAD` | worktree branchの起点となるbranch/tag/commit |
 | `.worktree.setup` | - | - | worktree作成後、agent cwdで一度だけ実行するsetup command |
 | `.ssh.persist` | - | `tmux` | `.cmd` が `ssh …` の定義で、接続先のプロセスを `tmux` / `screen` セッション内に置く(`none` = keepalive のみ)。[ssh 接続の永続化と再接続](#ssh-接続の永続化と再接続) |
-| `.ssh.session` | - | `ptygrid-<name>` | 接続先の tmux / screen セッション名(`[A-Za-z0-9_-]` のみ) |
+| `.ssh.session` | - | `ptygrid-<name>`(2 個目以降 `-2`, `-3`…) | 接続先の tmux / screen セッション名(`[A-Za-z0-9_-]` と `{n}`)。`{n}` は同じ定義の何個目かに置換。`{n}` 無しの固定名は全ペインが同じセッションに入る(鏡写し) |
 | `.ssh.remote_cmd` | - | ログインシェル | セッション内で実行するコマンド(例 `claude --continue`)。`.cmd` の宛先の後ろに書いたコマンドでも可(両方は不可) |
 | `.ssh.reconnect` | - | `true` | 接続断(ssh exit 255)で自動再接続 |
 | `.ssh.keepalive` | - | `15` | `ServerAliveInterval` 秒(`CountMax` は 3 固定 → 約 45 秒で切断検知) |
@@ -1125,6 +1125,13 @@ ssh -p 2222 -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu-box 
   再接続しません。`autorestart` とは独立で、こちらの「連続 5 回」上限は適用されません。
 - **バックオフ**: 1 秒 → 2 秒 → 4 秒 … 最大 30 秒。10 秒以上つながっていた後の切断は 1 秒から
   やり直します(`max_reconnects` のカウントもリセット)。
+- **同じ定義を複数ペイン**: チップを 2 回押す・`spawn_agent` を 2 回呼ぶなど、同じ定義を同時に複数起動すると、
+  2 個目以降のセッション名は自動で `ptygrid-<name>-2`, `-3`… になり、それぞれ独立したリモートシェルと
+  独立した再接続になります(番号は「その定義で今開いているペインの空き最小番号」。終了したペインも
+  ✕ で閉じるまで番号を保持するので、⟳ で同じセッションに戻れます)。ペインの表示名(定義名)は
+  変わらず、ヘッダーの `⇄ tmux:…` バッジで区別します。`session: "work-{n}"` と書けば番号の位置を
+  指定でき、`session: shared` のように固定名を書くと全ペインが同じセッションに入って**鏡写し**になります
+  (別ペインで同じ画面を見たいとき用)。
 - **表示**: 接続中はヘッダーに `⇄ tmux:ptygrid-gpu` バッジ(hover で接続先)、切断後は黄色の
   `⇄ 再接続中 (n回目)` バッジ。⟳ ボタンで今すぐ再接続、✕ で止められます。
 - **手打ちの ssh**: シェルペインで `ssh host` と打って接続していた場合、その ssh が終了して

@@ -548,10 +548,14 @@ impl PtyManager {
         // persistent (tmux/screen) + keepalive form and pins the reconnect
         // policy on the slot. The rewrite is pure; a malformed cmd is a launch
         // error, not a silently non-persistent pane.
+        // Two chips of the same definition must NOT attach to one tmux session
+        // (that mirrors the screen): each concurrent launch gets the smallest
+        // free instance number, which suffixes the default session name.
         let base_cmd = command_for_definition(def, logical_resume).to_string();
         let (cmd, remote) = match def.ssh.as_ref() {
             Some(ssh) => {
-                let wrapped = remote::wrap_ssh_command(&base_cmd, &def.name, ssh)
+                let instance = self.next_remote_instance(&def.name);
+                let wrapped = remote::wrap_ssh_command(&base_cmd, &def.name, ssh, instance)
                     .map_err(|e| format!("{}: {e}", def.name))?;
                 (wrapped.command, Some(wrapped.spec))
             }
@@ -630,6 +634,21 @@ impl PtyManager {
                 Err(e)
             }
         }
+    }
+
+    /// Phase 4.4.5: instance number for a new launch of definition `name` —
+    /// the smallest positive integer no slot of that definition currently
+    /// holds. EVERY slot in the map counts, `exited` included: an exited ssh
+    /// pane still owns its remote session (⟳ revives it in place), and only
+    /// closing the pane (✕, which removes the slot) frees the number.
+    fn next_remote_instance(&self, name: &str) -> u32 {
+        let used: Vec<u32> = self
+            .lock_sessions()
+            .values()
+            .filter(|s| s.spec.name.as_deref() == Some(name))
+            .filter_map(|s| s.spec.remote.as_ref().map(|r| r.instance))
+            .collect();
+        remote::next_instance(&used)
     }
 
     /// Test-only: a shell-wrapped session carrying a `RemoteSpec`, so the
@@ -2569,6 +2588,7 @@ mod tests {
     fn probe_spec(reconnect: bool, max: u32) -> RemoteSpec {
         RemoteSpec {
             destination: "me@gpu".into(),
+            instance: 1,
             persist: crate::config::SshPersist::Tmux,
             session: "ptygrid-probe".into(),
             reconnect,
@@ -2677,6 +2697,49 @@ mod tests {
         wait_state(&manager, id, SessionState::Restarting, 5);
         assert!(manager.reconnect_count(id).is_some_and(|c| c <= 1));
         manager.kill_pty(id).unwrap();
+    }
+
+    /// Phase 4.4.5: two launches of one definition get two remote sessions
+    /// (`…`, `…-2`); an exited pane keeps its number, a closed pane frees it.
+    /// Uses an unreachable destination (connection refused → 255) with
+    /// `reconnect: false`, so no real ssh session is ever established.
+    #[test]
+    fn same_definition_twice_gets_independent_remote_sessions() {
+        let handle = mock_handle();
+        let manager = PtyManager::new();
+        let _grid = GridGuard(&manager);
+        let cfg = config::parse_config(
+            "agents:\n  - name: gpu\n    cmd: ssh -o BatchMode=yes -o ConnectTimeout=1 -p 9 127.0.0.1\n    ssh:\n      reconnect: false\n",
+        )
+        .unwrap();
+        let def = &cfg.agents[0];
+        let dir = std::env::temp_dir();
+        let a = manager.spawn_agent(handle.clone(), def, &dir, 80, 24).unwrap();
+        let b = manager.spawn_agent(handle.clone(), def, &dir, 80, 24).unwrap();
+        let session_of = |id: u32| {
+            manager
+                .list_sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.remote)
+                .and_then(|r| r.session)
+                .unwrap()
+        };
+        assert_eq!(session_of(a), "ptygrid-gpu");
+        assert_eq!(session_of(b), "ptygrid-gpu-2");
+        // Both fail fast (refused → 255, reconnect off) but stay in the map as
+        // exited: the numbers are still taken.
+        wait_state(&manager, a, SessionState::Exited, 10);
+        wait_state(&manager, b, SessionState::Exited, 10);
+        let c = manager.spawn_agent(handle.clone(), def, &dir, 80, 24).unwrap();
+        assert_eq!(session_of(c), "ptygrid-gpu-3");
+        // Closing the first pane frees "1" for the next launch.
+        manager.kill_pty(a).unwrap();
+        let d = manager.spawn_agent(handle, def, &dir, 80, 24).unwrap();
+        assert_eq!(session_of(d), "ptygrid-gpu");
+        for id in [b, c, d] {
+            let _ = manager.kill_pty(id);
+        }
     }
 
     /// End-to-end against a real sshd + tmux (or screen): the remote process

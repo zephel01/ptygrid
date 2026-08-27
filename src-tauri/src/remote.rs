@@ -36,6 +36,11 @@ pub const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 pub struct RemoteSpec {
     /// Display destination (`user@host`, alias, or URI authority).
     pub destination: String,
+    /// 1-based concurrent-instance number of the definition this session was
+    /// launched as (drives the `-2`, `-3` session suffix / `{n}`). Held by
+    /// the slot for its whole life — including `exited` — so the number is
+    /// only reused once the pane is closed.
+    pub instance: u32,
     pub persist: SshPersist,
     /// Multiplexer session name (meaningless for `persist: none`).
     pub session: String,
@@ -94,6 +99,7 @@ pub fn wrap_ssh_command(
     cmd: &str,
     def_name: &str,
     ssh: &SshConfig,
+    instance: u32,
 ) -> Result<WrappedCommand, String> {
     let words = split_shell_words_spanned(cmd)?;
     let tokens: Vec<String> = words.iter().map(|w| w.value.clone()).collect();
@@ -131,7 +137,7 @@ pub fn wrap_ssh_command(
     };
 
     let persist = ssh.effective_persist();
-    let session = ssh.effective_session(def_name);
+    let session = ssh.effective_session(def_name, instance);
     let keepalive = ssh.effective_keepalive();
 
     let mut out: Vec<String> = head; // ssh + user options, verbatim
@@ -184,6 +190,7 @@ pub fn wrap_ssh_command(
         command,
         spec: RemoteSpec {
             destination,
+            instance: instance.max(1),
             persist,
             session,
             reconnect: ssh.effective_reconnect(),
@@ -218,6 +225,16 @@ pub fn decide_reconnect(
         return None;
     }
     Some((count + 1, backoff_delay(count)))
+}
+
+/// Smallest positive integer not in `used` — the instance number for a new
+/// launch of a definition whose live slots hold the numbers in `used`.
+pub fn next_instance(used: &[u32]) -> u32 {
+    let mut n = 1;
+    while used.contains(&n) {
+        n += 1;
+    }
+    n
 }
 
 /// 1s · 2^n, capped at [`RECONNECT_MAX_DELAY`].
@@ -348,7 +365,7 @@ mod tests {
 
     #[test]
     fn wraps_plain_ssh_into_tmux_attach_with_keepalive() {
-        let w = wrap_ssh_command("ssh me@gpu", "gpu box", &ssh("")).unwrap();
+        let w = wrap_ssh_command("ssh me@gpu", "gpu box", &ssh(""), 1).unwrap();
         assert_eq!(
             w.command,
             "ssh -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu \
@@ -367,6 +384,7 @@ mod tests {
             "ssh -p 2222 -i ~/.ssh/id -l root web01",
             "w",
             &ssh("keepalive: 5\nsession: s1"),
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -379,37 +397,37 @@ mod tests {
 
     #[test]
     fn remote_cmd_runs_inside_the_multiplexer_quoted() {
-        let w = wrap_ssh_command("ssh h", "a", &ssh("remote_cmd: claude --continue")).unwrap();
+        let w = wrap_ssh_command("ssh h", "a", &ssh("remote_cmd: claude --continue"), 1).unwrap();
         assert!(w.command.ends_with(
             "-- h 'tmux new-session -A -s ptygrid-a '\\''claude --continue'\\'''"
         ), "{}", w.command);
         // Inline remote command after the destination is picked up too.
-        let w = wrap_ssh_command("ssh h claude --continue", "a", &ssh("")).unwrap();
+        let w = wrap_ssh_command("ssh h claude --continue", "a", &ssh(""), 1).unwrap();
         assert!(w.command.contains("'claude --continue'"), "{}", w.command);
         // Both at once is an error, not a guess.
-        let err = wrap_ssh_command("ssh h claude", "a", &ssh("remote_cmd: codex")).unwrap_err();
+        let err = wrap_ssh_command("ssh h claude", "a", &ssh("remote_cmd: codex"), 1).unwrap_err();
         assert!(err.contains("one, not both"), "{err}");
     }
 
     #[test]
     fn screen_and_none_shapes() {
-        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: screen\nremote_cmd: top")).unwrap();
+        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: screen\nremote_cmd: top"), 1).unwrap();
         assert!(w.command.ends_with("-- h 'screen -D -R -S ptygrid-a sh -c top'"), "{}", w.command);
-        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: none")).unwrap();
+        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: none"), 1).unwrap();
         assert_eq!(
             w.command,
             "ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- h"
         );
         assert_eq!(w.spec.info().session, None);
-        let w = wrap_ssh_command("ssh h uptime", "a", &ssh("persist: none")).unwrap();
+        let w = wrap_ssh_command("ssh h uptime", "a", &ssh("persist: none"), 1).unwrap();
         assert!(w.command.ends_with("-- h uptime"));
     }
 
     #[test]
     fn rejects_non_ssh_and_missing_destination() {
-        assert!(wrap_ssh_command("mosh h", "a", &ssh("")).is_err());
-        assert!(wrap_ssh_command("ssh -p 22", "a", &ssh("")).is_err());
-        assert!(wrap_ssh_command("ssh 'unterminated", "a", &ssh("")).is_err());
+        assert!(wrap_ssh_command("mosh h", "a", &ssh(""), 1).is_err());
+        assert!(wrap_ssh_command("ssh -p 22", "a", &ssh(""), 1).is_err());
+        assert!(wrap_ssh_command("ssh 'unterminated", "a", &ssh(""), 1).is_err());
     }
 
     #[test]
@@ -418,6 +436,7 @@ mod tests {
             "ssh -i \"$HOME/.ssh/id\" -o 'ProxyCommand=nc %h %p' $DEST",
             "a",
             &ssh("persist: none"),
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -426,7 +445,7 @@ mod tests {
              -o ServerAliveCountMax=3 -- $DEST"
         );
         assert_eq!(w.spec.destination, "$DEST");
-        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: none\nremote_cmd: claude --continue")).unwrap();
+        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: none\nremote_cmd: claude --continue"), 1).unwrap();
         assert!(w.command.ends_with("-- h 'claude --continue'"), "{}", w.command);
     }
 
@@ -455,6 +474,7 @@ mod tests {
     fn reconnect_only_on_255_with_backoff_and_cap() {
         let spec = RemoteSpec {
             destination: "h".into(),
+            instance: 1,
             persist: SshPersist::Tmux,
             session: "s".into(),
             reconnect: true,
@@ -477,6 +497,22 @@ mod tests {
         assert_eq!(decide_reconnect(Some(&off), false, Some(255), 0, false), None);
         let unlimited = RemoteSpec { max_reconnects: 0, ..spec };
         assert_eq!(decide_reconnect(Some(&unlimited), false, Some(255), 500, false).map(|r| r.0), Some(501));
+    }
+
+    #[test]
+    fn instance_number_suffixes_the_default_session_and_fills_gaps() {
+        let w = wrap_ssh_command("ssh h", "gpu", &ssh(""), 2).unwrap();
+        assert_eq!(w.spec.session, "ptygrid-gpu-2");
+        assert_eq!(w.spec.instance, 2);
+        assert!(w.command.contains("-s ptygrid-gpu-2"));
+        let w = wrap_ssh_command("ssh h", "gpu", &ssh("session: work-{n}"), 3).unwrap();
+        assert_eq!(w.spec.session, "work-3");
+        let w = wrap_ssh_command("ssh h", "gpu", &ssh("session: shared"), 3).unwrap();
+        assert_eq!(w.spec.session, "shared", "fixed name mirrors on purpose");
+        assert_eq!(next_instance(&[]), 1);
+        assert_eq!(next_instance(&[1]), 2);
+        assert_eq!(next_instance(&[2, 3]), 1, "a closed first pane frees its number");
+        assert_eq!(next_instance(&[1, 2, 4]), 3);
     }
 
     #[test]
