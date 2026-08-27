@@ -14,6 +14,7 @@
 | [multi-agent/](multi-agent/ptygrid.yml) | Claude / Codex / Grok を並行実行し、Queen で協調させる |
 | [web-dev/](web-dev/ptygrid.yml) | Web開発。エージェント + dev server / テストwatchを autorestart で常駐 |
 | [worktree/](worktree/ptygrid.yml) | エージェントごとに linked worktree で作業ツリーを分離 |
+| [remote-ssh/](remote-ssh/ptygrid.yml) | ssh 先のエージェント / 常駐プロセスを tmux（または screen）で永続化し、回線断から自動再接続（Phase 4.4.5）。`ssh:` ブロックの全フィールド、screen 版、keepalive のみの `persist: none`、常駐 dev server の 5 パターン |
 | [teammates/](teammates/ptygrid.yml) | Claude Code の subagent/teammate をペインで観測（Phase 4.0/4.1） |
 | [team-preset/](team-preset/ptygrid.yml) | ローカルLLM主体 + クラウド standby のチームを 👥 で一括起動（Phase 4.3） |
 | [adaptive-orchestration/](adaptive-orchestration/ptygrid.yml) | タスクを分類して worker を事前選抜し、Verifier 合格まで反復させる（Phase 5.7.0）。router + routing_hints 表 + plan-build-verify + 総当たり bakeoff |

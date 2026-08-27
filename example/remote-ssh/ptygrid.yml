@@ -1,0 +1,62 @@
+# remote-ssh — ssh 先で動くエージェントを tmux / screen で永続化し、回線が切れても
+# 自動で再接続する（Phase 4.4.5）。
+#
+# 使い方: <host> を自分の接続先（user@host / .ssh/config のエイリアス）に置換して
+# プロジェクトルートへ ptygrid.yml としてコピー。接続先に tmux（screen 版は screen）が
+# 入っていて、鍵認証で `ssh <host>` が通ることが前提。
+#
+# 仕組み: `ssh:` ブロック付きの定義は
+#   ssh <自分のオプション> -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- <host> \
+#       'tmux new-session -A -s ptygrid-<name> [remote_cmd]'
+# に書き換えて起動する。切断（ssh exit 255）→ 1s/2s/4s…最大 30s のバックオフで再起動 →
+# `-A` で同じ tmux セッションに戻る。`exit` や detach（exit 0）では再接続しない。
+# 同じ定義を 2 ペイン以上開くと 2 個目以降は ptygrid-<name>-2, -3… の別セッションになる。
+
+project: remote-ssh
+
+agents:
+  # 1) 接続先の tmux 内で Claude Code。切断しても会話中のプロセスが残り、再接続で戻る。
+  - name: remote-claude
+    cmd: "ssh <host>"
+    cwd: "."
+    autostart: false
+    ssh:
+      remote_cmd: "claude --continue"   # tmux セッション内で実行するコマンド
+      # persist: tmux                   # 既定 tmux。screen | none も可
+      # session: ptygrid-claude         # 既定 ptygrid-<name>（2個目以降 -2, -3…。"{n}" で位置指定）
+      # reconnect: true                 # 既定 true。false で再接続しない
+      # keepalive: 15                   # ServerAliveInterval 秒。CountMax は 3 固定
+      # max_reconnects: 0               # 連続再接続の上限。0 = 無制限
+
+  # 2) 接続先のログインシェル（remote_cmd 省略）。手作業用の永続シェル。
+  - name: remote-shell
+    cmd: "ssh <host>"
+    autostart: false
+    ssh: {}
+
+  # 3) tmux が無いホスト向けの screen 版。
+  - name: remote-screen
+    cmd: "ssh <host>"
+    autostart: false
+    ssh:
+      persist: screen
+      remote_cmd: "codex"
+
+  # 4) 永続化はせず keepalive + 再接続だけ（リモート側は毎回新しいシェル）。
+  #    ホストがしばらく落ちる想定なら max_reconnects で打ち止めを付ける。
+  - name: remote-plain
+    cmd: "ssh -p 2222 <host>"          # 自分の ssh オプションはそのまま残る
+    autostart: false
+    ssh:
+      persist: none
+      max_reconnects: 10
+
+processes:
+  # 5) リモートの常駐プロセス（dev server 等）。tmux 内で動くので回線断でも止まらない。
+  #    プロセスが自分で終了（exit 0/1）したら tmux セッションも閉じ、再接続はしない。
+  - name: remote-dev
+    cmd: "ssh <host>"
+    autostart: false
+    ssh:
+      session: "dev-{n}"
+      remote_cmd: "cd ~/app && npm run dev"

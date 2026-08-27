@@ -3695,6 +3695,27 @@ agents:
     }
 
     // ---- example/ configs actually parse ----
+    #[test]
+    fn example_remote_ssh_parses_with_all_five_shapes() {
+        let text = include_str!("../../example/remote-ssh/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/remote-ssh must parse");
+        assert_eq!(cfg.agents.len(), 4);
+        assert_eq!(cfg.processes.len(), 1);
+        assert!(cfg.agents.iter().chain(cfg.processes.iter()).all(|d| d.ssh.is_some()));
+        let screen = cfg.agents.iter().find(|d| d.name == "remote-screen").unwrap();
+        assert_eq!(screen.ssh.as_ref().unwrap().effective_persist(), SshPersist::Screen);
+        let plain = cfg.agents.iter().find(|d| d.name == "remote-plain").unwrap();
+        assert_eq!(plain.ssh.as_ref().unwrap().effective_persist(), SshPersist::None);
+        assert_eq!(plain.ssh.as_ref().unwrap().effective_max_reconnects(), 10);
+        let dev = cfg.processes[0].ssh.as_ref().unwrap();
+        assert_eq!(dev.effective_session("remote-dev", 2), "dev-2");
+        // Every definition rewrites cleanly (the placeholder host is a valid token).
+        for d in cfg.agents.iter().chain(cfg.processes.iter()) {
+            crate::remote::wrap_ssh_command(&d.cmd, &d.name, d.ssh.as_ref().unwrap(), 1)
+                .unwrap_or_else(|e| panic!("{}: {e}", d.name));
+        }
+    }
+
 
     /// `example/measure-parallelism/ptygrid.yml` is the synthetic (sleep-only)
     /// fixture used to measure orchestration overhead by hand, so nothing but a
