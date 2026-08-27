@@ -1702,12 +1702,28 @@ impl SshConfig {
         self.persist.unwrap_or_default()
     }
 
-    /// Multiplexer session name: explicit `session`, else `ptygrid-<name>`
-    /// with characters tmux/screen reject (`.`, `:`, whitespace) folded to `-`.
-    pub fn effective_session(&self, def_name: &str) -> String {
+    /// Multiplexer session name for the `instance`-th concurrent launch of
+    /// this definition (1-based; see `session::next_remote_instance`):
+    ///
+    /// - explicit `session` containing `{n}` → `{n}` replaced by the instance;
+    /// - explicit `session` without `{n}` → used verbatim for EVERY instance
+    ///   (deliberate mirroring: two panes attached to one session);
+    /// - omitted → `ptygrid-<name>` for the first instance, `ptygrid-<name>-2`,
+    ///   `-3`… for further ones, so two chips of the same definition get two
+    ///   independent remote shells instead of a mirrored one. Characters
+    ///   tmux/screen reject (`.`, `:`, whitespace) are folded to `-`.
+    pub fn effective_session(&self, def_name: &str, instance: u32) -> String {
+        let n = instance.max(1);
         match self.session.as_deref() {
-            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => format!("ptygrid-{}", sanitize_session_name(def_name)),
+            Some(s) if !s.trim().is_empty() => s.trim().replace("{n}", &n.to_string()),
+            _ => {
+                let base = format!("ptygrid-{}", sanitize_session_name(def_name));
+                if n == 1 {
+                    base
+                } else {
+                    format!("{base}-{n}")
+                }
+            }
         }
     }
 
@@ -1773,10 +1789,11 @@ fn validate_ssh(config: &Config) -> Result<(), String> {
                 if s.is_empty() {
                     return Err(format!("{ctx}.session: must not be empty"));
                 }
-                if s != sanitize_session_name(s) {
+                if s.replace("{n}", "") != sanitize_session_name(&s.replace("{n}", "")) {
                     return Err(format!(
-                        "{ctx}.session: '{s}' may only contain [A-Za-z0-9_-] \
-                         (tmux rejects '.' and ':', screen rejects whitespace)"
+                        "{ctx}.session: '{s}' may only contain [A-Za-z0-9_-] and the \
+                         `{{n}}` instance placeholder (tmux rejects '.' and ':', \
+                         screen rejects whitespace)"
                     ));
                 }
             }
@@ -3678,6 +3695,27 @@ agents:
     }
 
     // ---- example/ configs actually parse ----
+    #[test]
+    fn example_remote_ssh_parses_with_all_five_shapes() {
+        let text = include_str!("../../example/remote-ssh/ptygrid.yml");
+        let cfg = parse_config(text).expect("example/remote-ssh must parse");
+        assert_eq!(cfg.agents.len(), 4);
+        assert_eq!(cfg.processes.len(), 1);
+        assert!(cfg.agents.iter().chain(cfg.processes.iter()).all(|d| d.ssh.is_some()));
+        let screen = cfg.agents.iter().find(|d| d.name == "remote-screen").unwrap();
+        assert_eq!(screen.ssh.as_ref().unwrap().effective_persist(), SshPersist::Screen);
+        let plain = cfg.agents.iter().find(|d| d.name == "remote-plain").unwrap();
+        assert_eq!(plain.ssh.as_ref().unwrap().effective_persist(), SshPersist::None);
+        assert_eq!(plain.ssh.as_ref().unwrap().effective_max_reconnects(), 10);
+        let dev = cfg.processes[0].ssh.as_ref().unwrap();
+        assert_eq!(dev.effective_session("remote-dev", 2), "dev-2");
+        // Every definition rewrites cleanly (the placeholder host is a valid token).
+        for d in cfg.agents.iter().chain(cfg.processes.iter()) {
+            crate::remote::wrap_ssh_command(&d.cmd, &d.name, d.ssh.as_ref().unwrap(), 1)
+                .unwrap_or_else(|e| panic!("{}: {e}", d.name));
+        }
+    }
+
 
     /// `example/measure-parallelism/ptygrid.yml` is the synthetic (sleep-only)
     /// fixture used to measure orchestration overhead by hand, so nothing but a
@@ -4667,7 +4705,9 @@ agents:
         .unwrap();
         let ssh = cfg.agents[0].ssh.as_ref().unwrap();
         assert_eq!(ssh.effective_persist(), SshPersist::Tmux);
-        assert_eq!(ssh.effective_session("gpu box"), "ptygrid-gpu-box");
+        assert_eq!(ssh.effective_session("gpu box", 1), "ptygrid-gpu-box");
+        assert_eq!(ssh.effective_session("gpu box", 2), "ptygrid-gpu-box-2");
+        assert_eq!(ssh.effective_session("gpu box", 0), "ptygrid-gpu-box", "0 is clamped to 1");
         assert!(ssh.effective_reconnect());
         assert_eq!(ssh.effective_keepalive(), SSH_DEFAULT_KEEPALIVE);
         assert_eq!(ssh.effective_max_reconnects(), 0);
@@ -4684,7 +4724,11 @@ agents:
         .unwrap();
         let ssh = cfg.processes[0].ssh.as_ref().unwrap();
         assert_eq!(ssh.effective_persist(), SshPersist::Screen);
-        assert_eq!(ssh.effective_session("w"), "my_sess-1");
+        assert_eq!(ssh.effective_session("w", 1), "my_sess-1");
+        assert_eq!(ssh.effective_session("w", 3), "my_sess-1", "fixed name: every instance mirrors");
+        let tpl = SshConfig { session: Some("gpu-{n}".into()), ..Default::default() };
+        assert_eq!(tpl.effective_session("w", 1), "gpu-1");
+        assert_eq!(tpl.effective_session("w", 4), "gpu-4");
         assert_eq!(ssh.remote_cmd.as_deref(), Some("claude --continue"));
         assert!(!ssh.effective_reconnect());
         assert_eq!(ssh.effective_keepalive(), 3600, "clamped");
@@ -4716,7 +4760,8 @@ agents:
         )
         .unwrap_err();
         assert!(err.contains("dtach") || err.contains("variant"), "{err}");
-        // A full path to ssh is fine.
+        // A full path to ssh is fine; so is the `{n}` placeholder.
         parse_config("agents:\n  - name: a\n    cmd: /usr/bin/ssh h\n    ssh: {}\n").unwrap();
+        parse_config("agents:\n  - name: a\n    cmd: ssh h\n    ssh:\n      session: \"gpu-{n}\"\n").unwrap();
     }
 }

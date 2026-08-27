@@ -1472,6 +1472,9 @@ tmux の再実装はしない。既存契約はすべて不変（additive）。
 `agents[].ssh` / `processes[].ssh`（任意）: `persist: tmux|screen|none`（既定 tmux）/
 `session`（既定 `ptygrid-<name>`、`[A-Za-z0-9_-]` のみ）/ `remote_cmd` / `reconnect`（既定 true）/
 `keepalive`（`ServerAliveInterval` 秒、既定 15、`CountMax` は 3 固定）/ `max_reconnects`（既定 0 = 無制限）。
+`session` は `{n}` プレースホルダーを受け付ける。`n` = 同じ定義で map に存在する slot（`exited` 含む）が
+持っていない最小の正整数（`session::next_remote_instance`）。既定名は n=1 で `ptygrid-<name>`、n≥2 で
+`ptygrid-<name>-<n>`。`{n}` を含まない固定名は全インスタンスで同名（意図的な鏡写し）。
 `cmd` が ssh でない・`session` が不正・`keepalive: 0`・`resume` が ssh でない場合は **config load が失敗**する
 （`team_presets:` / `workflows:` と同じ扱い）。
 
@@ -1484,7 +1487,7 @@ tmux の再実装はしない。既存契約はすべて不変（additive）。
 
 ## SessionInfo（additive）
 
-- `remote?: { destination, persist: "tmux"|"screen"|"none", session?, reconnect }` — `ssh:` 付き定義から起動した
+- `remote?: { destination, persist: "tmux"|"screen"|"none", session?, reconnect }`（`session` は instance 番号解決後の実名） — `ssh:` 付き定義から起動した
   session にのみ付与。`list_sessions` / `session-state` の両方に載る。
 
 ## Tauri Event（新規 2 本）

@@ -166,7 +166,9 @@ agents:
   #   cmd: "ssh -p 2222 me@gpu-box"
   #   ssh:
   #     persist: tmux                # tmux | screen | none   (default tmux)
-  #     session: ptygrid-gpu         # default "ptygrid-<name>"
+  #     session: ptygrid-gpu         # default "ptygrid-<name>"; a 2nd/3rd pane of the
+  #                                  # same definition gets "-2"/"-3" (use "{n}" to place
+  #                                  # the number; a fixed name mirrors one session)
   #     remote_cmd: "claude --continue"   # default: remote login shell
   #     reconnect: true              # default true (only on ssh exit 255)
   #     keepalive: 15                # ServerAliveInterval seconds (default 15)
