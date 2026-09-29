@@ -27,6 +27,7 @@ agents:
       # reconnect: true                 # 既定 true。false で再接続しない
       # keepalive: 15                   # ServerAliveInterval 秒。CountMax は 3 固定
       # max_reconnects: 0               # 連続再接続の上限。0 = 無制限
+      # mouse: true                     # tmux のみ。ホイールで tmux の履歴をスクロール(既定 true)
 
   # 2) 接続先のログインシェル（remote_cmd 省略）。手作業用の永続シェル。
   - name: remote-shell

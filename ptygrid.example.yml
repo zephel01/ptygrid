@@ -173,6 +173,7 @@ agents:
   #     reconnect: true              # default true (only on ssh exit 255)
   #     keepalive: 15                # ServerAliveInterval seconds (default 15)
   #     max_reconnects: 0            # 0 = unlimited (default)
+  #     mouse: true                  # tmux only: wheel scrolls tmux history (default true)
 
 processes:
   - name: web

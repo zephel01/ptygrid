@@ -8,6 +8,7 @@
     getTermHandle,
     COPY_SHORTCUT,
     PASTE_SHORTCUT,
+    SCROLL_BOTTOM_SHORTCUT,
     type TermHandle,
   } from "./terminals";
   import { msg } from "./i18n.svelte";
@@ -22,6 +23,17 @@
   let resizeObserver: ResizeObserver | undefined;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
+
+  // "↓ Latest" button: shown while the viewport is above the live bottom of
+  // the normal buffer (never in the alternate screen, which has no scrollback).
+  let scrolledUp = $state(false);
+  let unsubscribeScroll: (() => void) | undefined;
+
+  function jumpToLatest(): void {
+    const h = getTermHandle(sessionId);
+    h?.scrollToBottom();
+    h?.term.focus();
+  }
 
   // ---- right-click menu (copy / paste) ----
   // Fixed-position like the toolbar popovers in App. `canCopy` is sampled when
@@ -113,6 +125,10 @@
     if (destroyed) return;
 
     handle.attach(containerEl);
+    scrolledUp = handle.scrollState().scrolledUp;
+    unsubscribeScroll = handle.onScrollState((st) => {
+      scrolledUp = st.scrolledUp;
+    });
 
     resizeObserver = new ResizeObserver(() => {
       if (debounceTimer) clearTimeout(debounceTimer);
@@ -126,6 +142,7 @@
     menu = null;
     if (debounceTimer) clearTimeout(debounceTimer);
     resizeObserver?.disconnect();
+    unsubscribeScroll?.();
     containerEl?.removeEventListener("contextmenu", openMenu);
     containerEl?.removeEventListener("focusin", markActive);
     containerEl?.removeEventListener("mousedown", markActive);
@@ -135,11 +152,22 @@
   });
 </script>
 
-<div
-  class="terminal-container"
-  bind:this={containerEl}
-  aria-label={title}
-></div>
+<div class="terminal-wrap">
+  <div
+    class="terminal-container"
+    bind:this={containerEl}
+    aria-label={title}
+  ></div>
+  {#if scrolledUp}
+    <button
+      class="scroll-latest"
+      title="{m.scrollToLatestTitle} ({SCROLL_BOTTOM_SHORTCUT})"
+      onclick={jumpToLatest}
+    >
+      {m.scrollToLatest}
+    </button>
+  {/if}
+</div>
 
 {#if menu}
   <div
@@ -172,6 +200,33 @@
 {/if}
 
 <style>
+  .terminal-wrap {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .scroll-latest {
+    position: absolute;
+    right: 18px;
+    bottom: 10px;
+    z-index: 5;
+    background: rgba(45, 45, 48, 0.92);
+    border: 1px solid #5a5a5a;
+    border-radius: 12px;
+    padding: 3px 10px;
+    color: #e8e8e8;
+    font-size: 11px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  }
+
+  .scroll-latest:hover {
+    background: #3a3d41;
+    border-color: #7a7a7a;
+  }
+
   .terminal-container {
     width: 100%;
     height: 100%;

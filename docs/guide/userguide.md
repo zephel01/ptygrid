@@ -151,6 +151,34 @@ npm run tauri dev    # 初回は Rust ビルドで数分かかります
 > 実機確認は macOS のみ(ペインをまたいだコピー & 貼り付けと右クリックメニュー)。
 > Linux / Windows のキー割り当ては実装済みですが実機未検証です。
 
+### スクロール(作業ログの読み返し)
+
+| 操作 | macOS | Linux / Windows |
+|---|---|---|
+| スクロール | ホイール / トラックパッド | ホイール |
+| 1 ページ上 / 下 | Cmd+↑ / Cmd+↓(Shift+PageUp / PageDown も可) | Ctrl+Shift+↑ / ↓(Shift+PageUp / PageDown も可) |
+| 先頭 / 最新 | Cmd+Home / Cmd+End(fn+Cmd+← / →) | Ctrl+Shift+Home / End |
+
+- 上に遡っている間はペイン右下に「↓ 最新へ」ボタンが出ます。キー入力しても最新に戻ります。
+- 遡れるのはペインごとに最大 5000 行です。
+- **スクロールバック保護**: `clear` や Claude Code が送る「スクロールバック消去」
+  (`ESC[3J`)は既定で無視し、過去ログを残します。画面そのもののクリアは通常どおり動きます。
+  元の動作(消去を受け付ける)に戻すには、開発者ツールのコンソールで
+  `localStorage.setItem("ptygrid.preserveScrollback", "0")` を実行してから再読み込みします。
+- **代替画面では xterm のスクロールバックが使えません**: tmux / vim / 全画面型の TUI は代替画面に
+  描画するため、ペイン側には履歴が溜まりません。この状態でホイールを回すと、端末の仕様により
+  ↑/↓ キーとして届きます(シェルの履歴が次々出る)。tmux の場合は `set -g mouse on`
+  (`~/.tmux.conf`)でホイールが tmux の copy-mode に入るようになります。ssh の `.ssh` 定義の
+  ペインでは ptygrid が自動で設定します([ssh 接続の永続化と再接続](#ssh-接続の永続化と再接続))。
+- **残った画面モードの自動復帰**: tmux / vim / Claude Code などが強制終了したり、手打ちの
+  `ssh` の先で動いていた tmux が回線断で切れたりすると、ペインが代替画面のまま残り、シェルに
+  戻ってもホイールで履歴が回るだけになります(手動なら `tput rmcup` か `reset` で直ります)。
+  ptygrid は次の時点で、ペインの表示側だけを元に戻します(実行中のプログラムには何も送りません)。
+  - プロセス終了時・再起動時・`.ssh` 定義の再接続時: 代替画面・マウス報告・入力モードを解除
+  - フォアグラウンドがプログラムからシェル(zsh / bash / fish など)に戻ったとき: 代替画面か
+    マウス報告が残っている場合だけ解除し、ペインに「画面モードを元に戻しました」と表示します。
+    このときプロンプトが消えて見えることがあるので Enter で再表示してください。
+
 ## Git status / diff
 
 ツールバー右の「Git」を押すと、現在のプロジェクトの変更ファイルとunified diffを
@@ -270,6 +298,7 @@ processes:        # 通常の常駐プロセス(dev サーバー等)。フィー
 | `.ssh.reconnect` | - | `true` | 接続断(ssh exit 255)で自動再接続 |
 | `.ssh.keepalive` | - | `15` | `ServerAliveInterval` 秒(`CountMax` は 3 固定 → 約 45 秒で切断検知) |
 | `.ssh.max_reconnects` | - | `0` | 連続再接続の上限。`0` = 無制限。安定して接続していた後の切断はカウントをリセット |
+| `.ssh.mouse` | - | `true` | tmux のみ。そのセッションに `set-option mouse on` を掛け、ホイールで tmux の履歴をスクロールできるようにする(`false` で付けない) |
 
 > すべてのセッションには環境変数 `QUEEN_URL`(例: `http://127.0.0.1:39237/mcp?token=<token>`)が
 > 注入されます(認証トークン込み)。ペイン内で接続先を確認したいときは `echo $QUEEN_URL` を
@@ -1108,13 +1137,14 @@ agents:
       reconnect: true                  # 既定 true
       keepalive: 15                    # ServerAliveInterval 秒(既定 15)
       max_reconnects: 0                # 0 = 無制限(既定)
+      mouse: true                      # tmux のホイールスクロール(既定 true)
 ```
 
 実際に実行されるコマンド(ペインの `cmd` 表示にもこの形で出ます):
 
 ```
 ssh -p 2222 -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu-box \
-    'tmux new-session -A -s ptygrid-gpu '\''claude --continue'\'''
+    'tmux new-session -A -s ptygrid-gpu '\''claude --continue'\'' \; set-option mouse on'
 ```
 
 - **書き換えの規則**: 自分で書いたオプションは元の位置・元の表記のまま残ります(`~` や `${VAR}` は
@@ -1140,6 +1170,13 @@ ssh -p 2222 -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu-box 
   外から見えないため、こちらは**提案止まり**で自動では再接続しません。`exit` で自分で抜けた
   ときも出るので、不要なら無視してください(次に ssh すると消えます)。手打ちの場合、接続先の
   プロセスを残したいなら `ssh -t host tmux new -A -s work` のように自分で tmux を付けてください。
+- **スクロール**: tmux は代替画面に描画するため、ペイン(xterm)側にはスクロールバックが
+  溜まりません。tmux 既定の `mouse off` のままだとホイールが ↑/↓ キーに変換され、シェルの
+  履歴が送られるだけになります。そこで `mouse on` をそのセッションにだけ設定します(新規作成時も
+  再アタッチ時も適用。グローバル設定は変更しません)。ホイールで tmux の copy-mode に入り、
+  `q` で抜けます。遡れる行数は tmux の `history-limit`(既定 2000)に従います。mouse on の間の
+  テキスト選択は Option+ドラッグ(macOS)/ Shift+ドラッグ(その他)です。tmux 2.1 未満は
+  非対応(`mouse` オプションが無い)。screen にはこの設定はありません(`Ctrl-a [` で copy-mode)。
 - **制限**: 接続先に tmux / screen が入っている必要があります(無いと `127` で終了し、その旨が
   ペインに出ます)。認証失敗・ホストダウンも ssh は 255 を返すので、`max_reconnects: 0` の
   ままだと 30 秒間隔で再試行し続けます(✕ で止める、または上限を設定)。`cmd` に `$(…)` や

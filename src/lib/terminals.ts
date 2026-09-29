@@ -11,6 +11,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { isTauri } from "./tauri";
 import type { PtyOutputPayload } from "./types";
+import { modeResetSequence, type ModeResetScope } from "./termModes";
 
 // Exact font stack per CONTRACT.md (Nerd Font glyph fallback chain).
 const FONT_FAMILY =
@@ -35,6 +36,7 @@ const IS_MAC = (() => {
 /** Shortcut hints for the pane context menu. Symbols/ASCII — not translated. */
 export const COPY_SHORTCUT = IS_MAC ? "⌘C" : "Ctrl+Shift+C";
 export const PASTE_SHORTCUT = IS_MAC ? "⌘V" : "Ctrl+Shift+V";
+export const SCROLL_BOTTOM_SHORTCUT = IS_MAC ? "⌘End" : "Ctrl+Shift+End";
 
 /** Layout-tolerant letter match: physical key first, produced character as fallback
  * (with Shift held, `key` is "C"/"V", hence the toLowerCase). */
@@ -42,6 +44,31 @@ function isLetter(ev: KeyboardEvent, letter: "c" | "v"): boolean {
   const code = letter === "c" ? "KeyC" : "KeyV";
   return ev.code === code || ev.key.toLowerCase() === letter;
 }
+
+// ---- scrollback preservation -----------------------------------------
+//
+// `ESC[3J` (ED 3, "erase saved lines") wipes xterm's scrollback. Claude Code
+// and `clear` emit it, which is exactly when an operator loses the log they
+// wanted to read back. With this on (default), ED 3 is swallowed; ED 0/1/2
+// still work, so the visible screen clears as usual. Toggle without a UI:
+//   localStorage.setItem("ptygrid.preserveScrollback", "0")  // then reload
+const PRESERVE_SCROLLBACK_KEY = "ptygrid.preserveScrollback";
+
+function preserveScrollback(): boolean {
+  try {
+    return localStorage.getItem(PRESERVE_SCROLLBACK_KEY) !== "0";
+  } catch {
+    return true; // storage unavailable → keep the default
+  }
+}
+
+/** Buffer/scroll state a pane needs for its "jump to latest" affordance. */
+export type ScrollState = {
+  /** Viewport is above the live bottom of the normal buffer. */
+  scrolledUp: boolean;
+  /** The alternate screen (tmux/vim/full-screen TUIs) is active — no xterm scrollback. */
+  altBuffer: boolean;
+};
 
 export type TermHandle = {
   term: XTerm;
@@ -58,6 +85,14 @@ export type TermHandle = {
   copySelection(): Promise<boolean>;
   /** Read the clipboard and feed it to the PTY. Rejects on clipboard failure. */
   pasteFromClipboard(): Promise<void>;
+  /** Current scroll state (see ScrollState). */
+  scrollState(): ScrollState;
+  /** Subscribe to scroll-state changes. Returns an unsubscribe function. */
+  onScrollState(listener: (state: ScrollState) => void): () => void;
+  /** Jump the viewport to the live bottom. */
+  scrollToBottom(): void;
+  /** Undo stale alt-screen / mouse / input modes (see termModes.ts). Returns true when anything was written. */
+  resetModes(scope: ModeResetScope): boolean;
   dispose(): void;
 };
 
@@ -70,6 +105,11 @@ const canceledPending = new Set<number>();
 
 export function getTermHandle(id: number): TermHandle | undefined {
   return handles.get(id);
+}
+
+/** Undo stale terminal modes in a session's xterm (see termModes.ts). */
+export function resetTermModes(id: number, scope: ModeResetScope): boolean {
+  return handles.get(id)?.resetModes(scope) ?? false;
 }
 
 /** Write text locally into a session's terminal (exit banners, restart dividers). */
@@ -139,6 +179,106 @@ async function createTermHandle(id: number): Promise<TermHandle> {
   let unlistenOutput: (() => void) | undefined;
   let disposed = false;
 
+  // ---- scrollback ------------------------------------------------------
+  //
+  // ED 3 guard (see preserveScrollback above). Returning true marks the
+  // sequence handled, so xterm's own ED handler (which would drop the saved
+  // lines) never runs; any other ED falls through to the default.
+  term.parser.registerCsiHandler({ final: "J" }, (params) => {
+    return params.length > 0 && params[0] === 3 && preserveScrollback();
+  });
+
+  // Wheel → scrollLines, driven here instead of by xterm's Viewport.
+  // xterm scrolls the normal buffer by moving the native scrollTop of
+  // `.xterm-viewport` and deriving the buffer position from it; in the macOS
+  // WKWebView the panes did not scroll at all, even with plenty of
+  // scrollback. term.scrollLines() moves the buffer position directly (the
+  // viewport's scrollTop is then synced from it), so it does not depend on
+  // the DOM scroll path. Scope is deliberately narrow:
+  //   - only the NORMAL buffer with scrollback; the alternate screen (tmux,
+  //     vim, full-screen TUIs) keeps xterm's default (wheel → ↑/↓, or mouse
+  //     reports when the program enabled mouse tracking — xterm never calls
+  //     this handler in that case);
+  //   - Shift+wheel is left alone (xterm treats it as horizontal).
+  let wheelPartial = 0;
+  function rowHeightPx(): number {
+    const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
+    const h = screen && term.rows > 0 ? screen.clientHeight / term.rows : 0;
+    return h > 0 ? h : 16;
+  }
+  term.attachCustomWheelEventHandler((ev) => {
+    if (disposed) return true;
+    const buf = term.buffer.active;
+    if (buf.type !== "normal" || buf.baseY === 0) return true;
+    if (ev.deltaY === 0 || ev.shiftKey) return true;
+    let lines: number;
+    if (ev.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      lines = Math.round(ev.deltaY);
+    } else if (ev.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      lines = Math.round(ev.deltaY) * term.rows;
+    } else {
+      wheelPartial += ev.deltaY / rowHeightPx();
+      lines = Math.trunc(wheelPartial);
+      wheelPartial -= lines;
+    }
+    if (lines !== 0) term.scrollLines(lines);
+    ev.preventDefault();
+    return false;
+  });
+
+  // Keyboard scrolling for keyboards without PageUp/Home/End (MacBook).
+  // Shift+PageUp/PageDown already work (xterm built-in). Normal buffer only:
+  // in the alternate screen these chords reach the program as before.
+  //   macOS:        ⌘↑ / ⌘↓ page,  ⌘Home / ⌘End (fn+⌘←/→) top / bottom
+  //   Linux/Win:    Ctrl+Shift+↑/↓ page, Ctrl+Shift+Home/End top / bottom
+  function handleScrollKey(ev: KeyboardEvent): boolean {
+    const chord = IS_MAC
+      ? ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey
+      : ev.ctrlKey && ev.shiftKey && !ev.metaKey && !ev.altKey;
+    if (!chord || term.buffer.active.type !== "normal") return false;
+    switch (ev.key) {
+      case "ArrowUp":
+        term.scrollPages(-1);
+        return true;
+      case "ArrowDown":
+        term.scrollPages(1);
+        return true;
+      case "Home":
+        term.scrollToTop();
+        return true;
+      case "End":
+        term.scrollToBottom();
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Scroll-state notifications for the pane's "jump to latest" button.
+  // term.onScroll does not fire for scrolls that start in the DOM viewport
+  // (xterm suppresses it there), so the viewport's native `scroll` event is
+  // observed too (wired in attach(), once the element exists).
+  const scrollListeners = new Set<(state: ScrollState) => void>();
+  let lastScrolledUp = false;
+  let lastAlt = false;
+  function computeScrollState(): ScrollState {
+    const buf = term.buffer.active;
+    const altBuffer = buf.type !== "normal";
+    return { scrolledUp: !altBuffer && buf.viewportY < buf.baseY, altBuffer };
+  }
+  function emitScrollState(): void {
+    if (disposed) return;
+    const st = computeScrollState();
+    if (st.scrolledUp === lastScrolledUp && st.altBuffer === lastAlt) return;
+    lastScrolledUp = st.scrolledUp;
+    lastAlt = st.altBuffer;
+    for (const l of scrollListeners) l(st);
+  }
+  term.onScroll(emitScrollState);
+  term.onWriteParsed(emitScrollState);
+  term.buffer.onBufferChange(emitScrollState);
+  let viewportScrollWired = false;
+
   // ---- clipboard ------------------------------------------------------
   //
   // Copy writes through `navigator.clipboard.writeText` (the app's existing
@@ -183,6 +323,11 @@ async function createTermHandle(id: number): Promise<TermHandle> {
   term.attachCustomKeyEventHandler((ev) => {
     // The handler is also called for keypress/keyup; act once, on keydown.
     if (ev.type !== "keydown") return true;
+
+    if (handleScrollKey(ev)) {
+      ev.preventDefault();
+      return false;
+    }
 
     const isCopyChord = IS_MAC
       ? ev.metaKey && !ev.ctrlKey && !ev.altKey && isLetter(ev, "c")
@@ -283,6 +428,16 @@ async function createTermHandle(id: number): Promise<TermHandle> {
       } else {
         container.appendChild(term.element);
       }
+      if (!viewportScrollWired && term.element) {
+        // Capture phase: `scroll` does not bubble, but it does reach an
+        // ancestor's capturing listener. term.element survives re-parenting,
+        // so this is wired exactly once and dies with term.dispose().
+        term.element.addEventListener("scroll", emitScrollState, {
+          capture: true,
+          passive: true,
+        });
+        viewportScrollWired = true;
+      }
       requestAnimationFrame(() => handle.fitAndSync());
     },
     detach(container) {
@@ -298,6 +453,24 @@ async function createTermHandle(id: number): Promise<TermHandle> {
     },
     copySelection,
     pasteFromClipboard,
+    scrollState: computeScrollState,
+    onScrollState(listener) {
+      scrollListeners.add(listener);
+      return () => scrollListeners.delete(listener);
+    },
+    scrollToBottom() {
+      if (!disposed) term.scrollToBottom();
+    },
+    resetModes(scope) {
+      if (disposed) return false;
+      const seq = modeResetSequence(scope, {
+        altBuffer: term.buffer.active.type === "alternate",
+        mouseTracking: term.modes.mouseTrackingMode,
+      });
+      if (seq === "") return false;
+      term.write(seq);
+      return true;
+    },
     fitAndSync() {
       if (disposed) return;
       const container = term.element?.parentElement;
@@ -325,6 +498,7 @@ async function createTermHandle(id: number): Promise<TermHandle> {
       // thing that must be unhooked by hand (BUG-1).
       unlistenOutput?.();
       unlistenOutput = undefined;
+      scrollListeners.clear();
       term.dispose();
       handles.delete(id);
     },

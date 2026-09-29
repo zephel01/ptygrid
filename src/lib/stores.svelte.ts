@@ -29,7 +29,8 @@ import type {
 } from "./types";
 import { msg } from "./i18n.svelte";
 import { isTauri } from "./tauri";
-import { writeToTerm } from "./terminals";
+import { resetTermModes, writeToTerm } from "./terminals";
+import { returnedToShell } from "./termModes";
 
 export type LayoutMode = "auto" | 1 | 2 | 3;
 
@@ -276,6 +277,10 @@ function teammateToast(ev: TeammateLifecyclePayload): string {
 
 let listenersInitialized = false;
 
+// Last foreground process name per session, for the "program → shell" edge
+// that triggers stale-mode recovery (termModes.ts).
+const lastForeground = new Map<number, string>();
+
 /**
  * Set up the global listeners once:
  * session-state / session-resources / pty-exit / config-changed / queen-notify.
@@ -295,7 +300,16 @@ export async function initGlobalListeners(): Promise<void> {
       payload.id in ui.sessions || ui.panes.includes(payload.id);
 
     if (known) {
+      const prevState = ui.sessions[payload.id]?.state;
       ui.sessions[payload.id] = payload;
+      // The process is gone and will be respawned (autorestart, ⟳, managed
+      // ssh reconnect): drop whatever alt-screen / mouse / input modes it
+      // left, so the next process starts from a clean terminal. Emitted by
+      // the backend before the respawn, so this lands ahead of new output.
+      if (payload.state === "restarting" && prevState !== "restarting") {
+        resetTermModes(payload.id, "processGone");
+      }
+      if (payload.state !== "running") lastForeground.delete(payload.id);
       // Phase 4.4.5: a reconnect badge lives exactly as long as `restarting`;
       // the matching ssh-reconnect event (if any) arrives right after this.
       if (payload.state !== "restarting") delete ui.sshReconnect[payload.id];
@@ -344,6 +358,14 @@ export async function initGlobalListeners(): Promise<void> {
     for (const fg of event.payload.foreground ?? []) {
       const session = ui.sessions[fg.id];
       if (session?.state === "running") {
+        // Program → shell edge: a crashed / killed TUI or a dropped ssh+tmux
+        // can leave the pane in the alt screen with the prompt on top of it
+        // (wheel then cycles shell history instead of scrolling).
+        const prevFg = lastForeground.get(fg.id);
+        lastForeground.set(fg.id, fg.name);
+        if (returnedToShell(prevFg, fg.name) && resetTermModes(fg.id, "shellReturned")) {
+          writeToTerm(fg.id, `\r\n\x1b[2m— ${msg().termModesRestored} —\x1b[0m\r\n`);
+        }
         session.foreground = fg.name;
         // Phase 4.4.3: destination detail (ssh) rides the same entry. Absent
         // detail clears the stored one so `ssh host` → back-to-shell is clean.
@@ -378,6 +400,10 @@ export async function initGlobalListeners(): Promise<void> {
       session.state = "exited";
       session.code = event.payload.code;
     }
+    lastForeground.delete(event.payload.id);
+    // Leave the alt screen etc. first so the divider (and the last output)
+    // land in the normal buffer, where they can be scrolled back to.
+    resetTermModes(event.payload.id, "processGone");
     // Muted grey divider rather than an alarming red "[process exited]"
     // banner: autorestart emits pty-exit before session-state(restarting)
     // arrives, so a red banner falsely reads as a crash every restart (BUG-3).

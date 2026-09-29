@@ -30,6 +30,8 @@ pub const SSH_CONNECTION_ERROR: i32 = 255;
 /// Reconnect backoff: 1s, 2s, 4s … capped here.
 pub const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 pub const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Chained after `tmux new-session …` (see [`wrap_ssh_command`]). tmux ≥ 2.1.
+pub const TMUX_MOUSE_SUFFIX: &str = " \\; set-option mouse on";
 
 /// Resolved, immutable per-launch remote settings carried on the session slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +87,7 @@ pub struct WrappedCommand {
 ///
 /// ```text
 /// ssh <user opts> -t -o ServerAliveInterval=K -o ServerAliveCountMax=3 -- <dest> \
-///     'tmux new-session -A -s <session> [<remote_cmd>]'
+///     'tmux new-session -A -s <session> [<remote_cmd>] \; set-option mouse on'
 /// ```
 ///
 /// Rules:
@@ -94,7 +96,11 @@ pub struct WrappedCommand {
 /// - a remote command already present after the destination in `cmd` is used
 ///   as the command run inside the multiplexer; combining that with
 ///   `ssh.remote_cmd` is an error rather than a silent choice;
-/// - `persist: none` only adds the keepalive probe (no multiplexer, no `-t`).
+/// - `persist: none` only adds the keepalive probe (no multiplexer, no `-t`);
+/// - tmux gets `\; set-option mouse on` chained after `new-session` (session
+///   scoped, runs on create AND on re-attach) unless `ssh.mouse: false`, so
+///   the wheel scrolls tmux history instead of sending ↑/↓ to the program.
+///   `\;` is unescaped by the REMOTE shell into tmux's command separator.
 pub fn wrap_ssh_command(
     cmd: &str,
     def_name: &str,
@@ -157,6 +163,9 @@ pub fn wrap_ssh_command(
             if let Some(rc) = &remote_cmd {
                 r.push(' ');
                 r.push_str(&shell_quote(rc));
+            }
+            if ssh.effective_mouse() {
+                r.push_str(TMUX_MOUSE_SUFFIX);
             }
             Some(r)
         }
@@ -369,7 +378,7 @@ mod tests {
         assert_eq!(
             w.command,
             "ssh -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- me@gpu \
-             'tmux new-session -A -s ptygrid-gpu-box'"
+             'tmux new-session -A -s ptygrid-gpu-box \\; set-option mouse on'"
         );
         assert_eq!(w.spec.destination, "me@gpu");
         assert_eq!(w.spec.persist, SshPersist::Tmux);
@@ -390,7 +399,7 @@ mod tests {
         assert_eq!(
             w.command,
             "ssh -p 2222 -i ~/.ssh/id -l root -t -o ServerAliveInterval=5 \
-             -o ServerAliveCountMax=3 -- web01 'tmux new-session -A -s s1'"
+             -o ServerAliveCountMax=3 -- web01 'tmux new-session -A -s s1 \\; set-option mouse on'"
         );
         assert_eq!(w.spec.destination, "root@web01");
     }
@@ -399,7 +408,7 @@ mod tests {
     fn remote_cmd_runs_inside_the_multiplexer_quoted() {
         let w = wrap_ssh_command("ssh h", "a", &ssh("remote_cmd: claude --continue"), 1).unwrap();
         assert!(w.command.ends_with(
-            "-- h 'tmux new-session -A -s ptygrid-a '\\''claude --continue'\\'''"
+            "-- h 'tmux new-session -A -s ptygrid-a '\\''claude --continue'\\'' \\; set-option mouse on'"
         ), "{}", w.command);
         // Inline remote command after the destination is picked up too.
         let w = wrap_ssh_command("ssh h claude --continue", "a", &ssh(""), 1).unwrap();
@@ -407,6 +416,20 @@ mod tests {
         // Both at once is an error, not a guess.
         let err = wrap_ssh_command("ssh h claude", "a", &ssh("remote_cmd: codex"), 1).unwrap_err();
         assert!(err.contains("one, not both"), "{err}");
+    }
+
+    #[test]
+    fn tmux_mouse_is_on_by_default_and_can_be_disabled() {
+        let w = wrap_ssh_command("ssh h", "a", &ssh(""), 1).unwrap();
+        assert!(w.command.ends_with("-s ptygrid-a \\; set-option mouse on'"), "{}", w.command);
+        let w = wrap_ssh_command("ssh h", "a", &ssh("mouse: false"), 1).unwrap();
+        assert!(w.command.ends_with("'tmux new-session -A -s ptygrid-a'"), "{}", w.command);
+        assert!(!w.command.contains("mouse"), "{}", w.command);
+        // screen / none never get the tmux suffix.
+        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: screen"), 1).unwrap();
+        assert!(!w.command.contains("mouse"), "{}", w.command);
+        let w = wrap_ssh_command("ssh h", "a", &ssh("persist: none"), 1).unwrap();
+        assert!(!w.command.contains("mouse"), "{}", w.command);
     }
 
     #[test]
