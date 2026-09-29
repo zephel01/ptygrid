@@ -1664,6 +1664,9 @@ pub struct AgentDef {
 ///   reconnect: true          # reconnect on connection loss (default true)
 ///   keepalive: 15            # ServerAliveInterval seconds (default 15)
 ///   max_reconnects: 0        # 0 = unlimited (default)
+///   mouse: true              # tmux only: `set-option mouse on` for this
+///                            # session so the wheel scrolls tmux history
+///                            # (default true)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SshConfig {
@@ -1679,6 +1682,13 @@ pub struct SshConfig {
     pub keepalive: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_reconnects: Option<u32>,
+    /// tmux only: enable tmux mouse mode for this session. tmux draws on the
+    /// alternate screen, so xterm.js never accumulates scrollback for the
+    /// pane; with `mouse off` (tmux's default) the wheel is translated into
+    /// ↑/↓ keys and scrolling is impossible. `mouse on` makes the wheel enter
+    /// tmux copy-mode instead. Default true; ignored for screen / none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
 }
 
 /// `tmux | screen | none` (default tmux).
@@ -1740,6 +1750,11 @@ impl SshConfig {
     /// 0 = unlimited.
     pub fn effective_max_reconnects(&self) -> u32 {
         self.max_reconnects.unwrap_or(0)
+    }
+
+    /// tmux mouse mode (wheel scrolling). Default on.
+    pub fn effective_mouse(&self) -> bool {
+        self.mouse.unwrap_or(true)
     }
 }
 

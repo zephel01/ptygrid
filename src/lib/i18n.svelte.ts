@@ -170,6 +170,8 @@ const en = {
   sshReconnectTitle: (destination: string, attempt: number, max: number, delayMs: number) =>
     `Link to ${destination} lost (ssh exit 255). Reconnect attempt ${attempt}${max > 0 ? ` of ${max}` : ""} in ${Math.round(delayMs / 1000)}s. Restart (⟳) reconnects now; close (✕) stops.`,
   sshDroppedDivider: "ended — click ⇄ in the header to reconnect",
+  termModesRestored:
+    "screen mode left over by the previous program was reset (press Enter to redraw the prompt)",
   sshDroppedReconnect: (destination: string) => `reconnect ${destination}`,
   sshDroppedTitle: (command: string) => `Re-run in this pane: ${command}`,
   sshReconnectFailed: (destination: string, err: unknown) =>
@@ -381,6 +383,8 @@ const en = {
     "Nothing selected — drag to select (Option-drag on macOS / Shift-drag elsewhere while a TUI is using the mouse)",
   ctxPaste: "Paste",
   ctxPasteTitle: "Paste the clipboard into this pane",
+  scrollToLatest: "↓ Latest",
+  scrollToLatestTitle: "Jump to the latest output",
 
   // ---- semantic status ----
   astatusBlocked: "blocked (waiting for approval)",
@@ -697,6 +701,8 @@ const ja: Messages = {
   sshReconnectTitle: (destination: string, attempt: number, max: number, delayMs: number) =>
     `${destination} への接続が切れました (ssh exit 255)。${Math.round(delayMs / 1000)}秒後に再接続します (${attempt}回目${max > 0 ? ` / 上限${max}` : ""})。⟳ で今すぐ再接続、✕ で停止。`,
   sshDroppedDivider: "が終了しました — ヘッダーの ⇄ で再接続",
+  termModesRestored:
+    "前のプログラムが残した画面モードを元に戻しました(Enter でプロンプトを再表示)",
   sshDroppedReconnect: (destination: string) => `${destination} に再接続`,
   sshDroppedTitle: (command: string) => `このペインで再実行: ${command}`,
   sshReconnectFailed: (destination: string, err: unknown) =>
@@ -912,6 +918,8 @@ const ja: Messages = {
     "選択範囲がありません — ドラッグで選択してください（TUI がマウスを使っている間は macOS なら Option＋ドラッグ、それ以外は Shift＋ドラッグ）",
   ctxPaste: "貼り付け",
   ctxPasteTitle: "クリップボードの内容をこのペインに貼り付けます",
+  scrollToLatest: "↓ 最新へ",
+  scrollToLatestTitle: "最新の出力へ移動します",
 
   // ---- semantic status ----
   astatusBlocked: "blocked（承認待ち）",

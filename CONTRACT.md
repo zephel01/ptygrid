@@ -1471,7 +1471,8 @@ tmux の再実装はしない。既存契約はすべて不変（additive）。
 
 `agents[].ssh` / `processes[].ssh`（任意）: `persist: tmux|screen|none`（既定 tmux）/
 `session`（既定 `ptygrid-<name>`、`[A-Za-z0-9_-]` のみ）/ `remote_cmd` / `reconnect`（既定 true）/
-`keepalive`（`ServerAliveInterval` 秒、既定 15、`CountMax` は 3 固定）/ `max_reconnects`（既定 0 = 無制限）。
+`keepalive`（`ServerAliveInterval` 秒、既定 15、`CountMax` は 3 固定）/ `max_reconnects`（既定 0 = 無制限）/
+`mouse`（tmux のみ、既定 true: `new-session` の後に `\; set-option mouse on` を連結。セッション単位で global は不変）。
 `session` は `{n}` プレースホルダーを受け付ける。`n` = 同じ定義で map に存在する slot（`exited` 含む）が
 持っていない最小の正整数（`session::next_remote_instance`）。既定名は n=1 で `ptygrid-<name>`、n≥2 で
 `ptygrid-<name>-<n>`。`{n}` を含まない固定名は全インスタンスで同名（意図的な鏡写し）。
